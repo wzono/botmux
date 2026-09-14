@@ -59,7 +59,7 @@ import { parseDocWatchCommand } from './doc-watch-command.js';
 import { parseVcMeetingPrepareCommand } from './vc-meeting-prepare-command.js';
 import { latestDocCommentPollCursor } from './doc-comment-poller.js';
 import {
-  putDocSubscription, removeDocSubscription, listDocSubscriptionsForSession, listAllDocSubscriptions, getDocSubscription,
+  docWatchAnchor, putDocSubscription, removeDocSubscription, listDocSubscriptionsForSession, listAllDocSubscriptions, getDocSubscription,
   type CommentTriggerMode, type DocSubscription,
 } from '../services/doc-subs-store.js';
 import {
@@ -3606,7 +3606,7 @@ export async function handleCommand(
           const existing = getDocSubscription(dataDir, larkAppId, file.fileToken);
           const mode: CommentTriggerMode = request.requestedMode
             ?? (botCfg.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only');
-          const anchor = ds ? sessionAnchorId(ds) : `doc:${file.fileToken}`;
+          const anchor = ds ? sessionAnchorId(ds) : docWatchAnchor(file.fileToken);
           // Existing chat/thread sessions own their project binding. A watch
           // without an explicit --dir inherits that binding; session-less
           // document watches keep their own stored/mapped directory fallback.
@@ -3643,7 +3643,7 @@ export async function handleCommand(
             sessionAnchor: anchor,
             sessionId: ds?.session.sessionId,
             scope: ds?.scope ?? 'chat',
-            chatId: ds?.chatId ?? `doc:${file.fileToken}`,
+            chatId: ds?.chatId ?? anchor,
             commentTriggerMode: mode,
             managedBy: 'watch-comment',
             ownerOpenId: message.senderId,

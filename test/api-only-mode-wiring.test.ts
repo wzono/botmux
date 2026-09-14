@@ -119,6 +119,14 @@ describe('API-only bot mode — runtime Feishu transport gates (source lock)', (
     expect(block).toContain('.filter(notApiOnly)');
   });
 
+  it('normalizes legacy document watches before restoring sessions can close them', () => {
+    const block = region(daemonSource, 'reapOrphanWorkers();', '// Close CoT thinking bubbles');
+    expect(block).toContain('normalizeDocNativeSubscriptionsBeforeSessionRestore(cfg.larkAppId)');
+    expect(block).toContain('restoreSessionsAndScheduleStartupRecovery({');
+    expect(block.indexOf('normalizeDocNativeSubscriptionsBeforeSessionRestore(cfg.larkAppId)'))
+      .toBeLessThan(block.indexOf('restoreSessionsAndScheduleStartupRecovery({'));
+  });
+
   it('gates doc-subscription restore + comment poller behind !cfg.apiOnly', () => {
     const block = region(daemonSource, '文档订阅恢复 + 评论轮询', 'Sweep orphan sandbox trees');
     expect(block).toContain('if (!cfg.apiOnly) {');

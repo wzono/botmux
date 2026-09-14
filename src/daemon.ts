@@ -231,6 +231,7 @@ import {
   admitQueuedActivationTail,
   reserveQueuedActivationTailAdmission,
   type QueuedActivationTailReservation,
+  type WorkerForkAdmission,
   codexAppCleanInputAcceptedForSession,
   hasQueuedActivationAdmissionGate,
   sendWorkerSessionInput,
@@ -515,7 +516,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
 import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
-import { getDocSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, putDocSubscription, removeDocSubscription, setDocCommentPollCursor, type DocSubscription } from './services/doc-subs-store.js';
+import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, normalizeDocNativeWatchSubscription, putDocSubscription, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
@@ -21632,7 +21633,8 @@ async function handleThreadReplyAdmitted(
 /**
  * 为文档评论自动创建 session（无活跃 IM session 时调用）。
  *
- * 用虚拟 anchor = `doc:{fileToken}` 作为 session key，workingDir 取自：
+ * 文档原生监听用 `doc:{fileToken}:{commentId}` 作为 session key；显式绑定会话
+ * 失效后的兼容回退仍使用 `doc:{fileToken}`。workingDir 取自：
  *   1) sub.workingDir（如果订阅时指定了）
  *   2) bot 的 defaultWorkingDir / workingDir 配置
  *   3) fallback 到 ~
@@ -21642,14 +21644,62 @@ async function handleThreadReplyAdmitted(
  * handleDocComment delivery owner 统一完成这些动作。
  * 返回胜出的 DaemonSession（已加入 activeSessions），失败返回 null。
  */
-async function autoCreateDocSession(sub: DocSubscription, larkAppId: string, ctx: DocCommentContext): Promise<DaemonSession | null> {
+const ephemeralDocCommentSessions = new WeakSet<DaemonSession>();
+const docCommentSessionReservations = new WeakMap<DaemonSession, Set<string>>();
+
+function reserveDocCommentSession(ds: DaemonSession, turnId: string): () => void {
+  const reservations = docCommentSessionReservations.get(ds) ?? new Set<string>();
+  reservations.add(turnId);
+  docCommentSessionReservations.set(ds, reservations);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    reservations.delete(turnId);
+    if (reservations.size === 0) docCommentSessionReservations.delete(ds);
+  };
+}
+
+function claimUnacceptedDocCommentSessionRetirement(ds: DaemonSession): boolean {
+  if (!ephemeralDocCommentSessions.has(ds)) return false;
+  if ((docCommentSessionReservations.get(ds)?.size ?? 0) > 0) return false;
+  if (ds.worker && !ds.worker.killed) return false;
+  if ((ds.docCommentTurns?.size ?? 0) > 0) return false;
+  if (Object.keys(ds.session.docCommentTargets ?? {}).length > 0) return false;
+  if (ds.pendingRepo || ds.worktreeCreating || hasProtectedSessionMutationOwnership(ds)) return false;
+  const key = sessionKey(sessionAnchorId(ds), ds.larkAppId);
+  if (activeSessions.get(key) !== ds) return false;
+  activeSessions.delete(key);
+  ephemeralDocCommentSessions.delete(ds);
+  return true;
+}
+
+function acceptDocCommentSession(ds: DaemonSession): void {
+  ephemeralDocCommentSessions.delete(ds);
+}
+
+export const __testOnly_markEphemeralDocCommentSession = (ds: DaemonSession): void => {
+  ephemeralDocCommentSessions.add(ds);
+};
+export const __testOnly_reserveDocCommentSession = reserveDocCommentSession;
+export const __testOnly_claimUnacceptedDocCommentSessionRetirement = claimUnacceptedDocCommentSessionRetirement;
+export const __testOnly_acceptDocCommentSession = acceptDocCommentSession;
+
+async function autoCreateDocSession(
+  sub: DocSubscription,
+  larkAppId: string,
+  ctx: DocCommentContext,
+): Promise<DaemonSession | null> {
   const botCfg = getBot(larkAppId).config;
-  const virtualChatId = `doc:${sub.fileToken}`;
-  const virtualAnchor = virtualChatId;
+  const docNative = isDocNativeWatchSubscription(sub);
+  const virtualAnchor = docNative
+    ? docCommentThreadAnchor(sub.fileToken, ctx.commentId)
+    : `doc:${sub.fileToken}`;
+  const virtualChatId = virtualAnchor;
   const routingKey = sessionKey(virtualAnchor, larkAppId);
   const existing = activeSessions.get(routingKey);
   if (existing?.session.status === 'active' && ownsCurrentRoute(existing, larkAppId)) {
-    persistDocBindingToSession(sub, larkAppId, existing);
+    if (!docNative) persistDocBindingToSession(sub, larkAppId, existing);
     return existing;
   }
 
@@ -21695,7 +21745,9 @@ async function autoCreateDocSession(sub: DocSubscription, larkAppId: string, ctx
     logger.warn(`[doc-comment] auto-create registration lost without an active winner file=${sub.fileToken.slice(0, 12)}`);
     return null;
   }
-  await persistSelectedDocBinding(routingKey, sub, larkAppId, selected, ds);
+  if (!docNative) {
+    await persistSelectedDocBinding(routingKey, sub, larkAppId, selected, ds);
+  }
   if (selected !== ds) {
     logger.info(
       `[doc-comment] auto-create ${session.sessionId.slice(0, 8)} lost to ` +
@@ -21706,7 +21758,8 @@ async function autoCreateDocSession(sub: DocSubscription, larkAppId: string, ctx
 
   // 不在这里 forkWorker —— handleDocComment 会统一处理 reaction、per-turn
   // 回复落点及 fork/send。这里只建好 session skeleton。
-  logger.info(`[doc-comment] auto-created session for file=${sub.fileToken.slice(0, 12)} (wd=${workingDir}, cli=${botCfg.cliId})`);
+  if (docNative) ephemeralDocCommentSessions.add(selected);
+  logger.info(`[doc-comment] auto-created session for file=${sub.fileToken.slice(0, 12)} comment=${ctx.commentId.slice(0, 12)} (wd=${workingDir}, cli=${botCfg.cliId})`);
   return selected;
 }
 
@@ -21731,6 +21784,25 @@ class DocCommentDeferredError extends Error {
     super(reason);
     this.name = 'DocCommentDeferredError';
   }
+}
+
+class DocCommentSubscriptionChangedError extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = 'DocCommentSubscriptionChangedError';
+  }
+}
+
+function currentDocSubscriptionForDelivery(
+  larkAppId: string,
+  expected: DocSubscription,
+): DocSubscription {
+  const current = getDocSubscription(config.session.dataDir, larkAppId, expected.fileToken);
+  if (!current) throw new DocCommentSubscriptionChangedError('subscription removed');
+  if (!sameDocBindingRoute(current, expected) || current.managedBy !== expected.managedBy) {
+    throw new DocCommentSubscriptionChangedError('subscription rebound');
+  }
+  return current;
 }
 
 async function runClaimedDocCommentTurn(
@@ -21775,8 +21847,8 @@ export function __testOnly_resetDocCommentClaims(): void {
  * ds.docCommentTurns —— deliverFinalOutput 据此把正文发表为文档评论。状态卡 /
  * 占位卡仍走会话起点（飞书），天然实现「卡片留飞书、正文进评论」的分流。
  *
- * MVP 边界：仅投递给 activeSessions 里仍在的会话（含 idle 挂起、worker=null —
- * 走 resume 重 fork）；已 /close 的会话其订阅在关闭时已退订，这里查不到 ds 即跳过。
+ * 显式绑定模式沿用绑定会话；文档原生 watch 按 commentId 创建可独立关闭的会话，
+ * 关闭单个评论会话不会停止整篇文档监听。
  */
 async function handleDocComment(ctx: DocCommentContext): Promise<boolean> {
   return withBotTurnAdmission(
@@ -21785,14 +21857,16 @@ async function handleDocComment(ctx: DocCommentContext): Promise<boolean> {
   );
 }
 
-async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean> {
-  const { larkAppId, sub, commentId, text } = ctx;
+async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0): Promise<boolean> {
+  const { larkAppId, commentId, text } = ctx;
+  let sub = ctx.sub;
   const turnId = ctx.replyId || commentId;
   const claimKey = `${larkAppId}:${sub.fileToken}:${turnId}`;
   const userReplyId = ctx.replyId;
   let reactionId: string | undefined;
   let deliveryDs: DaemonSession | undefined;
   let deliverySession: Session | undefined;
+  let releaseDeliveryReservation: (() => void) | undefined;
 
   const targetMatchesThisTurn = (target: {
     fileToken: string;
@@ -21805,7 +21879,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
     && target.commentId === commentId
     && target.replyId === userReplyId;
 
-  const cleanupFailedDelivery = async (): Promise<void> => {
+  const cleanupFailedDelivery = async (error: unknown): Promise<void> => {
     if (deliveryDs) {
       const runtimeTarget = deliveryDs.docCommentTurns?.get(turnId);
       if (targetMatchesThisTurn(runtimeTarget)) {
@@ -21854,6 +21928,14 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
         );
       }
     }
+
+    releaseDeliveryReservation?.();
+    if (deliveryDs && claimUnacceptedDocCommentSessionRetirement(deliveryDs)) {
+      await closeSessionForBackgroundCleanup(
+        deliveryDs.session.sessionId,
+        'document comment admission cleanup',
+      );
+    }
   };
 
   try {
@@ -21863,16 +21945,29 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
     }
     return await runClaimedDocCommentTurn(claimKey, async () => {
       const loc = localeForBot(larkAppId);
-      let ds: DaemonSession | undefined | null = resolveBoundDocSession(sub, larkAppId);
+      const currentSub = getDocSubscription(config.session.dataDir, larkAppId, sub.fileToken);
+      if (!currentSub) {
+        logger.info(`[doc-comment] ignored stale delivery after subscription removal file=${sub.fileToken.slice(0, 12)} turn=${turnId.slice(0, 12)}`);
+        return;
+      }
+      sub = currentSub;
+      const docNative = isDocNativeWatchSubscription(sub);
+      const docThreadAnchor = docNative
+        ? docCommentThreadAnchor(sub.fileToken, commentId)
+        : undefined;
+      let ds: DaemonSession | undefined | null = docThreadAnchor
+        ? activeSessions.get(sessionKey(docThreadAnchor, larkAppId))
+        : resolveBoundDocSession(sub, larkAppId);
+      if (ds && !ownsCurrentRoute(ds, larkAppId)) ds = undefined;
       if (!ds) {
-        // 无活跃 session → 自动为该文档创建一个（用虚拟 anchor = doc:{fileToken}）
-        logger.info(`[doc-comment] no active session for anchor=${sub.sessionAnchor.slice(0, 12)}; auto-creating for file=${sub.fileToken.slice(0, 12)}`);
+        logger.info(`[doc-comment] no active session for anchor=${(docThreadAnchor ?? sub.sessionAnchor).slice(0, 12)}; auto-creating for file=${sub.fileToken.slice(0, 12)}`);
         ds = await autoCreateDocSession(sub, larkAppId, ctx);
         if (!ds) {
           throw new Error(`auto-create session failed for ${sub.fileToken.slice(0, 12)}`);
         }
       }
       deliveryDs = ds;
+      releaseDeliveryReservation = reserveDocCommentSession(ds, turnId);
       const generation = captureRoutingGeneration(ds);
       deliverySession = generation.session;
       ensureCurrentRoutingGeneration(generation, 'comment:start');
@@ -21893,6 +21988,8 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
         );
       }
 
+      sub = currentDocSubscriptionForDelivery(larkAppId, sub);
+
       // 给用户的回复加 "Typing" reaction，让评论者知道 bot 正在处理。
       if (userReplyId) {
         reactionId = await addCommentReaction(larkAppId,
@@ -21903,6 +22000,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
 
       const sender = ctx.authorOpenId ? await resolveSender(larkAppId, ctx.authorOpenId, 'user') : undefined;
       ensureCurrentRoutingGeneration(generation, 'comment:sender');
+      sub = currentDocSubscriptionForDelivery(larkAppId, sub);
       const authorName = sender?.name || ctx.authorOpenId?.slice(0, 8) || '?';
       const dsBotCfg = getBot(ds.larkAppId).config;
       const promptInput = {
@@ -21957,13 +22055,22 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
         rememberLastCliInput(ds, promptContent, cliInput);
         await noteTurnReceived(ds, commentId, text, sender, turnId);
         ensureCurrentRoutingGeneration(generation, 'comment:live-note');
+        sub = currentDocSubscriptionForDelivery(larkAppId, sub);
         if (ds.worker !== targetWorker || targetWorker.killed) {
           throw new Error('worker generation changed during comment:live-note');
         }
         if (!sendWorkerInput(ds, cliInput, turnId)) {
           throw new Error('worker became unavailable during comment:live-send');
         }
-        beginNewTurn(ds, text, turnId);
+        acceptDocCommentSession(ds);
+        try {
+          beginNewTurn(ds, text, turnId);
+        } catch (err) {
+          // Worker IPC already accepted this turn. Presentation/session
+          // projection failure must not make the provider retry the comment and
+          // execute it twice.
+          logger.error(`[${tag(ds)}] doc-comment post-admission projection failed (turn ${turnId.slice(0, 8)}): ${err instanceof Error ? err.message : String(err)}`);
+        }
         logger.info(`[${tag(ds)}] doc-comment turn injected (turn ${turnId.slice(0, 8)})`);
         return;
       }
@@ -22003,17 +22110,47 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
       rememberLastCliInput(ds, promptContent, wrappedInput);
       await noteTurnReceived(ds, commentId, text, sender, turnId);
       ensureCurrentRoutingGeneration(generation, 'comment:refork-note');
+      sub = currentDocSubscriptionForDelivery(larkAppId, sub);
       if (ds.worker && !ds.worker.killed) {
         throw new Error('worker became active during comment:refork-note');
       }
       sessionStore.updateSession(ds.session);
       if (ds.adoptedFrom) {
-        forkAdoptWorker(ds, { prompt: wrappedInput.content, turnId });
+        if (forkAdoptWorker(ds, { prompt: wrappedInput.content, turnId }) !== 'accepted') {
+          throw new Error('adopt worker fork did not accept document comment input');
+        }
+        acceptDocCommentSession(ds);
       } else {
-        forkWorker(ds, wrappedInput, { resume: ds.hasHistory, turnId });
+        let forkAdmission: WorkerForkAdmission | undefined;
+        const forked = forkWorker(
+          ds,
+          wrappedInput,
+          { resume: ds.hasHistory, turnId },
+          {
+            onAdmission: admission => { forkAdmission = admission; },
+            deferDuringDeviceIsolation: false,
+          },
+        );
+        if (!forked || forkAdmission === undefined || forkAdmission === 'rejected') {
+          throw new Error('worker fork did not accept document comment input');
+        }
+        acceptDocCommentSession(ds);
       }
     }, cleanupFailedDelivery);
   } catch (err) {
+    if (err instanceof DocCommentSubscriptionChangedError) {
+      const current = getDocSubscription(config.session.dataDir, larkAppId, sub.fileToken);
+      if (!current) {
+        logger.info(`[doc-comment] stopped watch consumed stale turn file=${sub.fileToken.slice(0, 12)} turn=${turnId.slice(0, 12)}`);
+        return true;
+      }
+      if (routeRetry < 1) {
+        logger.info(`[doc-comment] retrying turn on rebound route file=${sub.fileToken.slice(0, 12)} turn=${turnId.slice(0, 12)}`);
+        return await handleDocCommentAdmitted({ ...ctx, sub: current }, routeRetry + 1);
+      }
+      logger.warn(`[doc-comment] route changed repeatedly; retry deferred file=${sub.fileToken.slice(0, 12)} turn=${turnId.slice(0, 12)}`);
+      return false;
+    }
     if (err instanceof DocCommentDeferredError) {
       // Retryable defer (durable opening ownership): claim was released above so
       // the provider cursor re-attempts this exact comment later. Not a failure.
@@ -22025,6 +22162,8 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext): Promise<boolean
     }
     logger.warn(`[doc-comment] delivery failed, claim released for retry file=${sub.fileToken.slice(0, 12)} turn=${turnId.slice(0, 12)} err=${err instanceof Error ? err.message : String(err)}`);
     return false;
+  } finally {
+    releaseDeliveryReservation?.();
   }
 }
 
@@ -22062,6 +22201,66 @@ export const __testOnly_handleChatModeConverted = handleChatModeConverted;
 
 let docCommentPollRunning = false;
 
+async function retryPendingDocCommentDeliveries(
+  larkAppId: string,
+  deliver: (ctx: DocCommentContext) => Promise<boolean> = handleDocComment,
+): Promise<{ acceptedKeys: Set<string>; blockedFiles: Set<string> }> {
+  const acceptedKeys = new Set<string>();
+  const blockedFiles = new Set<string>();
+  const snapshots = listAllDocSubscriptions(config.session.dataDir, larkAppId)
+    .filter(sub => (sub.pendingDocCommentDeliveries?.length ?? 0) > 0);
+  for (const snapshot of snapshots) {
+    for (const pending of snapshot.pendingDocCommentDeliveries ?? []) {
+      const current = getDocSubscription(config.session.dataDir, larkAppId, snapshot.fileToken);
+      if (!current) break;
+      const key = pending.replyId || pending.commentId;
+      const currentPending = current.pendingDocCommentDeliveries?.find(candidate =>
+        (candidate.replyId || candidate.commentId) === key);
+      if (!currentPending) continue;
+      if (currentPending.acceptedAt !== undefined) {
+        acceptedKeys.add(`${snapshot.fileToken}:${key}`);
+        continue;
+      }
+      try {
+        const accepted = await deliver({
+          larkAppId,
+          sub: current,
+          commentId: pending.commentId,
+          replyId: pending.replyId,
+          text: pending.text,
+          selectedText: pending.selectedText,
+          priorReplies: pending.priorReplies,
+          isWhole: pending.isWhole,
+          authorOpenId: pending.authorOpenId,
+        });
+        if (!accepted) {
+          blockedFiles.add(snapshot.fileToken);
+          logger.warn(`[doc-comment-retry] still pending file=${snapshot.fileToken.slice(0, 12)} reply=${key.slice(0, 12)}`);
+          break;
+        }
+        settleDocCommentWsDelivery(
+          config.session.dataDir,
+          larkAppId,
+          snapshot.fileToken,
+          pending,
+          true,
+        );
+        const latest = getDocSubscription(config.session.dataDir, larkAppId, snapshot.fileToken);
+        const retained = latest?.pendingDocCommentDeliveries?.some(candidate =>
+          (candidate.replyId || candidate.commentId) === key);
+        if (retained) acceptedKeys.add(`${snapshot.fileToken}:${key}`);
+        logger.info(`[doc-comment-retry] accepted file=${snapshot.fileToken.slice(0, 12)} reply=${key.slice(0, 12)}`);
+      } catch (err) {
+        blockedFiles.add(snapshot.fileToken);
+        logger.warn(`[doc-comment-retry] failed file=${snapshot.fileToken.slice(0, 12)} reply=${key.slice(0, 12)}: ${err instanceof Error ? err.message : String(err)}`);
+        break;
+      }
+    }
+  }
+  return { acceptedKeys, blockedFiles };
+}
+export const __testOnly_retryPendingDocCommentDeliveries = retryPendingDocCommentDeliveries;
+
 /**
  * `/watch-comment --all` 的应用身份增量轮询。
  *
@@ -22073,10 +22272,12 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
   if (docCommentPollRunning) return;
   docCommentPollRunning = true;
   try {
+    const pendingRetry = await retryPendingDocCommentDeliveries(larkAppId);
     const subs = listAllDocSubscriptions(config.session.dataDir, larkAppId)
       .filter(sub => sub.managedBy === 'watch-comment' && sub.commentTriggerMode === 'all');
     for (const snapshot of subs) {
       try {
+        if (pendingRetry.blockedFiles.has(snapshot.fileToken)) continue;
         const comments = await listDocComments(larkAppId, {
           fileToken: snapshot.fileToken,
           fileType: snapshot.fileType,
@@ -22084,13 +22285,20 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
         const latest = latestDocCommentPollCursor(comments);
         const current = getDocSubscription(config.session.dataDir, larkAppId, snapshot.fileToken);
         if (!current || current.managedBy !== 'watch-comment' || current.commentTriggerMode !== 'all') continue;
+        const acceptedPending = current.pendingDocCommentDeliveries?.filter(item => item.acceptedAt !== undefined) ?? [];
+        const visibleReplyIds = new Set(comments.flatMap(comment => comment.replies.map(reply => reply.replyId)));
+        if (acceptedPending.some(item => !visibleReplyIds.has(item.replyId || item.commentId))) {
+          logger.info(`[doc-comment-poll] waiting for accepted reply visibility file=${current.fileToken.slice(0, 12)}`);
+          continue;
+        }
 
         if (!current.pollBaselineReady || current.pollCursorAt === undefined || current.pollCursorReplyId === undefined) {
-          setDocCommentPollCursor(
+          commitDocCommentPollCursor(
             config.session.dataDir,
             larkAppId,
             current.fileToken,
             latest ?? { createdAt: Math.floor(Date.now() / 1000), replyId: '' },
+            { clearAcceptedBaseline: true },
           );
           logger.info(`[doc-comment-poll] baseline file=${current.fileToken.slice(0, 12)} comments=${comments.length}`);
           continue;
@@ -22110,6 +22318,8 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
             if (!stillWatching || stillWatching.managedBy !== 'watch-comment' || stillWatching.commentTriggerMode !== 'all') {
               return false; // watch removed mid-loop → stop without advancing
             }
+            const pendingKey = `${current.fileToken}:${reply.replyId}`;
+            if (pendingRetry.acceptedKeys.has(pendingKey)) return true;
             const selfBotOpenId = getBot(larkAppId).botOpenId;
             const isSelfReply = (selfBotOpenId && reply.authorOpenId === selfBotOpenId)
               || isBotAuthoredReply(reply.replyId)
@@ -22133,10 +22343,27 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
             });
             if (!ok) {
               logger.warn(`[doc-comment-poll] cursor NOT advanced for reply=${reply.replyId.slice(0, 12)} (handleDocComment returned false; stopping this round, will retry next poll)`);
+              return false;
             }
-            return ok;
+            settleDocCommentWsDelivery(
+              config.session.dataDir,
+              larkAppId,
+              current.fileToken,
+              {
+                commentId: reply.commentId,
+                replyId: reply.replyId,
+                text: reply.text,
+                selectedText: reply.selectedText,
+                priorReplies: reply.priorReplies,
+                isWhole: reply.isWhole,
+                authorOpenId: reply.authorOpenId,
+                queuedAt: Date.now(),
+              },
+              true,
+            );
+            return true;
           },
-          (reply) => { setDocCommentPollCursor(config.session.dataDir, larkAppId, current.fileToken, reply); },
+          (reply) => { commitDocCommentPollCursor(config.session.dataDir, larkAppId, current.fileToken, reply); },
         );
       } catch (err) {
         logger.warn(`[doc-comment-poll] file=${snapshot.fileToken.slice(0, 12)} failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -22144,6 +22371,17 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
     }
   } finally {
     docCommentPollRunning = false;
+  }
+}
+
+function normalizeDocNativeSubscriptionsBeforeSessionRestore(larkAppId: string): void {
+  let subs: DocSubscription[];
+  try { subs = listAllDocSubscriptions(config.session.dataDir, larkAppId); } catch { return; }
+  for (const sub of subs) {
+    const normalized = normalizeDocNativeWatchSubscription(sub);
+    if (normalized === sub) continue;
+    putDocSubscription(config.session.dataDir, larkAppId, normalized);
+    logger.info(`[doc-comment] migrated thread-scoped watch ${sub.fileToken.slice(0, 12)} before session restore`);
   }
 }
 
@@ -22158,6 +22396,10 @@ async function restoreDocSubscriptions(_sessions: Map<string, DaemonSession>): P
     try { subs = listAllDocSubscriptions(config.session.dataDir, appId); } catch { continue; }
     for (const sub of subs) {
       const file = { fileToken: sub.fileToken, fileType: sub.fileType };
+      if (isDocNativeWatchSubscription(sub)) {
+        logger.info(`[doc-comment] restore: kept thread-scoped event watch ${sub.fileToken.slice(0, 12)}`);
+        continue;
+      }
       // 判定保留/退订以**持久化的会话状态**为准（不看内存 activeSessions，避免恢复
       // 时序 / keying 差异误删活跃会话的订阅）。只有「明确已关闭」才退订清表：
       //   • 有 sessionId 且其会话 status==='closed' → 真的关了 → 退订 + 删表
@@ -23490,7 +23732,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // See reapOrphanWorkers() in worker-pool.ts.
   reapOrphanWorkers();
 
-  // Restore active sessions from previous run
+  // Normalize legacy document-native watches before restore can close their old sessions.
+  if (!cfg.apiOnly) normalizeDocNativeSubscriptionsBeforeSessionRestore(cfg.larkAppId);
+
   // Restore active sessions from previous run
   await restoreSessionsAndScheduleStartupRecovery({
     larkAppId: cfg.larkAppId,

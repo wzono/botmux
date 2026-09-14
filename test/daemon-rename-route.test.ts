@@ -74,8 +74,14 @@ const mocks = vi.hoisted(() => {
       const session = sessions.get(sessionId);
       if (session) session.status = 'closed';
     }),
-    forkWorker: vi.fn((ds: any) => {
+    forkWorker: vi.fn((ds: any, _input?: any, _resume?: any, opts?: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      opts?.onAdmission?.('accepted');
+      return true;
+    }),
+    forkAdoptWorker: vi.fn((ds: any) => {
+      ds.worker = { killed: false, send: vi.fn() };
+      return 'accepted' as const;
     }),
     // Must mirror the real contract: closeSession() always resolves a
     // CloseSessionResult. Returning undefined made the remote-close guard
@@ -94,6 +100,7 @@ const mocks = vi.hoisted(() => {
     runAutoWorktreeCommit: vi.fn(async (deps: any) => {
       deps.ds.worktreeCreating = true;
     }),
+    persistStreamCardState: vi.fn((impl: (...args: any[]) => any, ...args: any[]) => impl(...args)),
   };
 });
 
@@ -147,7 +154,10 @@ vi.mock('../src/core/worker-pool.js', async () => {
   return {
     ...actual,
     forkWorker: mocks.forkWorker,
+    forkAdoptWorker: mocks.forkAdoptWorker,
     closeSession: mocks.closeWorkerPoolSession,
+    closeSessionForBackgroundCleanup: (sessionId: string) =>
+      mocks.closeWorkerPoolSession(sessionId),
   };
 });
 
@@ -177,6 +187,8 @@ vi.mock('../src/core/session-manager.js', async () => {
     ...actual,
     getAvailableBots: mocks.getAvailableBots,
     downloadResources: mocks.downloadResources,
+    persistStreamCardState: (...args: any[]) =>
+      mocks.persistStreamCardState(actual.persistStreamCardState, ...args),
   };
 });
 
@@ -211,6 +223,7 @@ import {
   __testOnly_prewarmDocCommentSession as prewarmDocCommentSession,
   __testOnly_releaseQueuedActivationReservation as releaseQueuedActivationReservation,
   __testOnly_resetDocCommentClaims as resetDocCommentClaims,
+  __testOnly_retryPendingDocCommentDeliveries as retryPendingDocCommentDeliveries,
 } from '../src/daemon.js';
 import {
   admitQueuedActivationTail,
@@ -560,9 +573,16 @@ describe('/rename production routing — must not pre-create a session (review P
     mocks.getChatMode.mockResolvedValue('group');
     mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
     mocks.sessions.clear();
-    mocks.forkWorker.mockImplementation((ds: any) => {
+    mocks.forkWorker.mockImplementation((ds: any, _input?: any, _resume?: any, opts?: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      opts?.onAdmission?.('accepted');
+      return true;
     });
+    mocks.forkAdoptWorker.mockImplementation((ds: any) => {
+      ds.worker = { killed: false, send: vi.fn() };
+      return 'accepted';
+    });
+    mocks.persistStreamCardState.mockImplementation((impl: (...args: any[]) => any, ...args: any[]) => impl(...args));
     mocks.closeWorkerPoolSession.mockImplementation(async (sessionId: string) => {
       for (const [key, candidate] of activeSessions) {
         if (candidate.session.sessionId !== sessionId) continue;
@@ -3001,8 +3021,10 @@ describe('document comment canonical ownership and single-flight delivery', () =
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.sessions.clear();
-    mocks.forkWorker.mockImplementation((ds: any) => {
+    mocks.forkWorker.mockImplementation((ds: any, _input?: any, _resume?: any, opts?: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      opts?.onAdmission?.('accepted');
+      return true;
     });
     mocks.getAvailableBots.mockResolvedValue([]);
     activeSessions.clear();
@@ -3026,6 +3048,21 @@ describe('document comment canonical ownership and single-flight delivery', () =
     return sub;
   }
 
+  function docNativeSub(fileToken: string): any {
+    const anchor = `doc:${fileToken}:watch`;
+    const sub = {
+      fileToken,
+      fileType: 'docx',
+      sessionAnchor: anchor,
+      scope: 'chat' as const,
+      chatId: anchor,
+      commentTriggerMode: 'all' as const,
+      managedBy: 'watch-comment' as const,
+      createdAt: Date.now(),
+    };
+    putDocSubscription(config.session.dataDir, APP, sub);
+    return sub;
+  }
   function docCtx(sub: any, suffix: string): any {
     return {
       larkAppId: APP,
@@ -3130,50 +3167,243 @@ describe('document comment canonical ownership and single-flight delivery', () =
     removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
   });
 
-  it('serializes concurrent get-or-create, merges targets, and reuses canonical state after restart', async () => {
+  it('isolates concurrent document comment threads and reuses one thread after restart', async () => {
     const fileToken = `doc-concurrent-${Date.now()}`;
-    const sub = docSub(fileToken);
+    const sub = docNativeSub(fileToken);
 
     await expect(Promise.all([
       handleDocComment(docCtx(sub, 'one')),
       handleDocComment(docCtx(sub, 'two')),
     ])).resolves.toEqual([true, true]);
 
-    const key = sessionKey(`doc:${fileToken}`, APP);
-    const owner = activeSessions.get(key)!;
-    expect(owner).toBeDefined();
-    expect(mocks.createSession).toHaveBeenCalledTimes(1);
-    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
-    expect(Object.keys(owner.session.docCommentTargets ?? {}).sort()).toEqual(['reply-one', 'reply-two']);
+    const keyOne = sessionKey(`doc:${fileToken}:comment-one`, APP);
+    const keyTwo = sessionKey(`doc:${fileToken}:comment-two`, APP);
+    const ownerOne = activeSessions.get(keyOne)!;
+    const ownerTwo = activeSessions.get(keyTwo)!;
+    expect(ownerOne).toBeDefined();
+    expect(ownerTwo).toBeDefined();
+    expect(ownerOne).not.toBe(ownerTwo);
+    expect(mocks.createSession).toHaveBeenCalledTimes(2);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(2);
+    expect(Object.keys(ownerOne.session.docCommentTargets ?? {})).toEqual(['reply-one']);
+    expect(Object.keys(ownerTwo.session.docCommentTargets ?? {})).toEqual(['reply-two']);
 
     const persisted = getDocSubscription(config.session.dataDir, APP, fileToken)!;
     expect(persisted).toMatchObject({
-      sessionAnchor: `doc:${fileToken}`,
-      sessionId: owner.session.sessionId,
+      sessionAnchor: `doc:${fileToken}:watch`,
       scope: 'chat',
-      chatId: `doc:${fileToken}`,
+      chatId: `doc:${fileToken}:watch`,
     });
-    // This is the exact anchor closeSession uses to find subscriptions.
-    expect(sessionAnchorId(owner)).toBe(persisted.sessionAnchor);
+    expect(persisted.sessionId).toBeUndefined();
 
-    // Simulate a daemon memory restart restoring the same persisted session at
-    // activeSessionKey(ds), then deliver another comment from a stale snapshot.
     activeSessions.clear();
-    owner.worker = null;
-    activeSessions.set(key, owner);
+    ownerOne.worker = null;
+    activeSessions.set(keyOne, ownerOne);
     const staleSnapshot = { ...sub };
-    await expect(handleDocComment(docCtx(staleSnapshot, 'three'))).resolves.toBe(true);
-    expect(mocks.createSession).toHaveBeenCalledTimes(1);
-    expect(activeSessions.get(key)).toBe(owner);
-    expect(Object.keys(owner.session.docCommentTargets ?? {}).sort()).toEqual([
+    await expect(handleDocComment({
+      ...docCtx(staleSnapshot, 'one-followup'),
+      commentId: 'comment-one',
+    })).resolves.toBe(true);
+    expect(mocks.createSession).toHaveBeenCalledTimes(2);
+    expect(activeSessions.get(keyOne)).toBe(ownerOne);
+    expect(Object.keys(ownerOne.session.docCommentTargets ?? {}).sort()).toEqual([
       'reply-one',
-      'reply-three',
-      'reply-two',
+      'reply-one-followup',
     ]);
 
     removeDocSubscription(config.session.dataDir, APP, fileToken);
   });
+  it('consumes a stale comment after its document watch is stopped during sender lookup', async () => {
+    const fileToken = `doc-stopped-${Date.now()}`;
+    const sub = docNativeSub(fileToken);
+    const gate = deferred();
+    mocks.resolveSender.mockImplementationOnce(async () => {
+      await gate.promise;
+      return { openId: OWNER, type: 'user' as const };
+    });
+    mocks.closeWorkerPoolSession.mockImplementationOnce(async (sessionId: string) => {
+      for (const [key, candidate] of activeSessions) {
+        if (candidate.session.sessionId !== sessionId) continue;
+        activeSessions.delete(key);
+        candidate.session.status = 'closed';
+      }
+      return { ok: true as const, outcome: 'closed' as const, alreadyClosed: false, known: true };
+    });
 
+    const delivery = handleDocComment(docCtx(sub, 'stopped'));
+    await vi.waitFor(() => expect(mocks.createSession).toHaveBeenCalledTimes(1));
+    removeDocSubscription(config.session.dataDir, APP, fileToken);
+    gate.resolve();
+
+    await expect(delivery).resolves.toBe(true);
+    expect(mocks.closeWorkerPoolSession).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(activeSessions.has(sessionKey(`doc:${fileToken}:comment-stopped`, APP))).toBe(false);
+  });
+
+  it('retries a stale document comment on the latest explicit session binding', async () => {
+    const fileToken = `doc-rebound-${Date.now()}`;
+    const sub = docNativeSub(fileToken);
+    const gate = deferred();
+    mocks.resolveSender.mockImplementationOnce(async () => {
+      await gate.promise;
+      return { openId: OWNER, type: 'user' as const };
+    });
+    mocks.closeWorkerPoolSession.mockImplementationOnce(async (sessionId: string) => {
+      for (const [key, candidate] of activeSessions) {
+        if (candidate.session.sessionId !== sessionId) continue;
+        activeSessions.delete(key);
+        candidate.session.status = 'closed';
+      }
+      return { ok: true as const, outcome: 'closed' as const, alreadyClosed: false, known: true };
+    });
+
+    const delivery = handleDocComment(docCtx(sub, 'rebound'));
+    await vi.waitFor(() => expect(mocks.createSession).toHaveBeenCalledTimes(1));
+    const rebound = seedThreadSession(`om_rebound_${fileToken}`, 'rebound doc owner');
+    putDocSubscription(config.session.dataDir, APP, {
+      ...sub,
+      sessionAnchor: sessionAnchorId(rebound),
+      sessionId: rebound.session.sessionId,
+      scope: rebound.scope,
+      chatId: rebound.chatId,
+    });
+    gate.resolve();
+
+    await expect(delivery).resolves.toBe(true);
+    expect(mocks.closeWorkerPoolSession).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(rebound.session.docCommentTargets).toHaveProperty('reply-rebound');
+    expect(activeSessions.has(sessionKey(`doc:${fileToken}:comment-rebound`, APP))).toBe(false);
+    removeDocSubscription(config.session.dataDir, APP, fileToken);
+  });
+
+  it('keeps a live-worker comment accepted when post-send projection fails', async () => {
+    const fileToken = `doc-live-projection-${Date.now()}`;
+    const sub = docSub(fileToken);
+    sub.commentTriggerMode = 'mention-only';
+    const ds = seedThreadSession(sub.sessionAnchor, 'live projection');
+    const send = vi.fn();
+    ds.worker = { killed: false, send } as any;
+    bindSubToSession(sub, ds);
+    mocks.persistStreamCardState.mockImplementationOnce(() => {
+      throw new Error('projection persistence failed');
+    });
+
+    await expect(handleDocComment(docCtx(sub, 'projection'))).resolves.toBe(true);
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(ds.session.docCommentTargets).toHaveProperty('reply-projection');
+    expect(getDocSubscription(config.session.dataDir, APP, fileToken)?.pendingDocCommentDeliveries).toBeUndefined();
+    removeDocSubscription(config.session.dataDir, APP, fileToken);
+  });
+
+  it('keeps the comment retryable when worker admission rejects the fork', async () => {
+    const fileToken = `doc-admission-rejected-${Date.now()}`;
+    const sub = docNativeSub(fileToken);
+    mocks.forkWorker.mockImplementationOnce((_ds: any, _input: any, _resume: any, opts?: any) => {
+      opts?.onAdmission?.('rejected');
+      return true;
+    });
+
+    await expect(handleDocComment(docCtx(sub, 'rejected'))).resolves.toBe(false);
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[3]).toEqual(expect.objectContaining({
+      deferDuringDeviceIsolation: false,
+    }));
+    expect(mocks.closeWorkerPoolSession).toHaveBeenCalledTimes(1);
+    expect(activeSessions.has(sessionKey(`doc:${fileToken}:comment-rejected`, APP))).toBe(false);
+    expect(getDocSubscription(config.session.dataDir, APP, fileToken)).not.toBeNull();
+    removeDocSubscription(config.session.dataDir, APP, fileToken);
+  });
+
+  it('keeps an explicitly bound adopted comment retryable when the adopt fork rejects', async () => {
+    const fileToken = `doc-adopt-rejected-${Date.now()}`;
+    const sub = docSub(fileToken);
+    const ds = seedThreadSession(sub.sessionAnchor, 'adopted doc owner');
+    ds.adoptedFrom = {
+      source: 'tmux',
+      tmuxTarget: 'work:0.0',
+      originalCliPid: 4242,
+      sessionId: 'sess-adopt-live',
+      cliId: 'claude-code',
+      cwd: '/repo',
+    };
+    ds.session.adoptedFrom = { ...ds.adoptedFrom };
+    bindSubToSession(sub, ds);
+    mocks.forkAdoptWorker.mockReturnValueOnce('rejected');
+
+    await expect(handleDocComment(docCtx(sub, 'adopt-rejected'))).resolves.toBe(false);
+
+    expect(mocks.forkAdoptWorker).toHaveBeenCalledTimes(1);
+    expect(ds.session.docCommentTargets).not.toHaveProperty('reply-adopt-rejected');
+    expect(getDocSubscription(config.session.dataDir, APP, fileToken)).not.toBeNull();
+    removeDocSubscription(config.session.dataDir, APP, fileToken);
+  });
+
+  it('retries persisted WS delivery across rounds using the latest explicit binding', async () => {
+    const fileToken = `doc-pending-ws-${Date.now()}`;
+    const sub = docSub(fileToken);
+    sub.commentTriggerMode = 'mention-only';
+    putDocSubscription(config.session.dataDir, APP, {
+      ...sub,
+      pendingDocCommentDeliveries: [{
+        commentId: 'comment-pending',
+        replyId: 'reply-pending',
+        text: 'retry me',
+        queuedAt: 1,
+      }],
+    });
+    const attempts: string[] = [];
+    const reject = vi.fn(async (ctx: any) => {
+      attempts.push(ctx.sub.sessionAnchor);
+      return false;
+    });
+
+    const blocked = await retryPendingDocCommentDeliveries(APP, reject);
+    expect(blocked).toEqual({ acceptedKeys: new Set(), blockedFiles: new Set([fileToken]) });
+    expect(getDocSubscription(config.session.dataDir, APP, fileToken)?.pendingDocCommentDeliveries).toHaveLength(1);
+
+    const rebound = seedThreadSession(`om_pending_rebound_${fileToken}`, 'pending rebound');
+    bindSubToSession(getDocSubscription(config.session.dataDir, APP, fileToken)!, rebound);
+    const accept = vi.fn(async (ctx: any) => {
+      attempts.push(ctx.sub.sessionAnchor);
+      return true;
+    });
+    const accepted = await retryPendingDocCommentDeliveries(APP, accept);
+
+    expect(accepted).toEqual({ acceptedKeys: new Set(), blockedFiles: new Set() });
+    expect(attempts).toEqual([sub.sessionAnchor, sessionAnchorId(rebound)]);
+    expect(getDocSubscription(config.session.dataDir, APP, fileToken)?.pendingDocCommentDeliveries).toBeUndefined();
+    removeDocSubscription(config.session.dataDir, APP, fileToken);
+  });
+  it('does not re-execute an accepted --all pending marker after restart', async () => {
+    const fileToken = `doc-accepted-marker-${Date.now()}`;
+    const sub = docSub(fileToken);
+    sub.commentTriggerMode = 'all';
+    putDocSubscription(config.session.dataDir, APP, {
+      ...sub,
+      pendingDocCommentDeliveries: [{
+        commentId: 'comment-accepted',
+        replyId: 'reply-accepted',
+        text: 'already delivered',
+        queuedAt: 1,
+        acceptedAt: 2,
+      }],
+    });
+    const deliver = vi.fn(async () => true);
+
+    await expect(retryPendingDocCommentDeliveries(APP, deliver)).resolves.toEqual({
+      acceptedKeys: new Set([`${fileToken}:reply-accepted`]),
+      blockedFiles: new Set(),
+    });
+
+    expect(deliver).not.toHaveBeenCalled();
+    expect(getDocSubscription(config.session.dataDir, APP, fileToken)?.pendingDocCommentDeliveries?.[0])
+      .toMatchObject({ replyId: 'reply-accepted', acceptedAt: 2 });
+    removeDocSubscription(config.session.dataDir, APP, fileToken);
+  });
   it('makes duplicate WS/poll deliveries share failure so neither advances its cursor', async () => {
     const fileToken = `doc-failure-${Date.now()}`;
     const sub = docSub(fileToken);
@@ -3189,8 +3419,10 @@ describe('document comment canonical ownership and single-flight delivery', () =
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
 
     // Failure was not recorded as completed: a later poll retry can deliver.
-    mocks.forkWorker.mockImplementation((ds: any) => {
+    mocks.forkWorker.mockImplementation((ds: any, _input?: any, _resume?: any, opts?: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      opts?.onAdmission?.('accepted');
+      return true;
     });
     await expect(handleDocComment(ctx)).resolves.toBe(true);
     expect(mocks.forkWorker).toHaveBeenCalledTimes(2);
