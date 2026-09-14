@@ -28,7 +28,7 @@ import {
 } from '../services/message-listener-run-preview-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
 import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
-import { resolveSessionLaunchModel } from './session-model.js';
+import { resolveSessionLaunchModel, resolveSessionGroupSettings } from './session-model.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
 import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName } from '../im/lark/card-builder.js';
@@ -470,6 +470,7 @@ import {
 } from './session-preview-registry.js';
 import { composeRowFromActive } from './dashboard-rows.js';
 import { publishAttentionPatch, publishClosedSessionPatch } from './session-activity.js';
+import { trustedSessionController } from './trusted-session-controller.js';
 import {
   attachOrdinaryTurnRecovery,
   beginOrdinaryTurnRecovery,
@@ -716,6 +717,21 @@ export interface WorkerPoolCallbacks {
     terminal: Extract<WorkerToDaemon, { type: 'turn_terminal' }>,
     context: { workerGeneration: number },
   ) => void | Promise<void>;
+  /** Worker-authoritative deterministic rejection handoff. Returning true
+   * means the daemon durably took ownership, so the original delivery record
+   * may be cleared without emitting the ambiguous-failure terminal. */
+  onOrdinaryImInputRejected?: (
+    ds: DaemonSession,
+    context: {
+      message: Extract<DaemonToWorker, { type: 'message' | 'init' }>;
+      turnId: string;
+      reason: string;
+      rejectedBeforeAdmission: boolean;
+      activeTurnId?: string;
+      activeCaller?: TrustedCaller;
+      activeController?: TrustedCaller;
+    },
+  ) => boolean | Promise<boolean>;
   /** A hidden fresh-topic schedule can be reclaimed once its exact turn is
    * settled. Transcript-backed CLIs report `terminal`; screen-only/remote
    * adapters use the existing debounced idle edge as a compatibility fallback. */
@@ -1646,6 +1662,7 @@ function sessionAgentConfig(
   botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[]; env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean },
 ): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[] } {
   const selected = ds.session.cliLaunchSnapshot;
+  const groupEffort = resolveSessionGroupSettings(ds, selected?.cliId ?? ds.session.cliId ?? botCfg.cliId).reasoningEffort;
   if (selected) {
     if (selected.cliId.toLowerCase() === 'riff') throw new Error('CLI selection rejected: Riff requires bot-level backend configuration and cannot be selected per session');
     if (botCfg.env && Object.keys(botCfg.env).length > 0) throw new Error('CLI selection rejected: bot env is configured');
@@ -1656,7 +1673,7 @@ function sessionAgentConfig(
     const runtime = selected.cliRuntime ?? undefined;
     const legacyPath = selected.cliPathOverride ?? undefined;
     const wrapperCli = selected.wrapperCli ?? undefined;
-    const reasoningEffort = selected.reasoningEffort ?? undefined;
+    const reasoningEffort = selected.reasoningEffort ?? groupEffort;
     const modelBackendVariant = selected.cliId === 'traex'
       ? selected.modelBackendVariant ?? undefined
       : undefined;
@@ -1682,6 +1699,10 @@ function sessionAgentConfig(
     const model = resolveSessionLaunchModel(ds, botCfg);
     recordLaunchModel(ds, model);
     return { cliId: selected.cliId, cliRuntime: runtime, cliPathOverride: legacyPath, wrapperCli, model, modelBackendVariant, reasoningEffort, launchShell, startupCommands };
+  }
+  if (groupEffort && !ds.session.reasoningEffort) {
+    ds.session.reasoningEffort = groupEffort;
+    sessionStore.updateSession(ds.session);
   }
   // Freeze the agent launch config (cli / runtime / cliPath / wrapper) onto the
   // session the first time a worker forks, so later bot-level edits never
@@ -7543,6 +7564,10 @@ type OrdinaryImDelivery = {
   received: boolean;
   transportConfirmed: boolean;
   delayNotified: boolean;
+  /** At most one daemon ownership handoff may run for a logical delivery.
+   * Duplicate worker reject events join this promise instead of creating a
+   * second durable record. */
+  rejectionHandoff?: Promise<boolean>;
   timer?: ReturnType<typeof setTimeout>;
 };
 
@@ -7810,16 +7835,56 @@ function completeStaleWorkerOrdinaryImDelivery(worker: ChildProcess, turnId: str
   }
 }
 
-function rejectOrdinaryImDelivery(
+async function rejectOrdinaryImDelivery(
   ds: DaemonSession,
   turnId: string,
   workerGeneration: number,
-  reason: string,
-): void {
+  rejection: {
+    reason: string;
+    rejectedBeforeAdmission?: true;
+    activeTurnId?: string;
+    activeCaller?: TrustedCaller;
+    activeController?: TrustedCaller;
+  },
+): Promise<void> {
   const key = ordinaryImDeliveryKey(ds, turnId, workerGeneration);
   const record = pendingOrdinaryImDeliveries.get(key);
   if (!record) return;
-  retryOrFailOrdinaryImDelivery(record, `worker_rejected:${reason}`);
+  if (rejection.rejectedBeforeAdmission && requireCallbacks().onOrdinaryImInputRejected) {
+    if (record.rejectionHandoff) {
+      await record.rejectionHandoff;
+      return;
+    }
+    const handoff = Promise.resolve().then(() => requireCallbacks().onOrdinaryImInputRejected!(ds, {
+      message: record.message,
+      turnId,
+      reason: rejection.reason,
+      rejectedBeforeAdmission: true,
+      ...(rejection.activeTurnId ? { activeTurnId: rejection.activeTurnId } : {}),
+      ...(rejection.activeCaller ? { activeCaller: rejection.activeCaller } : {}),
+      ...(rejection.activeController ? { activeController: rejection.activeController } : {}),
+    }));
+    record.rejectionHandoff = handoff;
+    try {
+      const accepted = await handoff;
+      if (accepted) {
+        clearOrdinaryImDelivery(record);
+        logger.info(
+          `[${tag(ds)}] Ordinary IM rejection durably handed back to daemon `
+          + `turn=${turnId.substring(0, 16)} reason=${rejection.reason}`,
+        );
+        return;
+      }
+    } catch (err) {
+      logger.error(
+        `[${tag(ds)}] Ordinary IM rejection handoff failed turn=${turnId.substring(0, 16)}: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      if (record.rejectionHandoff === handoff) record.rejectionHandoff = undefined;
+    }
+  }
+  retryOrFailOrdinaryImDelivery(record, `worker_rejected:${rejection.reason}`);
 }
 
 function settleOrdinaryImDeliveriesForWorker(
@@ -9429,6 +9494,7 @@ export function sendWorkerInput(
   const transferGate = transferInputGates.get(ds);
   if ((!ds.worker || ds.worker.killed) && !transferGate) return false;
   const normalized = typeof payload === 'string' ? { content: payload } : payload;
+  const trustedController = trustedSessionController(ds);
   const bot = getBot(ds.larkAppId);
   const effectiveCliId = sessionCliId(ds, bot.config);
   const effectiveTurnId = turnId ?? (effectiveCliId === 'codex-app'
@@ -9476,6 +9542,7 @@ export function sendWorkerInput(
           // (admission computed once; never re-inferred downstream).
           ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
           ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
+          ...(trustedController ? { trustedController } : {}),
         },
         turnId: queuedTurnId,
         ...(opts.dispatchAttempt !== undefined
@@ -9545,6 +9612,8 @@ export function sendWorkerInput(
     ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
     ...(opts.atMostOnce ? { atMostOnce: true } : {}),
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
+    ...(trustedController ? { trustedController } : {}),
+    ...(normalized.rerouteEnvelope ? { rerouteEnvelope: normalized.rerouteEnvelope } : {}),
     ...(vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin }
       : {}),
@@ -9860,6 +9929,7 @@ export function promoteQueuedActivationTail(
     // it. Only `=== true`; a missing/false tail head stays forced-serial.
     ...(head.cliInput.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
     ...(head.cliInput.trustedCaller ? { trustedCaller: head.cliInput.trustedCaller } : {}),
+    ...(head.cliInput.trustedController ? { trustedController: head.cliInput.trustedController } : {}),
   };
   const vcMeetingImTurnOrigin = resolveVcMeetingImTurnOrigin(ds.session, head.turnId);
 
@@ -9935,6 +10005,7 @@ export function promoteQueuedActivationTail(
       // legitimate superseded settlement would be wrongly rejected.
       ...(exactInput.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
       ...(exactInput.trustedCaller ? { trustedCaller: exactInput.trustedCaller } : {}),
+      ...(exactInput.trustedController ? { trustedController: exactInput.trustedController } : {}),
       queuedActivationToken: token,
       ...(vcMeetingImTurnOrigin ? { vcMeetingImTurnOrigin } : {}),
     } as DaemonToWorker);
@@ -10003,6 +10074,7 @@ export function admitQueuedActivationTail(
       // every queued/opening turn — the strip point that defeated the R4 fix.
       ...(entry.cliInput.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
       ...(entry.cliInput.trustedCaller ? { trustedCaller: entry.cliInput.trustedCaller } : {}),
+      ...(entry.cliInput.trustedController ? { trustedController: entry.cliInput.trustedController } : {}),
     },
   };
   const priorTail = ds.session.queuedActivationTail;
@@ -10301,6 +10373,10 @@ export function forkWorker(
     ?? (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
       ? resumeOrTurnId.trustedCaller
       : undefined);
+  // The controller is daemon-derived from the frozen session owner, never from
+  // a caller-supplied prompt envelope. It lets the real task owner regain
+  // control even when a bot/schedule currently owns the CLI turn.
+  const initTrustedController = trustedSessionController(ds);
   if (ds.session.queuedActivationPending && ds.session.queuedActivationResume !== undefined) {
     resume = ds.session.queuedActivationResume;
   }
@@ -10331,6 +10407,7 @@ export function forkWorker(
           // staged tail entry (only `=== true`).
           ...(initCodexAppSteerable ? { codexAppSteerable: true as const } : {}),
           ...(initTrustedCaller ? { trustedCaller: initTrustedCaller } : {}),
+          ...(initTrustedController ? { trustedController: initTrustedController } : {}),
         },
         turnId,
         ...(initDispatchAttempt !== undefined
@@ -10730,6 +10807,8 @@ export function forkWorker(
       // R4-B1: preserve the frozen steer authorization when re-parking N+1 behind
       // a recovery fork (COPY, never re-infer).
       ...(initCodexAppSteerable ? { codexAppSteerable: true } : {}),
+      ...(initTrustedCaller ? { trustedCaller: initTrustedCaller } : {}),
+      ...(initTrustedController ? { trustedController: initTrustedController } : {}),
     };
     ds.session.queuedActivationTurnId = initAttributionTurnId;
     ds.session.queuedActivationDispatchAttempt = initDispatchAttempt;
@@ -11070,6 +11149,7 @@ export function forkWorker(
     ...(initAtMostOnce ? { atMostOnce: true } : {}),
     vcMeetingImTurnOrigin: initVcMeetingImTurnOrigin,
     ...(initTrustedCaller ? { trustedCaller: initTrustedCaller } : {}),
+    ...(initTrustedController ? { trustedController: initTrustedController } : {}),
     pluginBindings: botCfg.plugins,
     skillPolicy: botCfg.skills,
     ...(runtimeIdentity.status === 'known'
@@ -11665,7 +11745,7 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored turn_input_rejected from stale worker generation`);
           break;
         }
-        rejectOrdinaryImDelivery(ds, msg.turnId, workerGeneration, msg.reason);
+        await rejectOrdinaryImDelivery(ds, msg.turnId, workerGeneration, msg);
         break;
       }
       case 'turn_input_committed': {
@@ -12220,6 +12300,9 @@ function setupWorkerHandlers(
           sendWorkerSessionInput(ds, {
             type: 'raw_input',
             content: rawInput,
+            ...(trustedSessionController(ds)
+              ? { trustedController: trustedSessionController(ds) }
+              : {}),
             // Passthrough commands (/compact, /model, ...) become REAL mojo turns,
             // so they must carry the same credential snapshot a normal message
             // does — otherwise a cleared or rotated JWT simply did not apply here.
@@ -13195,6 +13278,7 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored claude_exit from stale worker generation`);
           break;
         }
+        ds.activeInteractiveTurn = undefined;
         // The live-send capability dies with this backend. Preserve the
         // worker-generation policy capability only while this local worker is
         // still eligible for same-worker crash recovery. Branches that cannot
@@ -14043,6 +14127,12 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Dropped managed_turn_origin_revoked with mismatched sessionId`);
           break;
         }
+        // Same-generation exact-turn revocation is positive idle evidence for
+        // daemon-side pre-routing. Never let historical caller/session fields
+        // keep this optimistic hint alive after the worker released authority.
+        if (ds.activeInteractiveTurn?.turnId === msg.turnId) {
+          ds.activeInteractiveTurn = undefined;
+        }
         // Same-worker IPC is ordered, but exact-match both authorities so a
         // delayed revoke can never clear a token already rotated by the next
         // turn. Live-send and policy authority are independent: a stale token
@@ -14520,6 +14610,7 @@ function setupWorkerHandlers(
       ds.workerToken = null;
       ds.workerViewToken = null;
       ds.managedTurnOrigin = undefined;
+      ds.activeInteractiveTurn = undefined;
       if (ds.remoteCloseState) {
         ds.remoteCloseState = { ...ds.remoteCloseState, phase: 'uncertain' };
       }
@@ -15413,7 +15504,12 @@ export function adoptSandboxBlocked(
 
 export function forkAdoptWorker(
   ds: DaemonSession,
-  opts?: { restoredFromMetadata?: boolean; prompt?: string; turnId?: string },
+  opts?: {
+    restoredFromMetadata?: boolean;
+    prompt?: string;
+    turnId?: string;
+    trustedCaller?: TrustedCaller;
+  },
 ): 'accepted' | 'rejected' {
   if (ds.session.cliInstanceBinding) throw new Error('External adoption cannot carry a Codex instance binding');
   if (isSessionTransferring(ds)) {
@@ -15626,6 +15722,10 @@ export function forkAdoptWorker(
     // wrapper leaks into the user's un-injected external CLI.
     prompt: opts?.prompt ?? '',
     turnId: opts?.turnId,
+    ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
+    ...(trustedSessionController(ds)
+      ? { trustedController: trustedSessionController(ds) }
+      : {}),
     resume: false,
     ownerOpenId: ds.ownerOpenId,
     webPort: ds.session.webPort,
