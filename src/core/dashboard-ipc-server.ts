@@ -5547,6 +5547,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     // that is always empty — the CLI has no resolvable transcript).
     usageSupported: cliSupportsNativeUsage(cliId),
     disableStreamingCard: cardPrefs.disableStreamingCard,
+    replyCardMode: cardPrefs.replyCardMode,
     hiddenStreamingCardButtons: cardPrefs.hiddenStreamingCardButtons,
     pinStreamingCard: cardPrefs.pinStreamingCard,
     silentTurnReactions: cardPrefs.silentTurnReactions,
@@ -5678,6 +5679,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: {
     usageDisplay?: unknown;
+    replyCardMode?: unknown;
     disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; thinkingCard?: unknown;
     thinkingCardToolResult?: unknown;
     botToBotSameDir?: unknown;
@@ -5691,6 +5693,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
 
   const patch: {
     usageDisplay?: UsageDisplayMode;
+    replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
     disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; thinkingCard?: boolean;
     thinkingCardToolResult?: boolean;
     botToBotSameDir?: boolean;
@@ -5701,6 +5704,12 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     senderTag?: boolean;
   } = {};
   if (body.usageDisplay === 'streaming' || body.usageDisplay === 'footer' || body.usageDisplay === 'off') patch.usageDisplay = body.usageDisplay;
+  if (body.replyCardMode !== undefined) {
+    if (body.replyCardMode !== 'legacy' && body.replyCardMode !== 'unified') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_reply_card_mode' });
+    }
+    patch.replyCardMode = body.replyCardMode;
+  }
   if (typeof body.disableStreamingCard === 'boolean') patch.disableStreamingCard = body.disableStreamingCard;
   if (Array.isArray(body.hiddenStreamingCardButtons)
       && body.hiddenStreamingCardButtons.every(isStreamingCardButtonId)) {

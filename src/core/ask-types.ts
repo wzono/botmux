@@ -87,6 +87,8 @@ export interface AskJsonOutput {
  *
  *  v0.1.8 变更：`options`/`prompt` 字段替换为 `questions: ReadonlyArray<AskQuestion>`。 */
 export interface CreateAskInput {
+  /** Daemon-bound presentation target; never accepted directly from CLI JSON. */
+  replyCardTarget?: { turnId: string; dispatchAttempt?: number };
   larkAppId: string;
   chatId: string;
   /** thread-scope ask → root message_id; chat-scope ask → null. */
@@ -129,6 +131,8 @@ export interface CreateAskInput {
  *
  *  v0.1.8 变更：`options`/`prompt` 替换为 `questions`。 */
 export interface PendingAsk {
+  replyCardTarget?: CreateAskInput['replyCardTarget'];
+  result?: AskResult;
   askId: string;
   /** Broker origin, exposed only to daemon/card routing so host-owned choice
    * cards can decline arbitrary free-text replies instead of swallowing them. */

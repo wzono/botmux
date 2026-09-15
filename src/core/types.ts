@@ -360,6 +360,8 @@ export interface DaemonSession {
    *  the live card. Left undefined for sessions driven only by HTTP/async
    *  triggers, where an unknown-lineage turn stays trusted. In-memory only. */
   currentTurnId?: string;
+  /** Actual input-committed turn for the managed reply card's Stop control. */
+  replyCardRunningTurnId?: string;
   /**
    * Authenticated human principal that owns the currently executing interactive
    * turn. Set only after a worker accepts the turn and cleared by its exact

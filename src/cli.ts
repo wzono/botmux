@@ -19,6 +19,7 @@
  *   botmux list           — interactive session picker (TUI), attach to managed tmux/ZMX sessions
  *   botmux list --plain   — plain table output (for piping / scripts)
  *   botmux preview <port> — register this session's loopback Web preview
+ *   botmux tabs add <url> [--name <name>] — add/reuse a URL tab in the current Lark chat
  *   botmux delete <id>    — close a session by ID prefix
  *   botmux delete all     — close all active sessions
  *   botmux autostart enable|disable|status — manage boot-time autostart (launchd / user systemd / Windows Task Scheduler)
@@ -165,6 +166,8 @@ import {
 import { parseCardRuntimeStatusArgs } from './cli/card-runtime-status-dispatch.js';
 import { readCardStreamUsageSnapshot } from './cli/card-stream-usage.js';
 import { CardStreamStore } from './services/card-stream-store.js';
+import { TurnReplyCardStore } from './services/turn-reply-card.js';
+import { buildTurnReplyCard, replyCardPresentation } from './im/lark/turn-reply-card.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
 import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
@@ -783,6 +786,18 @@ async function finishOpenPlatformSetup(
  * 列表 → 交互选择 → 自动读取该应用的 AppSecret。仅支持飞书 (feishu.cn) 租户
  * （Web console 机制所限）。
  *
+ * **登录态「半失效」必须能自救**：console `/app` 首页照样吐 `window.csrfToken`，
+ * 而 `prepareFeishuWebSession` 的粗检只探 ask.feishu.cn（跨了域名，压根看不出
+ * console 已经不认这份 cookie），于是缓存被判「有效」原样复用，真正打
+ * `/developers/v1/*` 才收到 passport 登出信号（实报：HTTP 400 + code=99991641 +
+ * `error.Code=4101`「please log in again」）。没有 forceQrLogin 就永远拿同一份
+ * 旧 cookie 去撞同一堵墙 —— 用户被钉在「拉取应用列表失败 → 回来源菜单 → 再选
+ * → 一模一样的 400」死循环里，除非改走别的来源。所以这里用
+ * `openPlatformWebSessionExpired`（与 dashboard 改名/头像链路同一个判定器，刻意
+ * 不把顶层通用 code=99991641 单独当失效）识别登出信号，TTY 下给一次「重新扫码」
+ * 覆盖掉旧 cookie；非 TTY 不弹二维码（管道里没人扫），照旧降级手动输入。
+ * 同款理由见 `src/dashboard/feishu-login.ts` 的 forceQrLogin 注释。
+ *
  * 失败返回区分两类，调用方据此导航：
  *   - back   — 用户主动退出（列表 Esc / 放弃手动粘 secret）→ 回「飞书应用来源」
  *   - failed — 技术性失败（登录 / 列表 / console 访问）→ 提示后回「飞书应用来源」
@@ -798,61 +813,125 @@ async function pickExistingAppCredentials(
     createOpenPlatformApiClient,
     listOpenPlatformApps,
     fetchOpenPlatformAppSecret,
+    openPlatformWebSessionExpired,
   } = await import('./setup/open-platform-automation.js');
+  const interactive = process.stdin.isTTY && process.stdout.isTTY;
 
-  console.log('\n获取飞书 Web 登录态（复用上次登录，过期则需重新扫码）…');
-  const prepared = await prepareFeishuWebSession({
-    onQrCode: (info) => {
-      process.stderr.write('\n请用飞书 App 扫码登录，以读取你创建过的应用列表：\n\n');
-      process.stderr.write(`${info.qrText}\n`);
-    },
-    onStatus: (message) => { process.stderr.write(`${message}\n`); },
-  });
-  if (!prepared.ok) {
-    console.log(`⚠️  飞书 Web 登录失败 (${prepared.reason}): ${prepared.message}`);
-    return { ok: false, reason: 'failed' };
-  }
+  // 第一轮复用缓存；识别出登录态失效且用户确认后，第二轮 forceQrLogin 重扫。
+  // 只给一轮：扫完还失效就不是 cookie 的问题了，再问一遍只是换个死循环。
+  let forceQrLogin = false;
+  /**
+   * rescan — 用户要重新扫码，调用方置 forceQrLogin 后 continue 重来一轮
+   * back   — 用户明确选了「返回应用来源」（菜单上这么写就得这么做，不许再加戏）
+   * unavailable — 压根没法问（非 TTY 无人扫码 / 这一轮已经重扫过了）
+   */
+  const offerRescan = async (detail: string): Promise<'rescan' | 'back' | 'unavailable'> => {
+    console.log('⚠️  飞书 Web 登录态已失效，开放平台要求重新登录。');
+    console.log(`   详细信息: ${detail}`);
+    if (forceQrLogin) return 'unavailable'; // 刚扫过还是失效 → 不再兜圈子
+    if (!interactive) {
+      console.log('   非交互模式不自动弹二维码；请在终端里重新运行 `botmux setup` 扫码。');
+      return 'unavailable';
+    }
+    const choice = await pickChoice(rl, {
+      title: '飞书登录态已失效',
+      items: [
+        { label: '重新扫码登录', hint: '生成新二维码，覆盖本机旧登录态' },
+        { label: '返回「飞书应用来源」', hint: '改走创建新应用 / 手动输入' },
+      ],
+      defaultIndex: 0,
+      footer: 'Esc 返回「飞书应用来源」',
+    });
+    return choice === 0 ? 'rescan' : 'back';
+  };
+  /** 失效但没能重扫时的导航：用户主动退 = back（静默回菜单），问不成 = failed（带提示）。 */
+  const afterDeclinedRescan = (outcome: 'back' | 'unavailable'): { ok: false; reason: 'back' | 'failed' } =>
+    ({ ok: false, reason: outcome === 'back' ? 'back' : 'failed' });
 
-  const clientRes = await createOpenPlatformApiClient(prepared.cookies);
-  if (!clientRes.ok) {
-    console.log(`⚠️  开放平台访问失败 (${clientRes.reason}): ${clientRes.message}`);
-    return { ok: false, reason: 'failed' };
-  }
+  for (;;) {
+    console.log(forceQrLogin
+      ? '\n重新登录飞书 Web（旧登录态已失效，需要重新扫码）…'
+      : '\n获取飞书 Web 登录态（复用上次登录，过期则需重新扫码）…');
+    const prepared = await prepareFeishuWebSession({
+      forceQrLogin,
+      onQrCode: (info) => {
+        process.stderr.write('\n请用飞书 App 扫码登录，以读取你创建过的应用列表：\n\n');
+        process.stderr.write(`${info.qrText}\n`);
+      },
+      onStatus: (message) => { process.stderr.write(`${message}\n`); },
+    });
+    if (!prepared.ok) {
+      console.log(`⚠️  飞书 Web 登录失败 (${prepared.reason}): ${prepared.message}`);
+      return { ok: false, reason: 'failed' };
+    }
 
-  let apps;
-  try {
-    apps = await listOpenPlatformApps(clientRes.client);
-  } catch (err: any) {
-    console.log(`⚠️  拉取应用列表失败: ${err?.message ?? String(err)}`);
-    return { ok: false, reason: 'failed' };
-  }
-  if (apps.length === 0) {
-    console.log('⚠️  当前账号名下没有可选的自建应用。');
-    return { ok: false, reason: 'failed' };
-  }
+    const clientRes = await createOpenPlatformApiClient(prepared.cookies);
+    if (!clientRes.ok) {
+      // missing_csrf = console 页面没吐 csrfToken，最常见的原因就是这份 cookie 已经
+      // 不算登录态，和下面的 4101 同源；network 是真连不上，重扫没用。
+      if (clientRes.reason === 'missing_csrf') {
+        const decision = await offerRescan(clientRes.message);
+        if (decision === 'rescan') { forceQrLogin = true; continue; }
+        return afterDeclinedRescan(decision);
+      }
+      console.log(`⚠️  开放平台访问失败 (${clientRes.reason}): ${clientRes.message}`);
+      return { ok: false, reason: 'failed' };
+    }
+    // 重扫后可能换了账号，可见的应用列表也会跟着变——先把身份摆出来，省得用户
+    // 对着一份陌生的列表找自己的应用。
+    if (clientRes.identity) {
+      console.log(`   当前飞书账号：${clientRes.identity.userName} · ${clientRes.identity.tenantName}`);
+    }
 
-  // 已在 bots.json 里的应用打标——可以重复选（比如换机器重配），但要让人知道。
-  const configured = new Set(loadBotsJson().map(b => b?.larkAppId));
-  const idx = await pickChoice(rl, {
-    title: '选择已有应用',
-    items: apps.map(a => ({
-      label: a.name,
-      hint: `${a.clientId}${configured.has(a.clientId) ? ' · 已在 bots.json' : ''}`,
-    })),
-    footer: 'Esc 返回上一步',
-  });
-  if (idx === null) return { ok: false, reason: 'back' };
-  const app = apps[idx];
+    let apps;
+    try {
+      apps = await listOpenPlatformApps(clientRes.client);
+    } catch (err: any) {
+      if (openPlatformWebSessionExpired(err)) {
+        const decision = await offerRescan(err?.message ?? String(err));
+        if (decision === 'rescan') { forceQrLogin = true; continue; }
+        return afterDeclinedRescan(decision);
+      }
+      console.log(`⚠️  拉取应用列表失败: ${err?.message ?? String(err)}`);
+      return { ok: false, reason: 'failed' };
+    }
+    if (apps.length === 0) {
+      console.log('⚠️  当前账号名下没有可选的自建应用。');
+      return { ok: false, reason: 'failed' };
+    }
 
-  try {
-    const appSecret = await fetchOpenPlatformAppSecret(clientRes.client, app.clientId);
-    console.log(`✅ 已选择 ${app.name} (${app.clientId})，AppSecret 已自动获取`);
-    return { ok: true, appId: app.clientId, appSecret, brand: 'feishu' };
-  } catch (err: any) {
-    console.log(`⚠️  自动读取 AppSecret 失败: ${err?.message ?? String(err)}`);
-    const manual = (await ask(rl, `请手动粘贴 ${app.clientId} 的 AppSecret（留空返回上一步）: `)).trim();
-    if (!manual) return { ok: false, reason: 'back' };
-    return { ok: true, appId: app.clientId, appSecret: manual, brand: 'feishu' };
+    // 已在 bots.json 里的应用打标——可以重复选（比如换机器重配），但要让人知道。
+    const configured = new Set(loadBotsJson().map(b => b?.larkAppId));
+    const idx = await pickChoice(rl, {
+      title: '选择已有应用',
+      items: apps.map(a => ({
+        label: a.name,
+        hint: `${a.clientId}${configured.has(a.clientId) ? ' · 已在 bots.json' : ''}`,
+      })),
+      footer: 'Esc 返回上一步',
+    });
+    if (idx === null) return { ok: false, reason: 'back' };
+    const app = apps[idx];
+
+    try {
+      const appSecret = await fetchOpenPlatformAppSecret(clientRes.client, app.clientId);
+      console.log(`✅ 已选择 ${app.name} (${app.clientId})，AppSecret 已自动获取`);
+      return { ok: true, appId: app.clientId, appSecret, brand: 'feishu' };
+    } catch (err: any) {
+      // 选完应用才失效：重扫后应用列表得重新拉（换账号可见范围就变了），所以
+      // 回循环顶重来，而不是原地只重试这一个接口。
+      if (openPlatformWebSessionExpired(err)) {
+        const decision = await offerRescan(err?.message ?? String(err));
+        if (decision === 'rescan') { forceQrLogin = true; continue; }
+        // 用户选了「返回」就真的返回；问不成（非 TTY）才退到下面的手动粘贴 —— 那是
+        // 管道输入下唯一还能走通的路，保持旧契约。
+        if (decision === 'back') return { ok: false, reason: 'back' };
+      }
+      console.log(`⚠️  自动读取 AppSecret 失败: ${err?.message ?? String(err)}`);
+      const manual = (await ask(rl, `请手动粘贴 ${app.clientId} 的 AppSecret（留空返回上一步）: `)).trim();
+      if (!manual) return { ok: false, reason: 'back' };
+      return { ok: true, appId: app.clientId, appSecret: manual, brand: 'feishu' };
+    }
   }
 }
 
@@ -3641,13 +3720,15 @@ interface SessionData {
   quoteTargetId?: string;
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
   /** Per-turn reply targets（见 Session.replyTargets in types.ts）——排队/并发轮次各自的回复锚点。 */
-  replyTargets?: Record<string, { rootMessageId?: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string }>;
+  replyTargets?: Record<string, { rootMessageId?: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: import('./types.js').TurnParticipant[] }>;
   /** Frozen per-turn reply contexts（见 Session.turnReplyContexts in types.ts）。
    *  `botmux send` 只读其中的 `inThread`：判断本轮 quote 目标当初是否从**顶层**
    *  进来，据此拦住「顶层 @ 之后那条消息才被开成话题」时 quote 把回复带进话题。 */
   turnReplyContexts?: Record<string, {
     target?: { mode?: string; chatId?: string; rootMessageId?: string };
     inThread?: boolean;
+    replyTargetSenderOpenId?: string;
+    replyTargetSenderIsBot?: boolean;
   }>;
   codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
   codexAppGenerationCommits?: unknown;
@@ -3675,6 +3756,8 @@ interface SessionData {
   cliId?: string;
   /** CLI-native resume id when it differs from botmux's Session id. */
   cliSessionId?: string;
+  /** Frozen file-sandbox decision from the persisted session. */
+  sandbox?: boolean;
   backendType?: BackendType;
   /** Exact persistent host/agent selected by the worker. In particular, Herdr
    * may own one agent inside a shared host session rather than the host itself. */
@@ -6355,6 +6438,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                    同源 /preview/<sessionId>/ 访问，不暴露本机地址或任何 token。
                    端口必须由本会话的进程持有（在会话内直接启动，别 setsid/nohup
                    脱离进程树）；换代/关闭后需重新注册，远端 sandbox 后端不支持
+  tabs list|add|update|remove|sort
+                   查看和管理当前飞书群标签页；add 按 URL 幂等，适合后台自动化调用
   autostart enable     注册开机自启（macOS launchd / Linux user systemd / Windows Task Scheduler，无需 sudo）
   autostart disable    注销开机自启
   autostart status     查看自启状态
@@ -7339,6 +7424,56 @@ async function resolveSessionAppId(sessionIdArg: string | undefined): Promise<{ 
     for (const cfg of loadBotConfigs()) registerBot(cfg);
   } catch { /* ignore */ }
   return { sid, larkAppId: s.larkAppId, session: s };
+}
+
+async function cmdTabs(rest: string[]): Promise<void> {
+  const {
+    CHAT_TABS_CLI_USAGE,
+    executeChatTabsCli,
+    formatChatTabsCliResult,
+    parseChatTabsCli,
+  } = await import('./cli/chat-tabs-command.js');
+  let parsed;
+  try {
+    parsed = parseChatTabsCli(rest);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message === CHAT_TABS_CLI_USAGE) {
+      console.log(message);
+      return;
+    }
+    console.error(`botmux tabs: ${message}\n\n${CHAT_TABS_CLI_USAGE}`);
+    process.exitCode = 2;
+    return;
+  }
+
+  assertTurnTransportOrExit('tabs');
+  await registerSelfFromCredFile();
+  const { sid, larkAppId, session } = await resolveSessionAppId(parsed.sessionId);
+  assertSessionTransportOrExit(session, 'tabs');
+  // The worker refreshes BOTMUX_CHAT_ID for the current managed session. Prefer
+  // that turn-bound value over an old session record whose chatType/chatId may
+  // predate a DM→group handoff. Never apply it to an explicit different sid.
+  const currentEnvChatId = sid === process.env.BOTMUX_SESSION_ID
+    ? process.env.BOTMUX_CHAT_ID?.trim()
+    : undefined;
+  const chatId = parsed.chatId ?? currentEnvChatId ?? session.chatId;
+  if (!chatId || (session.chatType === 'p2p' && !parsed.chatId && !currentEnvChatId)) {
+    console.error('botmux tabs: 当前会话不是群聊；请在群会话中运行，或传 --chat-id <oc_xxx>');
+    process.exitCode = 2;
+    return;
+  }
+  try {
+    const result = await executeChatTabsCli({ ...parsed, larkAppId, resolvedChatId: chatId });
+    console.log(parsed.json
+      ? JSON.stringify({ ok: true, chatId, ...(result as object) })
+      : formatChatTabsCliResult(result));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (parsed.json) console.log(JSON.stringify({ ok: false, chatId, error: message }));
+    else console.error(`botmux tabs: ${message}`);
+    process.exitCode = 1;
+  }
 }
 
 async function cmdHistory(rest: string[]): Promise<void> {
@@ -9877,6 +10012,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         messageId,
         ...(originTurnId ? { turnId: originTurnId } : {}),
         ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
+        ...(unifiedReplyUsed ? { replyCardResponseKind: effectiveResponseKind } : {}),
       };
       Object.assign(marker, buildBridgeSendMarkerContent(sentContent));
       const line = JSON.stringify(marker) + '\n';
@@ -9885,6 +10021,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   };
 
   const shouldRecordBridgeMarker = !sendTopLevel && !overrideChatId && !sendInto;
+  let unifiedReplyUsed = false;
 
   // Quote chain (普通群): the primary message replies to the turn's target so
   // Lark renders a 引用 chain. --quote overrides, --no-quote opts out. Thread
@@ -9931,6 +10068,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     content: string,
     msgType: string,
     originAlreadyRevalidated = false,
+    uuid?: string,
   ): Promise<string> => {
     // `dispatchPrimaryMessage` may call replyMessage directly for a quote, so
     // fence immediately before preparing/performing that primary effect too.
@@ -9974,7 +10112,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         quoteTargetId: canonicalOutput.quoteTargetId,
         content: canonicalOutput.content,
         msgType: canonicalOutput.msgType,
-        ...(prepared ? { uuid: prepared.providerKey } : {}),
+        ...(prepared ? { uuid: prepared.providerKey } : uuid ? { uuid } : {}),
         // Managed meeting output must never fan out through user-configured
         // outbound hooks, including its first provider attempt.
         ...(prepared ? { suppressHook: true } : {}),
@@ -10379,15 +10517,68 @@ async function cmdSend(rest: string[]): Promise<void> {
         }
       }
 
+      const canonicalCard = createReplyCard([...elements], layoutHeader);
       if (feedbackPolicy && effectiveResponseKind === 'final') {
-        const canonicalCard = createReplyCard([...elements], layoutHeader);
         const feedbackElement = buildFeedbackElement(feedbackPolicy);
         const footerIndex = canonicalCard.body.elements.findIndex((element: any) => element?.element_id === 'botmux_reply_footer');
         canonicalCard.body.elements.splice(footerIndex >= 0 ? footerIndex : canonicalCard.body.elements.length, 0, feedbackElement);
         feedbackBaseCard = canonicalCard as unknown as Record<string, unknown>;
-        messageId = await dispatchPrimary(JSON.stringify(feedbackBaseCard), 'interactive');
+      }
+      const replyStore = new TurnReplyCardStore(resolveDataDir());
+      const replyKey = currentTurnId ? { larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt } : undefined;
+      const replyTargetSenderIsBot = frozenTurnDispatch?.replyTargetSenderIsBot
+        ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderIsBot
+        ?? s.replyTargets?.[currentTurnId ?? '']?.participants?.find(p => p.openId === replyTargetSenderOpenId)?.isBot
+        ?? (currentTurnId && s.quoteTargetId === currentTurnId ? s.quoteTargetSenderIsBot : undefined);
+      // Mentioning this turn's human requester is still an ordinary reply.
+      // Peer bots, other recipients and unknown identities need a new message
+      // so their notification/automation cannot be swallowed by a PATCH.
+      const onlyRequesterMentions = !explicitKnownBotMention && mentions.every(mention =>
+        mention.open_id === replyTargetSenderOpenId && replyTargetSenderIsBot === false);
+      // A restored record can remain readable (for example via the Linux host
+      // relay). Match the daemon's sandbox exclusion instead of reviving it.
+      const replyCardSandboxed = s.sandbox === true || process.env.BOTMUX_READ_ISOLATION === '1'
+        || process.env.BOTMUX_SANDBOX === '1';
+      const canUseReplyCard = replyKey && !replyCardSandboxed && !sendTopLevel && !overrideChatId && !sendInto
+        && !vcMeetingManagedSendOrigin && !attention.requested && !explicitQuote && !noQuote
+        && effectiveResponseKind !== 'auxiliary' && onlyRequesterMentions && !containsLarkAtTag(text)
+        && (effectiveResponseKind === 'final' || (imageKeys.length === 0 && files.length === 0 && videoAttachments.length === 0));
+      const replyRecord = canUseReplyCard ? replyStore.read(replyKey) : undefined;
+      if (replyRecord && replyKey) {
+        if (replyRecord.chatId !== targetChatId) throw new Error('Reply-card destination changed; send refused');
+        const delivered = await replyStore.update(replyKey, effectiveResponseKind === 'final'
+          ? { kind: 'final', text, card: JSON.stringify(canonicalCard), source: 'explicit',
+              ...(feedbackPolicy ? { feedback: { policy: feedbackPolicy, requesterSubjectId: feedbackRequesterSubjectId } } : {}) }
+          : { kind: 'progress', text }, {
+          beforeEffect: async () => { await revalidateIsolatedOriginBeforeEffect(); revalidateVcMeetingManagedSend(); },
+          send: (body, uuid) => dispatchPrimary(body, 'interactive', undefined, uuid),
+          patch: async (id, body) => {
+            const { updateMessage } = await import('./im/lark/client.js');
+            await updateMessage(appId, id, body);
+          },
+          isWithdrawn: error => error instanceof MessageWithdrawnError,
+          render: record => buildTurnReplyCard(record, {
+            ...replyCardPresentation(getBot(appId).config, targetChatId), locale: localeForBot(appId), workingDir: s.workingDir,
+            showLiveUsage: resolveUsageDisplay(appId) === 'streaming',
+            canStop: replyCardPresentation(getBot(appId).config, targetChatId).canStop && getBot(appId).config.codexRpcInput !== true,
+          }),
+          sendOverflow: async (fullText, uuid) => {
+            const path = join(replyStore.directory, `${replyStore.id(replyKey)}-reply.md`);
+            writeFileSync(path, fullText, { mode: 0o600 });
+            await revalidateIsolatedOriginBeforeEffect();
+            const fileKey = await uploadFile(appId, path);
+            return dispatchAfterOriginGate(JSON.stringify({ file_key: fileKey }), 'file', uuid);
+          },
+        });
+        unifiedReplyUsed = true;
+        if (!delivered.delivered || !delivered.messageId) {
+          console.error('进度已保存到本轮记录；请用 botmux send --response-kind final 发送完整答复。');
+          console.log(JSON.stringify({ success: true, accepted: true, delivered: false, sessionId: sid, turnId: currentTurnId }));
+          return;
+        }
+        messageId = delivered.messageId;
       } else {
-        messageId = await dispatchPrimary(JSON.stringify(createReplyCard(elements, layoutHeader)), 'interactive');
+        messageId = await dispatchPrimary(JSON.stringify(canonicalCard), 'interactive');
       }
     }
 
@@ -10506,7 +10697,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     // (the ghosting shape). The injected prompt keeps a one-line sentinel note
     // only for the genuine never-send silence case (message addressed to another
     // bot). See services/bridge-fallback-gate.ts for the matching strip-and-forward gate.
-    console.error(t('ai.send.after_success_hint', undefined, localeForBot(appId)));
+    console.error(unifiedReplyUsed && effectiveResponseKind !== 'final'
+      ? '进度已更新到本轮卡片。完成时请用 botmux send --response-kind final 发送完整答复。'
+      : t('ai.send.after_success_hint', undefined, localeForBot(appId)));
 
     // --attention: message is already delivered above; now flip the dashboard
     // needs-you state via the daemon (botmux send is direct-to-Lark, so the
@@ -12560,6 +12753,8 @@ export async function runHook(
   /** 按 OpenCode 原生会话 id（payload.session_id，ses_*）反查所属 botmux 会话；
    *  缺省用真实实现（在线 daemon 并发查询 + budget 封顶）。测试注入 stub。 */
   resolveCliSessionRouteFn?: (cliSessionId: string) => Promise<import('./adapters/adopt-route.js').AdoptRoute | null>,
+  resolveTurnOriginFn: (sessionId: string) => { turnId?: string; dispatchAttempt?: number } | null | undefined =
+    sessionId => resolveSessionContext(resolveDataDir(), sessionId),
 ): Promise<{ stdout: string }> {
   const { getHookAdapter } = await import('./core/ask-hook/registry.js');
 
@@ -12688,6 +12883,11 @@ export async function runHook(
   // originKind='hook' namespaces it away from an explicit `botmux ask buttons`.
   const requestId = randomUUID();
 
+  // Freeze the issuing turn before reconnect retries. Shared-service/adopt
+  // routing cannot borrow this process's ambient turn identity.
+  const hookOrigin = !explicitRoute && routeSessionId === sessionId && ['claude-code', 'codex'].includes(cliId)
+    ? resolveTurnOriginFn(routeSessionId!) : undefined;
+
   const body: Record<string, unknown> = {
     sessionId: routeSessionId,
     chatId: routeChatId,
@@ -12697,6 +12897,8 @@ export async function runHook(
     timeoutMs,
     requestId,
     originKind: 'hook',
+    ...(hookOrigin?.turnId ? { originTurnId: hookOrigin.turnId } : {}),
+    ...(hookOrigin?.dispatchAttempt !== undefined ? { originDispatchAttempt: hookOrigin.dispatchAttempt } : {}),
   };
 
   // Post the ask, RETRYING across a daemon restart. The daemon holds pending
@@ -15165,6 +15367,7 @@ switch (command) {
     break;
   }
   case 'send':     await cmdSend(process.argv.slice(3)); break;
+  case 'tabs':     await cmdTabs(process.argv.slice(3)); break;
   case 'card':     await cmdCard(process.argv.slice(3)); break;
   case 'chat':     await cmdChat(process.argv.slice(3)); break;
   case 'project':  await cmdProject(process.argv.slice(3)); break;

@@ -178,7 +178,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.codex'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, workingDir, model, reasoningEffort, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, readIsolation, remoteWsUrl, remoteThreadId, shellSubprocessEnv }) {
+    buildArgs({ sessionId, resume, resumeSessionId, quietResume, forkSession, workingDir, model, reasoningEffort, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, readIsolation, remoteWsUrl, remoteThreadId, shellSubprocessEnv }) {
       // Hybrid RPC input mode: attach this TUI to the botmux-owned app-server
       // thread. User input is delivered out-of-band via JSON-RPC (turn/start,
       // see codex-rpc-engine + worker), so the pane is a pure viewer — no paste
@@ -204,6 +204,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen',
           '-c', 'check_for_update_on_startup=false',
           ...modelNudgeArgs,
+          ...(quietResume ? ['-c', 'tui.auto_recap=false'] : []),
           remoteThreadId];
       }
       // Read isolation for Codex is enforced by the worker's Seatbelt wrapper,
@@ -303,7 +304,8 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       // privilege-escalation guard on fork. Falls back to plain `resume` when we
       // somehow lack a source id (nothing to fork from).
       const codexArgs = codexSessionId
-        ? [forkSession ? 'fork' : 'resume', ...baseArgs, codexSessionId]
+        ? [forkSession ? 'fork' : 'resume', ...baseArgs,
+          ...(quietResume && !forkSession ? ['-c', 'tui.auto_recap=false'] : []), codexSessionId]
         : freshArgs;
       return codexArgs;
     },

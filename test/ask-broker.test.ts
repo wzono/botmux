@@ -341,6 +341,7 @@ describe('timeout', () => {
     }));
     await Promise.resolve();
     expect(d.sendCalls).toHaveLength(1);
+    expect(d.sendCalls[0]?.originKind).toBe('host_cross_principal_classification');
 
     vi.advanceTimersByTime(60_000);
     expect(_pendingCount()).toBe(1);

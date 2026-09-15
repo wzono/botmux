@@ -86,6 +86,8 @@ import {
 import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
 import { handleCotThinkingUpdate, finalizeCotMessage, abortCotMessage } from '../im/lark/cot-message.js';
+import { replyCardModeFor, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards } from './turn-reply-card.js';
+import { ReplyCardWithdrawnError } from '../services/turn-reply-card.js';
 import { replyToDocComment, chunkCommentText, unsubscribeDocFile, removeCommentReaction } from '../im/lark/doc-comment.js';
 import { listDocSubscriptionsForSession, removeDocSubscription } from '../services/doc-subs-store.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
@@ -744,6 +746,14 @@ export interface WorkerPoolCallbacks {
   onWorkerExit?: (
     ds: DaemonSession,
     context: { sessionId: string; workerGeneration: number; code: number | null; signal: NodeJS.Signals | null },
+  ) => void | Promise<void>;
+  /** Runs only after closeSession has durably closed the row and the exact
+   * worker-exit fence has proved that generation can no longer write. Narrow
+   * XPI shared-cwd coordinator migration is performed here, never by a hot
+   * input path guessing a replacement coordinator. */
+  onSessionClosed?: (
+    session: Session,
+    context: { workerGeneration?: number; workerExitProven: boolean },
   ) => void | Promise<void>;
   /** The managed CLI can crash and auto-restart inside a still-live Node
    *  worker. Durable receipts dispatched to this generation become ambiguous
@@ -3264,17 +3274,42 @@ function reconcilePostedStartingCard(ds: DaemonSession, turnId: string | undefin
  * some CLIs consume a turn without emitting another screen_update, which used
  * to leave streamCardPending stuck and suppress cards for every later turn.
  *
- * Only one POST may be in flight per session. If another turn arrives during
- * the request, the generation check preserves that newer pending state and
- * immediately follows with its card after the first POST settles.
+ * Only one terminal-status POST may be in flight per session. If another turn
+ * arrives during it, the generation check preserves that newer pending state
+ * and follows with its status card after the first POST settles. Dynamic reply
+ * cards have their own per-turn publication lock and identity.
  */
 export async function postTurnStartingCard(
   ds: DaemonSession,
-  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>,
+  sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string, opts?: WorkerSessionReplyOptions) => Promise<string>,
   turnId: string,
 ): Promise<boolean> {
   if (!ds.streamCardPending || ds.streamCardPendingTurnId !== turnId) return false;
   if (remoteRetirementAdmissionPhase(ds)) return false;
+  let replyPost: Promise<boolean> = Promise.resolve(false);
+  if (replyCardModeFor(ds, turnId) !== 'legacy') {
+    // Reserve the turn before the CLI can call `botmux send`. Its reply uses
+    // the same durable record even while the first card POST is in flight.
+    replyPost = updateTurnReplyCard(ds, turnId, { kind: 'refresh' },
+      (body, type, uuid) => sessionReply(sessionAnchorId(ds), body, type, ds.larkAppId, turnId, { uuid }))
+      .then(result => !!result).catch(error => {
+        logger.warn(`[reply-card] initial card: ${error instanceof Error ? error.message : String(error)}`);
+        return false;
+      });
+  }
+  // The optional terminal card owns streamCardId/pending independently of the
+  // durable reply card. Start both before awaiting either to preserve the
+  // terminal card's synchronous generation/sentinel fence during slow POSTs.
+  const statusPost = postTurnStartingStatusCard(ds, sessionReply, turnId);
+  const [replyPosted, statusPosted] = await Promise.all([replyPost, statusPost]);
+  return replyPosted || statusPosted;
+}
+
+async function postTurnStartingStatusCard(
+  ds: DaemonSession,
+  sessionReply: Parameters<typeof postTurnStartingCard>[1],
+  turnId: string,
+): Promise<boolean> {
   if (ds.streamCardId === CARD_POSTING_SENTINEL) return false;
   if (streamingCardDisabled(ds, turnId)) return false;
   if (!workerHasInitialized(ds)) return false;
@@ -6762,6 +6797,7 @@ export async function closeSession(
     teardownAuthoritativePersistentBackingBeforeCloseImpl(teardownTarget, true);
   }
   let killedLive = false;
+  const hadWorkerReference = !!ds?.worker;
   const hadLiveWorker = !!ds?.worker && !ds.worker.killed;
   const closeWorkerGeneration = ds ? closeFenceGeneration(ds) : undefined;
   // Snapshot ownership + transition state before mutating the live object:
@@ -6968,15 +7004,56 @@ export async function closeSession(
     );
   }
 
+  const closedSnapshot = sessionStore.getOwnedSession(sessionId) ?? ds?.session ?? stored;
+  const runClosedLifecycle = async (workerExitProven: boolean): Promise<void> => {
+    if (!closedSnapshot || !callbacks?.onSessionClosed) return;
+    try {
+      await callbacks.onSessionClosed(structuredClone(closedSnapshot), {
+        workerGeneration: closeWorkerGeneration,
+        workerExitProven,
+      });
+    } catch (error) {
+      // The session is already closed and the worker is fenced. Leave the old
+      // coordinator pointer fail-closed; boot recovery will quarantine the group
+      // rather than inventing a second authority.
+      logger.error(
+        `[${sessionId.slice(0, 8)}] post-close XPI shared-cwd migration failed: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  };
+
   if (wasOpen && hadLiveWorker) {
     if (awaitWorkerExit) {
-      await closeFenceFor(sessionId, closeWorkerGeneration);
-      sessionStore.cleanupSessionBridgeSendMarkersNow(sessionId);
+      const closeFence = closeFenceFor(sessionId, closeWorkerGeneration);
+      if (!closeFence) {
+        logger.error(
+          `[${sessionId.slice(0, 8)}] close fence missing; refusing to claim worker exit before XPI shared-cwd migration`,
+        );
+        await runClosedLifecycle(false);
+      } else {
+        await closeFence;
+        sessionStore.cleanupSessionBridgeSendMarkersNow(sessionId);
+        await runClosedLifecycle(true);
+      }
     } else {
       // Don't block the caller on the worker exiting (killWorker already armed
       // the SIGKILL backstop). Defer bridge-marker cleanup behind the same
       // fence so a mid-flight send is still credited until the worker ACKs/exits.
       sessionStore.cleanupSessionBridgeSendMarkers(sessionId);
+      const closeFence = closeFenceFor(sessionId, closeWorkerGeneration);
+      if (!closeFence) {
+        logger.error(
+          `[${sessionId.slice(0, 8)}] close fence missing; refusing XPI shared-cwd coordinator migration`,
+        );
+        await runClosedLifecycle(false);
+      } else void closeFence.then(() => runClosedLifecycle(true), (error) => {
+        logger.error(
+          `[${sessionId.slice(0, 8)}] close fence rejected before XPI shared-cwd migration: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+        return runClosedLifecycle(false);
+      });
     }
   }
 
@@ -7042,6 +7119,14 @@ export async function closeSession(
       }
     }
     if (subs.length) logger.info(`[doc-comment] session ${sessionId.slice(0, 8)} closed → removed ${subs.length} doc binding(s)`);
+  }
+
+  if (wasOpen && !hadLiveWorker) {
+    // A workerless row has no process that can still write this cwd. Run the
+    // durable coordinator transition before returning, but preserve the
+    // established close ordering: per-turn reaction cleanup is started first
+    // so adding an XPI callback cannot stall unrelated cleanup indefinitely.
+    await runClosedLifecycle(!hadWorkerReference);
   }
 
   // alreadyClosed = nothing happened on either path.
@@ -7658,6 +7743,15 @@ function delayOrdinaryImDelivery(record: OrdinaryImDelivery): void {
   const messageKey = record.received
     ? 'worker.input_commit_delayed'
     : 'worker.input_delivery_delayed';
+  if (replyCardModeFor(record.ds, record.turnId) !== 'legacy') {
+    // The turn card already represents queued/working state. A slow worker
+    // receipt must not create a second message (or expose progress in final-only).
+    void updateTurnReplyCard(record.ds, record.turnId, { kind: 'refresh' },
+      (body, type, uuid) => requireCallbacks().sessionReply(
+        sessionAnchorId(record.ds), body, type, record.ds.larkAppId, record.turnId, { uuid },
+      )).catch(err => logger.warn(`[${tag(record.ds)}] reply-card delivery wait: ${err.message}`));
+    return;
+  }
   void requireCallbacks().sessionReply(
     sessionAnchorId(record.ds),
     tr(messageKey, { turnId: record.turnId.substring(0, 16) }, loc),
@@ -10121,6 +10215,10 @@ export type ForkResumeOrTurnId = boolean | string | {
    *  finding #1). */
   atMostOnce?: boolean;
   trustedCaller?: TrustedCaller;
+  /** Internal admission seam for the narrow XPI shared-cwd fallback. It is
+   * invoked with reserveWorkerGeneration's actual result after every earlier
+   * fork gate has passed and before a worker is replaced or spawned. */
+  onWorkerGenerationReserved?: (workerGeneration: number) => void;
 };
 
 export type WorkerForkAdmission = 'accepted' | 'deferred' | 'rejected';
@@ -10357,6 +10455,7 @@ export function forkWorker(
   let restartAttemptId: string | undefined;
   let initCodexAppInputGateFrozen = promptInput === ds.session.queuedActivationInput;
   let initAtMostOnce: boolean | undefined;
+  let onWorkerGenerationReserved: ((workerGeneration: number) => void) | undefined;
   if (typeof resumeOrTurnId === 'string') {
     initTurnId = resumeOrTurnId;
   } else if (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null) {
@@ -10366,6 +10465,7 @@ export function forkWorker(
     restartAttemptId = resumeOrTurnId.restartAttemptId;
     initCodexAppInputGateFrozen ||= resumeOrTurnId.codexAppInputGateFrozen === true;
     initAtMostOnce = resumeOrTurnId.atMostOnce;
+    onWorkerGenerationReserved = resumeOrTurnId.onWorkerGenerationReserved;
   } else {
     resume = resumeOrTurnId;
   }
@@ -10627,6 +10727,7 @@ export function forkWorker(
   // existing worker. A failed reservation leaves the old worker untouched;
   // a successful reservation immediately invalidates any late old-worker ACK.
   const workerGeneration = reserveWorkerGeneration(ds);
+  onWorkerGenerationReserved?.(workerGeneration);
 
   // Guard against double-fork: if a worker is already running, kill it first
   if (ds.worker && !ds.worker.killed) {
@@ -11200,6 +11301,7 @@ export function forkWorker(
   }
 
   // Use shared handler for IPC messages and exit
+  replyCardModeFor(ds, initMsg.turnId);
   setupWorkerHandlers(ds, worker, startupState, workerGeneration);
 
   ds.worker = worker;
@@ -11771,6 +11873,12 @@ function setupWorkerHandlers(
         } else {
           logger.warn(`[${t}] Ignored unbound input commit turn=${msg.turnId.slice(0, 16)}`);
         }
+        if (!managedAuxUiSuppressed(msg.turnId)) {
+          ds.replyCardRunningTurnId = msg.turnId;
+          void updateTurnReplyCard(ds, msg.turnId, { kind: 'start' },
+            (body, type, uuid) => scopedReply(body, type, msg.turnId, { uuid }),
+            { owns: ownsLifecycleMutation }).catch(error => logger.warn(`[${t}] reply-card start: ${error.message}`));
+        }
         break;
       }
       case 'session_ready_ack': {
@@ -12329,6 +12437,19 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'cli_runtime_version': {
+        if (!ownsLifecycleMutation()) break;
+        ds.cliVersion = msg.version;
+        dashboardEventBus.publish({
+          type: 'session.update',
+          body: {
+            sessionId: ds.session.sessionId,
+            patch: { cliVersion: msg.version },
+          },
+        });
+        break;
+      }
+
       case 'runner_build_ready': {
         const identity = runtimeBuildIdentity();
         if (
@@ -12485,6 +12606,13 @@ function setupWorkerHandlers(
         // Cache even when the CoT switches are off — `/cot show` uses this to
         // summon the bubble mid-turn with everything accumulated so far.
         ds.lastThinkingUpdate = { entries: msg.entries, turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt };
+        if (replyCardModeFor(ds, msg.turnId) !== 'legacy') {
+          if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
+            queueTurnReplyTools(ds, msg,
+              (body, type, uuid) => scopedReply(body, type, msg.turnId, { uuid }), ownsLifecycleMutation);
+          }
+          break;
+        }
         handleCotThinkingUpdate(ds, msg);
         break;
       }
@@ -12596,6 +12724,14 @@ function setupWorkerHandlers(
         }
 
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) { clearUsageRefreshTimer(ds); break; }
+
+        if (msg.turnId && prevStatus !== ds.lastScreenStatus && replyCardModeFor(ds, msg.turnId) !== 'legacy'
+          && (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'stalled')) {
+          void updateTurnReplyCard(ds, msg.turnId,
+            { kind: 'phase', phase: ds.lastScreenStatus === 'stalled' ? 'waiting' : 'working' },
+            (body, type, uuid) => scopedReply(body, type, msg.turnId, { uuid }),
+            { owns: ownsLifecycleMutation }).catch(error => logger.warn(`[${t}] reply-card status: ${error.message}`));
+        }
 
         // Proactive rate/usage-limit notification. The streaming-card PATCH
         // (card-on) carries no unread/mention signal, and card-off sessions
@@ -13762,6 +13898,18 @@ function setupWorkerHandlers(
         // (RUN_FINISHED auto-completes the CoT server-side). Also consumes the
         // one-shot `/cot show` force and drops the mid-turn thinking cache (a
         // post-terminal summon would create a bubble nobody ever finishes).
+        if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt) && replyCardModeFor(ds, msg.turnId) !== 'legacy') {
+          if (ds.replyCardRunningTurnId === msg.turnId) ds.replyCardRunningTurnId = undefined;
+          void (async () => {
+            await flushTurnReplyTools(ds, msg.turnId, msg.dispatchAttempt).catch(error => {
+              logger.warn(`[${t}] reply-card final tool flush: ${error.message}`);
+            });
+            await updateTurnReplyCard(ds, msg.turnId, {
+              kind: 'terminal', phase: msg.status, durationMs: msg.durationMs, completedAtMs: msg.completedAtMs,
+            }, (body, type, uuid) => scopedReply(body, type, msg.turnId, { uuid }),
+            { dispatchAttempt: msg.dispatchAttempt, owns: ownsLifecycleMutation });
+          })().catch(error => logger.warn(`[${t}] reply-card terminal: ${error.message}`));
+        }
         finalizeCotMessage(ds, msg.turnId, msg.status);
         ds.cotForced = undefined;
         ds.lastThinkingUpdate = undefined;
@@ -13879,6 +14027,7 @@ function setupWorkerHandlers(
           && !structuredFailedOwnsNotice
           && !nonLarkFailureHandled
           && !recoveryHandled
+          && replyCardModeFor(ds, msg.turnId) === 'legacy'
           && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt);
         if (shouldPostFailureCard) {
           const failureCode = msg.errorCode ?? msg.status;
@@ -14624,6 +14773,7 @@ function setupWorkerHandlers(
       // path) — settle any live CoT thinking bubble as interrupted so it
       // doesn't spin until the next daemon restart. Cosmetic, self-catching.
       abortCotMessage(ds);
+      void settleTurnReplyCards(ds).catch(error => logger.warn(`[${t}] reply-card disconnect: ${error.message}`));
       ds.lastThinkingUpdate = undefined;
       // Fence this lifetime before a polling dispatcher can observe its last
       // ACK. Keeping the old receipt is useful audit evidence, but the
@@ -14850,6 +15000,7 @@ async function persistFinalOutputDelivery(
   requesterSubjectId: string | undefined,
   webhookDestinations: import('../services/feedback-outbox.js').FeedbackWebhookDestination[] | undefined,
   logTag: string,
+  correlationDiscriminator?: string,
 ): Promise<void> {
   // A control needs BOTH the policy and the card snapshot to stay clickable
   // after a restart; either one missing means "record the delivery, no control".
@@ -14857,10 +15008,12 @@ async function persistFinalOutputDelivery(
   try {
     const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
     const feedbackStore = await getSkillFeedbackStore(config.session.dataDir);
+    if (feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, messageId)) return;
     feedbackStore.recordTurnDelivery({
       botAppId: ds.larkAppId,
       sessionId: ds.session.sessionId,
       turnId: msg.turnId,
+      correlationDiscriminator,
       nativeSessionId: msg.sourceHermesSessionId ?? ds.session.cliSessionId,
       platform: 'lark',
       platformAppId: ds.larkAppId,
@@ -15333,9 +15486,8 @@ function deliverFinalOutput(
         return;
       }
 
-      // Always deliver the answer as a fresh message — never PATCH a card in
-      // place. message.patch is silent (no Feishu notification / unread), which
-      // used to swallow the answer; a brand-new message always pings.
+      // Legacy delivery remains a fresh, notifying message. Opted-in ordinary
+      // replies below use the turn's durable card instead.
       revalidateManagedSend();
       if (!isStillOwned()) {
         onComplete?.(false);
@@ -15358,7 +15510,20 @@ function deliverFinalOutput(
               : {}),
           }
         : codexAppSettlementReply ?? { uuid: bridgeFinalOutputUuid(ds, msg) };
-      const messageId = await scopedReply(
+      if (!managedReceiver && (!msg.kind || msg.kind === 'bridge') && replyCardModeFor(ds, msg.turnId) !== 'legacy') {
+        await flushTurnReplyTools(ds, msg.turnId, msg.dispatchAttempt).catch(error => {
+          logger.warn(`[${t}] reply-card final tool flush: ${error.message}`);
+        });
+      }
+      const unifiedReply = !managedReceiver && (!msg.kind || msg.kind === 'bridge')
+        ? await updateTurnReplyCard(ds, msg.turnId, {
+            kind: 'final', text: safeAssistantText, card: cardJson, source: 'bridge',
+            ...(feedbackPolicy && feedback ? { feedback: { policy: feedbackPolicy, requesterSubjectId: feedbackRequesterSubjectId } } : {}),
+          }, (body, type, uuid) => scopedReply(body, type, msg.replyTurnId ?? msg.turnId,
+            frozenReplyTarget ? { uuid, replyTarget: frozenReplyTarget } : { uuid }),
+          { dispatchAttempt: msg.dispatchAttempt, owns: isStillOwned })
+        : undefined;
+      const messageId = unifiedReply?.messageId ?? await scopedReply(
         canonicalOutput.content,
         canonicalOutput.msgType,
         msg.replyTurnId ?? msg.turnId,
@@ -15382,11 +15547,23 @@ function deliverFinalOutput(
       if (messageId && !managedReceiver) {
         // Normal fallback final only; managed VC receivers have their own
         // delivery accounting and no feedback turn_terminal to correlate to.
-        await persistFinalOutputDelivery(ds, msg, safeAssistantText, effectiveCliId, messageId, feedbackPolicy, baseFeedbackCard, feedbackRequesterSubjectId, getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t);
+        const explicit = unifiedReply?.record.finalSource === 'explicit' ? unifiedReply.record : undefined;
+        await persistFinalOutputDelivery(ds, msg, explicit?.finalText ?? safeAssistantText, effectiveCliId, messageId,
+          explicit ? explicit.feedback?.policy : feedbackPolicy,
+          explicit ? (explicit.feedback && explicit.finalCard ? JSON.parse(explicit.finalCard) as Record<string, unknown> : undefined) : baseFeedbackCard,
+          explicit ? explicit.feedback?.requesterSubjectId : feedbackRequesterSubjectId,
+          getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t, explicit ? messageId : undefined);
       }
       onComplete?.(true);
     } catch (err: any) {
       if (!isStillOwned()) { onComplete?.(false); return; }
+      if (err instanceof ReplyCardWithdrawnError) {
+        // Withdrawing one answer is not closing the conversation. Preserve the
+        // session and consume only this turn's automatic delivery retry.
+        ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+        onComplete?.(true);
+        return;
+      }
       if (err instanceof MessageWithdrawnError) {
         // Withdrawal is permanent for this target, but it is not explicit
         // abandon. Keep an unsettled FIFO owner recoverable; only ledger-empty
@@ -15434,7 +15611,7 @@ export const __testOnly_retireTerminalizedCodexAppLedgerEntriesForRecovery = ret
 
 // ─── Fork adopt worker ──────────────────────────────────────────────────────
 
-function reserveWorkerGeneration(ds: DaemonSession): number {
+export function reserveWorkerGeneration(ds: DaemonSession): number {
   const previousDaemonGeneration = ds.workerGeneration;
   const previousSessionGeneration = ds.session.workerGeneration;
   const workerGeneration = Math.max(
@@ -15508,7 +15685,9 @@ export function forkAdoptWorker(
     restoredFromMetadata?: boolean;
     prompt?: string;
     turnId?: string;
+    atMostOnce?: boolean;
     trustedCaller?: TrustedCaller;
+    onWorkerGenerationReserved?: (workerGeneration: number) => void;
   },
 ): 'accepted' | 'rejected' {
   if (ds.session.cliInstanceBinding) throw new Error('External adoption cannot carry a Codex instance binding');
@@ -15554,6 +15733,7 @@ export function forkAdoptWorker(
   // Reserve before replacing an existing bridge worker for the same reason as
   // forkWorker: persistence failure must leave the old lifetime untouched.
   const workerGeneration = reserveWorkerGeneration(ds);
+  opts?.onWorkerGenerationReserved?.(workerGeneration);
 
   // Guard against double-fork
   if (ds.worker && !ds.worker.killed) {
@@ -15722,6 +15902,7 @@ export function forkAdoptWorker(
     // wrapper leaks into the user's un-injected external CLI.
     prompt: opts?.prompt ?? '',
     turnId: opts?.turnId,
+    ...(opts?.atMostOnce ? { atMostOnce: true } : {}),
     ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(trustedSessionController(ds)
       ? { trustedController: trustedSessionController(ds) }
