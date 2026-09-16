@@ -919,8 +919,19 @@ export interface CrossPrincipalInterruption {
     | 'preparing_independent'
     | 'independent_queued';
   /** Legacy field retained for restore compatibility. New records start the
-   *  classification clock only after the classification card is delivered. */
+   *  classification clock only after the classification card is delivered.
+   *
+   *  Read-only for current builds: `staleLegacyXpiDetail` treats an elapsed
+   *  value as a tripwire and quarantines the session, so nothing may write it.
+   *  A bot proposer's classification countdown lives in
+   *  {@link botClassifyDeadlineAt}. */
   classificationDeadlineAt?: number;
+  /** Deadline for a *bot* proposer to answer the classification notice with
+   *  `botmux send --as …`. Bots get a plain-text notice instead of a card, so
+   *  this clock is owned by the daemon rather than the ask broker. Distinct
+   *  from {@link classificationDeadlineAt}: an elapsed value here is ordinary
+   *  expiry that the driver cleans up, never a restore tripwire. */
+  botClassifyDeadlineAt?: number;
   /** Separate bound for waiting until the active owner turn finishes. This is
    *  not the owner's confirmation timeout. */
   ownerWaitDeadlineAt?: number;

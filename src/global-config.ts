@@ -325,6 +325,17 @@ export interface DashboardGlobalConfig {
    *  model; harmless but unnecessary otherwise. Read live — see config.ts
    *  `noVisibleOutputHint`. */
   noVisibleOutputHint?: boolean;
+  /** Experimental: enforce cross-principal turn isolation (XPI). When a message
+   *  arrives while a DIFFERENT principal owns the active CLI turn, the daemon
+   *  diverts it into a staged `crossPrincipalInterruptions` record and asks the
+   *  proposer to classify it (另开任务 / 留给当前任务) instead of delivering it.
+   *  Default OFF (absent ⇒ off): the classification round-trip is not reliable
+   *  on Feishu today — a v2 card re-serialization drops the hidden `--as` token
+   *  and strips button `value`, so neither the flag nor the bare keyword settles
+   *  the card and the message can never leave the queue. With the switch OFF the
+   *  message is delivered exactly as it was before the feature existed. Read live
+   *  — see config.ts `crossPrincipalInterruption`. */
+  crossPrincipalInterruption?: boolean;
   /** 流式卡片上下文占用百分比变色/高亮阈值（1-100 整数）。缺省 80。由 card-builder
    *  在构建时读取（readGlobalConfig 2s TTL 缓存），低于阈值灰色、≥阈值红色并提示压缩。 */
   contextCompactThreshold?: number;
@@ -462,6 +473,7 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   if (typeof d.bypassCodexHookTrust === 'boolean') out.bypassCodexHookTrust = d.bypassCodexHookTrust;
   if (typeof d.hideCodexRateLimitModelNudge === 'boolean') out.hideCodexRateLimitModelNudge = d.hideCodexRateLimitModelNudge;
   if (typeof d.noVisibleOutputHint === 'boolean') out.noVisibleOutputHint = d.noVisibleOutputHint;
+  if (typeof d.crossPrincipalInterruption === 'boolean') out.crossPrincipalInterruption = d.crossPrincipalInterruption;
   // 非法值（非数字 / NaN / 越界）静默丢弃，走 card-builder 的默认 80。
   if (typeof d.contextCompactThreshold === 'number'
     && Number.isFinite(d.contextCompactThreshold)
@@ -834,6 +846,35 @@ export function isWorkflowFeatureEnabled(env: NodeJS.ProcessEnv = process.env): 
     return v === 'true' || v === '1' || v === 'yes' || v === 'on';
   }
   return readGlobalConfig().workflow?.enabled === true;
+}
+
+/**
+ * Machine-wide experimental switch for cross-principal turn isolation (XPI).
+ *
+ * OFF (the default) restores the pre-#1348 delivery shape exactly: a message
+ * from another principal is appended to the queue and delivered to the active
+ * CLI turn like any other message — no divert, no staged record, no
+ * classification card. That is deliberate mitigation, not a repair: the
+ * classification round-trip cannot currently be answered on Feishu (the card
+ * re-serialization drops the hidden `--as` token and strips button `value`), so
+ * an enforced isolation can strand the proposer's message indefinitely.
+ *
+ * Mirrors isWorkflowFeatureEnabled: `BOTMUX_XPI_ENABLED` wins when set (an
+ * escape hatch for a single daemon / a test), otherwise the dashboard toggle.
+ * Read live off the short-TTL config cache, so flipping Settings applies to the
+ * next turn without a daemon restart. Worker and daemon each call this on their
+ * own side; a mid-turn flip can only change what happens to the NEXT message,
+ * never rewrite an authority tuple already in flight.
+ */
+export function isCrossPrincipalInterruptionEnabled(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const flag = env.BOTMUX_XPI_ENABLED;
+  if (flag != null && flag !== '') {
+    const v = flag.trim().toLowerCase();
+    return v === 'true' || v === '1' || v === 'yes' || v === 'on';
+  }
+  return readGlobalConfig().dashboard?.crossPrincipalInterruption === true;
 }
 
 /** Derive repo-picker scan options from the machine-wide `repoPickerMode`.

@@ -67,6 +67,7 @@ interface DashboardSettings {
     targetDaemonOnline: boolean;
   };
   noVisibleOutputHint: boolean;
+  crossPrincipalInterruption: boolean;
   vcMeetingAgent: {
     enabled: boolean;
     larkCliVersion?: string | null;
@@ -217,6 +218,7 @@ function parseSettings(s: any): DashboardSettings {
       targetDaemonOnline: s?.hostOverloadAlert?.targetDaemonOnline === true,
     },
     noVisibleOutputHint: s?.noVisibleOutputHint === true,
+    crossPrincipalInterruption: s?.crossPrincipalInterruption === true,
     vcMeetingAgent: {
       enabled: s?.vcMeetingAgent?.enabled !== false,
       larkCliVersion: s?.vcMeetingAgent?.larkCliVersion === undefined ? undefined : (s.vcMeetingAgent.larkCliVersion ?? null),
@@ -724,7 +726,7 @@ function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'noVisibleOutputHint' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
@@ -900,6 +902,13 @@ function SettingsBody(props: {
             checked={settings.noVisibleOutputHint}
             disabled={dis || savingKey === 'noVisibleOutputHint'}
             onChange={value => saveBoolean('noVisibleOutputHint', value)}
+          />
+          <ToggleRow
+            title={tr('settings.crossPrincipalInterruption')}
+            help={tr('settings.crossPrincipalInterruptionHelp')}
+            checked={settings.crossPrincipalInterruption}
+            disabled={dis || savingKey === 'crossPrincipalInterruption'}
+            onChange={value => saveBoolean('crossPrincipalInterruption', value)}
           />
         </SettingsBlock>
         <SettingsBlock id="settings-overload" title={tr('settings.sectionHostOverloadAlert')}>

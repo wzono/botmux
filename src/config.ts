@@ -4,6 +4,7 @@ import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { resolveWorkerHttpHost } from './utils/worker-http.js';
 import {
   globalVcMeetingAgentListenerBotAppId,
+  isCrossPrincipalInterruptionEnabled,
   isGlobalVcMeetingAgentEnabled,
   readGlobalConfig,
 } from './global-config.js';
@@ -365,6 +366,14 @@ export const config = {
   // thinking-only nudge as a send failure; it is harmless but unnecessary for the
   // common all-Claude setup, so operators opt in explicitly.
   get noVisibleOutputHint(): boolean { return readGlobalConfig().dashboard?.noVisibleOutputHint === true; },
+  // Live getter (like noVisibleOutputHint): the experimental cross-principal
+  // interruption (XPI) switch. Default OFF (absent ⇒ disabled) — with it off the
+  // daemon delivers another principal's message normally instead of diverting it
+  // into a staged record, i.e. exactly the pre-#1348 behavior. Read per message
+  // so a Settings flip applies to the next turn without a daemon restart; the
+  // worker reads the same switch through isCrossPrincipalInterruptionEnabled so
+  // both ends of the IPC agree. `BOTMUX_XPI_ENABLED` overrides for one process.
+  get crossPrincipalInterruption(): boolean { return isCrossPrincipalInterruptionEnabled(); },
   // Live getter: whether to auto-bypass Codex's interactive hook-trust gate for
   // Codex-family plain-TUI launches. Re-read per spawn so a Settings toggle takes
   // effect on the next session without a daemon restart (existing panes keep their

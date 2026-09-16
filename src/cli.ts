@@ -268,6 +268,11 @@ import {
   type BotMentionEntry,
 } from './utils/bot-routing.js';
 import { isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
+import {
+  crossPrincipalAsKeyword,
+  embedCrossPrincipalAsToken,
+  parseCrossPrincipalAsFlag,
+} from './core/cross-principal-choice.js';
 import { registerPromptOverrideResolver } from './skills/effective-builtins.js';
 import { type Brand, chatAppLink, larkHosts, normalizeBrand } from './im/lark/lark-hosts.js';
 import { clearWorkerConfig, mergeDashboardConfig, mergeGlobalConfig, mergeWorkerConfig, readGlobalConfig, setGlobalLocale, globalConfigPath, type WorkerConfig } from './global-config.js';
@@ -6506,6 +6511,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --layout result|progress|risk|blocked|handoff
                                        可选回复卡卡头薄壳；只在关键结果/进度/风险/阻塞/交接节点显式使用
        --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈
+       --as independent|suggestion     对方任务正在跑时声明处理方式：另开任务 / 留给当前任务
        --mention <id:name>             @提及（可重复）。id 默认是 open_id；bot 配置开启
                                        allowArbitraryMention 后也可传完整邮箱/手机号/union_id，
                                        自动解析并校验其为目标群成员，否则拒发
@@ -7982,7 +7988,7 @@ async function relaySend(
   // routing (--chat-id/--into/--top-level) and --session-id flags are dropped —
   // content/attachments come from the outbox and session-id is forced host-side.
   const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash']);
-  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--plugin-card-action']);
+  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--as', '--plugin-card-action']);
   const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const tok = rest[i];
@@ -8808,6 +8814,25 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error('botmux send: --response-kind 仅支持 progress|final|auxiliary');
     process.exit(2);
   }
+  const asOccurrences = rest.filter(token => token === '--as' || token.startsWith('--as=')).length;
+  if (asOccurrences > 1) {
+    console.error('botmux send: --as 只能指定一次');
+    process.exit(2);
+  }
+  if (flagPresentButValueMissing(rest, '--as')) {
+    console.error(t('xpi.send.as_usage'));
+    process.exit(2);
+  }
+  const asRaw = argValue(rest, '--as');
+  const asChoice = parseCrossPrincipalAsFlag(asRaw);
+  if (asRaw !== undefined && !asChoice) {
+    console.error(t('xpi.send.as_usage'));
+    process.exit(2);
+  }
+  if (asChoice && customCardRequested) {
+    console.error('botmux send: --as 不能与 --card-file/--card-json 混用；请先发卡片，再单独 `botmux send --as independent|suggestion`');
+    process.exit(2);
+  }
   // Backward-compatible default: an unclassified proactive send is non-final.
   // Only an explicit `final` may opt into feedback controls and indexing;
   // `progress` and `auxiliary` (interim / supplementary output) both deliver
@@ -9277,6 +9302,12 @@ async function cmdSend(rest: string[]): Promise<void> {
   // complete internal suffix into Lark or count it in send markers.
   content = stripTrailingOaiMemoryCitation(content);
   if (!contentFile && !customCardRequested) rejectLikelyWindowsStdinMojibake(content);
+  if (asChoice) {
+    content = embedCrossPrincipalAsToken(
+      content.trim() ? content : crossPrincipalAsKeyword(asChoice),
+      asChoice,
+    );
+  }
 
   const managedPayloadError = managedVcSendPayloadError({
     managed: !!vcMeetingManagedSendOrigin,
@@ -9292,7 +9323,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     process.exit(2);
   }
 
-  if (!customCard && !content.trim() && images.length === 0 && files.length === 0 && videoAttachments.length === 0) {
+  if (!customCard && !content.trim() && !asChoice && images.length === 0 && files.length === 0 && videoAttachments.length === 0) {
     console.error('没有内容可发送。用法:\n  echo "消息" | botmux send\n  botmux send "消息"\n  botmux send --content-file /tmp/msg.md --images /tmp/chart.png\n  botmux send --videos /tmp/replay.mp4 --video-covers /tmp/cover.png --no-mention "视频预览"');
     process.exit(1);
   }
@@ -10700,6 +10731,20 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error(unifiedReplyUsed && effectiveResponseKind !== 'final'
       ? '进度已更新到本轮卡片。完成时请用 botmux send --response-kind final 发送完整答复。'
       : t('ai.send.after_success_hint', undefined, localeForBot(appId)));
+    const sendLocale = localeForBot(appId);
+    if (asChoice) {
+      console.error(t(
+        asChoice === 'independent' ? 'xpi.send.as_marked_independent' : 'xpi.send.as_marked_suggestion',
+        undefined,
+        sendLocale,
+      ));
+    } else if (config.crossPrincipalInterruption
+      && rest.some(tok => tok === '--mention' || tok.startsWith('--mention='))) {
+      // Only advertise `--as` while cross-principal isolation is actually
+      // enforced; with the experimental switch off nothing is ever staged, so
+      // the flag would classify nothing.
+      console.error(t('xpi.send.as_needed_hint', undefined, sendLocale));
+    }
 
     // --attention: message is already delivered above; now flip the dashboard
     // needs-you state via the daemon (botmux send is direct-to-Lark, so the

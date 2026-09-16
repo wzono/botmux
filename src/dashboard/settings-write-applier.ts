@@ -93,6 +93,7 @@ export interface ResolvedDashboardSettingsView {
     targetDaemonOnline?: boolean;
   };
   noVisibleOutputHint: boolean;
+  crossPrincipalInterruption: boolean;
   vcMeetingAgent: {
     enabled: boolean;
     larkCliVersion?: string | null;
@@ -239,6 +240,7 @@ export type ApplySettingsWriteError =
   | 'hostOverloadAlert_target_owner_missing'
   | 'hostOverloadAlert_target_offline'
   | 'invalid_noVisibleOutputHint'
+  | 'invalid_crossPrincipalInterruption'
   | 'invalid_repoPickerMode'
   | 'invalid_remoteAccess'
   | 'invalid_vcMeetingAgent'
@@ -458,6 +460,13 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_noVisibleOutputHint' };
     }
     patch.noVisibleOutputHint = obj.noVisibleOutputHint;
+  }
+
+  if ('crossPrincipalInterruption' in obj) {
+    if (typeof obj.crossPrincipalInterruption !== 'boolean') {
+      return { ok: false, error: 'invalid_crossPrincipalInterruption' };
+    }
+    patch.crossPrincipalInterruption = obj.crossPrincipalInterruption;
   }
 
   let codexNotifierPatch: import('../global-config.js').CodexNotifierGlobalConfig | undefined;

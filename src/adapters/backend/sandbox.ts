@@ -1028,6 +1028,7 @@ const RELAY_FLAGS_VAL = new Set([
   '--mention',
   '--quote',
   '--response-kind',
+  '--as',
   '--layout',
   '--plugin-card-action',
 ]);
@@ -1136,6 +1137,9 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       if (v.startsWith('--')) return { ok: false, error: `flag ${f} value must not be a flag` };
       if (f === '--response-kind' && !['progress', 'final', 'auxiliary'].includes(v)) {
         return { ok: false, error: 'flag --response-kind must be progress, final, or auxiliary' };
+      }
+      if (f === '--as' && !['independent', 'suggestion'].includes(v)) {
+        return { ok: false, error: 'flag --as must be independent or suggestion' };
       }
       if (f === '--layout' && !['result', 'progress', 'risk', 'blocked', 'handoff'].includes(v)) {
         return { ok: false, error: 'flag --layout must be result, progress, risk, blocked, or handoff' };

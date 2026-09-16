@@ -533,6 +533,20 @@ botmux send --no-mention "后台任务还在跑，预计 5 分钟。"
 
 （可设环境变量 \`BOTMUX_REQUIRE_MENTION_DECISION=false\` 关闭此硬门。）
 
+### 对方正在执行任务时：\`--as\`
+
+你的消息如果碰上其他成员（人或另一个 bot）正在跑任务，**不会打断对方**，而是先暂存。这时必须二选一：
+
+| flag | 含义 |
+|---|---|
+| \`botmux send --as independent\` | **另开任务**：马上单独做，不打断当前任务 |
+| \`botmux send --as suggestion\` | **留给当前任务**：等对方结束后确认要不要采纳 |
+
+可以跟原文一起发：\`botmux send --as independent --mention <ou_xxx> "请帮我看这段 diff"\`。
+也可以先发出原文，再单独 \`botmux send --as independent\` 或 \`botmux send --as suggestion\`。
+
+人在飞书里会看到两个按钮（另开任务 / 留给当前任务）；agent 用上面的 flag 选，不要去点卡片。
+
 ### 引用串联（普通群）
 
 普通群里，回复默认会**引用本轮触发的那条消息**（飞书"引用"样式），把对话串成可追溯的链——你无需做任何事。

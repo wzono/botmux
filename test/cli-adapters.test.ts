@@ -261,6 +261,37 @@ describe('claude-code buildArgs', () => {
     }
   });
 
+  // 同一条对齐守卫，但针对受实验开关控制的 `--as` 提示：两条注入路径必须同时
+  // 出现、同时消失。只断言「开启时都有」会漏掉「关闭时只有一条路径漏了」，
+  // 所以两个方向都断言。开关默认关闭，见 isCrossPrincipalInterruptionEnabled。
+  it('keeps the cross-principal --as hint aligned across both injection paths, in both switch states', () => {
+    const originalXpi = process.env.BOTMUX_XPI_ENABLED;
+    try {
+      process.env.BOTMUX_XPI_ENABLED = 'true';
+      for (const prompt of [
+        buildBotmuxSystemPromptText({ locale: 'en' }),
+        buildBotmuxShellHints('en').join('\n'),
+      ]) {
+        expect(prompt).toContain('--as independent');
+        expect(prompt).toContain('--as suggestion');
+      }
+
+      process.env.BOTMUX_XPI_ENABLED = 'false';
+      for (const prompt of [
+        buildBotmuxSystemPromptText({ locale: 'en' }),
+        buildBotmuxShellHints('en').join('\n'),
+      ]) {
+        expect(prompt).not.toContain('--as independent');
+        expect(prompt).not.toContain('--as suggestion');
+        // 闸是外科式的：其余路由提示不受影响。
+        expect(prompt).toContain('--response-kind final');
+      }
+    } finally {
+      if (originalXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = originalXpi;
+    }
+  });
+
   // ── no-transport gate (质量①): a program request/response turn (apiOnly
   //    core-only bot OR HTTP virtual chat) drops the whole send/@/silence
   //    collaboration routing block — it is noise there, and `usage_silence`

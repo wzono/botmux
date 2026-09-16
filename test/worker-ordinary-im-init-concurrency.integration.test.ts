@@ -104,7 +104,9 @@ setInterval(() => {}, 1_000);
     }));
   }, 15_000);
 
-  it('rejects a different principal at the worker backstop before type-ahead can steer it', async () => {
+  // 跨身份隔离（XPI）现在由实验开关控制且默认关闭，所以这条用例必须显式打开它
+  // ——它锁的正是「开关打开时」的拒绝行为。关闭态的镜像用例紧随其后。
+  it('rejects a different principal at the worker backstop before type-ahead can steer it (XPI on)', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-principal-queue-'));
     tempDirs.add(root);
     const dataDir = join(root, 'session');
@@ -149,6 +151,7 @@ setInterval(() => {}, 1_000);
         HOME: root,
         SESSION_DATA_DIR: dataDir,
         BOTMUX_SESSION_ID: 'sid-worker-principal-queue',
+        BOTMUX_XPI_ENABLED: 'true',
         BOTMUX_TIME_SCALE: '0.05',
         LARK_APP_ID: 'app_test',
         LARK_APP_SECRET: 'secret',
@@ -277,6 +280,130 @@ setInterval(() => {}, 1_000);
     await waitFor(() => readFileSync(inputLog, 'utf8').includes('B_AFTER_A'), logs);
     await waitFor(() => messages.some(message =>
       message.type === 'turn_input_committed' && message.turnId === 'om_principal_b_after_a'), logs);
+  }, 20_000);
+
+  // 关闭态镜像：这是「整体关掉」真正要保证的行为——第二个身份的消息不再被拦成
+  // turn_input_rejected，而是像该特性上线（#1348）之前那样直接送达 CLI。
+  // 断言的是送达本身（stdin 里出现 marker + turn_input_committed），不是「没有拒绝」；
+  // 纯否定断言在 worker 起不来时也会通过，那种绿是空的。
+  it('delivers a different principal instead of rejecting it when the XPI switch is off', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-principal-xpi-off-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+    const inputLog = join(root, 'stdin.log');
+    const fakePi = join(root, 'fake-pi');
+    writeFileSync(fakePi, `#!/usr/bin/env node
+const fs = require('node:fs');
+const inputLog = process.env.FAKE_INPUT_LOG;
+let firstSeen = false;
+setTimeout(() => process.stdout.write('Ready\\n'), 100);
+process.stdin.on('data', chunk => {
+  const text = chunk.toString();
+  fs.appendFileSync(inputLog, text);
+  if (!firstSeen && text.includes('PRINCIPAL_A_MARKER')) {
+    firstSeen = true;
+    fs.appendFileSync(inputLog, '\\nA_SEEN\\n');
+    process.stdout.write('Working...\\n');
+    setTimeout(() => {
+      fs.appendFileSync(inputLog, '\\nA_DONE\\n');
+      process.stdout.write('\\x1b[2J\\x1b[HReady\\n');
+    }, 500);
+  }
+});
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakePi, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-worker-principal-xpi-off',
+        // The switch under test. Set explicitly so the case does not depend on
+        // the ambient default staying off.
+        BOTMUX_XPI_ENABLED: 'false',
+        BOTMUX_TIME_SCALE: '0.05',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+        FAKE_INPUT_LOG: inputLog,
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => {
+      messages.push(raw as WorkerToDaemon);
+      logs.push(`[ipc] ${JSON.stringify(raw)}\n`);
+    });
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-worker-principal-xpi-off',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'pi',
+      cliPathOverride: fakePi,
+      backendType: 'pty',
+      prompt: '',
+      env: { FAKE_INPUT_LOG: inputLog },
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+
+    await waitFor(() => messages.some(message => message.type === 'ready'), logs);
+
+    // Principal A takes the active turn first.
+    child.send({
+      type: 'message',
+      content: 'PRINCIPAL_A_MARKER',
+      turnId: 'om_principal_a',
+      trustedCaller: {
+        requestUserOpenId: 'ou_a',
+        requestUserUnionId: 'on_a',
+        requestLarkAppId: 'app_test',
+        senderType: 'user',
+      },
+    } satisfies DaemonToWorker);
+    await waitFor(() => existsSync(inputLog)
+      && readFileSync(inputLog, 'utf8').includes('A_SEEN'), logs);
+
+    // A DIFFERENT principal interrupts while A still owns the active turn.
+    child.send({
+      type: 'message',
+      content: 'PRINCIPAL_B_MARKER',
+      turnId: 'om_principal_b',
+      trustedCaller: {
+        requestUserOpenId: 'ou_b',
+        requestUserUnionId: 'on_b',
+        requestLarkAppId: 'app_test',
+        senderType: 'user',
+      },
+      rerouteEnvelope: {
+        turnId: 'om_principal_b',
+        text: 'PRINCIPAL_B_MARKER',
+        userPrompt: 'PRINCIPAL_B_MARKER',
+        createdAt: new Date().toISOString(),
+      },
+    } satisfies DaemonToWorker);
+
+    // Positive assertion: it reaches the CLI and commits.
+    await waitFor(() => existsSync(inputLog)
+      && readFileSync(inputLog, 'utf8').includes('PRINCIPAL_B_MARKER'), logs);
+    await waitFor(() => messages.some(message =>
+      message.type === 'turn_input_committed' && message.turnId === 'om_principal_b'), logs);
+
+    // And nothing was rejected on cross-principal grounds.
+    expect(messages.filter(message =>
+      message.type === 'turn_input_rejected'
+      && (message as { reason?: string }).reason === 'cross_principal_requires_owner_confirmation',
+    )).toEqual([]);
   }, 20_000);
 
   it('holds a non-argv follow-up until the initial prompt owns the queue head', async () => {
