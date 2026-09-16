@@ -390,7 +390,7 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
         tag: 'div',
         text: {
           tag: 'lark_md',
-          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeMd(truncate(q.prompt, 512, locale))}`,
+          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeMd(truncate(sanitizeBotAnswererPrompt(q.prompt, ask), 512, locale))}`,
         },
       });
 
@@ -418,6 +418,22 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
             },
       }));
       appendActionRows(elements, optionButtons);
+
+      // 选项的详细说明（Claude Code AskUserQuestion 的 options[].description）。
+      // 不进按钮（飞书按钮无副标题），在按钮行下方以小字列出 label → description，
+      // 缺省时整块不渲染，老调用方渲染结果不变。
+      const described = q.options.filter((opt) => opt.description?.trim());
+      if (described.length > 0) {
+        elements.push({
+          tag: 'div',
+          text: {
+            tag: 'lark_md',
+            content: described
+              .map((opt) => `**${escapeMd(truncate(opt.label, 120, locale))}**：${escapeMd(truncate(opt.description!.trim(), 400, locale))}`)
+              .join('\n'),
+          },
+        });
+      }
     }
 
     if (requiresSubmit) {
@@ -638,8 +654,38 @@ function templateForResult(result: AskResult): string {
   }
 }
 
-function approverSummary(ask: PendingAsk, locale?: Locale): string {
+/**
+ * Mention token for the locked answerer, safe for card `lark_md`.
+ *
+ * Bot answerers MUST render as plain text, never `<at id=…>`: Feishu rejects a
+ * card whose at-target is a bot open_id with 400/100290 "invalid user resource
+ * (at/person)", so the whole card fails to send and the ask invalidates
+ * instantly (observed driving a peer-bot cross-principal re-send storm). The
+ * peer bot receives the group message anyway, so nothing is lost by dropping
+ * the at-ping. Fall back to a truncated open_id when no display name is known.
+ */
+function answererMentionToken(ask: PendingAsk): string {
+  if (ask.answererIsBot) {
+    const name = ask.answererDisplayName?.trim();
+    return name ? `@${name}` : `@${short(ask.answererOpenId ?? '', 16)}`;
+  }
   if (ask.answererOpenId) return `<at id=${ask.answererOpenId}></at>`;
+  return '';
+}
+
+/** Replace `<at id=X></at>` markers in a prompt body that target a bot answerer
+ *  with the plain-text mention, so a caller-authored prompt can't reintroduce
+ *  the unsupported card at-tag. */
+function sanitizeBotAnswererPrompt(prompt: string, ask: PendingAsk): string {
+  if (!ask.answererIsBot || !ask.answererOpenId) return prompt;
+  const token = answererMentionToken(ask);
+  const escaped = ask.answererOpenId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return prompt.replace(new RegExp(`<at\\s+id=${escaped}\\s*></at>`, 'g'), token);
+}
+
+function approverSummary(ask: PendingAsk, locale?: Locale): string {
+  const token = answererMentionToken(ask);
+  if (token) return token;
   // 答复权限 = canTalk：谁能在该群跟 bot 说话谁就能答。卡片统一显示「本群可对话成员」，
   // 不再按 open_id 列名单（鉴权在 broker 点击时按 canTalk 判定）。
   return t('card.ask.answerable_talk_members', undefined, locale);

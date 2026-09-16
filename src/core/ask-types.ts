@@ -9,10 +9,16 @@
 /** A single selectable option on an ask card. `key` is the stable identifier
  *  returned via stdout; `label` is the human-facing button text. When the user
  *  writes `--options "yes,no"`, `key === label`. With `--options "yes=继续"`,
- *  `key="yes"` and `label="继续"`. */
+ *  `key="yes"` and `label="继续"`.
+ *
+ *  `description` is the optional longer explanation the upstream CLI attaches
+ *  to an option (Claude Code `AskUserQuestion.options[].description`,
+ *  OpenCode `question.options[].description`). It is shown beneath the option
+ *  label; older callers that omit it render exactly as before. */
 export interface AskOption {
   key: string;
   label: string;
+  description?: string;
 }
 
 /** 多问多选模型中一个问题的描述。`key` 是问题的稳定标识符（可选，默认用序号），
@@ -124,6 +130,16 @@ export interface CreateAskInput {
   /** Optional exact responder lock for host-owned approval asks. Ordinary
    * agent asks omit it and retain the existing canTalk-any-member policy. */
   answererOpenId?: string;
+  /** Whether the locked answerer is a bot (Feishu `sender_type` bot / known
+   * peer). Ask cards must NOT render `<at id=botOpenId>` inside card markup:
+   * Feishu rejects the whole card with 400/100290 "invalid user resource
+   * (at/person)", which invalidates the ask instantly and, for cross-principal
+   * gating between peer bots, drives a re-send storm. Bot answerers get a plain
+   * text name instead. Absent = unknown, rendered the human way (`<at>`). */
+  answererIsBot?: boolean;
+  /** Display name of a bot answerer, rendered as plain text in place of the
+   * unsupported card `<at>`. Only consulted when answererIsBot is true. */
+  answererDisplayName?: string;
 }
 
 /** Daemon-internal state for a pending ask. Not exported on the IPC boundary —
@@ -149,6 +165,10 @@ export interface PendingAsk {
   chatType?: 'group' | 'p2p';
   /** When present, only this app-scoped open_id may settle the ask. */
   answererOpenId?: string;
+  /** Bot answerer flag + plain-text display name — see CreateAskInput. Cards
+   * render these without an `<at>` tag. */
+  answererIsBot?: boolean;
+  answererDisplayName?: string;
   /** 问题列表，替代旧的 `options` + `prompt`。 */
   questions: ReadonlyArray<AskQuestion>;
   /** 当前已勾选答案快照。仅 daemon/card 内部使用；CLI IPC 边界不暴露。 */

@@ -27,6 +27,16 @@ export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 
       ...(submit ? { icon: { tag: 'standard_icon', token: selected.has(option.key) ? 'check_outlined' : 'rectangle_outlined' } } : {}),
     }));
     for (let start = 0; start < buttons.length; start += 3) elements.push(row(buttons.slice(start, start + 3)));
+    // 选项详细说明（Claude Code AskUserQuestion options[].description）：按钮无副标题，
+    // 在按钮行下用小字列出。safe() 已做转义，这里仅按 label 加粗。缺省不渲染。
+    const described = q.options.filter(option => option.description?.trim());
+    if (described.length) {
+      elements.push({
+        tag: 'markdown',
+        text_size: 'notation',
+        content: described.map(option => `**${safe(option.label)}**：${safe(option.description!.trim())}`).join('\n'),
+      });
+    }
   });
   if (submit) {
     if (entry.confirmEmptyArmed) elements.push({ tag: 'markdown', content: t('card.ask.empty_warning', undefined, locale) });
