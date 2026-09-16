@@ -76,6 +76,10 @@ export interface PersistedAsk {
   chatType?: 'group' | 'p2p';
   /** Optional app-scoped responder lock for host-owned approval asks. */
   answererOpenId?: string;
+  /** Bot answerer flag + plain-text display name, carried across restarts so
+   * the re-sent card keeps omitting the unsupported `<at id=botOpenId>`. */
+  answererIsBot?: boolean;
+  answererDisplayName?: string;
   questions: ReadonlyArray<AskQuestion>;
   createdAt: number;
   deadlineAt: number;

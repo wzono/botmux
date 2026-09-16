@@ -881,6 +881,8 @@ export const messages: Record<string, string> = {
   'xpi.agent.hint': 'Choose one:\n  botmux send --as independent   # start a new task now\n  botmux send --as suggestion    # leave it for the current task',
   'xpi.bot.classify.notice': '{at} Another member\'s task is still running. Your message was saved and will not interrupt it.',
   'xpi.bot.wait.notice': '{at} The original task is still running. Choose again, or keep waiting.',
+  'xpi.bot.owner.notice': '{at} Another member left a suggestion for the current task:\n\n{advice}\n\nAdopt and re-run? Reply in this thread with “采纳并重新执行” (accept) or “不采纳” (reject).',
+  'xpi.timeout.owner_unconfirmed': 'The suggestion was not confirmed, so it was not executed.',
   'xpi.send.as_usage': 'botmux send: --as only accepts independent|suggestion',
   'xpi.send.as_marked_independent': 'Marked as “start a new task”: it will run separately without interrupting the current task.',
   'xpi.send.as_marked_suggestion': 'Marked as “leave it for the current task”: the other party will decide whether to take it.',

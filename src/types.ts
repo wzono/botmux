@@ -941,6 +941,12 @@ export interface CrossPrincipalInterruption {
   /** Legacy field retained for restore compatibility. New owner-confirmation
    *  clocks are owned by the ask broker and start after card delivery. */
   ownerDeadlineAt?: number;
+  /** Deadline for a *bot* owner to answer the owner-confirmation notice with a
+   *  plain-text reply (采纳并重新执行 / 不采纳). Bot owners get a text notice
+   *  instead of a card for the same reason as {@link botClassifyDeadlineAt}:
+   *  a choice card cannot at-mention a bot, so the bot could neither see nor
+   *  answer it. The daemon owns this clock. */
+  botOwnerDeadlineAt?: number;
   messages: CrossPrincipalInterruptionMessage[];
   independentRootMessageId?: string;
   independentChildSessionId?: string;

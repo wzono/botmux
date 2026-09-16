@@ -229,3 +229,19 @@ export function crossPrincipalBotWaitNotice(
 ): string {
   return `${t('xpi.bot.wait.notice', { at: `<at id=${proposerOpenId}></at>` }, locale)}\n${crossPrincipalAgentHint(locale)}`;
 }
+
+/** Plain-text owner-confirmation notice for a *bot* owner. A choice card
+ *  cannot at-mention a bot (Feishu 400/100290), so a bot owner answers the
+ *  same accept/reject gate with a plain-text reply — the keywords are parsed
+ *  by {@link isCrossPrincipalChoiceOnlyText} at the owner gate. */
+export function crossPrincipalBotOwnerNotice(
+  ownerOpenId: string,
+  advice: string,
+  locale?: Locale,
+): string {
+  return t(
+    'xpi.bot.owner.notice',
+    { at: `<at id=${ownerOpenId}></at>`, advice },
+    locale,
+  );
+}

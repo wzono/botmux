@@ -4,6 +4,7 @@ import type { CrossPrincipalChoiceKind } from '../src/core/cross-principal-choic
 import {
   crossPrincipalAgentHint,
   crossPrincipalBotClassifyNotice,
+  crossPrincipalBotOwnerNotice,
   crossPrincipalClassificationOptions,
   embedCrossPrincipalAsToken,
   isCrossPrincipalChoiceOnlyText,
@@ -126,6 +127,15 @@ describe('cross-principal choice wiring', () => {
     expect(cliSource).toContain('embedCrossPrincipalAsToken');
     expect(cliSource).toContain('xpi.send.as_needed_hint');
   });
+
+  it('routes a bot owner through the plain-text owner notice, never a choice card', () => {
+    expect(daemonSource).toContain('crossPrincipalBotOwnerNotice');
+    expect(daemonSource).toContain("record.owner.senderType === 'bot'");
+    // The owner's text reply must be consumed at ingress.
+    expect(daemonSource).toContain('trySettleCrossPrincipalOwnerChoice(ds, threadTrustedCaller,');
+    // A bot-owner timeout/decline uses the shared unconfirmed copy.
+    expect(daemonSource).toContain('xpi.timeout.owner_unconfirmed');
+  });
 });
 
 describe('cross-principal choice copy', () => {
@@ -156,8 +166,32 @@ describe('cross-principal choice copy', () => {
     expect(notice).not.toContain('请选一种处理方式');
   });
 
-  it('keeps zh/en send-hint keys aligned', () => {
-    for (const key of [
+  it('gives a bot owner a plain-text at-notice whose keywords answer the owner gate', () => {
+    const notice = crossPrincipalBotOwnerNotice('ou_bot', '建议重试一遍失败的用例', 'zh');
+    // Plain-text at-mentions of bots are legal; card at-mentions are rejected
+    // with 400/100290. The notice must carry the former, never card markup.
+    expect(notice).toContain('<at id=ou_bot></at>');
+    expect(notice).toContain('建议重试一遍失败的用例');
+    // Every instruction keyword in the notice must actually settle the gate,
+    // otherwise the bot does exactly what it was told and is ignored.
+    expect(isCrossPrincipalChoiceOnlyText('采纳并重新执行', 'owner')).toBe(true);
+    expect(isCrossPrincipalChoiceOnlyText('不采纳', 'owner')).toBe(true);
+    expect(parseCrossPrincipalChoiceText('采纳并重新执行', 'owner')).toBe('accept');
+    expect(parseCrossPrincipalChoiceText('不采纳', 'owner')).toBe('reject');
+
+    const en = crossPrincipalBotOwnerNotice('ou_bot', 'retry the flaky case', 'en');
+    expect(en).toContain('<at id=ou_bot></at>');
+    expect(en).toContain('retry the flaky case');
+  });
+
+  it('keeps zh/en owner notice + timeout keys aligned', () => {
+    expect(zhMessages['xpi.bot.owner.notice']).toContain('{at}');
+    expect(enMessages['xpi.bot.owner.notice']).toContain('{at}');
+    expect(zhMessages['xpi.timeout.owner_unconfirmed']).toBeTruthy();
+    expect(enMessages['xpi.timeout.owner_unconfirmed']).toBeTruthy();
+  });
+
+  it('keeps zh/en send-hint keys aligned', () => {    for (const key of [
       'xpi.card.classify.independent',
       'xpi.card.classify.suggestion',
       'xpi.agent.hint',

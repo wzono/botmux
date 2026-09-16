@@ -43,6 +43,10 @@ interface InternalPending extends Omit<PendingAsk, 'selections'> {
   askKey: string;
   /** Per-invocation id (hook generates once, reuses across reconnect retries). */
   requestId: string;
+  /** Bot answerer flag + plain-text display name — card layer must render these
+   *  without an `<at>` tag (Feishu 400/100290 on bot open_id in card markup). */
+  answererIsBot?: boolean;
+  answererDisplayName?: string;
   /** Caller kind ('hook' | 'explicit' | …) namespacing the identity. */
   originKind: string;
   /** Whether this ask is eligible for persistence + restart resume (its origin
@@ -287,6 +291,8 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean): Promi
       sessionId: input.sessionId,
       chatType: input.chatType,
       answererOpenId: input.answererOpenId,
+      answererIsBot: input.answererIsBot,
+      answererDisplayName: input.answererDisplayName,
       questions: input.questions,
       replyCardTarget: input.replyCardTarget,
       createdAt,
@@ -489,6 +495,8 @@ function persistFromInternal(ask: InternalPending): void {
     sessionId: ask.sessionId,
     chatType: ask.chatType,
     answererOpenId: ask.answererOpenId,
+    answererIsBot: ask.answererIsBot,
+    answererDisplayName: ask.answererDisplayName,
     questions: ask.questions,
     createdAt: ask.createdAt,
     deadlineAt: ask.deadlineAt,
@@ -818,6 +826,8 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       sessionId: p.sessionId,
       chatType: p.chatType,
       answererOpenId: p.answererOpenId,
+      answererIsBot: p.answererIsBot,
+      answererDisplayName: p.answererDisplayName,
       questions: p.questions,
       createdAt: p.createdAt,
       deadlineAt: p.deadlineAt,

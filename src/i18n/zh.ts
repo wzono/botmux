@@ -879,6 +879,8 @@ export const messages: Record<string, string> = {
   'xpi.agent.hint': '请选择：\n  botmux send --as independent   # 另开任务，马上单独做\n  botmux send --as suggestion    # 留给当前任务，等对方确认',
   'xpi.bot.classify.notice': '{at} 当前有其他成员的任务正在执行。你的消息已暂存，不会打断。',
   'xpi.bot.wait.notice': '{at} 原任务还在执行。请再选一次，或继续等。',
+  'xpi.bot.owner.notice': '{at} 另一位成员留给当前任务的建议：\n\n{advice}\n\n是否采纳并重新执行？请在本话题直接回复「采纳并重新执行」或「不采纳」。',
+  'xpi.timeout.owner_unconfirmed': '建议未获确认，未执行。',
   'xpi.send.as_usage': 'botmux send: --as 仅支持 independent|suggestion（另开任务|留给当前任务）',
   'xpi.send.as_marked_independent': '已按「另开任务」标记：马上单独做，不打断当前任务。',
   'xpi.send.as_marked_suggestion': '已按「留给当前任务」标记：等对方确认后再决定是否采纳。',

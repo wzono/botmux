@@ -369,6 +369,7 @@ import {
 } from './core/cross-principal-interruption-store.js';
 import {
   crossPrincipalBotClassifyNotice,
+  crossPrincipalBotOwnerNotice,
   crossPrincipalBotWaitNotice,
   crossPrincipalClassificationOptions,
   crossPrincipalClassificationPrompt,
@@ -18356,6 +18357,18 @@ function findPendingCrossPrincipalForProposer(
     && sameTrustedPrincipal(record.proposer, proposer));
 }
 
+/** Find the record whose bot OWNER is currently being asked to confirm a
+ *  suggestion. Bot owners get a plain-text notice rather than an (unanswerable)
+ *  choice card, so their reply is matched here instead of the ask broker. */
+function findPendingCrossPrincipalForOwner(
+  ds: DaemonSession,
+  owner: TrustedCaller,
+): CrossPrincipalInterruption | undefined {
+  return ds.session.crossPrincipalInterruptions?.find(record =>
+    record.phase === 'awaiting_owner'
+    && sameTrustedPrincipal(record.owner, owner));
+}
+
 function sanitizeCrossPrincipalMessage(
   message: CrossPrincipalInterruptionMessage,
 ): { message: CrossPrincipalInterruptionMessage; choice?: 'independent' | 'suggestion' } {
@@ -18431,6 +18444,43 @@ async function trySettleCrossPrincipalProposerChoice(
   );
   if (!choice) return false;
   return applyCrossPrincipalProposerChoice(ds, record, choice);
+}
+
+/** Consume a bot OWNER's plain-text accept/reject reply during awaiting_owner.
+ *  Bot owners cannot answer a choice card (cards cannot at-mention a bot), so
+ *  the owner leg posts a text notice whose keywords are parsed here with the
+ *  same vocabulary as the card's free-text gate. Anything that is not exactly
+ *  a choice returns false so ordinary owner messages keep their normal route. */
+async function trySettleCrossPrincipalOwnerChoice(
+  ds: DaemonSession,
+  owner: TrustedCaller | undefined,
+  text: string,
+  mentions?: LarkMention[],
+): Promise<boolean> {
+  if (!owner) return false;
+  const record = findPendingCrossPrincipalForOwner(ds, owner);
+  if (!record) return false;
+  const body = stripLeadingMentions(text.trim(), mentions);
+  if (!isCrossPrincipalChoiceOnlyText(body, 'owner')) return false;
+  const choice = parseCrossPrincipalChoiceText(body, 'owner');
+  const current = ds.session.crossPrincipalInterruptions?.find(item => item.id === record.id);
+  if (!current) return false;
+  if (choice !== 'accept') {
+    removeCrossPrincipalRecord(ds, current.id);
+    await notifyCrossPrincipalTerminal(
+      ds,
+      current,
+      tr('xpi.timeout.owner_unconfirmed', undefined, localeForBot(ds.larkAppId)),
+    );
+    return true;
+  }
+  clearTimeout(ds.crossPrincipalWaitTimer);
+  ds.crossPrincipalWaitTimer = undefined;
+  current.botOwnerDeadlineAt = undefined;
+  current.phase = 'owner_approved';
+  persistCrossPrincipalQueue(ds);
+  queueMicrotask(() => { void driveCrossPrincipalInterruptions(ds); });
+  return true;
 }
 
 async function stageCrossPrincipalInterruption(args: {
@@ -19078,6 +19128,7 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
       }
       clearTimeout(ds.crossPrincipalWaitTimer);
       ds.crossPrincipalWaitTimer = undefined;
+      const loc = localeForBot(ds.larkAppId);
       const ownerId = record.owner.requestUserOpenId;
       if (!ownerId) {
         removeCrossPrincipalRecord(ds, record.id);
@@ -19085,6 +19136,38 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
         return;
       }
       const ownerTarget = pickTurnReplyTarget(ds.session, record.ownerTurnId);
+      // Bot owner leg: mirror the bot proposer legs — no choice card (Feishu
+      // rejects cards that at-mention a bot and an unmentioned card never
+      // reaches the peer bot's router). Post a plain-text at-notice with the
+      // accept/reject keywords; trySettleCrossPrincipalOwnerChoice consumes the
+      // owner's reply. The daemon owns the deadline, like botClassifyDeadlineAt.
+      if (record.owner.senderType === 'bot') {
+        if (record.botOwnerDeadlineAt && Date.now() >= record.botOwnerDeadlineAt) {
+          removeCrossPrincipalRecord(ds, record.id);
+          await notifyCrossPrincipalTerminal(
+            ds,
+            record,
+            tr('xpi.timeout.owner_unconfirmed', undefined, loc),
+          );
+          return;
+        }
+        if (!record.botOwnerDeadlineAt) {
+          await sessionReply(
+            sessionAnchorId(ds),
+            crossPrincipalBotOwnerNotice(
+              ownerId,
+              record.messages.map(m => m.text).join('\n\n'),
+              loc,
+            ),
+            'text',
+            ds.larkAppId,
+          );
+          record.botOwnerDeadlineAt = Date.now() + CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS;
+          persistCrossPrincipalQueue(ds);
+        }
+        scheduleCrossPrincipalOwnerWait(ds, record.botOwnerDeadlineAt!);
+        return;
+      }
       const result = await registerHostAsk({
         larkAppId: ds.larkAppId,
         chatId: ds.chatId,
@@ -22338,6 +22421,13 @@ async function handleThreadReplyAdmitted(
   // record would time out, and the notice would ask for the answer just sent.
   if (ds && threadTrustedCaller
     && await trySettleCrossPrincipalProposerChoice(ds, threadTrustedCaller, cmdContent, parsed.mentions)) {
+    markIngressAdmitted(ctx);
+    return;
+  }
+  // Bot owner leg of the same gate: a plain-text 采纳并重新执行/不采纳 reply to
+  // the bot owner notice settles awaiting_owner without a choice card.
+  if (ds && threadTrustedCaller
+    && await trySettleCrossPrincipalOwnerChoice(ds, threadTrustedCaller, cmdContent, parsed.mentions)) {
     markIngressAdmitted(ctx);
     return;
   }
