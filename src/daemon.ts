@@ -87,6 +87,7 @@ import {
 import { resolveHiddenStreamingCardButtons } from './im/lark/streaming-card-buttons.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
+import { listObservedBots } from './services/observed-bots-store.js';
 import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
 import { CardStreamStore } from './services/card-stream-store.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
@@ -18328,6 +18329,24 @@ function choiceFromAskResult(
   return parseCrossPrincipalChoiceText(result.comment ?? '', 'any');
 }
 
+/** Answerer metadata for a host cross-principal ask card. A bot proposer/owner
+ *  must be flagged so the card renders a plain-text mention instead of
+ *  `<at id=botOpenId>` — Feishu rejects such cards (400/100290), which used to
+ *  invalidate the classification gate instantly and make peer bots re-send in
+ *  a tight loop. The bot's display name comes from the observed-bot roster
+ *  when available. */
+function hostAskAnswererMeta(ds: DaemonSession, caller: TrustedCaller): {
+  answererOpenId: string;
+  answererIsBot?: boolean;
+  answererDisplayName?: string;
+} {
+  const openId = caller.requestUserOpenId!;
+  if (caller.senderType !== 'bot') return { answererOpenId: openId };
+  const displayName = listObservedBots(config.session.dataDir, ds.larkAppId, ds.chatId)
+    .find(b => b.openId === openId)?.name;
+  return { answererOpenId: openId, answererIsBot: true, ...(displayName ? { answererDisplayName: displayName } : {}) };
+}
+
 function findPendingCrossPrincipalForProposer(
   ds: DaemonSession,
   proposer: TrustedCaller,
@@ -18953,7 +18972,7 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
         sessionId: ds.session.sessionId,
         originKind: 'host_cross_principal_classification',
         requestId: `${record.id}:classification`,
-        answererOpenId: proposerId,
+        ...hostAskAnswererMeta(ds, record.proposer),
         chatType: ds.chatType,
         // registerHostAsk starts this clock only after Lark confirms that the
         // proposer can actually see the choice card.
@@ -18969,7 +18988,16 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
       if (!current) return;
       if (choice && await applyCrossPrincipalProposerChoice(ds, current, choice)) return;
       removeCrossPrincipalRecord(ds, record.id);
-      await notifyCrossPrincipalTerminal(ds, record, tr('xpi.timeout.unclassified', undefined, loc));
+      // Card delivery failure (invalidated) must NOT tell peer bots to re-send:
+      // that instruction is what turned a deterministic card-send failure into
+      // an infinite bot re-send loop. Only a real timeout invites a retry.
+      await notifyCrossPrincipalTerminal(
+        ds,
+        record,
+        result.kind === 'invalidated'
+          ? '选择卡片发送失败，本次消息未执行。'
+          : tr('xpi.timeout.unclassified', undefined, loc),
+      );
       return;
     }
 
@@ -19023,7 +19051,7 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
           sessionId: ds.session.sessionId,
           originKind: 'host_cross_principal_wait',
           requestId: `${record.id}:wait:${round}`,
-          answererOpenId: proposerId,
+          ...hostAskAnswererMeta(ds, record.proposer),
           chatType: ds.chatType,
           timeoutMs: CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS,
           questions: [{
@@ -19037,10 +19065,14 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
         if (!current) return;
         if (waitChoice && await applyCrossPrincipalProposerChoice(ds, current, waitChoice)) return;
         removeCrossPrincipalRecord(ds, record.id);
+        // Same invalidated vs. timeout distinction as the classification gate.
+        const waitTerminalText = waitResult.kind === 'invalidated'
+          ? '选择卡片发送失败，本次消息未执行。'
+          : tr('xpi.timeout.still_busy', undefined, loc);
         await notifyCrossPrincipalTerminal(
           ds,
           record,
-          tr('xpi.timeout.still_busy', undefined, loc),
+          waitTerminalText,
         );
         return;
       }
@@ -19061,7 +19093,7 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
         sessionId: ds.session.sessionId,
         originKind: 'host_cross_principal_owner',
         requestId: `${record.id}:owner`,
-        answererOpenId: ownerId,
+        ...hostAskAnswererMeta(ds, record.owner),
         chatType: ds.chatType,
         // This is a new human-action window: it starts when the owner card is
         // confirmed delivered, not while the previous turn was still running.
