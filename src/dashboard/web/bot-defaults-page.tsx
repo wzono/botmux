@@ -62,7 +62,7 @@ import {
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
 import { BOT_DESCRIPTION_MAX_CHARS, normalizeBotDescriptions } from '../../services/bot-description-schema.js';
-import { CODEX_REASONING_EFFORTS, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
+import { CODEX_REASONING_EFFORTS, isBackendVariantCliId, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 import { lookupCliSelection } from '../../setup/cli-selection.js';
 import {
   STREAMING_CARD_BUTTON_IDS,
@@ -2362,7 +2362,7 @@ export function BotAgentSection(props: {
     } else {
       setModel(current => current.trim() === cliState.ttadkModelDefault ? '' : current);
     }
-    if (nextKey !== 'traex') {
+    if (!isBackendVariantCliId(nextKey)) {
       setModelBackendVariant('');
       setModelBackendVariantTouched(true);
     }
@@ -2457,7 +2457,7 @@ export function BotAgentSection(props: {
       const body = {
         cliId: cliKey,
         model,
-        ...(cliKey === 'traex' && modelBackendVariantTouched ? { modelBackendVariant } : {}),
+        ...(isBackendVariantCliId(cliKey) && modelBackendVariantTouched ? { modelBackendVariant } : {}),
         reasoningEffort: cliSupportsReasoningEffort(cliKey) ? reasoningEffort : '',
         // dsh-only: only send when the user actually edited the field. Omitting
         // it makes the daemon preserve the current value; non-dsh selections
@@ -2663,7 +2663,7 @@ export function BotAgentSection(props: {
 
   const siSupport = bot.skillInjectionSupport === 'dynamic' ? 'dynamic' : bot.skillInjectionSupport === 'global' ? 'global' : 'none';
   const isRiff = cliKey === 'riff';
-  const isTraex = cliKey === 'traex';
+  const isTraex = isBackendVariantCliId(cliKey);
   const isCodexSelection = cliKey === 'codex' || cliKey === 'codex-app' || cliKey.endsWith('-codex');
   const isReasoningSelection = cliSupportsReasoningEffort(cliKey);
   // The dsh adapter is the only one that forwards a runner turn timeout.

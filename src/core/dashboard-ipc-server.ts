@@ -24,6 +24,7 @@ import { applySessionRowCommand } from '../services/session-commands.js';
 import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
 import {
   cliModelSupportsReasoningEffort,
+  isBackendVariantCliId,
   isConfigurableReasoningCliId,
   isCodexReasoningEffort,
 } from '../services/codex-reasoning-effort.js';
@@ -137,7 +138,12 @@ import {
   updateTaskWithOptionalPrecondition,
   type SchedulePreconditionMutation,
 } from './schedule-precondition-config.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
+import {
+  awaitReadonlyTaskContinuationUser,
+  cancelReadonlyTaskContinuationExplicit,
+  startReadonlyTaskContinuation,
+} from '../services/readonly-task-continuation.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
@@ -796,7 +802,7 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|project|project-dispatch-policy)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|project|project-dispatch-policy|continuation)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -1534,6 +1540,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/native-subagent-runtime', async (req,
     };
   }
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  const readonlyOrigin = ds.readonlyContinuationTurnOrigin;
+  if (readonlyOrigin
+    && readonlyOrigin.workerGeneration === ds.workerGeneration
+    && ds.managedTurnOrigin?.turnId === readonlyOrigin.turnId
+    && ds.managedTurnOrigin.dispatchAttempt === readonlyOrigin.dispatchAttempt) {
+    return nativeSubagentRuntimeJsonRes({
+      req, res, sessionId: params.sessionId, status: 200,
+      body: { ok: true, deny: true, reason: 'read-only continuation forbids subagents' },
+      ...responseAuth,
+    });
+  }
 
   let runtimeState;
   try { runtimeState = getBot(ds.larkAppId).nativeSubagentRuntimeState; }
@@ -2249,6 +2266,89 @@ ipcRoute('POST', '/api/project-groups/:chatId/refresh-card', async (_req, res, p
     return jsonRes(res, 502, {
       ok: false,
       error: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+/** Explicit control plane for one read-only long-running task lease. The
+ * rotating current-turn capability binds every action to the calling session
+ * and turn; the daemon owns all persisted state and timers. */
+ipcRoute('POST', '/api/sessions/:sessionId/continuation', async (req, res, params) => {
+  type ContinuationRequestBody = {
+    action?: unknown;
+    readonly?: unknown;
+    ttlMs?: unknown;
+    maxContinuations?: unknown;
+  } & Record<string, unknown>;
+  const body = await readJsonBody<ContinuationRequestBody>(req)
+    .catch(() => ({} as ContinuationRequestBody));
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  const turnId = typeof body.originTurnId === 'string' ? body.originTurnId : undefined;
+  if (!turnId || ds.managedTurnOrigin?.turnId !== turnId) {
+    return jsonRes(res, 409, { ok: false, error: 'active_turn_required' });
+  }
+  if (!ensureReadonlyTaskContinuationAttached(ds)) {
+    return jsonRes(res, 409, { ok: false, error: 'readonly_continuation_unavailable' });
+  }
+  try {
+    let state;
+    if (body.action === 'start') {
+      if (body.readonly !== true) {
+        return jsonRes(res, 400, { ok: false, error: 'readonly_required' });
+      }
+      if (!turnId.startsWith('om_') || ds.managedTurnOrigin?.dispatchAttempt !== undefined) {
+        return jsonRes(res, 409, { ok: false, error: 'ordinary_user_turn_required' });
+      }
+      if (body.ttlMs !== undefined
+        && (typeof body.ttlMs !== 'number' || !Number.isSafeInteger(body.ttlMs) || body.ttlMs <= 0)) {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_ttl_ms' });
+      }
+      if (body.maxContinuations !== undefined
+        && (typeof body.maxContinuations !== 'number'
+          || !Number.isSafeInteger(body.maxContinuations)
+          || body.maxContinuations <= 0)) {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_max_continuations' });
+      }
+      const generation = ds.workerGeneration;
+      const proof = ds.readonlyContinuationRpcProof;
+      if (!ds.worker || ds.worker.killed || ds.worker.connected === false
+        || ds.workerReady !== true
+        || !Number.isSafeInteger(generation) || (generation ?? 0) <= 0
+        || ds.session.workerGeneration !== generation
+        || proof?.workerGeneration !== generation) {
+        return jsonRes(res, 409, { ok: false, error: 'readonly_rpc_proof_required' });
+      }
+      state = startReadonlyTaskContinuation(ds.session, {
+        turnId,
+        workerGeneration: generation!,
+        ...(typeof body.ttlMs === 'number' ? { ttlMs: body.ttlMs } : {}),
+        ...(typeof body.maxContinuations === 'number'
+          ? { maxContinuations: body.maxContinuations }
+          : {}),
+      });
+    } else if (body.action === 'await-user') {
+      const before = ds.session.readonlyTaskContinuation;
+      state = awaitReadonlyTaskContinuationUser(ds.session, turnId);
+      if (state === before || state?.status !== 'awaiting_user') {
+        return jsonRes(res, 409, { ok: false, error: 'continuation_transition_rejected' });
+      }
+    } else if (body.action === 'cancel') {
+      const before = ds.session.readonlyTaskContinuation;
+      state = cancelReadonlyTaskContinuationExplicit(ds.session, turnId);
+      if (state === before || state?.status !== 'cancelled') {
+        return jsonRes(res, 409, { ok: false, error: 'continuation_transition_rejected' });
+      }
+    } else {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_action' });
+    }
+    return jsonRes(res, 200, { ok: true, state });
+  } catch (err) {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
     });
   }
 });
@@ -5424,7 +5524,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
       : null;
     wrapperCli = typeof cfg.wrapperCli === 'string' && cfg.wrapperCli.trim() ? cfg.wrapperCli : null;
     model = typeof cfg.model === 'string' && cfg.model.trim() ? cfg.model : null;
-    modelBackendVariant = cfg.cliId === 'traex'
+    modelBackendVariant = isBackendVariantCliId(cfg.cliId)
       && (cfg.modelBackendVariant === 'standard' || cfg.modelBackendVariant === 'max')
       ? cfg.modelBackendVariant
       : null;
@@ -6130,7 +6230,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   const model = typeof body.model === 'string' ? body.model.trim() : '';
   const modelBackendVariantFieldPresent = Object.prototype.hasOwnProperty.call(body, 'modelBackendVariant');
   let modelBackendVariant: 'standard' | 'max' | undefined;
-  const supportsModelBackendVariant = selected.cliId === 'traex';
+  const supportsModelBackendVariant = isBackendVariantCliId(selected.cliId);
   if (supportsModelBackendVariant
       && modelBackendVariantFieldPresent
       && body.modelBackendVariant !== null
@@ -6314,11 +6414,11 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     const storedModelBackendVariant = entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max'
       ? entry.modelBackendVariant
       : undefined;
-    const entryUsesTraex = entry.cliId === 'traex';
+    const entryUsesBackendVariantCli = isBackendVariantCliId(entry.cliId);
     const nextModelBackendVariant = supportsModelBackendVariant
       ? (modelBackendVariantFieldPresent
         ? modelBackendVariant
-        : entryUsesTraex ? storedModelBackendVariant : undefined)
+        : entryUsesBackendVariantCli ? storedModelBackendVariant : undefined)
       : undefined;
     const nextReasoningEffort = supportsReasoningEffort
       ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : entry.reasoningEffort)
@@ -6347,7 +6447,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     else if (modelBackendVariantFieldPresent) {
       if (modelBackendVariant) entry.modelBackendVariant = modelBackendVariant;
       else delete entry.modelBackendVariant;
-    } else if (!entryUsesTraex) {
+    } else if (!entryUsesBackendVariantCli) {
       delete entry.modelBackendVariant;
     }
     if (!supportsReasoningEffort) delete entry.reasoningEffort;

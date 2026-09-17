@@ -493,6 +493,10 @@ export interface CliAdapter {
    * It survives per-turn resets and is retired once per IdleDetector/spawn. */
   readonly startupPendingPattern?: RegExp;
   readonly startupReadyPattern?: RegExp;
+  /** Optional positive initialization evidence from a complete backend history
+   * snapshot. Must reject stale prompts, loading, dialogs, and unsent drafts.
+   * This only releases startup type-ahead; it never proves an idle/turn boundary. */
+  readonly startupReadyFromHistory?: (history: string) => boolean;
 
   /** When true, the adapter injects a `SessionStart` hook that calls
    *  `botmux session-ready` once the CLI's input box is genuinely rendered —

@@ -1055,8 +1055,12 @@ describe('startLarkEventDispatcher — WebSocket proxy', () => {
       startLarkEventDispatcher(MY_APP_ID, 'secret', makeHandlers());
 
       const agent = capturedWsClientOptions?.agent;
-      expect(agent?.constructor?.name).toBe('ProxyAgent');
-      expect(agent?.getProxyForUrl('wss://msg-frontier.feishu.cn/ws', {})).toBe('http://lower-proxy:8118');
+      // Must be HttpsProxyAgent, not ProxyAgent: Bun's built-in ws reads the
+      // proxy URL off `agent.proxy` (the HttpsProxyAgent shape) and silently
+      // ignores a ProxyAgent, so an http proxy has to arrive as HttpsProxyAgent
+      // for both runtimes. proxy-from-env prefers the lowercase https_proxy.
+      expect(agent?.constructor?.name).toBe('HttpsProxyAgent');
+      expect((agent as { proxy?: URL })?.proxy?.href).toBe('http://lower-proxy:8118/');
     });
   });
 
@@ -1067,9 +1071,10 @@ describe('startLarkEventDispatcher — WebSocket proxy', () => {
     }, () => {
       startLarkEventDispatcher(MY_APP_ID, 'secret', makeHandlers());
 
-      const agent = capturedWsClientOptions?.agent;
-      expect(agent?.getProxyForUrl('wss://msg-frontier.feishu.cn/ws', {})).toBe('');
-      expect(agent?.getProxyForUrl('wss://msg-frontier.larksuite.com/ws', {})).toBe('http://proxy.example:8118');
+      // The proxy is resolved once for the bot's own Open API domain
+      // (open.feishu.cn); NO_PROXY=.feishu.cn matches it, so the connection is
+      // direct and no agent is attached.
+      expect(capturedWsClientOptions?.agent).toBeUndefined();
     });
   });
 

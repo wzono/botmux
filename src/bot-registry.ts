@@ -46,7 +46,7 @@ import {
   normalizeReplyStyleConfig,
   type ReplyStyleConfig,
 } from './im/lark/reply-card-style.js';
-import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
+import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
 import {
   normalizeNativeSubagentRuntimePolicy,
   type NativeSubagentRuntimePolicy,
@@ -3555,7 +3555,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.model.trim()
         : undefined,
       groupDefaultModels: normalizeGroupDefaultModels(entry.groupDefaultModels),
-      modelBackendVariant: entryCliId === 'traex'
+      modelBackendVariant: isBackendVariantCliId(entryCliId)
         && (entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max')
         ? entry.modelBackendVariant
         : undefined,
