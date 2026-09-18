@@ -173,6 +173,8 @@ export type BotDefaultsRow = {
   autoStartOnGroupJoinSeed?: string;
   /** 内置默认 seed 文案（按 bot locale），供留空时 placeholder 展示。 */
   autoStartOnGroupJoinSeedDefault?: string;
+  groupJoinCommandEnabled?: boolean;
+  groupJoinCommand?: string;
   autoStartOnNewTopic?: boolean;
   autoGrantRequestCards?: boolean;
   restrictGrantCommands?: boolean;

@@ -3521,13 +3521,15 @@ async function ensureDevboxDashboardExportForCurrentPort(): Promise<void> {
  */
 async function dashboardMemberComingUp(): Promise<boolean | null> {
   try {
-    const { fleetStatePath, DASHBOARD_PROCESS_NAME } = await import('./core/fleet-runtime.js');
+    const { fleetStatePath, DASHBOARD_PROCESS_NAME, inspectSupervisorState } = await import('./core/fleet-runtime.js');
     const { readFleetState } = await import('./core/fleet-state-store.js');
+    const state = readFleetState(fleetStatePath());
     // The mapping itself lives in dashboard-command.ts as a pure function so it is
     // unit testable; this wrapper only supplies the I/O (state file + pid probe).
     return dashboardComingUpFromState(
-      readFleetState(fleetStatePath()),
+      state,
       DASHBOARD_PROCESS_NAME,
+      () => state !== null && inspectSupervisorState(state).status === 'exact',
       (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } },
     );
   } catch {
@@ -5429,7 +5431,7 @@ async function cmdSuspend(): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'project' | 'continuation',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project' | 'continuation',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -5649,6 +5651,91 @@ async function cmdChat(argv: string[]): Promise<void> {
   process.exitCode = 1;
 }
 
+const SESSION_RENAME_USAGE = '用法: botmux session rename "<标题>"（只改当前会话；会话自动识别，不接受 --session-id 等参数指定其他会话）';
+
+/** `botmux session rename "<标题>"`：agent 在会话内更新 botmux canonical 标题。
+ *  会话 id 只来自会话环境（祖先 pid marker / BOTMUX_SESSION_ID），与
+ *  botmux chat rename / preview 同一路径——绝不接受参数指定他人会话。 */
+async function cmdSessionRename(argv: string[]): Promise<void> {
+  if (argv.includes('--help') || argv.includes('-h')) {
+    console.log(`botmux session rename — 更新当前会话的 botmux 标题
+
+${SESSION_RENAME_USAGE}
+
+标题为 rename 之后的全部参数（空格拼接），建议命名「类型｜具体事项」，
+如「排障｜支付链路超时」。`);
+    return;
+  }
+  // 任何 flag 都是用法错误：本命令没有也不允许会话选择参数。
+  const flags = argv.filter(arg => arg.length > 1 && arg.startsWith('-'));
+  if (flags.length > 0) {
+    console.error(`未知参数: ${flags.join(' ')}\n${SESSION_RENAME_USAGE}`);
+    process.exitCode = 2;
+    return;
+  }
+  const title = argv.join(' ').trim();
+  if (!title) {
+    console.error(SESSION_RENAME_USAGE);
+    process.exitCode = 2;
+    return;
+  }
+  const ctx = findAncestorSessionContext();
+  const sid = ctx?.sessionId;
+  if (!sid) {
+    console.error(JSON.stringify({ ok: false, error: 'missing_session_context' }));
+    process.exitCode = 1;
+    return;
+  }
+  const sessions = loadSessions();
+  const session = [...sessions.values()].find(x => x.sessionId === sid || x.sessionId.startsWith(sid));
+  if (!session) {
+    console.error(JSON.stringify({ ok: false, error: 'missing_session_context' }));
+    process.exitCode = 1;
+    return;
+  }
+  const daemon = findDaemon(session.larkAppId);
+  if (!daemon) {
+    console.error(JSON.stringify({ ok: false, error: 'daemon_offline' }));
+    process.exitCode = 1;
+    return;
+  }
+  let response: Response;
+  try {
+    response = await postSessionCliIpc(
+      daemon.ipcPort,
+      session.sessionId,
+      'rename',
+      { title, source: 'agent' },
+    );
+  } catch {
+    console.error('✗ 无法连接当前会话的 daemon');
+    process.exitCode = 1;
+    return;
+  }
+  const body = await response.json().catch(() => ({})) as {
+    ok?: boolean;
+    error?: string;
+    title?: string;
+    agentSync?: string;
+  };
+  if (!response.ok || !body.ok) {
+    console.error(JSON.stringify(body, null, 2));
+    process.exitCode = 1;
+    return;
+  }
+  console.log(`✓ botmux 会话标题已更新为「${body.title ?? title}」（Dashboard 与 /sessions 列表生效）。`);
+  if (body.agentSync === 'requested') {
+    console.log('已请求运行中的 CLI 同步其原生会话名。');
+  } else if (body.agentSync === 'not_running') {
+    console.log('当前没有运行中的 CLI（CLI 不在线），原生会话名未同步；不影响标题更新。');
+  } else if (body.agentSync === 'unsupported') {
+    console.log('运行中的 CLI 不支持原生会话改名，原生会话名未同步；不影响标题更新。');
+  } else if (body.agentSync === 'failed') {
+    console.log('运行中的 CLI 原生会话名同步失败，原生会话名可能未更新；不影响标题更新。');
+  }
+  console.log('飞书话题（omt）标题平台无开放接口，不会改变，话题列表仍显示首条消息；`botmux chat rename` 改的是整个群名，与本命令不同。');
+}
+
 async function cmdProject(argv: string[]): Promise<void> {
   const subcommand = argv[0] ?? '';
   const { parseProjectArgs } = await import('./cli/project-args.js');
@@ -5667,7 +5754,7 @@ async function cmdProject(argv: string[]): Promise<void> {
   botmux project update [--goal <目标>] [--phase <阶段>] [--focus <当前焦点>]
                         [--progress <0-100>] [--remaining <待完成>]
                         [--blocker <阻塞>] [--clear-blockers]
-                        [--milestone <里程碑>] [--next-milestone <下一节点>]
+                        [--milestone <里程碑>] [--next-milestone <下一节点>] [--clear-next-milestone]
   botmux project close [--milestone <完成说明>]
   botmux project resume [--phase <阶段>] [--focus <当前焦点>]
 
@@ -6498,6 +6585,9 @@ const SEND_HELP_BODY = [
   '                                       原因。kind=authz|decision|blocked(默认)|help。',
   '                                       仅限回复当前会话，不能与 --top-level/--chat-id/--into',
   '                                       /--voice 混用；用户回复后自动撤下。',
+  '       --urgent[=app|sms|phone]        加急本轮触发者，须与 --mention-back 同用。',
+  '                                       默认 app（应用内）；sms/phone 会消耗租户额度。',
+  '                                       主消息已发出后加急失败不会重发消息。',
   '       --anyway                        跳过「@ 到活跃子 bot」护栏强发（见下）',
   '    @ 硬门：每条回复须三选一 --mention/--mention-back/--no-mention，否则报错不发。',
   '    按内容价值选：有实质结论要对方看/确认/决策→--mention-back(或--mention点名)；',
@@ -7931,6 +8021,8 @@ import {
   mentionBackAmbiguityError,
   parseAttentionFlag,
   attentionUsageError,
+  parseUrgentFlag,
+  urgentUsageError,
   managedVcQuoteError,
   managedVcCustomCardError,
   managedVcSendControlError,
@@ -8004,7 +8096,7 @@ async function relaySend(
     // the dashboard hand anyway; excluding it would silently send the reason as a
     // bare message instead of the original loud "no content" failure. Plumbing
     // `--attention` through the relay is a separate change, out of this scope.
-    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--slash']);
+    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--slash', '--urgent']);
     content = pos.length > 0 ? pos.join(' ') : await readStdin();
   }
   content = stripTrailingOaiMemoryCitation(content);
@@ -8065,12 +8157,13 @@ async function relaySend(
   // identity (must match the watcher's allowlist); path,
   // routing (--chat-id/--into/--top-level) and --session-id flags are dropped —
   // content/attachments come from the outbox and session-id is forced host-side.
-  const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash']);
+  const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent']);
   const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--as', '--plugin-card-action']);
   const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const tok = rest[i];
     if (FLAGS_NOVAL.has(tok)) flags.push(tok);
+    else if (/^--urgent=(app|sms|phone)$/.test(tok)) flags.push(tok);
     else if (FLAGS_VAL.has(tok) && i + 1 < rest.length) flags.push(tok, rest[++i]);
     else {
       const equals = tok.indexOf('=');
@@ -9016,12 +9109,18 @@ async function cmdSend(rest: string[]): Promise<void> {
   // needs-you column for this session. Parsed specially (not argValue) so a bare
   // `--attention "我卡住了"` doesn't eat the message as the flag value.
   const attention = parseAttentionFlag(rest);
+  const urgent = parseUrgentFlag(rest);
+  if (urgent.error) {
+    console.error(`botmux send: ${urgent.error}`);
+    process.exit(2);
+  }
   const managedControlError = managedVcSendControlError({
     managed: !!vcMeetingManagedSendOrigin,
     sendTopLevel,
     overrideChatId,
     sendInto,
     attentionRequested: attention.requested,
+    urgentRequested: urgent.requested,
     explicitMentionCount: mentionArgs.length,
     mentionBack,
     noMention,
@@ -9054,6 +9153,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
     if (attention.requested) {
       console.error('botmux send: --slash 不能与 --attention 混用');
+      process.exit(2);
+    }
+    if (urgent.requested) {
+      console.error('botmux send: --slash 不能与 --urgent 混用');
       process.exit(2);
     }
   }
@@ -9292,6 +9395,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       || videoCovers.length > 0
       || customCardRequested
       || attention.requested
+      || urgent.requested
       || explicitQuote !== undefined
       || noQuote) {
       console.error('botmux send refused: a document-comment turn supports only its exact plain-text comment reply');
@@ -9303,7 +9407,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   let content = '';
   let customCard: Record<string, unknown> | undefined;
   if (customCardRequested) {
-    const unexpectedText = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention']);
+    const unexpectedText = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent']);
     if (unexpectedText.length > 0) {
       console.error('botmux send: --card-file/--card-json 发送自定义卡片时不接受正文参数；卡片内容请写入 JSON');
       process.exit(2);
@@ -9381,7 +9485,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
   } else {
-    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--slash']);
+    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash']);
     if (pos.length > 0) {
       content = pos.join(' ');
     } else {
@@ -9429,6 +9533,15 @@ async function cmdSend(rest: string[]): Promise<void> {
     hasText: !!content.trim(),
   });
   if (attentionErr) { console.error(`botmux send: ${attentionErr}`); process.exit(2); }
+  const urgentErr = urgentUsageError({
+    requested: urgent.requested,
+    mentionBack,
+    sendTopLevel,
+    overrideChatId,
+    sendInto,
+    asVoice,
+  });
+  if (urgentErr) { console.error(`botmux send: ${urgentErr}`); process.exit(2); }
 
   const recordVcMeetingPrimaryOutput = (
     messageId: string,
@@ -9897,7 +10010,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!statSync(p).isFile()) { console.error(`不是普通文件: ${p}`); process.exit(1); }
   }
 
-  const { sendMessage, replyMessage, uploadImage, uploadFile, MessageWithdrawnError, getChatModeStrict, getMessageThreadId } = await import('./im/lark/client.js');
+  const { sendMessage, replyMessage, urgentMessage, uploadImage, uploadFile, MessageWithdrawnError, getChatModeStrict, getMessageThreadId } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
   // Effective target chat for top-level mode (defaults to session's chat)
   const targetChatId = overrideChatId ?? s.chatId;
@@ -10758,6 +10871,24 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
     }
 
+    // Buzz is a second provider effect after the primary message has already
+    // been accepted. Never fail the command here: a retry would duplicate the
+    // message. The exact turn sender is the sole recipient by design.
+    let urgentSent: boolean | undefined;
+    let urgentError: string | undefined;
+    if (urgent.requested) {
+      try {
+        await revalidateIsolatedOriginBeforeEffect();
+        await urgentMessage(appId, messageId, [replyTargetSenderOpenId!], urgent.mode);
+        urgentSent = true;
+        console.error(`📣 已${urgent.mode === 'app' ? '应用内' : urgent.mode === 'sms' ? '短信' : '电话'}加急本轮触发者`);
+      } catch (err) {
+        urgentSent = false;
+        urgentError = err instanceof Error ? err.message : String(err);
+        console.error(`⚠️ 消息已发送，但加急失败（请勿重发消息）：${urgentError}`);
+      }
+    }
+
     // Bridge fallback marker — append-only jsonl per session. Same-thread
     // sends can suppress transcript fallback when their content appears to
     // cover the same final answer; detoured sends suppress only when they
@@ -10911,6 +11042,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       ...(attention.requested ? { attentionRaised, attentionError } : {}),
       ...(attachmentMessageIds.length > 0 ? { attachmentMessageIds } : {}),
       ...(videoMessageIds.length > 0 ? { videoMessageIds } : {}),
+      ...(urgent.requested ? { urgent: { mode: urgent.mode, sent: urgentSent, error: urgentError } } : {}),
       ...(failedAttachments.length > 0
         ? { failedAttachments: failedAttachments.map(f => f.path) }
         : {}),
@@ -14407,6 +14539,13 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
     // workflow, deployment, or external messaging effect.
     'preview',
     'session-ready',
+    // UserPromptSubmit hook client botmux installs into ~/.claude/settings.json.
+    // Like `session-ready` (SessionStart) and `hook`, it's a purely local hook
+    // callback with no chat/workflow/deploy effect, and it fires on EVERY prompt
+    // a workflow subagent submits — omitting it makes the fence reject
+    // `botmux user-prompt-hook` (exit 2), which Claude surfaces as the whole
+    // prompt being "blocked by hook", so a v3 worker's `/goal` never lands.
+    'user-prompt-hook',
     'mcp',
     'ask', // dedicated cmdAsk guard emits the humanGate-specific guidance
     'schedule',
@@ -15551,6 +15690,13 @@ switch (command) {
     break;
   }
   case 'session': {
+    // `botmux session rename` lives in cli.ts (same file as
+    // postSessionCliIpc/findAncestorSessionContext, no import cycle); every
+    // other session subcommand stays in cli/session-command.ts.
+    if (process.argv[3] === 'rename') {
+      await cmdSessionRename(process.argv.slice(4));
+      break;
+    }
     const { cmdSession } = await import('./cli/session-command.js');
     process.exitCode = await cmdSession(process.argv.slice(3));
     break;

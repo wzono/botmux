@@ -453,6 +453,8 @@ export const CLONE_EXCLUDED_KEYS = [
   'name',
   'displayName',
   'messageListeners',
+  'globalMessageListener',
+  'groupMessageListenerOverrides',
   'oncallChats',
   'defaultOncallAutoboundChats',
   'allowedChatGroups',

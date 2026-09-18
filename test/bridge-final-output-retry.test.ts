@@ -114,6 +114,7 @@ import {
   getDaemonReplyCardUsageSnapshot,
   initWorkerPool,
   postTurnStartingCard,
+  pruneSteerFanoutState,
   __testOnly_setupWorkerHandlers,
   sendWorkerInput,
   __testOnly_resetOrdinaryImDeliveries,
@@ -875,7 +876,6 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
   it.each([
     { name: 'non-steerable head', steerable: false, sink: 'lark' as const },
-    { name: 'steerable but non-lark (http_wait) head', steerable: true, sink: 'http_wait' as const },
     { name: 'steerable but non-lark (doc_comment) head', steerable: true, sink: 'doc_comment' as const },
   ])(
     'R4-B4: rejects a steer_superseded settlement on a $name (ACK false, no pop, no mutation)',
@@ -1088,6 +1088,198 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'codex_app_dispatch_persisted', requestId: 'settle-grp-2', ok: true })));
     await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger ?? []).toEqual([]));
+  });
+
+  it('HTTP steer: an http_async steer group fans the REAL final out to the superseded member (in-memory + durable, no Lark)', async () => {
+    // options.steer over the HTTP control API: member 1 is the root riff task
+    // (http_async, polling trigger-result by its own triggerId), member 2 is the
+    // steer follow-up that merged into the active codex turn. Member 1 settles
+    // steer_superseded (parked, NOT delivered); the real final for member 2 must
+    // resolve BOTH members with the merged answer and drain the ledger.
+    const sessionReply = vi.fn(async () => 'om_delivered');
+    initWorkerPool({
+      sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.session.sessionId = 'sid-http-steer-async';
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'codex-app';
+    ds.asyncTriggerResults = new Map([
+      ['turn-http-grp-1', { status: 'pending' as const, createdAt: 1 }],
+      ['turn-http-grp-2', { status: 'pending' as const, createdAt: 2 }],
+    ]);
+    ds.idempotentAsyncTurns = new Map([
+      ['turn-http-grp-1', { ownerLarkAppId: 'app_test', key: 'k1', kind: 'turn' as const, workerGeneration: 1 }],
+    ]);
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'd-http-grp-1', turnId: 'turn-http-grp-1', state: 'prepared', content: '', deliverySink: 'http_async', codexAppSteerable: true },
+      { dispatchId: 'd-http-grp-2', turnId: 'turn-http-grp-2', state: 'accepted', content: 'merged answer', deliverySink: 'http_async', codexAppSteerable: true },
+    ];
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    // Member 1: superseded — ACK true, ledger pops, parked for fan-out, no Lark.
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: '', lastUuid: 'uuid-http-grp-1', turnId: 'turn-http-grp-1',
+      suppressDelivery: true, disposition: 'steer_superseded',
+      codexAppSettlement: { requestId: 'settle-http-grp-1', generation: 'gen-http-grp', seq: 1, dispatchId: 'd-http-grp-1' },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'codex_app_dispatch_persisted', requestId: 'settle-http-grp-1', ok: true })));
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger?.length).toBe(1));
+    expect(sessionReply).not.toHaveBeenCalled();
+    // Still pending: the merged answer has not arrived yet.
+    expect(ds.asyncTriggerResults.get('turn-http-grp-1')?.status).toBe('pending');
+
+    // Member 2: submit (accepted → prepared), then the real merged final.
+    (ds.worker as any).emit('message', {
+      type: 'codex_app_dispatch_transition',
+      sessionId: ds.session.sessionId,
+      requestId: 'prepare-http-grp-2',
+      operation: 'submit',
+      entries: [{ dispatchId: 'd-http-grp-2', turnId: 'turn-http-grp-2' }],
+    } satisfies Extract<WorkerToDaemon, { type: 'codex_app_dispatch_transition' }>);
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger?.[0]?.state).toBe('prepared'));
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: 'merged answer', lastUuid: 'uuid-http-grp-2', turnId: 'turn-http-grp-2',
+      codexAppSettlement: { requestId: 'settle-http-grp-2', generation: 'gen-http-grp', seq: 2, dispatchId: 'd-http-grp-2' },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+
+    // The real final resolves BOTH members with the merged answer.
+    await vi.waitFor(() => expect(ds.asyncTriggerResults.get('turn-http-grp-1')?.status).toBe('completed'));
+    expect(ds.asyncTriggerResults.get('turn-http-grp-1')?.content).toBe('merged answer');
+    expect(ds.asyncTriggerResults.get('turn-http-grp-1')?.usage).toBeUndefined(); // usage belongs to the real trigger only
+    expect(ds.asyncTriggerResults.get('turn-http-grp-2')?.status).toBe('completed');
+    expect(ds.asyncTriggerResults.get('turn-http-grp-2')?.content).toBe('merged answer');
+    // The convergence entry is dropped so a later graceful worker exit cannot
+    // retro-fail the merged root turn.
+    expect(ds.idempotentAsyncTurns.has('turn-http-grp-1')).toBe(false);
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger ?? []).toEqual([]));
+    expect(sessionReply).not.toHaveBeenCalled(); // HTTP-only group never touches Lark
+    // Durable fan-out: the superseded triggerId itself is a completed record.
+    const { lookup } = await import('../src/services/async-trigger-store.js');
+    const persisted1 = lookup(ds.session.sessionId, 'turn-http-grp-1');
+    expect(persisted1?.result.status).toBe('completed');
+    expect(persisted1?.result.content).toBe('merged answer');
+    expect(persisted1?.result.usage).toBeUndefined();
+  });
+
+  it('HTTP steer: an http_wait steer group resolves the superseded member\'s open wait promise with the merged answer', async () => {
+    const sessionReply = vi.fn(async () => 'om_delivered');
+    const resolveRootWait = vi.fn();
+    initWorkerPool({
+      sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.session.sessionId = 'sid-http-steer-wait';
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'codex-app';
+    ds.pendingWaitPromises = new Map([
+      ['turn-wait-grp-1', { resolve: resolveRootWait }],
+      ['turn-wait-grp-2', { resolve: vi.fn() }],
+    ]);
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'd-wait-grp-1', turnId: 'turn-wait-grp-1', state: 'prepared', content: '', deliverySink: 'http_wait', codexAppSteerable: true },
+      { dispatchId: 'd-wait-grp-2', turnId: 'turn-wait-grp-2', state: 'accepted', content: 'merged', deliverySink: 'http_wait', codexAppSteerable: true },
+    ];
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: '', lastUuid: 'uuid-wait-grp-1', turnId: 'turn-wait-grp-1',
+      suppressDelivery: true, disposition: 'steer_superseded',
+      codexAppSettlement: { requestId: 'settle-wait-grp-1', generation: 'gen-wait-grp', seq: 1, dispatchId: 'd-wait-grp-1' },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'codex_app_dispatch_persisted', requestId: 'settle-wait-grp-1', ok: true })));
+    expect(resolveRootWait).not.toHaveBeenCalled(); // parked until the real final
+
+    (ds.worker as any).emit('message', {
+      type: 'codex_app_dispatch_transition', sessionId: ds.session.sessionId,
+      requestId: 'prepare-wait-grp-2', operation: 'submit',
+      entries: [{ dispatchId: 'd-wait-grp-2', turnId: 'turn-wait-grp-2' }],
+    } satisfies Extract<WorkerToDaemon, { type: 'codex_app_dispatch_transition' }>);
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger?.[0]?.state).toBe('prepared'));
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: 'merged answer', lastUuid: 'uuid-wait-grp-2', turnId: 'turn-wait-grp-2',
+      codexAppSettlement: { requestId: 'settle-wait-grp-2', generation: 'gen-wait-grp', seq: 2, dispatchId: 'd-wait-grp-2' },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+
+    await vi.waitFor(() => expect(resolveRootWait).toHaveBeenCalledWith('merged answer'));
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger ?? []).toEqual([]));
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('HTTP steer: pruning fanout state on ledger drain stops a later real final resolving the parked failure-group member', async () => {
+    // Failure shape: the group's last head dies (turn_terminal / recovery fence)
+    // and the ledger drains WITHOUT a real final settle. The onCodexAppLedgerDrained
+    // chokepoint prunes the parked in-memory fanout state so the parked member
+    // converges through its own terminal/closed-session paths — and a final that
+    // settles afterwards must never retroactively fan content into it (the FIFO
+    // group is already over).
+    const sessionReply = vi.fn(async () => 'om_delivered');
+    initWorkerPool({
+      sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.session.sessionId = 'sid-http-steer-prune';
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'codex-app';
+    ds.asyncTriggerResults = new Map([
+      ['turn-prune-1', { status: 'pending' as const, createdAt: 1 }],
+      ['turn-prune-2', { status: 'pending' as const, createdAt: 2 }],
+    ]);
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'd-prune-1', turnId: 'turn-prune-1', state: 'prepared', content: '', deliverySink: 'http_async', codexAppSteerable: true },
+      { dispatchId: 'd-prune-2', turnId: 'turn-prune-2', state: 'accepted', content: 'merged answer', deliverySink: 'http_async', codexAppSteerable: true },
+    ];
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    // Member 1 settles superseded → parked for fan-out.
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: '', lastUuid: 'uuid-prune-1', turnId: 'turn-prune-1',
+      suppressDelivery: true, disposition: 'steer_superseded',
+      codexAppSettlement: { requestId: 'settle-prune-1', generation: 'gen-prune', seq: 1, dispatchId: 'd-prune-1' },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'codex_app_dispatch_persisted', requestId: 'settle-prune-1', ok: true })));
+    expect(ds.asyncTriggerResults.get('turn-prune-1')?.status).toBe('pending');
+
+    // The failure path drains the ledger (terminal/recovery fence). The daemon's
+    // onCodexAppLedgerDrained chokepoint prunes the parked group state at that
+    // point. Simulate that prune while T2 is still queued.
+    pruneSteerFanoutState(ds.session.sessionId);
+
+    // T2 then settles through the normal FIFO path (submit → real final). With
+    // the park table pruned its real final must NOT fan out to member 1.
+    (ds.worker as any).emit('message', {
+      type: 'codex_app_dispatch_transition',
+      sessionId: ds.session.sessionId,
+      requestId: 'prepare-prune-2',
+      operation: 'submit',
+      entries: [{ dispatchId: 'd-prune-2', turnId: 'turn-prune-2' }],
+    } satisfies Extract<WorkerToDaemon, { type: 'codex_app_dispatch_transition' }>);
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger?.[0]?.state).toBe('prepared'));
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: 'late merged answer', lastUuid: 'uuid-prune-2', turnId: 'turn-prune-2',
+      codexAppSettlement: { requestId: 'settle-prune-2', generation: 'gen-prune', seq: 2, dispatchId: 'd-prune-2' },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+
+    // T2 completes normally; wait for its SETTLEMENT ACK, not just the
+    // asyncResult completion — fan-out runs synchronously right after that ACK
+    // in the same handler continuation, so observing the ACK proves any
+    // (incorrect) fan-out onto member 1 has already happened or been skipped.
+    await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'codex_app_dispatch_persisted', requestId: 'settle-prune-2', ok: true })));
+    // Member 1 was pruned and stays pending for its own convergence path — the
+    // pruned park table must NOT have fanned T2's content into it.
+    expect(ds.asyncTriggerResults.get('turn-prune-1')?.status).toBe('pending');
+    expect(ds.asyncTriggerResults.get('turn-prune-1')?.content).toBeUndefined();
+    expect(sessionReply).not.toHaveBeenCalled();
   });
 
   it('still resolves a live HTTP wait sink without posting to Lark', async () => {

@@ -215,6 +215,7 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 | `messageQuota` | Message-quota override `{ "defaultLimit": N }`: **applies only to grantees admitted by grant cards or self-service requests** — once a positive integer is configured, new grant cards use an N-message quota; when unset they default to 3 messages per person. **Oncall groups are always unmetered and never read this value.** An explicit `/grant @user N` always uses N. Only constrains talk authorization, does not affect `canOperate` |
 | `restrictGrantCommands` | When `true`, people granted only via per-user authorization (`chatGrants` / `globalGrants`) are disabled from **all slash commands** and can only have plain conversations; owner / `allowedUsers` / oncall / whole-group members are unaffected. Defaults to `false` |
 | `autoGrantRequestCards` | Enabled by default. Set to `false` to stop automatically sending `/grant` request cards to the owner when an unauthorized person or external bot @mentions this bot in a group and the talk gate blocks it; the message is dropped silently instead |
+| `blockedUsers` | Block list (same identifier forms as `allowedUsers`: email / mobile / `on_xxx` / `ou_xxx`), a sender-dimension global deny: effective in both groups and DMs, and evaluated before every allow leg — on-call, whole-group open, guest grants, team trust. A blocked sender gets no grant request card. Owners / admins cannot be blocked (the write entry refuses it). It does not affect message-listener matching. Also maintained in Dashboard **Bot Config** and the group-member modal. See [Permissions & Access · Block list](/en/permissions#block-list-blockedusers) |
 
 ## File sandbox
 
@@ -280,6 +281,8 @@ Or write it directly into the bot's config:
 | `autoStartOnGroupJoin` | When `true`, the bot starts working automatically when added to a new group containing at least one `allowedUsers` member (no @ needed). Requires subscribing the `im.chat.member.bot.added_v1` event for this app in the Lark admin console |
 | `autoStartOnGroupJoinPrompt` | Paired with the above: the first-round prompt for proactive start; if empty / blank, opens with an empty message and lets the bot read the group context itself. Meaningless when `autoStartOnGroupJoin` is off |
 | `autoStartOnNewTopic` | When `true`, the first message of every new topic in a topic group starts working automatically without an @ (no effect in plain groups). Defaults to passive (only @ triggers) |
+| `groupJoinCommandEnabled` | When `true` and `groupJoinCommand` is non-empty, the bot runs that command on this host whenever it is added to **any** chat — no session, no model. Independent of `autoStartOnGroupJoin` (no `allowedUsers` membership requirement). Also requires the `im.chat.member.bot.added_v1` event. Editable in Dashboard → Bot defaults → Auto-start |
+| `groupJoinCommand` | The command to run on join. Same execution contract as [Hooks](./hooks.md): no shell (use `bash -c '…'` for pipes/redirects), minimal environment (no app secret); stdin is JSON `{event:"chat.bot_added", larkAppId, chatId, operatorOpenId, emittedAt}`, plus `BOTMUX_JOIN_CHAT_ID` / `BOTMUX_JOIN_LARK_APP_ID` / `BOTMUX_JOIN_OPERATOR_OPEN_ID` env vars; the process group is killed after 10 minutes |
 
 ## Group message listener
 

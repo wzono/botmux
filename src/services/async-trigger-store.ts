@@ -51,6 +51,15 @@ export interface PersistedAsyncTriggerResult {
     cacheReadTokens: number;
     cacheCreateTokens: number;
   };
+  /** Set ONLY on a still-`pending` result. A codex-app steer group member that
+   *  settled as `steer_superseded` (its content merged into a later turn via
+   *  native turn/steer) waits for the group's real final instead of completing
+   *  empty or hanging. This points at the IMMEDIATE successor's turnId (FIFO
+   *  order; N steers form a chain T1→T2→…→Tn). Poll/boot resolution walks the
+   *  chain to the first terminal record and mirrors it back onto this turn. The
+   *  live daemon normally fans the real final out in-memory before any poll;
+   *  this marker is solely the daemon-restart insurance. */
+  steerParkedBy?: string;
 }
 
 /** On-disk shape: { ownerLarkAppId, latestTriggerId, results }. ownerLarkAppId
@@ -128,6 +137,12 @@ function isValidPersistedResult(value: unknown): value is PersistedAsyncTriggerR
     }
   }
   if (status === 'completed' && typeof value.completedAt !== 'number') return false;
+  // steerParkedBy only makes sense on a parked-pending steer member; a present
+  // non-string/empty value is a corrupt marker (fail-closed, like the fields
+  // above), and it must never ride a terminal record.
+  if (value.steerParkedBy !== undefined) {
+    if (status !== 'pending' || typeof value.steerParkedBy !== 'string' || value.steerParkedBy.length === 0) return false;
+  }
   return true;
 }
 
@@ -225,6 +240,38 @@ export function recordCompleted(
       ...(usage ? { usage } : {}),
     };
     if (!file.latestTriggerId) file.latestTriggerId = triggerId;
+    save(sessionId, file);
+  });
+}
+
+/** Park a PENDING steer-group member behind its immediate FIFO successor.
+ *  Restart insurance for HTTP `options.steer` (codex-app native turn/steer):
+ *  the live daemon fans the group's merged real final out in-memory; if it dies
+ *  in the superseded→real-final window, this durable chain lets the next
+ *  trigger-result poll resolve the parked turn by walking `steerParkedBy`.
+ *
+ *  Completed/failed is stronger evidence and always wins: a non-pending record
+ *  is never overwritten. Best-effort save (same durability tier as
+ *  recordPending); serialized under the per-session lock against
+ *  recordCompleted/recordFailedStrict. */
+export function recordSteerParked(
+  sessionId: string,
+  triggerId: string,
+  successorTurnId: string,
+  now: number,
+  ownerLarkAppId: string,
+): void {
+  ensureDir();
+  withFileLockSync(getFilePath(sessionId), () => {
+    const file = load(sessionId);
+    const prev = file.results[triggerId];
+    if (prev && prev.status !== 'pending') return;
+    if (ownerLarkAppId) file.ownerLarkAppId = ownerLarkAppId;
+    file.results[triggerId] = {
+      status: 'pending',
+      createdAt: prev?.createdAt ?? now,
+      steerParkedBy: successorTurnId,
+    };
     save(sessionId, file);
   });
 }
@@ -364,6 +411,39 @@ export function lookupStrict(sessionId: string, triggerId?: string): {
     throw new Error(`corrupt async-trigger result (invalid shape) for ${sessionId}/${resolved}`);
   }
   return { triggerId: resolved, result, ownerLarkAppId: file.ownerLarkAppId };
+}
+
+/** Walk a durable steer-park chain (T1→T2→…→Tn) from `firstSuccessorTurnId`
+ *  to the first TERMINAL successor. Returns undefined when the chain is absent,
+ *  ends in a pending record without a pointer, or a hop is missing — the caller
+ *  then keeps reporting `running` (the group's real final may simply not be on
+ *  disk yet).
+ *
+ *  No hop COUNT limit: a legitimate steer group can have arbitrarily many
+ *  members, and capping the restart-insurance walk would strand early members
+ *  (running until session close) only when the daemon restarted mid-group.
+ *  Termination is guaranteed instead by a VISITED set: FIFO successors are
+ *  always distinct later turns, so a revisit can only come from a corrupt
+ *  on-disk cycle, which fails closed (undefined → stay running, never loop). */
+export function followSteerParkedChain(
+  sessionId: string,
+  firstSuccessorTurnId: string,
+): {
+  triggerId: string;
+  result: PersistedAsyncTriggerResult;
+  ownerLarkAppId?: string;
+} | undefined {
+  const visited = new Set<string>();
+  let next: string | undefined = firstSuccessorTurnId;
+  while (next !== undefined) {
+    if (visited.has(next)) return undefined;
+    visited.add(next);
+    const hit = lookup(sessionId, next);
+    if (!hit) return undefined;
+    if (hit.result.status === 'completed' || hit.result.status === 'failed') return hit;
+    next = hit.result.steerParkedBy;
+  }
+  return undefined;
 }
 
 /** Delete a session's persisted async results (called on session close). */
