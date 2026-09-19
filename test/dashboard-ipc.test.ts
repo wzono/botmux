@@ -1953,6 +1953,97 @@ describe('PUT /api/bot-card-prefs — streaming card buttons', () => {
   });
 });
 
+describe('PUT /api/bot-reply-delivery — 最终回复投递方式', () => {
+  async function withBot(cliId: string, run: (base: string, configPath: string, appId: string) => Promise<void>): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-reply-delivery-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = `test-reply-delivery-${cliId}`;
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      await run(`http://127.0.0.1:${handle.port}`, configPath, appId);
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  const put = (base: string, replyDelivery: unknown) => fetch(`${base}/api/bot-reply-delivery`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ replyDelivery }),
+  });
+  const persisted = (configPath: string) => JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+
+  it('claude-code: GET 生效值缺省 send（不随 CLI 翻转），PUT transcript / send 都落盘，PUT 空串 unset 回缺省', async () => {
+    await withBot('claude-code', async (base, configPath, appId) => {
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial).toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'send', replyDeliverySupported: true });
+      expect('replyDelivery' in persisted(configPath)).toBe(false);
+
+      // transcript：opt-in，显式落盘。
+      const on = await put(base, 'transcript');
+      expect(on.status).toBe(200);
+      expect(await on.json()).toMatchObject({ ok: true, replyDelivery: 'transcript', replyDeliveryDefault: 'send' });
+      expect(persisted(configPath).replyDelivery).toBe('transcript');
+      expect(getBot(appId).config.replyDelivery).toBe('transcript');
+      const afterOn = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(afterOn).toMatchObject({ replyDelivery: 'transcript', replyDeliveryDefault: 'send', replyDeliverySupported: true });
+
+      // send：显式退回也落盘（与缺省同值，但意图是钉住，不靠缺省兜）。
+      const off = await put(base, 'send');
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, replyDelivery: 'send' });
+      expect(persisted(configPath).replyDelivery).toBe('send');
+      expect(getBot(appId).config.replyDelivery).toBe('send');
+
+      // '' / 未知值删 key，回缺省 send。
+      const cleared = await put(base, '');
+      expect(cleared.status).toBe(200);
+      expect(await cleared.json()).toMatchObject({ ok: true, replyDelivery: 'send', replyDeliveryDefault: 'send' });
+      expect('replyDelivery' in persisted(configPath)).toBe(false);
+      expect(getBot(appId).config.replyDelivery).toBeUndefined();
+    });
+  });
+
+  it('cursor: GET 缺省 send/unsupported，PUT transcript 4xx reply_delivery_unsupported 且不落盘，PUT send 落盘', async () => {
+    await withBot('cursor', async (base, configPath, appId) => {
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial).toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'send', replyDeliverySupported: false });
+
+      const rejected = await put(base, 'transcript');
+      expect(rejected.status).toBe(400);
+      expect(await rejected.json()).toMatchObject({ ok: false, error: 'reply_delivery_unsupported' });
+      expect('replyDelivery' in persisted(configPath)).toBe(false);
+      expect(getBot(appId).config.replyDelivery).toBeUndefined();
+
+      // send 在不支持的 CLI 上仍可写，同样显式落盘。
+      const send = await put(base, 'send');
+      expect(send.status).toBe(200);
+      expect(await send.json()).toMatchObject({ ok: true, replyDelivery: 'send', replyDeliveryDefault: 'send' });
+      expect(persisted(configPath).replyDelivery).toBe('send');
+    });
+  });
+
+  it('bad JSON body → 400 bad_json', async () => {
+    await withBot('claude-code', async (base) => {
+      const res = await fetch(`${base}/api/bot-reply-delivery`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: '{not json',
+      });
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({ ok: false, error: 'bad_json' });
+    });
+  });
+});
+
 describe('PUT /api/bot-card-prefs — 入群执行命令', () => {
   it('persists toggle + command, rejects an unparsable command', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-join-cmd-'));
