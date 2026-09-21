@@ -57,7 +57,7 @@ import {
 } from './core/supervisor-shutdown-protocol.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
-import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -87,7 +87,6 @@ import {
 import { resolveHiddenStreamingCardButtons } from './im/lark/streaming-card-buttons.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
-import { listObservedBots } from './services/observed-bots-store.js';
 import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
 import { CardStreamStore } from './services/card-stream-store.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
@@ -143,7 +142,7 @@ import { hasProtectedSessionMutationOwnership } from './core/session-mutation-gu
 import { delay } from './utils/timing.js';
 import { BoundedMap } from './utils/bounded-map.js';
 import { checkAllowedChatGroupsConfig } from './services/allowed-chat-groups.js';
-import type { CliTurnPayload, CrossPrincipalInterruption, CrossPrincipalInterruptionMessage, Session, TrustedCaller, VcMeetingImTurnOrigin, TurnParticipant, LarkMention } from './types.js';
+import type { CliTurnPayload, CrossPrincipalInterruption, CrossPrincipalInterruptionDeliveryAudit, CrossPrincipalInterruptionMessage, Session, TrustedCaller, VcMeetingImTurnOrigin, TurnParticipant, LarkMention } from './types.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import { scrubTmuxServerGlobalEnv } from './setup/ensure-tmux.js';
 import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
@@ -276,7 +275,7 @@ import {
   pruneSteerFanoutState,
 } from './core/worker-pool.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activation.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
@@ -362,24 +361,24 @@ import { fillNativeTopicId } from './core/native-topic-id.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
 import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, isSubstituteTurn, pickTurnReplyTarget, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { sameTrustedPrincipal } from './core/active-turn-authority.js';
-import { trustedSessionController } from './core/trusted-session-controller.js';
+import { isSerialGroupInput, trustedSessionController } from './core/trusted-session-controller.js';
 import {
+  cancelCrossPrincipalInterruptionsForFeatureDisable,
   continueCrossPrincipalOwnerWait,
   crossPrincipalOwnerWaitDisposition,
   markCrossPrincipalSuggestionWaiting,
   stageCrossPrincipalInterruptionRecord,
 } from './core/cross-principal-interruption-store.js';
 import {
-  crossPrincipalBotClassifyNotice,
-  crossPrincipalBotOwnerNotice,
-  crossPrincipalBotWaitNotice,
+  crossPrincipalApprovedReplayPrompt,
   crossPrincipalClassificationOptions,
   crossPrincipalClassificationPrompt,
-  crossPrincipalStagedNotice,
+  crossPrincipalOwnerPrompt,
   crossPrincipalWaitOptions,
   crossPrincipalWaitPrompt,
   isCrossPrincipalChoiceOnlyText,
   parseCrossPrincipalChoiceText,
+  parseCrossPrincipalControlNotice,
   stripCrossPrincipalAsToken,
   type CrossPrincipalChoice,
 } from './core/cross-principal-choice.js';
@@ -5841,6 +5840,7 @@ async function adoptCodexNotifierEvent(
     ds.session.cliId = 'codex-app';
     ds.session.cliPathOverride = botCfg.cliPathOverride;
     delete ds.session.wrapperCli;
+    delete ds.session.cliLaunchMode;
     delete ds.session.model;
     ds.spawnModelOverride = undefined;
     ds.session.agentFrozen = true;
@@ -17637,11 +17637,13 @@ function setActiveInteractiveTurn(
   ds: DaemonSession,
   turnId: string,
   caller: TrustedCaller,
+  userPrompt?: string,
 ): void {
   const controller = trustedSessionController(ds);
   ds.activeInteractiveTurn = {
     turnId,
     caller: { ...caller },
+    ...(userPrompt?.trim() ? { userPrompt } : {}),
     ...(controller ? { controller } : {}),
   };
 }
@@ -17940,6 +17942,31 @@ function onXpiSharedCwdWorkerExit(
 
 export const __testOnly_onXpiSharedCwdTurnTerminal = onXpiSharedCwdTurnTerminal;
 export const __testOnly_onXpiSharedCwdWorkerExit = onXpiSharedCwdWorkerExit;
+
+/**
+ * A worker emits the exact-turn authority revoke before its terminal IPC. By
+ * the time onTurnTerminal runs, the daemon's optimistic active-turn mirror may
+ * therefore already be empty. Correlate XPI progress with the durable owner
+ * turn instead of that lossy mirror; a stale unrelated terminal remains a
+ * no-op, while a matching completed turn can advance its queued follower.
+ */
+function completedTurnHasCrossPrincipalFollower(
+  ds: DaemonSession,
+  terminal: { turnId: string; status: string },
+): boolean {
+  if (terminal.status !== 'completed') return false;
+  return !!ds.session.crossPrincipalInterruptions?.some(
+    record => record.ownerTurnId === terminal.turnId
+      // Approval can arrive after owner turn T1 completed while a later T2 is
+      // active. dispatchApprovedCrossPrincipalSuggestion parks behind T2, so
+      // T2's terminal must wake the durable approved record as well.
+      || record.phase === 'owner_approved',
+  ) || !!ds.pendingCrossPrincipalSuggestions?.some(
+    suggestion => suggestion.ownerTurnId === terminal.turnId,
+  );
+}
+
+export const __testOnly_completedTurnHasCrossPrincipalFollower = completedTurnHasCrossPrincipalFollower;
 
 function rollbackXpiSharedCwdAdmission(
   ds: DaemonSession,
@@ -18403,6 +18430,8 @@ function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableB
 const CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS = 10 * 60 * 1000;
 const CROSS_PRINCIPAL_OWNER_WAIT_MS = 10 * 60 * 1000;
 const CROSS_PRINCIPAL_PUBLIC_CONTEXT_LIMIT = 20;
+const XPI_IDENTITY_RESOLUTION_MAX_ATTEMPTS = 3;
+const XPI_IDENTITY_RESOLUTION_RETRY_MS = 5_000;
 
 function crossPrincipalSuggestionAccepted(
   result: Awaited<ReturnType<typeof registerAskBroker>>,
@@ -18435,6 +18464,191 @@ function persistCrossPrincipalQueue(ds: DaemonSession): void {
   sessionStore.updateSession(ds.session);
 }
 
+/** A contact API 5xx/timeout is not evidence that the human is invalid. Keep
+ * the durable XPI item and retry a small bounded number of times; definitive
+ * scope/visibility failures still fail closed immediately. */
+function deferTransientXpiIdentityResolution(
+  ds: DaemonSession,
+  record: CrossPrincipalInterruption,
+  role: XpiHumanIdentityRole,
+  resolution: XpiHumanOpenIdResolution,
+): boolean {
+  if (resolution.status !== 'transient') {
+    if (record.identityResolutionRetry?.role === role) {
+      delete record.identityResolutionRetry;
+      persistCrossPrincipalQueue(ds);
+    }
+    return false;
+  }
+  const attempts = record.identityResolutionRetry?.role === role
+    ? record.identityResolutionRetry.attempts + 1
+    : 1;
+  if (attempts >= XPI_IDENTITY_RESOLUTION_MAX_ATTEMPTS) {
+    delete record.identityResolutionRetry;
+    persistCrossPrincipalQueue(ds);
+    logger.warn(
+      `[${tag(ds)}] XPI human identity transient lookup exhausted role=${role} attempts=${attempts}`,
+    );
+    return false;
+  }
+  record.identityResolutionRetry = { role, attempts };
+  persistCrossPrincipalQueue(ds);
+  logger.warn(
+    `[${tag(ds)}] XPI human identity transient lookup deferred role=${role} attempts=${attempts}`,
+  );
+  scheduleCrossPrincipalOwnerWait(ds, Date.now() + XPI_IDENTITY_RESOLUTION_RETRY_MS);
+  return true;
+}
+
+const XPI_TERMINAL_ALERT_MAX_ATTEMPTS = 3;
+const XPI_TERMINAL_ALERT_RETRY_DELAYS_MS = [0, 250, 1_000];
+const XPI_TERMINAL_ALERT_AUDIT_LIMIT = 50;
+const XPI_TERMINAL_NOTICE_MAX_CYCLES = 3;
+const XPI_TERMINAL_NOTICE_RETRY_MS = 5_000;
+
+function recordCrossPrincipalDeliveryAudit(
+  ds: DaemonSession,
+  record: CrossPrincipalInterruption,
+  event: CrossPrincipalInterruptionDeliveryAudit['event'],
+  channel: CrossPrincipalInterruptionDeliveryAudit['channel'],
+  attempts: number,
+  reason: string,
+): void {
+  const audit: CrossPrincipalInterruptionDeliveryAudit = {
+    version: 1,
+    id: `${record.id}:${event}:${Date.now()}`,
+    event,
+    channel,
+    attempts,
+    reason: reason.slice(0, 240),
+    at: new Date().toISOString(),
+  };
+  const previous = ds.session.crossPrincipalInterruptionDeliveryAudits ?? [];
+  ds.session.crossPrincipalInterruptionDeliveryAudits = [...previous, audit].slice(-XPI_TERMINAL_ALERT_AUDIT_LIMIT);
+  sessionStore.updateSession(ds.session);
+}
+
+type XpiHumanIdentityRole = 'owner' | 'proposer';
+type XpiHumanOpenIdResolution =
+  | { status: 'resolved'; openId: string; source: 'resolved_from_union' | 'target_app_owner' | 'target_app_same_app' }
+  | { status: 'transient' | 'definitive' | 'rejected_source_app_open_id' };
+
+function maskedXpiIdentity(value: string | undefined): string {
+  if (!value) return 'missing';
+  if (value.length <= 12) return `${value.slice(0, 3)}...`;
+  return `${value.slice(0, 6)}...${value.slice(-4)}`;
+}
+
+/**
+ * Resolve a human identity in the receiving bot app before it reaches a card
+ * or an at/person tag.  A proposer's inbound open_id may have been issued by a
+ * different app, so it is never accepted as a fallback.  The active owner is
+ * the sole exception: that open_id was captured by this daemon from the turn
+ * currently owning this exact target-app session.
+ */
+async function resolveXpiHumanOpenId(
+  ds: DaemonSession,
+  principal: TrustedCaller,
+  role: XpiHumanIdentityRole,
+): Promise<XpiHumanOpenIdResolution> {
+  if (principal.senderType === 'bot') return { status: 'definitive' };
+  // An open_id captured from an inbound event by THIS exact app is already
+  // target-app scoped — including events Feishu did not stamp a union_id on.
+  // Cross-app conversion is required only when the id came from another app.
+  if (principal.requestLarkAppId === ds.larkAppId && principal.requestUserOpenId) {
+    return { status: 'resolved', openId: principal.requestUserOpenId, source: 'target_app_same_app' };
+  }
+  const unionId = principal.requestUserUnionId;
+  if (unionId) {
+    const resolved = await resolveTargetAppOpenId(ds.larkAppId, unionId);
+    logger.info(
+      `[${tag(ds)}] XPI human identity role=${role} source=resolved_from_union `
+      + `target_app=${ds.larkAppId} result=${resolved.status} `
+      + `id=${maskedXpiIdentity(resolved.status === 'resolved' ? resolved.openId : unionId)}`,
+    );
+    if (resolved.status === 'resolved') {
+      return { status: 'resolved', openId: resolved.openId, source: 'resolved_from_union' };
+    }
+    // The active owner was observed by this exact receiving app when the
+    // owning turn began, so its stored open_id is already target-app scoped.
+    // A contact-scope miss must not lock the owner out of approval.
+    if (role === 'owner' && principal.requestUserOpenId) {
+      logger.info(
+        `[${tag(ds)}] XPI human identity role=owner source=target_app_owner `
+        + `target_app=${ds.larkAppId} result=fallback id=${maskedXpiIdentity(principal.requestUserOpenId)}`,
+      );
+      return { status: 'resolved', openId: principal.requestUserOpenId, source: 'target_app_owner' };
+    }
+    return { status: resolved.status };
+  }
+  if (role === 'owner' && principal.requestUserOpenId) {
+    logger.info(
+      `[${tag(ds)}] XPI human identity role=owner source=target_app_owner `
+      + `target_app=${ds.larkAppId} result=resolved id=${maskedXpiIdentity(principal.requestUserOpenId)}`,
+    );
+    return { status: 'resolved', openId: principal.requestUserOpenId, source: 'target_app_owner' };
+  }
+  logger.warn(
+    `[${tag(ds)}] XPI human identity role=${role} source=rejected_source_app_open_id `
+    + `target_app=${ds.larkAppId} result=rejected id=${maskedXpiIdentity(principal.requestUserOpenId)}`,
+  );
+  return { status: 'rejected_source_app_open_id' };
+}
+
+export const __testOnly_resolveXpiHumanOpenId = resolveXpiHumanOpenId;
+
+function cancelDisabledCrossPrincipalInterruptions(ds: DaemonSession): number {
+  const cancelled = cancelCrossPrincipalInterruptionsForFeatureDisable(ds.session);
+  if (cancelled.length === 0) return 0;
+  clearTimeout(ds.crossPrincipalWaitTimer);
+  ds.crossPrincipalWaitTimer = undefined;
+  sessionStore.updateSession(ds.session);
+  logger.warn(
+    `[${tag(ds)}] XPI disabled: terminalised ${cancelled.length} staged interruption(s) `
+    + `ids=${cancelled.map(item => item.id).join(',')}`,
+  );
+  return cancelled.length;
+}
+
+function cancelAllCrossPrincipalInterruptionsForFeatureDisable(): number {
+  let total = 0;
+  const cancelledSessionIds = new Set<string>();
+  for (const ds of activeSessions.values()) {
+    total += cancelDisabledCrossPrincipalInterruptions(ds);
+    cancelledSessionIds.add(ds.session.sessionId);
+  }
+  // An inactive row can still carry staged input. Leaving it behind would
+  // make OFF look clean until XPI is re-enabled, at which point reopening the
+  // session could resurrect historical business input. Use the strict view:
+  // cleanup is a destructive state transition and must fail closed when the
+  // backing store cannot be proven readable.
+  for (const session of sessionStore.listSessionsStrict()) {
+    if (cancelledSessionIds.has(session.sessionId)) continue;
+    const cancelled = cancelCrossPrincipalInterruptionsForFeatureDisable(session);
+    if (cancelled.length === 0) continue;
+    sessionStore.updateSession(session);
+    total += cancelled.length;
+    logger.warn(
+      `[${session.sessionId.substring(0, 8)}] XPI disabled: terminalised `
+      + `${cancelled.length} inactive staged interruption(s) `
+      + `ids=${cancelled.map(item => item.id).join(',')}`,
+    );
+  }
+  return total;
+}
+
+function crossPrincipalNoticeUuid(
+  kind: 'classification' | 'wait' | 'terminal',
+  record: CrossPrincipalInterruption,
+  discriminator = '',
+): string {
+  const suffix = kind === 'wait' ? `-${record.waitDecisionRound ?? 0}` : '';
+  const digest = discriminator
+    ? `-${createHash('sha256').update(discriminator).digest('hex').slice(0, 8)}`
+    : '';
+  return `xpi-${kind[0]}-${record.id.slice(4)}${suffix}${digest}`;
+}
+
 function removeCrossPrincipalRecord(ds: DaemonSession, id: string): void {
   const queue = ds.session.crossPrincipalInterruptions;
   if (!queue) return;
@@ -18457,24 +18671,6 @@ function choiceFromAskResult(
   return parseCrossPrincipalChoiceText(result.comment ?? '', 'any');
 }
 
-/** Answerer metadata for a host cross-principal ask card. A bot proposer/owner
- *  must be flagged so the card renders a plain-text mention instead of
- *  `<at id=botOpenId>` — Feishu rejects such cards (400/100290), which used to
- *  invalidate the classification gate instantly and make peer bots re-send in
- *  a tight loop. The bot's display name comes from the observed-bot roster
- *  when available. */
-function hostAskAnswererMeta(ds: DaemonSession, caller: TrustedCaller): {
-  answererOpenId: string;
-  answererIsBot?: boolean;
-  answererDisplayName?: string;
-} {
-  const openId = caller.requestUserOpenId!;
-  if (caller.senderType !== 'bot') return { answererOpenId: openId };
-  const displayName = listObservedBots(config.session.dataDir, ds.larkAppId, ds.chatId)
-    .find(b => b.openId === openId)?.name;
-  return { answererOpenId: openId, answererIsBot: true, ...(displayName ? { answererDisplayName: displayName } : {}) };
-}
-
 function findPendingCrossPrincipalForProposer(
   ds: DaemonSession,
   proposer: TrustedCaller,
@@ -18482,18 +18678,6 @@ function findPendingCrossPrincipalForProposer(
   return ds.session.crossPrincipalInterruptions?.find(record =>
     (record.phase === 'awaiting_classification' || record.phase === 'awaiting_owner')
     && sameTrustedPrincipal(record.proposer, proposer));
-}
-
-/** Find the record whose bot OWNER is currently being asked to confirm a
- *  suggestion. Bot owners get a plain-text notice rather than an (unanswerable)
- *  choice card, so their reply is matched here instead of the ask broker. */
-function findPendingCrossPrincipalForOwner(
-  ds: DaemonSession,
-  owner: TrustedCaller,
-): CrossPrincipalInterruption | undefined {
-  return ds.session.crossPrincipalInterruptions?.find(record =>
-    record.phase === 'awaiting_owner'
-    && sameTrustedPrincipal(record.owner, owner));
 }
 
 function sanitizeCrossPrincipalMessage(
@@ -18524,9 +18708,28 @@ async function applyCrossPrincipalProposerChoice(
       return true;
     }
     if (choice === 'suggestion') {
+      // A bot principal has no human card actor behind it, and this receiving
+      // bot's configured owner is not authority for that foreign caller. Never
+      // execute B's content under A's bot identity without an explicit owner
+      // decision. Human cards hide this choice; text/legacy callers still hit
+      // this fail-closed boundary.
+      if (record.owner.senderType === 'bot') {
+        await settleCrossPrincipalTerminal(
+          ds,
+          record,
+          '原任务由机器人发起，无法确认追加建议；请选择独立任务。',
+        );
+        return true;
+      }
       markCrossPrincipalSuggestionWaiting(record, Date.now(), CROSS_PRINCIPAL_OWNER_WAIT_MS);
       persistCrossPrincipalQueue(ds);
       scheduleCrossPrincipalOwnerWait(ds, record.ownerWaitDeadlineAt!);
+      void notifyCrossPrincipalProposer(
+        ds,
+        record,
+        tr('xpi.notice.suggestion_saved', undefined, localeForBot(ds.larkAppId)),
+        'suggestion-saved',
+      );
       return true;
     }
     return false;
@@ -18573,43 +18776,6 @@ async function trySettleCrossPrincipalProposerChoice(
   return applyCrossPrincipalProposerChoice(ds, record, choice);
 }
 
-/** Consume a bot OWNER's plain-text accept/reject reply during awaiting_owner.
- *  Bot owners cannot answer a choice card (cards cannot at-mention a bot), so
- *  the owner leg posts a text notice whose keywords are parsed here with the
- *  same vocabulary as the card's free-text gate. Anything that is not exactly
- *  a choice returns false so ordinary owner messages keep their normal route. */
-async function trySettleCrossPrincipalOwnerChoice(
-  ds: DaemonSession,
-  owner: TrustedCaller | undefined,
-  text: string,
-  mentions?: LarkMention[],
-): Promise<boolean> {
-  if (!owner) return false;
-  const record = findPendingCrossPrincipalForOwner(ds, owner);
-  if (!record) return false;
-  const body = stripLeadingMentions(text.trim(), mentions);
-  if (!isCrossPrincipalChoiceOnlyText(body, 'owner')) return false;
-  const choice = parseCrossPrincipalChoiceText(body, 'owner');
-  const current = ds.session.crossPrincipalInterruptions?.find(item => item.id === record.id);
-  if (!current) return false;
-  if (choice !== 'accept') {
-    removeCrossPrincipalRecord(ds, current.id);
-    await notifyCrossPrincipalTerminal(
-      ds,
-      current,
-      tr('xpi.timeout.owner_unconfirmed', undefined, localeForBot(ds.larkAppId)),
-    );
-    return true;
-  }
-  clearTimeout(ds.crossPrincipalWaitTimer);
-  ds.crossPrincipalWaitTimer = undefined;
-  current.botOwnerDeadlineAt = undefined;
-  current.phase = 'owner_approved';
-  persistCrossPrincipalQueue(ds);
-  queueMicrotask(() => { void driveCrossPrincipalInterruptions(ds); });
-  return true;
-}
-
 async function stageCrossPrincipalInterruption(args: {
   ds: DaemonSession;
   ownerTurnId: string;
@@ -18626,6 +18792,9 @@ async function stageCrossPrincipalInterruption(args: {
     session: ds.session,
     ownerTurnId,
     owner,
+    ownerUserPrompt: ds.activeInteractiveTurn?.turnId === ownerTurnId
+      ? (ds.activeInteractiveTurn.userPrompt ?? ds.lastUserPrompt)
+      : undefined,
     proposer,
     message,
   });
@@ -18643,44 +18812,282 @@ async function stageCrossPrincipalInterruption(args: {
     return true;
   }
   const loc = localeForBot(ds.larkAppId);
-  const proposerOpenId = proposer.requestUserOpenId;
   if (proposer.senderType === 'bot') {
-    if (proposerOpenId) {
-      void sessionReply(
-        sessionAnchorId(ds),
-        crossPrincipalBotClassifyNotice(proposerOpenId, loc),
-        'text',
-        ds.larkAppId,
-        message.turnId,
-      ).catch(err => logger.warn(`[${tag(ds)}] Failed to acknowledge cross-principal handoff: ${err}`));
-    }
-    staged.record.botClassifyDeadlineAt = Date.now() + CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS;
-    persistCrossPrincipalQueue(ds);
-    scheduleCrossPrincipalOwnerWait(ds, staged.record.botClassifyDeadlineAt);
+    // New CLIs must declare `--as` before a bot-directed send leaves the
+    // process. A legacy sender may still arrive without the durable token; fail
+    // closed without publishing another bot-addressed control message into the
+    // shared topic (that was the mixed-version recursion source).
+    await settleCrossPrincipalTerminal(ds, staged.record, tr('xpi.timeout.unclassified', undefined, loc));
     return true;
   }
-  void sessionReply(
-    sessionAnchorId(ds),
-    crossPrincipalStagedNotice(proposerOpenId, loc),
-    'text',
-    ds.larkAppId,
-    message.turnId,
-  ).catch(err => logger.warn(`[${tag(ds)}] Failed to acknowledge cross-principal handoff: ${err}`));
+  // The classification card is the acknowledgement. Posting a separate
+  // "saved" message before the user chooses a disposition creates duplicate
+  // and misleading lifecycle noise. A suggestion-specific acknowledgement is
+  // emitted only after that choice is persisted.
   queueMicrotask(() => { void driveCrossPrincipalInterruptions(ds); });
   return true;
+}
+
+async function notifyCrossPrincipalProposer(
+  ds: DaemonSession,
+  record: CrossPrincipalInterruption,
+  text: string,
+  discriminator: string,
+): Promise<boolean> {
+  if (record.proposer.senderType === 'bot') {
+    logger.info(
+      `[${tag(ds)}] XPI bot outcome kept on control/audit plane `
+      + `record=${record.id} outcome=${discriminator}`,
+    );
+    return true;
+  }
+  const proposer = await resolveXpiHumanOpenId(ds, record.proposer, 'proposer');
+  if (proposer.status !== 'resolved') {
+    logger.warn(
+      `[${tag(ds)}] XPI proposer outcome not delivered: identity=${proposer.status} `
+      + `record=${record.id} outcome=${discriminator}`,
+    );
+    return false;
+  }
+  try {
+    await sessionReply(
+      sessionAnchorId(ds),
+      `<at id=${proposer.openId}></at> ${text}`,
+      'text',
+      ds.larkAppId,
+      undefined,
+      { uuid: crossPrincipalNoticeUuid('terminal', record, discriminator) },
+    );
+    return true;
+  } catch (error) {
+    logger.warn(
+      `[${tag(ds)}] XPI proposer outcome delivery failed record=${record.id} `
+      + `outcome=${discriminator}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return false;
+  }
+}
+
+function crossPrincipalHumanOutcome(text: string): string {
+  if (text.includes('原任务由机器人发起')) {
+    return '这条建议未执行：原任务由机器人发起，无法代替它确认追加建议。请重新发送并选择“另开任务”。';
+  }
+  if (text.includes('未获原任务发起人确认') || text.includes('建议未获确认')) {
+    return '你的建议未执行：原任务发起人未确认。你可以重新发送，或选择“另开任务”。';
+  }
+  if (text.includes('选择卡未能送达')) {
+    return '未能发送处理选项，该消息未执行。请重新发送；若仍失败，请联系管理员。';
+  }
+  if (text.includes('无法在当前应用解析') || text.includes('无法确认消息发送者身份')) {
+    return '暂时无法确认你的身份，该消息未执行。请重新发送；若仍失败，请联系管理员。';
+  }
+  if (text.includes('原任务仍在执行')) {
+    return '原任务仍在执行，且你未选择继续等待；该消息未执行。';
+  }
+  if (text.includes('未选择处理方式')) {
+    return '你未选择处理方式，该消息未执行。请重新发送。';
+  }
+  // Success and bounded operational outcomes are authored by trusted host
+  // code; collapse whitespace without exposing routing metadata.
+  return text.replace(/[\r\n]+/g, ' ').trim();
 }
 
 async function notifyCrossPrincipalTerminal(
   ds: DaemonSession,
   record: CrossPrincipalInterruption,
   text: string,
+): Promise<boolean> {
+  // A bot sender gets protocol/CLI feedback and local audit only. Publishing
+  // --as/appId/turn diagnostics into the shared topic is not actionable for a
+  // human observer and caused the noisy notices seen in live R10.
+  if (record.proposer.senderType === 'bot') {
+    logger.info(
+      `[${tag(ds)}] XPI bot terminal kept on control/audit plane `
+      + `record=${record.id} reason=${text.replace(/[\r\n]+/g, ' ').slice(0, 240)}`,
+    );
+    return true;
+  }
+
+  const proposer = await resolveXpiHumanOpenId(ds, record.proposer, 'proposer');
+  const recipients = proposer.status === 'resolved' ? [proposer.openId] : [];
+  const channel: CrossPrincipalInterruptionDeliveryAudit['channel'] =
+    ds.scope === 'thread' ? 'topic' : 'group';
+  const hasGroupTransport = ds.chatType === 'group';
+  const reason = text.replace(/[\r\n]+/g, ' ').trim().slice(0, 240) || 'XPI terminal notice';
+  if (!hasGroupTransport || recipients.length === 0) {
+    const why = !hasGroupTransport ? 'alert route is not a group/topic' : 'no human proposer resolved';
+    recordCrossPrincipalDeliveryAudit(ds, record, 'delivery_failed', channel, 0, why);
+    recordCrossPrincipalDeliveryAudit(ds, record, 'delivery_exhausted', channel, 0, why);
+    logger.error(`[${tag(ds)}] XPI human outcome not delivered: ${why} record=${record.id}`);
+    return false;
+  }
+
+  const ats = recipients.map(id => `<at id=${id}></at>`).join(' ');
+  const alert = `${ats} ${crossPrincipalHumanOutcome(text)}`;
+  const uuid = crossPrincipalNoticeUuid('terminal', record, 'human-outcome');
+  let failures = 0;
+  for (let attempt = 1; attempt <= XPI_TERMINAL_ALERT_MAX_ATTEMPTS; attempt += 1) {
+    const delay = XPI_TERMINAL_ALERT_RETRY_DELAYS_MS[attempt - 1] ?? 1_000;
+    if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+    try {
+      const deliveredMessageId = await sessionReply(
+        sessionAnchorId(ds),
+        alert,
+        'text',
+        ds.larkAppId,
+        undefined,
+        { uuid },
+      );
+      if (!deliveredMessageId) throw new Error('group/topic transport returned no message id');
+      if (failures > 0) {
+        recordCrossPrincipalDeliveryAudit(ds, record, 'delivery_recovered', channel, attempt, reason);
+      }
+      return true;
+    } catch (error) {
+      failures += 1;
+      const detail = error instanceof Error ? error.message : String(error);
+      recordCrossPrincipalDeliveryAudit(ds, record, 'delivery_failed', channel, attempt, detail);
+      logger.warn(`[${tag(ds)}] XPI human outcome attempt ${attempt}/${XPI_TERMINAL_ALERT_MAX_ATTEMPTS} failed: ${detail}`);
+    }
+  }
+  recordCrossPrincipalDeliveryAudit(ds, record, 'delivery_exhausted', channel, failures, reason);
+  logger.error(`[${tag(ds)}] XPI human outcome delivery exhausted after ${failures} attempts record=${record.id}`);
+  return false;
+}
+
+export const __testOnly_notifyCrossPrincipalTerminal = notifyCrossPrincipalTerminal;
+
+/** Keep a terminal XPI record durable until the human outcome is delivered.
+ * Each cycle already has the transport's short retry loop above; this outer,
+ * restart-safe state adds bounded recovery for longer outages without ever
+ * replaying the business action that produced the outcome. */
+async function settleCrossPrincipalTerminal(
+  ds: DaemonSession,
+  record: CrossPrincipalInterruption,
+  text: string,
 ): Promise<void> {
-  const ownerId = record.owner.requestUserOpenId;
-  const proposerId = record.proposer.requestUserOpenId;
-  const ats = [...new Set([ownerId, proposerId].filter((v): v is string => !!v))]
-    .map(id => `<at id=${id}></at>`)
-    .join(' ');
-  await sessionReply(sessionAnchorId(ds), `${ats}${ats ? ' ' : ''}${text}`, 'text', ds.larkAppId);
+  if (record.phase !== 'terminal_notice_pending') {
+    record.phase = 'terminal_notice_pending';
+    record.terminalNoticeText = text;
+    record.terminalNoticeAttempts = 0;
+    delete record.identityResolutionRetry;
+    persistCrossPrincipalQueue(ds);
+  } else if (!record.terminalNoticeText) {
+    record.terminalNoticeText = text;
+    persistCrossPrincipalQueue(ds);
+  }
+
+  let delivered = false;
+  try {
+    delivered = await notifyCrossPrincipalTerminal(ds, record, record.terminalNoticeText ?? text);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    recordCrossPrincipalDeliveryAudit(
+      ds,
+      record,
+      'delivery_failed',
+      ds.scope === 'thread' ? 'topic' : 'group',
+      0,
+      detail,
+    );
+    logger.warn(`[${tag(ds)}] XPI terminal notice cycle failed record=${record.id}: ${detail}`);
+  }
+  if (delivered) {
+    removeCrossPrincipalRecord(ds, record.id);
+    return;
+  }
+
+  record.terminalNoticeAttempts = (record.terminalNoticeAttempts ?? 0) + 1;
+  if (record.terminalNoticeAttempts >= XPI_TERMINAL_NOTICE_MAX_CYCLES) {
+    recordCrossPrincipalDeliveryAudit(
+      ds,
+      record,
+      'delivery_exhausted',
+      ds.scope === 'thread' ? 'topic' : 'group',
+      record.terminalNoticeAttempts,
+      'terminal notice outer retry exhausted; closing on audit plane',
+    );
+    logger.error(
+      `[${tag(ds)}] XPI terminal notice outer retry exhausted; `
+      + `closing on audit plane record=${record.id} cycles=${record.terminalNoticeAttempts}`,
+    );
+    removeCrossPrincipalRecord(ds, record.id);
+    return;
+  }
+  persistCrossPrincipalQueue(ds);
+  scheduleCrossPrincipalOwnerWait(ds, Date.now() + XPI_TERMINAL_NOTICE_RETRY_MS);
+}
+
+async function notifyCrossPrincipalOwnerLifecycle(
+  ds: DaemonSession,
+  record: CrossPrincipalInterruption,
+  text: string,
+  discriminator: string,
+): Promise<boolean> {
+  if (record.owner.senderType === 'bot') {
+    logger.info(
+      `[${tag(ds)}] XPI owner lifecycle kept on control/audit plane `
+      + `record=${record.id} outcome=${discriminator}`,
+    );
+    return true;
+  }
+  const owner = await resolveXpiHumanOpenId(ds, record.owner, 'owner');
+  if (owner.status !== 'resolved') {
+    logger.warn(
+      `[${tag(ds)}] XPI owner lifecycle not delivered: identity=${owner.status} `
+      + `record=${record.id} outcome=${discriminator}`,
+    );
+    return false;
+  }
+  try {
+    await sessionReply(
+      sessionAnchorId(ds),
+      `<at id=${owner.openId}></at> ${text}`,
+      'text',
+      ds.larkAppId,
+      undefined,
+      { uuid: crossPrincipalNoticeUuid('terminal', record, `owner-${discriminator}`) },
+    );
+    return true;
+  } catch (error) {
+    logger.warn(
+      `[${tag(ds)}] XPI owner lifecycle delivery failed record=${record.id} `
+      + `outcome=${discriminator}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return false;
+  }
+}
+
+async function notifyApprovedCrossPrincipalDispatch(
+  ds: DaemonSession,
+  record: CrossPrincipalInterruption,
+  state: 'started' | 'queued' | 'retrying',
+): Promise<void> {
+  const loc = localeForBot(ds.larkAppId);
+  const ownerMessageKey = state === 'started'
+    ? 'xpi.notice.owner_rerun_started'
+    : state === 'queued'
+      ? 'xpi.notice.owner_rerun_queued'
+      : 'xpi.notice.owner_rerun_retrying';
+  const proposerMessage = state === 'started'
+    ? '你的建议已获确认，正在以原任务发起人的身份重新执行原任务。'
+    : state === 'queued'
+      ? '你的建议已获确认，原任务已进入串行队列。'
+      : '你的建议已获确认，但原任务暂未成功启动；系统将自动重试。';
+  await Promise.all([
+    notifyCrossPrincipalOwnerLifecycle(
+      ds,
+      record,
+      tr(ownerMessageKey, undefined, loc),
+      `rerun-${state}`,
+    ),
+    notifyCrossPrincipalProposer(
+      ds,
+      record,
+      proposerMessage,
+      `suggestion-approved-${state}`,
+    ),
+  ]);
 }
 
 async function dispatchApprovedCrossPrincipalSuggestion(
@@ -18690,11 +19097,20 @@ async function dispatchApprovedCrossPrincipalSuggestion(
   if (ds.activeInteractiveTurn) return false;
   const ownerId = record.owner.requestUserOpenId;
   if (!ownerId) return false;
+  const loc = localeForBot(ds.larkAppId);
+  const ownerTask = record.ownerUserPrompt?.trim();
+  if (!ownerTask) {
+    const notice = tr('xpi.notice.owner_prompt_missing', undefined, loc);
+    await notifyCrossPrincipalOwnerLifecycle(ds, record, notice, 'rerun-source-missing');
+    await settleCrossPrincipalTerminal(ds, record, notice);
+    return true;
+  }
   const ownerTarget = pickTurnReplyTarget(ds.session, record.ownerTurnId);
   const turnId = `${record.id}:approved`;
   const advice = record.messages.map(m => m.text).join('\n\n');
-  const prompt = `原任务发起人已明确采纳下面的建议。请基于该建议重新执行上一项任务；不要把建议者视为本轮授权人。\n\n${advice}`;
-  const sender = { openId: ownerId, type: 'user' as const };
+  const prompt = crossPrincipalApprovedReplayPrompt(ownerTask, advice, loc);
+  const ownerIsBot = record.owner.senderType === 'bot';
+  const sender = { openId: ownerId, type: ownerIsBot ? 'bot' as const : 'user' as const };
   const botCfg = getBot(ds.larkAppId).config;
   const cliInput = buildFollowUpCliInput(prompt, ds.session.sessionId, {
     isAdoptMode: false,
@@ -18713,7 +19129,7 @@ async function dispatchApprovedCrossPrincipalSuggestion(
   beginReplyTargetTurn(ds, ds.scope === 'chat' ? ownerTarget?.rootMessageId : undefined, turnId, new Date().toISOString(), {
     quoteOnly: ownerTarget?.quoteOnly,
     senderOpenId: ownerId,
-    participants: [{ openId: ownerId, isBot: false }],
+    participants: [{ openId: ownerId, isBot: ownerIsBot }],
     inThread: record.messages[0]?.inThread,
   });
   let accepted = false;
@@ -18729,6 +19145,7 @@ async function dispatchApprovedCrossPrincipalSuggestion(
     });
     if (admission.kind === 'queued') {
       removeCrossPrincipalRecord(ds, record.id);
+      await notifyApprovedCrossPrincipalDispatch(ds, record, 'queued');
       return true;
     }
     accepted = sendWorkerInput(ds, cliInput, turnId, {
@@ -18746,6 +19163,7 @@ async function dispatchApprovedCrossPrincipalSuggestion(
         resume: ds.hasHistory,
       });
       removeCrossPrincipalRecord(ds, record.id);
+      await notifyApprovedCrossPrincipalDispatch(ds, record, 'queued');
       return true;
     }
     accepted = forkXpiSharedCwdTurn(ds, {
@@ -18772,12 +19190,15 @@ async function dispatchApprovedCrossPrincipalSuggestion(
   }
   if (!accepted || (ds.session.xpiSharedCwdAdmissionGroupId && admission.kind !== 'acquired')) {
     rollbackXpiSharedCwdAdmission(ds, admission, turnId);
+    await notifyApprovedCrossPrincipalDispatch(ds, record, 'retrying');
+    scheduleCrossPrincipalOwnerWait(ds, Date.now() + 5_000);
     return false;
   }
-  setActiveInteractiveTurn(ds, turnId, record.owner);
-  beginNewTurn(ds, advice, turnId);
+  setActiveInteractiveTurn(ds, turnId, record.owner, ownerTask);
+  beginNewTurn(ds, ownerTask, turnId);
   rememberLastCliInput(ds, prompt, cliInput);
   removeCrossPrincipalRecord(ds, record.id);
+  await notifyApprovedCrossPrincipalDispatch(ds, record, 'started');
   return true;
 }
 
@@ -18836,6 +19257,7 @@ function cloneIndependentLaunchPosture(source: Session, child: Session): void {
     : undefined;
   child.cliPathOverride = source.cliPathOverride;
   child.wrapperCli = source.wrapperCli;
+  child.cliLaunchMode = source.cliLaunchMode;
   child.agentFrozen = source.agentFrozen;
 }
 
@@ -18923,10 +19345,25 @@ async function prepareIndependentCrossPrincipalSession(
   sourceDs: DaemonSession,
   record: CrossPrincipalInterruption,
 ): Promise<void> {
-  const proposerId = record.proposer.requestUserOpenId;
+  let proposerId = record.proposer.requestUserOpenId;
+  if (record.proposer.senderType === 'user') {
+    const proposerIdentity = await resolveXpiHumanOpenId(sourceDs, record.proposer, 'proposer');
+    if (proposerIdentity.status !== 'resolved') {
+      if (deferTransientXpiIdentityResolution(sourceDs, record, 'proposer', proposerIdentity)) return;
+      await settleCrossPrincipalTerminal(
+        sourceDs,
+        record,
+        proposerIdentity.status === 'transient'
+          ? '多次重试后仍无法解析消息发送者身份，独立任务未创建。'
+          : '无法在当前应用解析消息发送者身份，独立任务未创建。',
+      );
+      return;
+    }
+    deferTransientXpiIdentityResolution(sourceDs, record, 'proposer', proposerIdentity);
+    proposerId = proposerIdentity.openId;
+  }
   if (!proposerId) {
-    removeCrossPrincipalRecord(sourceDs, record.id);
-    await notifyCrossPrincipalTerminal(sourceDs, record, '无法确认消息发送者身份，未执行。');
+    await settleCrossPrincipalTerminal(sourceDs, record, '无法确认消息发送者身份，未执行。');
     return;
   }
 
@@ -18951,10 +19388,17 @@ async function prepareIndependentCrossPrincipalSession(
 
   let rootMessageId = record.independentRootMessageId;
   if (!rootMessageId) {
+    // The root is the target daemon's own internal child-session anchor. A bot
+    // proposer must not be @-addressed here: doing so would publish another
+    // bot-directed control turn and wake old/mixed-version peers. Humans still
+    // receive the ordinary acknowledgement mention.
+    const proposerAt = record.proposer.senderType === 'bot'
+      ? ''
+      : `<at id=${proposerId}></at> `;
     rootMessageId = await sendMessage(
       sourceDs.larkAppId,
       sourceDs.chatId,
-      `<at id=${proposerId}></at> 已为这条独立任务创建隔离话题；不会读取原会话的 CLI 记录或工具输出。`,
+      `${proposerAt}已为这条独立任务创建隔离话题；不会读取原会话的 CLI 记录或工具输出。`,
       'text',
       record.id,
     );
@@ -19083,8 +19527,7 @@ async function prepareIndependentCrossPrincipalSession(
 
   const availableBots = await getAvailableBots(childDs.larkAppId, childDs.chatId);
   const started = forkReservedInitialSession(childDs, availableBots, record.proposer);
-  removeCrossPrincipalRecord(sourceDs, record.id);
-  await notifyCrossPrincipalTerminal(
+  await settleCrossPrincipalTerminal(
     sourceDs,
     record,
     started ? '独立会话已开始执行。' : '独立会话已进入共享目录串行队列。',
@@ -19101,8 +19544,52 @@ function scheduleCrossPrincipalOwnerWait(ds: DaemonSession, deadlineAt: number):
   ds.crossPrincipalWaitTimer.unref?.();
 }
 
+async function askCrossPrincipalConfirmation(
+  ds: DaemonSession,
+  record: CrossPrincipalInterruption,
+  input: Parameters<typeof registerHostAsk>[0],
+): Promise<Awaited<ReturnType<typeof registerHostAsk>> | undefined> {
+  if (record.confirmationRetryAt && record.confirmationRetryAt > Date.now()) {
+    scheduleCrossPrincipalOwnerWait(ds, record.confirmationRetryAt);
+    return undefined;
+  }
+  const attempt = record.confirmationRetryCount ?? 0;
+  let result: Awaited<ReturnType<typeof registerHostAsk>>;
+  try {
+    result = await registerHostAsk({
+      ...input,
+      requestId: attempt ? `${input.requestId}:retry:${attempt}` : input.requestId,
+    });
+  } catch (err) {
+    result = { kind: 'invalidated', reason: err instanceof Error ? err.message : String(err),
+      selected: null, by: null, comment: null, timedOut: false };
+  }
+  const current = ds.session.crossPrincipalInterruptions?.find(item => item.id === record.id);
+  if (ds.session.status !== 'active' || !current) return undefined;
+  if (result.kind !== 'invalidated') {
+    delete current.confirmationRetryAt;
+    return result;
+  }
+  // A delivery/infrastructure failure is not a human rejection. Keep the
+  // original input and use a fresh, durable ask identity on the next attempt;
+  // replaying the failed identity would return the broker's retained failure.
+  current.confirmationRetryCount = attempt + 1;
+  current.confirmationRetryAt = Date.now() + Math.min(60_000 * 2 ** Math.min(attempt, 4), 600_000);
+  persistCrossPrincipalQueue(ds);
+  scheduleCrossPrincipalOwnerWait(ds, current.confirmationRetryAt);
+  logger.warn(`[${tag(ds)}] Confirmation unavailable; keeping input queued: ${result.reason}`);
+  if (attempt === 0) {
+    await notifyCrossPrincipalTerminal(ds, record, '确认卡片暂时不可用，消息仍保留且尚未执行；系统将重试，请勿重复发送。');
+  }
+  return undefined;
+}
+
 async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void> {
-  if (ds.crossPrincipalInterruptionDriving) return;
+  if (ds.session.status !== 'active' || ds.crossPrincipalInterruptionDriving) return;
+  if (!config.crossPrincipalInterruption) {
+    cancelDisabledCrossPrincipalInterruptions(ds);
+    return;
+  }
   const record = ds.session.crossPrincipalInterruptions?.[0];
   if (!record) {
     clearTimeout(ds.crossPrincipalWaitTimer);
@@ -19111,68 +19598,72 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
   }
   ds.crossPrincipalInterruptionDriving = true;
   try {
+    if (record.phase === 'terminal_notice_pending') {
+      await settleCrossPrincipalTerminal(
+        ds,
+        record,
+        record.terminalNoticeText ?? '处理已结束，但结果通知未能送达。',
+      );
+      return;
+    }
     if (record.phase === 'preparing_independent' || record.phase === 'independent_queued') {
       await prepareIndependentCrossPrincipalSession(ds, record);
       return;
     }
     if (record.phase === 'awaiting_classification') {
       const loc = localeForBot(ds.larkAppId);
-      const proposerId = record.proposer.requestUserOpenId;
-      if (!proposerId) {
-        removeCrossPrincipalRecord(ds, record.id);
-        await notifyCrossPrincipalTerminal(ds, record, '无法确认消息发送者身份，消息未执行；可重新发送。');
-        return;
-      }
       if (record.proposer.senderType === 'bot') {
-        if (record.botClassifyDeadlineAt && Date.now() >= record.botClassifyDeadlineAt) {
-          removeCrossPrincipalRecord(ds, record.id);
-          await notifyCrossPrincipalTerminal(ds, record, tr('xpi.timeout.unclassified', undefined, loc));
-          return;
-        }
-        if (!record.botClassifyDeadlineAt) {
-          await sessionReply(
-            sessionAnchorId(ds),
-            crossPrincipalBotClassifyNotice(proposerId, loc),
-            'text',
-            ds.larkAppId,
-          );
-          record.botClassifyDeadlineAt = Date.now() + CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS;
-          persistCrossPrincipalQueue(ds);
-        }
-        scheduleCrossPrincipalOwnerWait(ds, record.botClassifyDeadlineAt);
+        await settleCrossPrincipalTerminal(ds, record, tr('xpi.timeout.unclassified', undefined, loc));
         return;
       }
-      const result = await registerHostAsk({
+      const proposerIdentity = await resolveXpiHumanOpenId(ds, record.proposer, 'proposer');
+      if (proposerIdentity.status !== 'resolved') {
+        if (deferTransientXpiIdentityResolution(ds, record, 'proposer', proposerIdentity)) return;
+        await settleCrossPrincipalTerminal(
+          ds,
+          record,
+          proposerIdentity.status === 'transient'
+            ? '多次重试后仍无法解析消息发送者身份，消息未执行；可重新发送。'
+            : '无法在当前应用解析消息发送者身份，消息未执行；可重新发送。',
+        );
+        return;
+      }
+      deferTransientXpiIdentityResolution(ds, record, 'proposer', proposerIdentity);
+      const proposerId = proposerIdentity.openId;
+      const botOwnedTurn = record.owner.senderType === 'bot';
+      const classificationOptions = crossPrincipalClassificationOptions(loc);
+      const result = await askCrossPrincipalConfirmation(ds, record, {
         larkAppId: ds.larkAppId,
         chatId: ds.chatId,
         rootMessageId: ds.scope === 'thread' ? ds.session.rootMessageId : null,
         sessionId: ds.session.sessionId,
         originKind: 'host_cross_principal_classification',
         requestId: `${record.id}:classification`,
-        ...hostAskAnswererMeta(ds, record.proposer),
+        answererOpenId: proposerId,
         chatType: ds.chatType,
         // registerHostAsk starts this clock only after Lark confirms that the
         // proposer can actually see the choice card.
         timeoutMs: CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS,
         questions: [{
-          prompt: crossPrincipalClassificationPrompt(proposerId, loc),
+          prompt: botOwnedTurn
+            ? tr('xpi.card.classify.bot_owner_prompt', undefined, loc)
+            : crossPrincipalClassificationPrompt(proposerId, loc),
           multiSelect: false,
-          options: crossPrincipalClassificationOptions(loc),
+          options: botOwnedTurn
+            ? classificationOptions.filter(option => option.key === 'independent')
+            : classificationOptions,
         }],
       });
+      if (!result) return;
       const choice = choiceFromAskResult(result);
       const current = ds.session.crossPrincipalInterruptions?.find(item => item.id === record.id);
       if (!current) return;
       if (choice && await applyCrossPrincipalProposerChoice(ds, current, choice)) return;
-      removeCrossPrincipalRecord(ds, record.id);
-      // Card delivery failure (invalidated) must NOT tell peer bots to re-send:
-      // that instruction is what turned a deterministic card-send failure into
-      // an infinite bot re-send loop. Only a real timeout invites a retry.
-      await notifyCrossPrincipalTerminal(
+      await settleCrossPrincipalTerminal(
         ds,
         record,
         result.kind === 'invalidated'
-          ? '选择卡片发送失败，本次消息未执行。'
+          ? '选择卡未能送达，消息未执行；请重新发送。'
           : tr('xpi.timeout.unclassified', undefined, loc),
       );
       return;
@@ -19196,39 +19687,34 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
           return;
         }
 
-        const proposerId = record.proposer.requestUserOpenId;
-        if (!proposerId) {
-          removeCrossPrincipalRecord(ds, record.id);
-          await notifyCrossPrincipalTerminal(ds, record, '等待期间无法确认消息发送者身份，消息未执行。');
-          return;
-        }
         const round = record.waitDecisionRound ?? 0;
         const loc = localeForBot(ds.larkAppId);
         if (record.proposer.senderType === 'bot') {
-          if ((record.waitDecisionRound ?? 0) > 0) {
-            removeCrossPrincipalRecord(ds, record.id);
-            await notifyCrossPrincipalTerminal(ds, record, tr('xpi.timeout.still_busy', undefined, loc));
-            return;
-          }
-          await sessionReply(
-            sessionAnchorId(ds),
-            crossPrincipalBotWaitNotice(proposerId, loc),
-            'text',
-            ds.larkAppId,
-          );
-          continueCrossPrincipalOwnerWait(record, Date.now(), CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS);
-          persistCrossPrincipalQueue(ds);
-          scheduleCrossPrincipalOwnerWait(ds, record.ownerWaitDeadlineAt!);
+          await settleCrossPrincipalTerminal(ds, record, tr('xpi.timeout.still_busy', undefined, loc));
           return;
         }
-        const waitResult = await registerHostAsk({
+        const proposerIdentity = await resolveXpiHumanOpenId(ds, record.proposer, 'proposer');
+        if (proposerIdentity.status !== 'resolved') {
+          if (deferTransientXpiIdentityResolution(ds, record, 'proposer', proposerIdentity)) return;
+          await settleCrossPrincipalTerminal(
+            ds,
+            record,
+            proposerIdentity.status === 'transient'
+              ? '等待期间多次重试仍无法解析消息发送者身份，消息未执行。'
+              : '等待期间无法在当前应用解析消息发送者身份，消息未执行。',
+          );
+          return;
+        }
+        deferTransientXpiIdentityResolution(ds, record, 'proposer', proposerIdentity);
+        const proposerId = proposerIdentity.openId;
+        const waitResult = await askCrossPrincipalConfirmation(ds, record, {
           larkAppId: ds.larkAppId,
           chatId: ds.chatId,
           rootMessageId: ds.scope === 'thread' ? ds.session.rootMessageId : null,
           sessionId: ds.session.sessionId,
           originKind: 'host_cross_principal_wait',
           requestId: `${record.id}:wait:${round}`,
-          ...hostAskAnswererMeta(ds, record.proposer),
+          answererOpenId: proposerId,
           chatType: ds.chatType,
           timeoutMs: CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS,
           questions: [{
@@ -19237,65 +19723,46 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
             options: crossPrincipalWaitOptions(loc),
           }],
         });
+        if (!waitResult) return;
         const waitChoice = choiceFromAskResult(waitResult);
         const current = ds.session.crossPrincipalInterruptions?.find(item => item.id === record.id);
         if (!current) return;
         if (waitChoice && await applyCrossPrincipalProposerChoice(ds, current, waitChoice)) return;
-        removeCrossPrincipalRecord(ds, record.id);
-        // Same invalidated vs. timeout distinction as the classification gate.
-        const waitTerminalText = waitResult.kind === 'invalidated'
-          ? '选择卡片发送失败，本次消息未执行。'
-          : tr('xpi.timeout.still_busy', undefined, loc);
-        await notifyCrossPrincipalTerminal(
+        await settleCrossPrincipalTerminal(
           ds,
           record,
-          waitTerminalText,
+          waitResult.kind === 'invalidated'
+            ? '选择卡未能送达，消息未执行；请重新发送。'
+            : tr('xpi.timeout.still_busy', undefined, loc),
         );
         return;
       }
       clearTimeout(ds.crossPrincipalWaitTimer);
       ds.crossPrincipalWaitTimer = undefined;
-      const loc = localeForBot(ds.larkAppId);
-      const ownerId = record.owner.requestUserOpenId;
-      if (!ownerId) {
-        removeCrossPrincipalRecord(ds, record.id);
-        await notifyCrossPrincipalTerminal(ds, record, '建议未获原任务发起人确认，未执行。');
-        return;
-      }
-      const ownerTarget = pickTurnReplyTarget(ds.session, record.ownerTurnId);
-      // Bot owner leg: mirror the bot proposer legs — no choice card (Feishu
-      // rejects cards that at-mention a bot and an unmentioned card never
-      // reaches the peer bot's router). Post a plain-text at-notice with the
-      // accept/reject keywords; trySettleCrossPrincipalOwnerChoice consumes the
-      // owner's reply. The daemon owns the deadline, like botClassifyDeadlineAt.
       if (record.owner.senderType === 'bot') {
-        if (record.botOwnerDeadlineAt && Date.now() >= record.botOwnerDeadlineAt) {
-          removeCrossPrincipalRecord(ds, record.id);
-          await notifyCrossPrincipalTerminal(
-            ds,
-            record,
-            tr('xpi.timeout.owner_unconfirmed', undefined, loc),
-          );
-          return;
-        }
-        if (!record.botOwnerDeadlineAt) {
-          await sessionReply(
-            sessionAnchorId(ds),
-            crossPrincipalBotOwnerNotice(
-              ownerId,
-              record.messages.map(m => m.text).join('\n\n'),
-              loc,
-            ),
-            'text',
-            ds.larkAppId,
-          );
-          record.botOwnerDeadlineAt = Date.now() + CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS;
-          persistCrossPrincipalQueue(ds);
-        }
-        scheduleCrossPrincipalOwnerWait(ds, record.botOwnerDeadlineAt!);
+        await settleCrossPrincipalTerminal(
+          ds,
+          record,
+          '原任务由机器人发起，无法确认追加建议；请选择独立任务。',
+        );
         return;
       }
-      const result = await registerHostAsk({
+      const ownerIdentity = await resolveXpiHumanOpenId(ds, record.owner, 'owner');
+      if (ownerIdentity.status !== 'resolved') {
+        if (deferTransientXpiIdentityResolution(ds, record, 'owner', ownerIdentity)) return;
+        await settleCrossPrincipalTerminal(
+          ds,
+          record,
+          ownerIdentity.status === 'transient'
+            ? '多次重试后仍无法解析原任务发起人身份，建议未执行。'
+            : '建议未获原任务发起人确认，未执行。',
+        );
+        return;
+      }
+      deferTransientXpiIdentityResolution(ds, record, 'owner', ownerIdentity);
+      const ownerId = ownerIdentity.openId;
+      const ownerTarget = pickTurnReplyTarget(ds.session, record.ownerTurnId);
+      const result = await askCrossPrincipalConfirmation(ds, record, {
         larkAppId: ds.larkAppId,
         chatId: ds.chatId,
         rootMessageId: ownerTarget?.rootMessageId
@@ -19303,13 +19770,20 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
         sessionId: ds.session.sessionId,
         originKind: 'host_cross_principal_owner',
         requestId: `${record.id}:owner`,
-        ...hostAskAnswererMeta(ds, record.owner),
+        answererOpenId: ownerId,
         chatType: ds.chatType,
         // This is a new human-action window: it starts when the owner card is
         // confirmed delivered, not while the previous turn was still running.
         timeoutMs: CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS,
         questions: [{
-          prompt: `<at id=${ownerId}></at> 另一位成员建议：${record.messages.map(m => m.text).join('\n\n')}\n\n是否采纳并重新执行？`,
+          // `answererOpenId` enforces who may answer. Do not duplicate it as an
+          // at/person card resource: Lark can reject cross-app-resolved ids in
+          // card content even though the same id is valid for authorization.
+          prompt: crossPrincipalOwnerPrompt(
+            record.messages.map(m => m.text).join('\n\n'),
+            record.messages[0]?.proposerName,
+            localeForBot(ds.larkAppId),
+          ),
           multiSelect: false,
           options: [
             { key: 'accept', label: '采纳并重新执行' },
@@ -19317,12 +19791,12 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
           ],
         }],
       });
+      if (!result) return;
       const choice = choiceFromAskResult(result);
       const current = ds.session.crossPrincipalInterruptions?.find(item => item.id === record.id);
       if (!current) return;
       if (choice !== 'accept') {
-        removeCrossPrincipalRecord(ds, record.id);
-        await notifyCrossPrincipalTerminal(ds, record, '建议未获确认，未执行。');
+        await settleCrossPrincipalTerminal(ds, record, '建议未获确认，未执行。');
         return;
       }
       current.phase = 'owner_approved';
@@ -19335,19 +19809,15 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
     }
   } catch (err) {
     if (err instanceof XpiSharedCwdQueueFullError) {
-      // This branch runs while the owner is actively resolving the durable
-      // confirmation record. Keep that record durable until the terminal
-      // notice is actually delivered; otherwise a transport failure would
-      // turn explicit backpressure into a silent drop. A failed notice gets a
-      // fixed-cadence retry and remains restart-recoverable through the same
-      // record; successful delivery is the only terminal condition.
+      // Keep the record on the same durable terminal-notice path as every
+      // other terminal outcome. The business action is not retried; only the
+      // human notification is.
       try {
-        await notifyCrossPrincipalTerminal(
+        await settleCrossPrincipalTerminal(
           ds,
           record,
           '建议已确认，但共享目录等待队列已满；本次未接收也不会执行，请稍后重新发起。',
         );
-        removeCrossPrincipalRecord(ds, record.id);
       } catch (noticeErr) {
         logger.warn(
           `[${tag(ds)}] failed to notify owner about full XPI shared-cwd queue: `
@@ -19417,7 +19887,11 @@ async function confirmNextCrossPrincipalSuggestion(ds: DaemonSession): Promise<v
         chatType: ds.chatType,
         timeoutMs: CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS,
         questions: [{
-          prompt: `<at id=${ownerOpenId}></at> 另一位成员建议：${suggestion.text}\n\n是否采纳该建议并重新执行？`,
+          prompt: crossPrincipalOwnerPrompt(
+            suggestion.text,
+            suggestion.proposerName,
+            localeForBot(ds.larkAppId),
+          ),
           multiSelect: false,
           options: [
             { key: 'accept', label: '采纳并重新执行' },
@@ -19498,7 +19972,7 @@ async function confirmNextCrossPrincipalSuggestion(ds: DaemonSession): Promise<v
   }
 
   ds.pendingCrossPrincipalSuggestions?.shift();
-  setActiveInteractiveTurn(ds, suggestion.turnId, suggestion.owner);
+  setActiveInteractiveTurn(ds, suggestion.turnId, suggestion.owner, suggestion.text);
   beginNewTurn(ds, suggestion.text, suggestion.turnId);
   rememberLastCliInput(ds, suggestion.userPrompt, approvedInput);
   sessionStore.updateSession(ds.session);
@@ -22149,6 +22623,20 @@ async function handleThreadReplyAdmitted(
   //（talk + operate）。与旧联邦 team-bots「学习入口限 bot sender」同一不变量。
   const threadTeamTrustUnionId = (isBotSenderType || isForeignBot) ? threadSenderUnionId : undefined;
   const threadTrustedCaller = trustedCallerForTurn(larkAppId, threadSenderOpenId, threadSenderUnionId, senderIsBotTriState(parsed.senderType, isForeignBot));
+  const xpiControlNotice = threadTrustedCaller?.senderType === 'bot'
+    ? parseCrossPrincipalControlNotice(parsed.content)
+    : undefined;
+  if (xpiControlNotice) {
+    // Legacy protocol traffic is never a business turn. New builds no longer
+    // publish these markers; consuming historical/mixed-version copies before
+    // session auto-create keeps an old loop from re-entering XPI staging.
+    markIngressAdmitted(ctx);
+    logger.info(
+      `[${larkAppId}] consumed XPI control notice kind=${xpiControlNotice.kind} `
+      + `record=${xpiControlNotice.recordId} surface=${ctxChatType ?? 'unknown'}`,
+    );
+    return;
+  }
   const threadChatId = ctxChatId ?? data?.message?.chat_id;
   const clearAgentAttentionForHumanInbound = (): void => {
     if (isForeignBot || isBotSenderType) return;
@@ -22625,13 +23113,6 @@ async function handleThreadReplyAdmitted(
   // record would time out, and the notice would ask for the answer just sent.
   if (ds && threadTrustedCaller
     && await trySettleCrossPrincipalProposerChoice(ds, threadTrustedCaller, cmdContent, parsed.mentions)) {
-    markIngressAdmitted(ctx);
-    return;
-  }
-  // Bot owner leg of the same gate: a plain-text 采纳并重新执行/不采纳 reply to
-  // the bot owner notice settles awaiting_owner without a choice card.
-  if (ds && threadTrustedCaller
-    && await trySettleCrossPrincipalOwnerChoice(ds, threadTrustedCaller, cmdContent, parsed.mentions)) {
     markIngressAdmitted(ctx);
     return;
   }
@@ -23336,6 +23817,7 @@ async function handleThreadReplyAdmitted(
   // Daemon-side hint: divert an already-known different principal before IPC.
   // The worker remains authoritative and hands a raced rejection back through
   // onOrdinaryImInputRejected; both paths converge on the same durable record.
+  const serialGroupInput = isSerialGroupInput(ds, threadTrustedCaller);
   //
   // Gated by the experimental XPI switch (default OFF). Off ⇒ fall through to
   // the existing-owner route below, i.e. deliver the message like any other —
@@ -23344,6 +23826,7 @@ async function handleThreadReplyAdmitted(
   const activePrincipalTurn = ds.activeInteractiveTurn;
   if (config.crossPrincipalInterruption
     && activePrincipalTurn
+    && !serialGroupInput
     && threadTrustedCaller
     && !sameTrustedPrincipal(activePrincipalTurn.caller, threadTrustedCaller)
     && !sameTrustedPrincipal(activePrincipalTurn.controller, threadTrustedCaller)) {
@@ -23541,7 +24024,12 @@ async function handleThreadReplyAdmitted(
         markIngressAdmitted(ctx);
         beginNewTurn(ds, parsed.content, parsed.messageId);
         if (threadTrustedCaller) {
-          setActiveInteractiveTurn(ds, parsed.messageId, threadTrustedCaller);
+          setActiveInteractiveTurn(
+            ds,
+            parsed.messageId,
+            threadTrustedCaller,
+            stripCrossPrincipalAsToken(parsed.content).text,
+          );
         }
         rememberLastCliInput(ds, promptContent, cliInput);
       }
@@ -23947,6 +24435,7 @@ async function handleThreadReplyAdmitted(
           ? (ds.session.queuedActivationTurnId ?? `queued-opening:${ds.session.sessionId}`)
           : parsed.messageId,
         threadTrustedCaller,
+        queuedHasDurableTail ? undefined : stripCrossPrincipalAsToken(parsed.content).text,
       );
     }
     // Record the input as the session's last real CLI turn ONLY after the fork
@@ -25528,14 +26017,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           + `session=${ds.session.sessionId.slice(0, 8)} attempt=${terminal.dispatchAttempt}`,
         );
       }
+      const shouldAdvanceCrossPrincipal = completedTurnHasCrossPrincipalFollower(ds, terminal);
       if (ds.activeInteractiveTurn?.turnId === terminal.turnId) {
         ds.activeInteractiveTurn = undefined;
-        if (terminal.status === 'completed') {
-          queueMicrotask(() => {
-            void confirmNextCrossPrincipalSuggestion(ds);
-            void driveCrossPrincipalInterruptions(ds);
-          });
-        }
+      }
+      if (shouldAdvanceCrossPrincipal) {
+        queueMicrotask(() => {
+          void confirmNextCrossPrincipalSuggestion(ds);
+          void driveCrossPrincipalInterruptions(ds);
+        });
       }
       // Feedback turn-completion persistence is a synchronous node:sqlite write.
       // Route it through the nonblocking, tracked retry queue so a cross-process
@@ -25703,6 +26193,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     logger.error(`[idempotency] boot reconcile failed to converge — aborting bot startup (fail-closed): ${err instanceof Error ? err.message : err}`);
     throw err instanceof Error ? err : new Error(String(err));
   }
+  // A daemon may have been offline when Dashboard persisted XPI=false, so it
+  // could not acknowledge the live cleanup fan-out. Sweep its owned store on
+  // every OFF boot before IPC or session restore can revive historical staged
+  // input. The explicit disable IPC below is unconditional on purpose: another
+  // process may still hold the 2s global-config cache from before the write.
+  if (!config.crossPrincipalInterruption) {
+    cancelAllCrossPrincipalInterruptionsForFeatureDisable();
+  }
   // Release durable mojo containment handles a REBOOT provably killed, BEFORE the
   // device-isolation activation inventory ever synthesises a blocker from them —
   // otherwise a post-reboot handle keeps blocking activation forever (round-11
@@ -25761,6 +26259,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // could slip past the 503 barrier. Armed-first means the very first accepted
   // connection already sees the not-ready gate.
   if (coreOnly) armCoreOnlyReadinessGate();
+  setCrossPrincipalInterruptionDisableHandler(() => cancelAllCrossPrincipalInterruptionsForFeatureDisable());
   const ipcHandle = await startIpcServer({
     port: ipcPort,
     host: '127.0.0.1',
@@ -26869,6 +27368,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // refused and never persisted (delivery cannot be reconstructed to
     // completed/failed/cancelled after the fact). Keep the queue and dispatcher
     // live through worker teardown.
+    await (await import('./services/constrained-invocation/daemon.js')).closeConstrainedInvocations();
     stopMaintenance();
     vcMeetingTerminalReconciler?.stop();
     clearInterval(vcMeetingDeliveryLeaseTimer);
@@ -27110,6 +27610,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // the descriptor so the dashboard doesn't see a phantom daemon.
   process.on('exit', () => {
     setSupervisorShutdownHandler(null);
+    setCrossPrincipalInterruptionDisableHandler(null);
     clearInterval(descriptorHeartbeat);
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);

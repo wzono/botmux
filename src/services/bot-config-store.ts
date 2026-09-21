@@ -17,7 +17,7 @@ import { config } from '../config.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { rmwBotEntry } from './config-store.js';
 import { resolveAllowedUsersWithMap } from '../im/lark/client.js';
-import { CLI_OPTIONS, resolveCliId } from '../setup/bot-config-editor.js';
+import { CLI_SELECT_OPTIONS, resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
 import { expandHomePath } from '../utils/working-dir.js';
 import { resolveTeamRoleFile } from '../core/role-resolver.js';
 import { existsSync, readFileSync, statSync } from 'node:fs';
@@ -28,6 +28,7 @@ import { parseCustomPassthroughInput, parseCanTalkDaemonCommandsInput } from '..
 import { parseStartupCommandsInput } from '../core/startup-commands.js';
 import { isReservedPerBotEnvKey, sanitizePerBotEnv } from '../core/per-bot-env.js';
 import { normalizeFeedbackPolicy } from './feedback-policy.js';
+import { normalizeOncallGroupPolicy } from './oncall-group-policy.js';
 import { normalizeFeedbackPolicyLayer, type FeedbackPolicyLayer } from './feedback-policy-resolver.js';
 import {
   notifyPinStreamingCardChanged,
@@ -43,6 +44,7 @@ import {
   MIN_CARD_ACTION_ACK_TIMEOUT_MS,
 } from '../core/card-action-ack.js';
 import { parseHiddenStreamingCardButtonsInput } from '../im/lark/streaming-card-buttons.js';
+import { validateCliLaunchModeConfig } from '../core/cli-launch-mode.js';
 import { defaultReplyDeliveryFor, supportsTranscriptReplyDelivery } from '../core/reply-delivery.js';
 
 /**
@@ -106,6 +108,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'allowedUsers', configKey: 'allowedUsers', kind: 'allowedUsers', effect: 'immediate', clearable: false, hint: '管理员名单（邮箱/on_/ou_，逗号或空格分隔）；改后需加 确认' },
   { key: 'skills', configKey: 'skills', kind: 'json', effect: 'next-session', clearable: true, hint: 'bot 级 skill policy JSON；unset 回底层 CLI 默认行为' },
   { key: 'feedback', configKey: 'feedback', kind: 'json', effect: 'immediate', clearable: true, hint: '最终回答反馈 JSON；默认关闭，enabled=true 后按本 bot 启用；unset 关闭' },
+  { key: 'oncallGroup', configKey: 'oncallGroup', kind: 'json', effect: 'immediate', clearable: true, hint: '拉起 Oncall 群按钮：enabled 开关及 chatIds 生效群，默认关闭' },
   { key: 'disableStreamingCard', configKey: 'disableStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭实时流式卡片 on|off' },
   { key: 'replyCardMode', configKey: 'replyCardMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['legacy', 'unified'], hint: '回答展示方式（下一轮生效）：legacy=默认模式｜unified=动态单卡模式；动态单卡限 Claude Code/Codex 普通飞书对话' },
   { key: 'hiddenStreamingCardButtons', configKey: 'hiddenStreamingCardButtons', kind: 'stringList', effect: 'immediate', clearable: true, parseList: parseHiddenStreamingCardButtonsInput, hint: '隐藏实时卡片按钮，逗号/空格分隔：output terminal writeLink compact stop close；unset 恢复全部' },
@@ -224,7 +227,9 @@ export function getConfigSnapshot(larkAppId: string): {
   const cfg = bot.config;
   const rows: ConfigSnapshotRow[] = CONFIG_FIELDS.map(spec => ({
     key: spec.key,
-    value: formatFieldValue(spec, (cfg as any)[spec.configKey], cfg),
+    value: spec.kind === 'cli'
+      ? selectionKeyForBot(cfg.cliId, cfg.wrapperCli, cfg.cliLaunchMode)
+      : formatFieldValue(spec, (cfg as any)[spec.configKey], cfg),
     effect: spec.effect,
   }));
   return {
@@ -281,11 +286,12 @@ async function applyConfigFieldInternal(
   const previousPinStreamingCard = spec.configKey === 'pinStreamingCard'
     ? bot.config.pinStreamingCard === true
     : undefined;
-  const oldText = formatFieldValue(spec, (bot.config as any)[spec.configKey], bot.config);
+  const oldText = spec.kind === 'cli'
+    ? selectionKeyForBot(bot.config.cliId, bot.config.wrapperCli, bot.config.cliLaunchMode)
+    : formatFieldValue(spec, (bot.config as any)[spec.configKey], bot.config);
 
   // 空数组（stringList 全被过滤）等价清除，bots.json 保持干净。
-  // replyDelivery 的 send / transcript 都显式落盘：缺省按 CLI 走（claude-code 缺省
-  // transcript），`set send` 是 claude-code 退回旧行为的唯一方式；只有 unset 才删 key。
+  // replyDelivery 的 send / transcript 都显式落盘；缺省为 send，只有 unset 才删 key。
   const effective = spec.kind === 'stringList' && Array.isArray(value) && value.length === 0 ? null
     : value;
 
@@ -294,11 +300,20 @@ async function applyConfigFieldInternal(
       entry.replyCardMode = 'unified';
       entry.disableStreamingCard = true;
     }
+    const cliSelection = spec.kind === 'cli' && effective !== null
+      ? typeof effective === 'string'
+        ? resolveCliSelection(effective)
+        : effective && typeof effective === 'object' && !Array.isArray(effective)
+          ? effective as ReturnType<typeof resolveCliSelection>
+          : undefined
+      : undefined;
     const currentCliId = typeof entry.cliId === 'string' && entry.cliId.trim()
       ? entry.cliId.trim()
       : bot.config.cliId;
-    const nextCliId = spec.configKey === 'cliId' && effective !== null && typeof effective === 'string'
-      ? effective.trim()
+    const nextCliId = cliSelection
+      ? cliSelection.cliId
+      : spec.configKey === 'cliId' && effective !== null && typeof effective === 'string'
+        ? effective.trim()
       : currentCliId;
     const currentModel = typeof entry.model === 'string' && entry.model.trim()
       ? entry.model.trim()
@@ -331,7 +346,26 @@ async function applyConfigFieldInternal(
         && !supportsTranscriptReplyDelivery(nextCliId)) {
       return { write: false, result: 'reply_delivery_unsupported' };
     }
-    if (effective === null) {
+    if (cliSelection) {
+      entry.cliId = cliSelection.cliId;
+      if (cliSelection.wrapperCli) entry.wrapperCli = cliSelection.wrapperCli;
+      else delete entry.wrapperCli;
+      if (cliSelection.cliLaunchMode) entry.cliLaunchMode = cliSelection.cliLaunchMode;
+      else delete entry.cliLaunchMode;
+      try {
+        validateCliLaunchModeConfig({
+          cliId: entry.cliId,
+          cliLaunchMode: entry.cliLaunchMode,
+          wrapperCli: entry.wrapperCli,
+          cliRuntime: entry.cliRuntime,
+          cliPathOverride: entry.cliPathOverride,
+          sandbox: entry.sandbox,
+          readIsolation: entry.readIsolation,
+        });
+      } catch (e) {
+        return { write: false, result: `invalid_cli_launch_mode: ${(e as Error).message}` };
+      }
+    } else if (effective === null) {
       delete entry[spec.configKey];
     } else if (spec.kind === 'boolean') {
       // 只持久化「非默认」的一侧，bots.json 保持干净：默认 OFF 的字段 true 才写、
@@ -355,7 +389,18 @@ async function applyConfigFieldInternal(
   if (r.result) return { ok: false, reason: r.result };
 
   // 同步内存 config（与 oncall/grant-prefs store 一致，路由/spawn 不重启即生效）。
-  if (effective === null) {
+  const cliSelection = spec.kind === 'cli' && effective !== null
+    ? typeof effective === 'string'
+      ? resolveCliSelection(effective)
+      : effective && typeof effective === 'object' && !Array.isArray(effective)
+        ? effective as ReturnType<typeof resolveCliSelection>
+        : undefined
+    : undefined;
+  if (cliSelection) {
+    bot.config.cliId = cliSelection.cliId;
+    bot.config.wrapperCli = cliSelection.wrapperCli;
+    bot.config.cliLaunchMode = cliSelection.cliLaunchMode;
+  } else if (effective === null) {
     (bot.config as any)[spec.configKey] = undefined;
   } else if (spec.kind === 'boolean') {
     (bot.config as any)[spec.configKey] = spec.defaultOn
@@ -366,10 +411,12 @@ async function applyConfigFieldInternal(
   } else {
     (bot.config as any)[spec.configKey] = effective;
   }
-  if (spec.configKey === 'cliId' && !isConfigurableReasoningCliId(String(effective ?? bot.config.cliId))) {
+  if (spec.configKey === 'cliId' && !isConfigurableReasoningCliId(bot.config.cliId)) {
     bot.config.reasoningEffort = undefined;
   }
-  const newText = formatFieldValue(spec, (bot.config as any)[spec.configKey], bot.config);
+  const newText = spec.kind === 'cli'
+    ? selectionKeyForBot(bot.config.cliId, bot.config.wrapperCli, bot.config.cliLaunchMode)
+    : formatFieldValue(spec, (bot.config as any)[spec.configKey], bot.config);
   if (spec.configKey === 'feedback') {
     try {
       const path = sendCredFilePath(config.session.dataDir, larkAppId);
@@ -684,8 +731,7 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
         : { ok: false, reason: 'invalid_enum' };
     case 'cli': {
       try {
-        const id = resolveCliId(s);
-        return id ? { ok: true, value: id } : { ok: false, reason: 'invalid_cli' };
+        return { ok: true, value: resolveCliSelection(s) };
       } catch { return { ok: false, reason: 'invalid_cli' }; }
     }
     case 'dir': {
@@ -695,6 +741,7 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
     case 'json': {
       try {
         const parsed = JSON.parse(s);
+        if (spec.configKey === 'oncallGroup') return { ok: true, value: normalizeOncallGroupPolicy(parsed) };
         if (spec.configKey === 'skills') {
           const policy = readBotSkillPolicy(parsed);
           return policy ? { ok: true, value: policy } : { ok: false, reason: 'invalid_json' };
@@ -795,8 +842,8 @@ export function getConfigCardData(larkAppId: string, modelChoices: readonly stri
   return {
     larkAppId,
     botName: cfg.displayName ?? bot.botName ?? cfg.cliId,
-    cliId: cfg.cliId,
-    cliOptions: CLI_OPTIONS.map(o => ({ id: o.id, label: o.label })),
+    cliId: selectionKeyForBot(cfg.cliId, cfg.wrapperCli, cfg.cliLaunchMode),
+    cliOptions: CLI_SELECT_OPTIONS.map(o => ({ id: o.key, label: o.label })),
     model: cfg.model ?? null,
     modelChoices: [...modelChoices],
     lang: cfg.lang ?? null,

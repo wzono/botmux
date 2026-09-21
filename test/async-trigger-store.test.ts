@@ -32,6 +32,7 @@ import {
   recordCompleted,
   recordFailedStrict,
   recordTerminalFailureStrict,
+  recordInterruptedStrict,
   lookup,
   lookupStrict,
   deleteResults,
@@ -250,6 +251,24 @@ describe('recordTerminalFailureStrict (explicit worker terminal)', () => {
       'sessTC', 'trg_tc', 7000, 'cli_test', 'provider_server_error',
     )).toBe('already_completed');
     expect(lookup('sessTC', 'trg_tc')?.result.status).toBe('completed');
+  });
+});
+
+describe('recordInterruptedStrict', () => {
+  it('persists an exact interrupt and preserves the original creation instant', () => {
+    recordPending('sessI', 'trg_i', 1000, 'cli_test');
+    expect(recordInterruptedStrict('sessI', 'trg_i', 7000, 'cli_test')).toBe('written_failed');
+    expect(lookup('sessI', 'trg_i')?.result).toMatchObject({
+      status: 'interrupted', createdAt: 1000, interruptedAt: 7000,
+    });
+  });
+
+  it('does not overwrite an interrupt with a late final or worker terminal', () => {
+    recordPending('sessIL', 'trg_i', 1000, 'cli_test');
+    recordInterruptedStrict('sessIL', 'trg_i', 7000, 'cli_test');
+    recordCompleted('sessIL', 'trg_i', 'late answer', 8000, 'cli_test');
+    recordTerminalFailureStrict('sessIL', 'trg_i', 9000, 'cli_test', 'provider_error');
+    expect(lookup('sessIL', 'trg_i')?.result.status).toBe('interrupted');
   });
 });
 

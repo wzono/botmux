@@ -392,6 +392,10 @@ export interface DaemonSession {
   activeInteractiveTurn?: {
     turnId: string;
     caller: import('../types.js').TrustedCaller;
+    /** Business prompt before daemon-owned quote/application wrappers. Kept
+     * only in memory so an approved XPI suggestion can replay the owner's
+     * actual request instead of duplicating transport context. */
+    userPrompt?: string;
     /** Stable authenticated task/session owner, when distinct from the caller
      * that happened to start the current CLI turn. */
     controller?: import('../types.js').TrustedCaller;
@@ -527,13 +531,14 @@ export interface DaemonSession {
    *  `latestAsyncTriggerId`; callers that need exact-match semantics can also
    *  pass the triggerId returned by the initial async activation response. */
   asyncTriggerResults?: Map<string, {
-    status: 'pending' | 'completed' | 'failed';
+    status: 'pending' | 'completed' | 'failed' | 'interrupted';
     createdAt: number;
     completedAt?: number;
     failedAt?: number;
     content?: string;
     errorCode?: 'trigger_failed';
     terminalErrorCode?: string;
+    interruptedAt?: number;
     usage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreateTokens: number };
   }>;
   latestAsyncTriggerId?: string;
