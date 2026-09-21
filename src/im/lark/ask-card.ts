@@ -430,6 +430,21 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
             },
       }));
       appendActionRows(elements, optionButtons);
+
+      // 选项的详细说明（Claude Code AskUserQuestion 的 options[].description）：
+      // 飞书按钮无副标题，在按钮行下方用小字列出 label → description；缺省不渲染。
+      const described = q.options.filter((opt) => opt.description?.trim());
+      if (described.length > 0) {
+        elements.push({
+          tag: 'div',
+          text: {
+            tag: 'lark_md',
+            content: described
+              .map((opt) => `**${escapeMd(truncate(opt.label, 120, locale))}**：${escapeMd(truncate(opt.description!.trim(), 400, locale))}`)
+              .join('\n'),
+          },
+        });
+      }
     }
 
     if (requiresSubmit) {
