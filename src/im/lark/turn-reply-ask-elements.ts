@@ -17,7 +17,13 @@ export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 
     tag: 'column', width: 'auto', elements: [b],
   })) });
   ask.questions.forEach((q, i) => {
-    elements.push({ tag: 'markdown', content: safe(q.prompt) });
+    // 显式 `botmux ask --mention` 的点名（daemon 已剔除 bot open_id）：嵌入
+    // turn-reply 卡时同样要保留真实 <at>，不能走 safe()——safe 会把 at 抹成
+    // [mention]，通知触达丢失。仅第一问前注入一次。
+    const mentionPrefix = i === 0 && ask.mentionedOpenId
+      ? `<at id=${ask.mentionedOpenId}></at>\n`
+      : '';
+    elements.push({ tag: 'markdown', content: `${mentionPrefix}${safe(q.prompt)}` });
     const selected = new Set(ask.selections?.[i] ?? []);
     const buttons = q.options.map(option => ({
       ...button(option.label,

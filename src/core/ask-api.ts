@@ -23,6 +23,9 @@ export interface AskApiBody {
   /** Caller kind ('hook' | 'explicit' | …) namespacing the identity so an
    *  explicit `botmux ask` can't re-claim a hook ask's card. Optional. */
   originKind?: string;
+  /** 显式 `botmux ask --mention <open_id>` 要 @ 的人类成员。daemon 会在发卡前
+   *  剔除 bot open_id（卡片 at bot 触发 100290）。 */
+  mentionedOpenId?: string;
 }
 
 export type AskApiBodyError =
@@ -37,12 +40,17 @@ export type AskApiBodyError =
   | 'bad_option_shape'
   | 'bad_option_key'
   | 'bad_option_label'
+  | 'bad_option_description'
   | 'duplicate_option_key'
   | 'bad_questions'
   | 'bad_question_shape'
   | 'bad_multiSelect'
   | 'bad_requestId'
-  | 'bad_originKind';
+  | 'bad_originKind'
+  | 'bad_mentionedOpenId';
+
+/** 选项说明长度上限（卡片渲染还会再截到 400 字，这里只给 IPC/持久化兜底）。 */
+const MAX_OPTION_DESCRIPTION = 1000;
 
 /** 校验单个 option 对象，返回解析后的 AskOption 或错误码。 */
 function parseOption(o: unknown): AskOption | AskApiBodyError {
@@ -50,7 +58,18 @@ function parseOption(o: unknown): AskOption | AskApiBodyError {
   const oo = o as Record<string, unknown>;
   if (typeof oo.key !== 'string' || !oo.key.trim()) return 'bad_option_key';
   if (typeof oo.label !== 'string') return 'bad_option_label';
-  return { key: oo.key, label: oo.label };
+  // 可选 description（Claude Code/OpenCode 的 AskUserQuestion 把选项详细解释放
+  // 这里）。此前该校验器只回 {key,label}，把 hook 已透传的说明静默丢弃——卡片
+  // 渲染端永远拿不到，用户只看到按钮。空白归一化为 undefined（与 hook 适配器
+  // 一致），非字符串/超长 fail loud。
+  let description: string | undefined;
+  if (oo.description !== undefined && oo.description !== null) {
+    if (typeof oo.description !== 'string') return 'bad_option_description';
+    const trimmed = oo.description.trim();
+    if (trimmed.length > MAX_OPTION_DESCRIPTION) return 'bad_option_description';
+    if (trimmed) description = trimmed;
+  }
+  return description ? { key: oo.key, label: oo.label, description } : { key: oo.key, label: oo.label };
 }
 
 /** 校验 questions[] 数组，返回解析后的 AskQuestion[] 或错误码。 */
@@ -116,6 +135,18 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     }
     originKind = r.originKind;
   }
+  let mentionedOpenId: string | undefined;
+  if (r.mentionedOpenId !== undefined && r.mentionedOpenId !== null) {
+    // 卡片 `<at id=…>` 只接受 open_id（`ou_` 前缀）。union_id/user_id 等其它
+    // ID 形态进了卡片会整条被飞书拒掉，这里 fail loud。
+    if (
+      typeof r.mentionedOpenId !== 'string'
+      || !/^ou_[A-Za-z0-9]{6,64}$/.test(r.mentionedOpenId)
+    ) {
+      return { error: 'bad_mentionedOpenId' };
+    }
+    mentionedOpenId = r.mentionedOpenId;
+  }
 
   let questions: AskQuestion[];
 
@@ -155,5 +186,6 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     timeoutMs: r.timeoutMs,
     ...(requestId !== undefined ? { requestId } : {}),
     ...(originKind !== undefined ? { originKind } : {}),
+    ...(mentionedOpenId !== undefined ? { mentionedOpenId } : {}),
   };
 }

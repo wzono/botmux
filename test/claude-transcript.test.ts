@@ -7,7 +7,7 @@
  *   - extractAssistantText / joinAssistantText concatenate multi-block text.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, appendFileSync, openSync, writeSync, closeSync, ftruncateSync, utimesSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, appendFileSync, openSync, writeSync, closeSync, ftruncateSync, utimesSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, basename } from 'node:path';
 import { shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.js';
@@ -287,6 +287,30 @@ describe('classifyClaudeTerminalEvent', () => {
     expect(classifyClaudeTerminalEvent(ev)).toEqual({
       status: 'failed',
       errorCode,
+      retryable: false,
+    });
+  });
+
+  it('classifies the under-sized image 400 as a poisoned-session failure, not generic invalid request', () => {
+    const ev: TranscriptEvent = {
+      type: 'assistant',
+      uuid: 'image-too-small',
+      isApiErrorMessage: true,
+      error: 'unknown',
+      apiErrorStatus: 400,
+      message: {
+        role: 'assistant',
+        stop_reason: 'stop_sequence',
+        content: [{
+          type: 'text',
+          text: 'API Error: 400 image data 0 failed: Image dimensions are too small. Minimum allowed dimension: 14 pixels. Current dimensions: width = 1, height = 1.',
+        }],
+      },
+    };
+
+    expect(classifyClaudeTerminalEvent(ev)).toEqual({
+      status: 'failed',
+      errorCode: 'provider_image_too_small',
       retryable: false,
     });
   });
@@ -650,6 +674,58 @@ describe('findJsonlContainingFingerprint', () => {
       3_000_000,
     );
     expect(findJsonlContainingFingerprint(projectDir, 'please run the bridge tests')).toBe(userPane);
+  });
+
+  // Regression: a prompt submitted while a Task tool agent is running is
+  // delivered to the subagent and recorded as a user event in
+  // <projectDir>/<sid>/subagents/agent-*.jsonl ("The user sent a new message
+  // while you were working: …"). The session jsonl the bridge watches gets no
+  // user event until the agent reports back, so a top-level-only fingerprint
+  // scan produced a false submit_unconfirmed even though the prompt ran.
+  it('finds a prompt delivered to a running Task subagent only when subagent scan is enabled', () => {
+    const sid = '11111111-2222-3333-4444-555555555555';
+    const subDir = join(projectDir, sid, 'subagents');
+    mkdirSync(subDir, { recursive: true });
+    const subagent = join(subDir, 'agent-aaaaaaaa.jsonl');
+    const ev = {
+      type: 'user',
+      timestamp: '2026-09-17T03:39:54.000Z',
+      message: {
+        role: 'user',
+        content: 'The user sent a new message while you were working: 那先提交&push 一波把',
+      },
+    };
+    writeFileSync(subagent, JSON.stringify(ev) + '\n');
+    utimesSync(subagent, 2_000_000, 2_000_000);
+
+    expect(findJsonlContainingFingerprint(projectDir, '那先提交&push 一波把')).toBeNull();
+    expect(findJsonlContainingFingerprint(projectDir, '那先提交&push 一波把', {
+      includeSubagentTranscripts: true,
+    })).toBe(subagent);
+  });
+
+  it('respects minMtimeMs for subagent transcripts', () => {
+    const sid = '11111111-2222-3333-4444-555555555555';
+    const subDir = join(projectDir, sid, 'subagents');
+    mkdirSync(subDir, { recursive: true });
+    const subagent = join(subDir, 'agent-aaaaaaaa.jsonl');
+    writeFileSync(subagent, '{"type":"user","message":{"role":"user","content":"repeatable short prompt"}}\n');
+    utimesSync(subagent, 1_000_000, 1_000_000);
+    expect(findJsonlContainingFingerprint(projectDir, 'repeatable short prompt', {
+      includeSubagentTranscripts: true,
+      minMtimeMs: 1_500_000_000,
+    })).toBeNull();
+  });
+
+  it('does not descend into non-session-named subdirectories', () => {
+    const rogue = join(projectDir, 'some-other-folder', 'subagents');
+    mkdirSync(rogue, { recursive: true });
+    const rogueFile = join(rogue, 'agent-x.jsonl');
+    writeFileSync(rogueFile, '{"type":"user","message":{"role":"user","content":"fingerprint-in-nested-folder"}}\n');
+    utimesSync(rogueFile, 2_000_000, 2_000_000);
+    expect(findJsonlContainingFingerprint(projectDir, 'fingerprint-in-nested-folder', {
+      includeSubagentTranscripts: true,
+    })).toBeNull();
   });
 });
 

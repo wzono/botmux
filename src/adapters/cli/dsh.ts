@@ -2,6 +2,7 @@ import { fileURLToPath } from 'node:url';
 import { existsSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommandReal } from './registry.js';
 import type { CliAdapter, PtyHandle } from './types.js';
@@ -38,6 +39,28 @@ function configuredDshHome(): string {
 function dshAuthPaths(): string[] {
   const configured = process.env.DSH_HOME?.trim();
   return configured ? ['~/.dsh', configured] : ['~/.dsh'];
+}
+
+/**
+ * Extract the DSH_HOME a wrapper script (e.g. dsh-super-relay) bakes in, so
+ * the runner reads the same settings.yaml the dsh process will use.
+ *
+ * Wrapper scripts set `export DSH_HOME=...` and then `exec dsh "$@"`. We
+ * source the script with `exec` stubbed out (and `set -e` neutralised) so the
+ * real dsh binary never runs, then read the exported DSH_HOME. Returns
+ * undefined when the script does not set DSH_HOME (e.g. dsh-trae), leaving
+ * the default ~/.dsh in place.
+ */
+function resolveDshHomeFromWrapper(scriptPath: string): string | undefined {
+  try {
+    const out = execFileSync('bash', [
+      '-c',
+      `set() { :; }; exec() { :; }; source "${scriptPath}" >/dev/null 2>&1; printf '%s' "${'$DSH_HOME'}"`,
+    ], { encoding: 'utf8' });
+    return out.length > 0 ? out : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function createDshAdapter(pathOverride?: string): CliAdapter {
@@ -77,6 +100,16 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
     },
 
     buildArgs({ sessionId, workingDir, botName, botOpenId, locale, model, turnTimeoutMs, dshProfile }) {
+      // The wrapper script (e.g. dsh-super-relay) may pin DSH_HOME to a
+      // separate settings.yaml. Surface it onto the worker env so the runner
+      // (which reads settings.yaml for the default provider) and the dsh
+      // process agree on which home they're using. Without this, the runner
+      // reads ~/.dsh/settings.yaml while dsh reads ~/.dsh-super-relay/settings.yaml
+      // → "no adapter registered for provider" mismatch.
+      const resolvedBin = cachedDshBin ??= resolveCommandReal(rawDshBin);
+      const wrapperDshHome = resolveDshHomeFromWrapper(resolvedBin);
+      if (wrapperDshHome) process.env.DSH_HOME = wrapperDshHome;
+
       // Pre-create the native dsh home + sessions subdir in the real HOME
       // before the worker enters the sandbox: the sandbox's keepExisting
       // filter drops authPaths that don't exist yet, and the runner can't
@@ -90,7 +123,7 @@ export function createDshAdapter(pathOverride?: string): CliAdapter {
       const args = [
         runnerArgv0('dsh-runner', runnerPath()),
         '--session-id', sessionId,
-        '--dsh-bin', (cachedDshBin ??= resolveCommandReal(rawDshBin)),
+        '--dsh-bin', resolvedBin,
       ];
       pushOpt(args, '--cwd', workingDir);
       pushOpt(args, '--bot-name', botName);

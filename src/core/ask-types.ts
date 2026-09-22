@@ -140,6 +140,11 @@ export interface CreateAskInput {
   /** Display name of a bot answerer, rendered as plain text in place of the
    * unsupported card `<at>`. Only consulted when answererIsBot is true. */
   answererDisplayName?: string;
+  /** 显式 `botmux ask --mention <open_id>` 要 @ 的人（仅人类 open_id；bot 的
+   *  open_id 在卡片里会触发 100290，daemon 侧会识别并剔除）。daemon 在卡片
+   *  问题正文前注入真实 `<at>`，确保接收者能收到通知——卡片不像回复消息那样
+   *  天然带 @。 */
+  mentionedOpenId?: string;
 }
 
 /** Daemon-internal state for a pending ask. Not exported on the IPC boundary —
@@ -169,6 +174,8 @@ export interface PendingAsk {
    * render these without an `<at>` tag. */
   answererIsBot?: boolean;
   answererDisplayName?: string;
+  /** 显式 ask 要 @ 的人类 open_id（见 CreateAskInput.mentionedOpenId）。 */
+  mentionedOpenId?: string;
   /** 问题列表，替代旧的 `options` + `prompt`。 */
   questions: ReadonlyArray<AskQuestion>;
   /** 当前已勾选答案快照。仅 daemon/card 内部使用；CLI IPC 边界不暴露。 */

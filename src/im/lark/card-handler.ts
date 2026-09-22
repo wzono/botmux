@@ -2334,7 +2334,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     );
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'retry_turn', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', 'stop_turn', 'compact_session', 'quote_confirm'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'retry_turn', 'purge_images_continue', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', 'stop_turn', 'compact_session', 'quote_confirm'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -3351,6 +3351,89 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ),
         },
       };
+    }
+
+    if (actionType === 'purge_images_continue' && ds) {
+      const locDs = localeForBot(ds.larkAppId);
+      // Same gates as retry_turn, plus the /restart gate set: the worker action
+      // rewrites the transcript and respawns --resume, which shared-adopt and
+      // remote backends must never do.
+      if (isSessionTransferring(ds)) {
+        return {
+          toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, locDs) },
+        };
+      }
+      if (isSharedAdoptSession(ds) || isRemoteBackendSession(ds)) {
+        return { toast: { type: 'warning', content: t('card.action.purge_images_unsupported', undefined, locDs) } };
+      }
+      if (sessionCliId(ds) !== 'claude-code') {
+        return { toast: { type: 'warning', content: t('card.action.purge_images_unsupported', undefined, locDs) } };
+      }
+      if (hasProtectedSessionMutationOwnership(ds)) {
+        return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
+      }
+      const failedTurn = ds.session.lastFailedTurn;
+      if (!failedTurn) {
+        return { toast: { type: 'warning', content: t('card.action.retry_turn_missing', undefined, locDs) } };
+      }
+      const clickedTurnId = value?.turn_id;
+      if (!clickedTurnId || clickedTurnId !== failedTurn.turnId) {
+        logger.info(
+          `[${tag(ds)}] purge_images_continue from stale card (clicked=${clickedTurnId?.slice(0, 8) ?? 'none'} `
+          + `current=${failedTurn.turnId.slice(0, 8)}) — refused`,
+        );
+        return { toast: { type: 'warning', content: t('card.action.retry_turn_stale', undefined, locDs) } };
+      }
+      const cooldownMs = retryCooldownRemaining(failedTurn);
+      if (cooldownMs > 0) {
+        return {
+          toast: {
+            type: 'warning',
+            content: t('card.action.retry_turn_cooldown', { seconds: Math.ceil(cooldownMs / 1000) }, locDs),
+          },
+        };
+      }
+      if ((!ds.worker || ds.worker.killed) && hasProtectedSessionMutationOwnership(ds)) {
+        return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
+      }
+      const submittedContent = buildTurnContinuePrompt();
+      let accepted = false;
+      try {
+        if (ds.worker && !ds.worker.killed) {
+          // Same turnId handling as retry_turn: do NOT reuse failedTurn.turnId —
+          // that om_ id is a committed ordinary turn and the worker would dedupe
+          // it before reaching the purge branch.
+          accepted = sendWorkerInput(ds, { content: submittedContent }, undefined, {
+            purgeUndersizedImages: true,
+          });
+        } else {
+          // No live worker: nothing to purge-and-respawn. Reject rather than
+          // silently doing a plain fork that would replay the poisoned file.
+          accepted = false;
+        }
+      } catch (err) {
+        logger.warn(
+          `[${tag(ds)}] purge_images_continue failed before acceptance: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      if (!accepted) {
+        return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
+      }
+      markRetryAttempt(ds.session);
+      rememberLastCliInput(ds, failedTurn.userPrompt, { content: submittedContent });
+      sessionStore.updateSession(ds.session);
+      ds.lastScreenStatus = 'working';
+      ds.streamCardPending = true;
+      ds.currentTurnTitle = (failedTurn.userPrompt || ds.currentTurnTitle || ds.session.title
+        || getCliDisplayName(sessionCliId(ds))).substring(0, 50);
+      ds.currentImageKey = undefined;
+      persistStreamCardState(ds);
+      logger.info(
+        `[${tag(ds)}] purge_images_continue accepted for turn ${failedTurn.turnId.slice(0, 8)} `
+        + `(attempt #${ds.session.lastFailedTurn?.retryCount ?? 1})`,
+      );
+      return { toast: { type: 'success', content: t('card.action.purge_images_started', undefined, locDs) } };
     }
 
     if (actionType === 'tui_keys' && ds) {

@@ -80,6 +80,8 @@ export interface PersistedAsk {
    * the re-sent card keeps omitting the unsupported `<at id=botOpenId>`. */
   answererIsBot?: boolean;
   answererDisplayName?: string;
+  /** 显式 ask 要 @ 的人类 open_id，跨重启保留以保证重发卡片仍带通知。 */
+  mentionedOpenId?: string;
   questions: ReadonlyArray<AskQuestion>;
   createdAt: number;
   deadlineAt: number;

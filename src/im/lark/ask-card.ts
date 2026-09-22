@@ -362,15 +362,15 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
     tag: 'div',
     fields: [
       { is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.deadline', undefined, locale)}**\n${escapeMd(deadline)}` } },
-      { is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.answerable', undefined, locale)}**\n${escapeMd(approverSummary(ask, locale))}` } },
+      { is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.answerable', undefined, locale)}**\n${escapeMdPreservingAt(approverSummary(ask, locale))}` } },
     ],
   };
 
   const elements: Array<Record<string, unknown>> = [metaDiv];
 
   if (status) {
-    // 已 settle：保留原问题内容，再展示状态摘要。审批卡若在点击后
-    // 只留下「已选择」，审批人就无法回看自己批准了什么。
+    // 已 settle：展示状态摘要，无可交互组件。保留原问题正文，让审批人能回看
+    // 自己批准的内容；at 标签按原样保留（不能 escape 掉 id 下划线）。
     elements.push({ tag: 'hr' });
     for (let i = 0; i < ask.questions.length; i++) {
       const q = ask.questions[i]!;
@@ -378,7 +378,7 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
         tag: 'div',
         text: {
           tag: 'lark_md',
-          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeMd(truncate(q.prompt, 512, locale))}`,
+          content: `**${t('card.ask.question_n', { n: i + 1}, locale)}**\n${escapeMdPreservingAt(truncate(q.prompt, 512, locale))}`,
         },
       });
     }
@@ -397,12 +397,19 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
     for (let i = 0; i < ask.questions.length; i++) {
       const q = ask.questions[i]!;
 
+      // 显式 `botmux ask --mention <open_id>` 的点名：卡片不像回复消息天然带 @，
+      // daemon 已保证这里的 open_id 是人类（bot 会触发 100290 被剔除），故可安全
+      // 注入真实 `<at>`。只在第一问前注入一次即可触达通知。
+      const mentionPrefix = i === 0 && ask.mentionedOpenId
+        ? `<at id=${ask.mentionedOpenId}></at>\n`
+        : '';
+
       // 问题标题
       elements.push({
         tag: 'div',
         text: {
           tag: 'lark_md',
-          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeMd(truncate(q.prompt, 512, locale))}`,
+          content: `${mentionPrefix}**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeMdPreservingAt(truncate(sanitizeBotAnswererPrompt(q.prompt, ask), 512, locale))}`,
         },
       });
 
@@ -431,8 +438,9 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
       }));
       appendActionRows(elements, optionButtons);
 
-      // 选项的详细说明（Claude Code AskUserQuestion 的 options[].description）：
-      // 飞书按钮无副标题，在按钮行下方用小字列出 label → description；缺省不渲染。
+      // 选项的详细说明（Claude Code AskUserQuestion 的 options[].description）。
+      // 不进按钮（飞书按钮无副标题），在按钮行下方以小字列出 label → description，
+      // 缺省时整块不渲染，老调用方渲染结果不变。
       const described = q.options.filter((opt) => opt.description?.trim());
       if (described.length > 0) {
         elements.push({
@@ -665,17 +673,44 @@ function templateForResult(result: AskResult): string {
   }
 }
 
-function approverSummary(ask: PendingAsk, locale?: Locale): string {
-  if (ask.answererOpenId) {
-    // XPI can resolve this id from union_id in another app. It is valid for the
-    // broker's callback authorization, but embedding it as an at/person card
-    // resource can make Lark reject the whole card with 230099. Keep ordinary
-    // same-app asks unchanged; only the three XPI origins use a neutral label.
-    if (ask.originKind?.startsWith('host_cross_principal_')) {
-      return t('card.ask.answerable_designated_member', undefined, locale);
-    }
-    return `<at id=${ask.answererOpenId}></at>`;
+/**
+ * Mention token for the locked answerer, safe for card `lark_md`.
+ *
+ * Bot answerers MUST render as plain text, never `<at id=…>`: Feishu rejects a
+ * card whose at-target is a bot open_id with 400/100290 "invalid user resource
+ * (at/person)", so the whole card fails to send and the ask invalidates
+ * instantly (observed driving a peer-bot cross-principal re-send storm). The
+ * peer bot receives the group message anyway, so nothing is lost by dropping
+ * the at-ping. Fall back to a truncated open_id when no display name is known.
+ */
+function answererMentionToken(ask: PendingAsk): string {
+  if (ask.answererIsBot) {
+    const name = ask.answererDisplayName?.trim();
+    return name ? `@${name}` : `@${short(ask.answererOpenId ?? '', 16)}`;
   }
+  if (ask.answererOpenId) return `<at id=${ask.answererOpenId}></at>`;
+  return '';
+}
+
+/** Replace `<at id=X></at>` markers in a prompt body that target a bot answerer
+ *  with the plain-text mention, so a caller-authored prompt can't reintroduce
+ *  the unsupported card at-tag. */
+function sanitizeBotAnswererPrompt(prompt: string, ask: PendingAsk): string {
+  if (!ask.answererIsBot || !ask.answererOpenId) return prompt;
+  const token = answererMentionToken(ask);
+  const escaped = ask.answererOpenId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return prompt.replace(new RegExp(`<at\\s+id=${escaped}\\s*></at>`, 'g'), token);
+}
+
+function approverSummary(ask: PendingAsk, locale?: Locale): string {
+  // Host XPI asks: the answerer id is only a click-authorization lock and must
+  // NOT be embedded as an at/person card resource (cross-app id invalidates
+  // the card). Show a neutral designated-member label instead.
+  if (ask.originKind?.startsWith('host_cross_principal_') && ask.answererOpenId) {
+    return t('card.ask.answerable_designated_member', undefined, locale);
+  }
+  const token = answererMentionToken(ask);
+  if (token) return token;
   // 答复权限 = canTalk：谁能在该群跟 bot 说话谁就能答。卡片统一显示「本群可对话成员」，
   // 不再按 open_id 列名单（鉴权在 broker 点击时按 canTalk 判定）。
   return t('card.ask.answerable_talk_members', undefined, locale);
@@ -711,10 +746,21 @@ function truncate(s: string, maxChars: number, locale?: Locale): string {
 }
 
 function escapeMd(s: string): string {
-  // A mention is structured Lark markup: escaping the underscore in its ID
-  // makes the entire card invalid. Keep complete user/bot mentions atomic.
-  return s.replace(/<at\s+id=(?:"ou_[\w-]+"|'ou_[\w-]+'|ou_[\w-]+)\s*><\/at>|[*_~`\[\]\\]/g,
-    (token) => token.startsWith('<at') ? token : `\\${token}`);
+  return s.replace(/[*_~`\[\]\\]/g, (c) => `\\${c}`);
+}
+
+/** Escape markdown special chars while keeping `<at id=…></at>` tags atomic:
+ *  escaping underscores inside an at id invalidates the card. Tokens are parked
+ *  in placeholders, the remainder escaped, then restored. */
+function escapeMdPreservingAt(s: string): string {
+  const tokens: string[] = [];
+  const parked = s.replace(/<at\s+id=[^>]*><\/at>/g, (m) => {
+    tokens.push(m);
+    return ` ${tokens.length - 1} `;
+  });
+  let out = escapeMd(parked);
+  out = out.replace(/ (\d+) /g, (_m, i) => tokens[Number(i)]);
+  return out;
 }
 
 function short(s: string, n: number): string {

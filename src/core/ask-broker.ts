@@ -293,6 +293,7 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean): Promi
       answererOpenId: input.answererOpenId,
       answererIsBot: input.answererIsBot,
       answererDisplayName: input.answererDisplayName,
+      mentionedOpenId: input.mentionedOpenId,
       questions: input.questions,
       replyCardTarget: input.replyCardTarget,
       createdAt,
@@ -331,15 +332,16 @@ function sameIdentity(ask: InternalPending, input: CreateAskInput): boolean {
 }
 
 /** Stable shape string for question-set equality (prompt + multiSelect + each
- *  option's key AND label, order-sensitive). Two question sets that would render
- *  a DIFFERENT card to the user — including a relabelled option whose key is
- *  unchanged — must not re-attach/replay (codex P1-2). */
+ *  option's key, label AND description, order-sensitive). Two question sets that
+ *  would render a DIFFERENT card to the user — including a relabelled option or
+ *  one whose description changed while its key is unchanged — must not
+ *  re-attach/replay (codex P1-2). */
 function questionsShape(qs: PendingAsk['questions']): string {
   return JSON.stringify(
     qs.map((q) => ({
       p: q.prompt,
       m: !!q.multiSelect,
-      o: q.options.map((o) => [o.key, o.label]),
+      o: q.options.map((o) => [o.key, o.label, o.description ?? null]),
     })),
   );
 }
@@ -497,6 +499,7 @@ function persistFromInternal(ask: InternalPending): void {
     answererOpenId: ask.answererOpenId,
     answererIsBot: ask.answererIsBot,
     answererDisplayName: ask.answererDisplayName,
+    mentionedOpenId: ask.mentionedOpenId,
     questions: ask.questions,
     createdAt: ask.createdAt,
     deadlineAt: ask.deadlineAt,
@@ -828,6 +831,7 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       answererOpenId: p.answererOpenId,
       answererIsBot: p.answererIsBot,
       answererDisplayName: p.answererDisplayName,
+      mentionedOpenId: p.mentionedOpenId,
       questions: p.questions,
       createdAt: p.createdAt,
       deadlineAt: p.deadlineAt,
