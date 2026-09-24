@@ -3603,15 +3603,15 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       );
     }
 
-    // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai，sami/openai
-    // 为对象，speaker/rate 透传，asr 为对象）；非对象或 engine 非法 → undefined。
-    // 深度校验（凭证是否可用 / asr 是否 enabled）在 resolveVoiceConfig /
-    // resolveAsrConfig 做，这里只挡明显垃圾。
+    // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai|minimax，
+    // 三类凭证为对象，speaker/rate 透传，asr 为对象）；非对象或 engine 非法 →
+    // undefined。深度校验（凭证是否可用 / asr 是否 enabled）在 resolveVoiceConfig
+    // / resolveAsrConfig 做，这里只挡明显垃圾（如 minimax.region 拼错）。
     let voice: VoiceConfig | undefined;
     const rawVoice = entry.voice;
     if (rawVoice && typeof rawVoice === 'object' && !Array.isArray(rawVoice)) {
       const eng = (rawVoice as any).engine;
-      if (eng === undefined || eng === 'sami' || eng === 'openai') {
+      if (eng === undefined || eng === 'sami' || eng === 'openai' || eng === 'minimax') {
         const v: VoiceConfig = {};
         if (eng) v.engine = eng;
         if (typeof (rawVoice as any).speaker === 'string') v.speaker = (rawVoice as any).speaker;
@@ -3620,6 +3620,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         if (s && typeof s === 'object') v.sami = { accessKey: s.accessKey, secretKey: s.secretKey, appkey: s.appkey, tokenUrl: s.tokenUrl, wsUrl: s.wsUrl };
         const o = (rawVoice as any).openai;
         if (o && typeof o === 'object') v.openai = { baseUrl: o.baseUrl, apiKey: o.apiKey, model: o.model };
+        const m = (rawVoice as any).minimax;
+        if (m && typeof m === 'object') v.minimax = {
+          apiKey: typeof m.apiKey === 'string' ? m.apiKey : undefined,
+          model: typeof m.model === 'string' ? m.model : undefined,
+          region: m.region === 'cn' ? 'cn' : m.region === 'global' ? 'global' : undefined,
+        };
         const a = (rawVoice as any).asr;
         if (a && typeof a === 'object') v.asr = {
           enabled: a.enabled === true,
@@ -3629,7 +3635,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
           ...(typeof a.timeoutMs === 'number' ? { timeoutMs: a.timeoutMs } : {}),
           ...(typeof a.language === 'string' ? { language: a.language } : {}),
         };
-        if (v.engine || v.sami || v.openai || v.speaker || v.asr) voice = v;
+        if (v.engine || v.sami || v.openai || v.minimax || v.speaker || v.asr) voice = v;
       }
     }
 
@@ -3810,7 +3816,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons),
       pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
-      cotEnabled: entry.cotEnabled === false ? false : undefined,
+      cotEnabled: normalizeCotEnabled(entry) ? undefined : false,
       // Default ON, same convention as cotEnabled: an absent key means the
       // <sender> tag is injected, so existing prompts are unchanged.
       senderTag: entry.senderTag === false ? false : undefined,
@@ -3952,4 +3958,20 @@ export function readBotSkillPolicy(raw: unknown): BotSkillPolicy | undefined {
   const include = readDirectSkillSelectors(r.include);
   if (include) out.include = include;
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * Read-compat for `thinkingCard`, renamed to `cotEnabled` in #1477 (shipped
+ * v3.27): without this, an explicitly muted thinking bubble silently comes
+ * back after upgrade. An explicit canonical boolean always wins.
+ *
+ * Removal plan: delete every site marked `[legacy-thinkingCard]` — grep
+ * that exact tag under src/ as the index (a bare `thinkingCard` grep also
+ * matches the unrelated, still-live `thinkingCardToolResult` switch from
+ * #1546) — no earlier than v3.33.0 (at least three minor releases after
+ * this compat ships). Removing it restores default-on for any un-migrated
+ * key, so bump the floor release if old keys still show up in support.
+ */
+export function normalizeCotEnabled(entry?: { cotEnabled?: unknown; thinkingCard?: unknown }): boolean {
+  return typeof entry?.cotEnabled === 'boolean' ? entry.cotEnabled : entry?.thinkingCard !== false;
 }
