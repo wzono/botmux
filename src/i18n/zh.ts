@@ -474,6 +474,7 @@ export const messages: Record<string, string> = {
   'cmd.login.bytedcli_failed': '❌ ByteCloud 授权失败：{detail}。可以重新发 /login bytedcli 再试一次。',
   'cmd.login.bytedcli_no_challenge': '❌ 没有正在进行的 ByteCloud 授权。请先发 /login bytedcli 拿授权链接。',
   'cmd.login.bytedcli_begin_failed': '❌ 无法发起 ByteCloud 授权：{detail}',
+  'cmd.login.bytedcli_unavailable': 'ByteCloud（bytedcli）：授权服务暂时不可用，已有授权和待确认的登录会保留。服务恢复后重试，无需重新授权。',
   'cmd.login.bytedcli_status_yes': 'ByteCloud（bytedcli）：已授权',
   'cmd.login.bytedcli_status_no': 'ByteCloud（bytedcli）：未授权 —— 首次调用时会自动返回登录链接',
   'cmd.login.lark_title': '🔐 lark-cli 授权（点链接确认）',
@@ -1721,6 +1722,9 @@ export const messages: Record<string, string> = {
   'sg.placeholder_untitled': '新会话',
   'sg.intro': '发起的私聊会话：',
   'sg.intro_no_text': '（非文本消息）',
+  // 原消息已转发到群里（就在这条上面），所以引言只负责点明来历，不再复述正文——
+  // 图片 / 文件 / 合并转发消息本来就复述不了。
+  'sg.intro_forwarded': '从私聊发起了本次会话，原消息已转发到本群（见上 ⬆️）。',
   'sg.receipt': '✅ 已为本次会话创建专属群，后续请在群里继续：{link}',
   'sg.birth_failed': '⚠️ 建群失败（{error}），本次会话回退为私聊话题。',
   'sg.cmd_unsupported': '⚠️ 会话群不支持 {cmd}：会话群由 bot 自动创建和管理，固定为连续会话模式。',
