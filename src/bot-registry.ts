@@ -1897,6 +1897,15 @@ export interface BotConfig {
    */
   autoGrantRequestCards?: boolean;
   /**
+   * 申请卡转投 owner 私聊。默认关闭（undefined = off），只有显式 true 才开：
+   * - 会话里没有任何管理员可点卡时（群里查不到管理员），申请卡改发到主 owner 私聊，
+   *   而不是回复在一个 owner 看不到的群里；
+   * - 私聊（p2p）被 talk 闸挡住时不再静默丢弃，同样把申请卡发到主 owner 私聊。
+   * 两种情况申请人都只收到一句不含 owner 身份的中性回执；私聊投递另受 owner 维度总量节流。
+   * 前提是 autoGrantRequestCards 未关闭。适合关掉 autoInviteOwnerOnGroupAdd、owner 不进群的用法。
+   */
+  grantRequestToOwnerDm?: boolean;
+  /**
    * 用户自定义、额外放行透传给 CLI 的 slash 命令 —— 在固定的 PASSTHROUGH_COMMANDS
    * 之上扩展（例如把 CLI 支持但默认不放行的 `/goal`、`/export` 加进来）。每项必须
    * `/` 开头、小写、仅含 [a-z0-9:_-]；解析时归一化（缺失的 `/` 自动补、转小写、去重、
@@ -2006,6 +2015,8 @@ export interface BotConfig {
    * {@link noCotChats} (`/cot off`).
   */
   cotEnabled?: boolean;
+  /** Legacy tool-output preference; false still suppresses result bodies. */
+  thinkingCardToolResult?: boolean;
   /** chat_id list: chats where the CoT (thinking process) message is suppressed
    *  even when {@link cotEnabled} is on. Written by `/cot off|on`. */
   noCotChats?: string[];
@@ -3820,6 +3831,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       restrictGrantCommands: entry.restrictGrantCommands === true || undefined,
       // Default is ON, so only explicit false is meaningful/persisted.
       autoGrantRequestCards: entry.autoGrantRequestCards === false ? false : undefined,
+      // 默认关，只落显式 true。
+      grantRequestToOwnerDm: entry.grantRequestToOwnerDm === true || undefined,
       // Default is ON (accept bot-sent slash), so only explicit false persists.
       acceptSlashFromBots: entry.acceptSlashFromBots === false ? false : undefined,
       customPassthroughCommands,
@@ -3846,6 +3859,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Retired final-only preference must not opt into an extra terminal card.
       disableStreamingCard: entry.disableStreamingCard === true || entry.replyCardMode === 'final-only' || undefined,
       replyCardMode: entry.replyCardMode === 'unified' || entry.replyCardMode === 'final-only' ? 'unified' : undefined,
+      thinkingCardToolResult: entry.thinkingCardToolResult === false ? false : undefined,
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons),
       pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).

@@ -2814,6 +2814,65 @@ describe('PUT /api/bot-grant-prefs — p2pOpen (私聊对话全开)', () => {
   });
 });
 
+describe('PUT /api/bot-grant-prefs — grantRequestToOwnerDm (申请卡转投 owner 私聊)', () => {
+  it('surfaces it in the Bot Defaults payload and persists explicit on/off', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-owner-dm-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-owner-dm-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+        allowedUsers: ['ou_owner'],
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial.grantRequestToOwnerDm).toBe(false);
+
+      const on = await fetch(`${base}/api/bot-grant-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ grantRequestToOwnerDm: true }),
+      });
+      expect(on.status).toBe(200);
+      expect(await on.json()).toMatchObject({ ok: true, grantRequestToOwnerDm: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].grantRequestToOwnerDm).toBe(true);
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).grantRequestToOwnerDm).toBe(true);
+
+      const off = await fetch(`${base}/api/bot-grant-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ grantRequestToOwnerDm: false }),
+      });
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, grantRequestToOwnerDm: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].grantRequestToOwnerDm).toBeUndefined();
+
+      const bogus = await fetch(`${base}/api/bot-grant-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ grantRequestToOwnerDm: 'on' }),
+      });
+      expect(bogus.status).toBe(400);
+      expect(await bogus.json()).toMatchObject({ ok: false, error: 'no_valid_fields' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].grantRequestToOwnerDm).toBeUndefined();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT/GET /api/message-listeners/:chatId — disabled draft persistence (Bug2: 二刷消失)', () => {
   it('persists a disabled listener that still has a prompt, and GET returns it after reload', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-listener-draft-'));
@@ -3738,6 +3797,57 @@ describe('GET /api/sessions/:sessionId/usage', () => {
     } finally {
       findSpy.mockRestore();
     }
+  });
+});
+
+describe('POST /api/sessions/:sessionId/live-stage', () => {
+  const path = '/api/sessions/handoff-fixture/live-stage';
+  const event = { turnId: 'trg_fixture', sequence: 1, kind: 'stage', title: '等待验证' };
+
+  it('requires host authentication before forwarding a validated event', async () => {
+    const ds = { session: { status: 'active' }, chatId: 'oc_fixture', scope: 'chat', chatType: 'group' } as any;
+    const find = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const update = vi.spyOn(workerPool, 'updateHandoffLiveCard').mockResolvedValue();
+    try {
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const body = JSON.stringify(event);
+      const denied = await requestJson(handle.port, path, { method: 'POST', body });
+      expect(denied.status).toBe(401);
+      expect(update).not.toHaveBeenCalled();
+      const accepted = await requestJson(handle.port, path, {
+        method: 'POST', body, headers: trustedHostHeaders('POST', path, handle.port),
+      });
+      expect(accepted.status).toBe(200);
+      expect(update).toHaveBeenCalledExactlyOnceWith(ds, event);
+    } finally { find.mockRestore(); update.mockRestore(); }
+  });
+
+  it('rejects malformed, missing and API-only targets without card effects', async () => {
+    const find = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(undefined);
+    const update = vi.spyOn(workerPool, 'updateHandoffLiveCard').mockResolvedValue();
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const post = (value: unknown) => requestJson(handle!.port, path, { method: 'POST', body: JSON.stringify(value) });
+      expect((await post({ ...event, kind: 'complete' })).status).toBe(400);
+      expect((await post(event)).json.error).toBe('session_not_active');
+      find.mockReturnValue({ session: { status: 'active' }, chatId: 'http_async_fixture', scope: 'chat', chatType: 'group' } as any);
+      expect((await post(event)).json.error).toBe('live_stage_unavailable');
+      expect(update).not.toHaveBeenCalled();
+    } finally { find.mockRestore(); update.mockRestore(); }
+  });
+
+  it('returns a conflict when a delayed connector event belongs to an old turn', async () => {
+    const find = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { status: 'active' }, chatId: 'oc_fixture', scope: 'chat', chatType: 'group',
+    } as any);
+    const update = vi.spyOn(workerPool, 'updateHandoffLiveCard').mockRejectedValue(new Error('stale_live_stage'));
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await requestJson(handle.port, path, { method: 'POST', body: JSON.stringify(event) });
+      expect(res.status).toBe(409);
+      expect(res.json).toEqual({ ok: false, error: 'stale_live_stage' });
+    } finally { find.mockRestore(); update.mockRestore(); }
   });
 });
 
@@ -10604,6 +10714,51 @@ describe('PUT /api/bot-idle-suspend-minutes — 空闲会话自动休眠 TTL', (
       expect(await clear.json()).toMatchObject({ ok: true, idleSuspendMinutes: null });
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].idleSuspendMinutes).toBeUndefined();
       expect(getBot(appId).config.idleSuspendMinutes).toBeUndefined();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('PUT /api/bot-card-prefs — tool result preference', () => {
+  it('persists tool result visibility without changing CoT visibility', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-reply-modes-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-reply-modes-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex',
+      }]));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const url = `http://127.0.0.1:${handle.port}/api/bot-card-prefs`;
+      for (const [patch, enabled] of [
+        [{ thinkingCardToolResult: false }, true],
+        [{ thinkingCardToolResult: true }, true],
+      ] as const) {
+        const result = await fetch(url, {
+          method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(patch),
+        });
+        expect(result.status).toBe(200);
+        expect(await result.json()).toMatchObject({ ok: true, cotEnabled: enabled });
+        expect(loadBotConfigs()[0].cotEnabled !== false).toBe(enabled);
+        const stored = JSON.parse(readFileSync(configPath, 'utf8'))[0];
+        if (patch.thinkingCardToolResult === false) {
+          expect(stored.thinkingCardToolResult).toBe(false);
+          expect(loadBotConfigs()[0].thinkingCardToolResult).toBe(false);
+        } else {
+          expect(stored).not.toHaveProperty('thinkingCardToolResult');
+          expect(loadBotConfigs()[0].thinkingCardToolResult).toBeUndefined();
+        }
+      }
+      expect(getBot(appId).config.thinkingCardToolResult).toBeUndefined();
     } finally {
       if (handle) await handle.close();
       handle = null;

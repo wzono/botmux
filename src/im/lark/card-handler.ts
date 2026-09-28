@@ -16,7 +16,8 @@ import { resolveHiddenStreamingCardButtons } from './streaming-card-buttons.js';
 import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
 import { isBotAdmin } from './grant-owner.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard, frozenIdleLabel, STREAMING_CARD_PATCH_VERSION } from './card-builder.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, buildGrantRequesterNoticeCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard, frozenIdleLabel, STREAMING_CARD_PATCH_VERSION } from './card-builder.js';
+import type { GrantCardDelivery } from './card-builder.js';
 import { codexServiceTierBadge } from '../../services/codex-service-tier.js';
 import {
   findConfigField,
@@ -99,7 +100,7 @@ import { buildTurnContinuePrompt } from '../../services/turn-failure-notice.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
-import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, canCommitStreamingCardPublication, continuePublishedStreamingCardPinChain, idleCardLabel, dshRuntimeForSession, postFreshStreamingCard, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
+import { setSessionReasoningEffort, forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, canCommitStreamingCardPublication, continuePublishedStreamingCardPinChain, idleCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
@@ -130,7 +131,7 @@ import {
 } from '../../services/local-cli-opener.js';
 import { hasProtectedSessionMutationOwnership } from '../../core/session-mutation-guard.js';
 import { persistPendingRepoCardMessageId } from '../../core/pending-repo-journal.js';
-import { runDetachedBotTurnAdmission, withBotTurnAdmission, withBotTurnMutation } from '../../core/bot-turn-mutation-gate.js';
+import { runDetachedBotTurnAdmission, withBotTurnAdmission, withBotTurnMutation, tryWithBotTurnMutation } from '../../core/bot-turn-mutation-gate.js';
 import { isSharedAdoptSession } from '../../core/shared-adopt.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
@@ -476,6 +477,26 @@ function duplicateMultiWorktreeChildNames(repoPaths: string[], projects: Project
     else seen.add(childName);
   }
   return [...dupes];
+}
+
+/** 转投私聊的申请卡被拒后，回原会话告知申请人（fire-and-forget，不阻塞 callback）。
+ *  群里 bot 申请人只写名字不 @，避免唤醒对方 bot 拉空会话（与授权成功通知同一口径）。 */
+function notifyGrantRequesterInOrigin(
+  larkAppId: string,
+  chatId: string,
+  outcome: 'deny',
+  delivery: GrantCardDelivery,
+  targets: string[],
+  names: string[],
+  loc?: Locale,
+): void {
+  void (async () => {
+    const humanFlags = delivery === 'dm_group'
+      ? await Promise.all(targets.map(id => isHumanOpenId(larkAppId, id).catch(() => false)))
+      : targets.map(() => true);
+    const entries = targets.map((id, i) => ({ openId: id, name: names[i] || undefined, isBot: !humanFlags[i] }));
+    await sendMessage(larkAppId, chatId, buildGrantRequesterNoticeCard(outcome, delivery, entries, loc), 'interactive');
+  })().catch(err => logger.warn(`grant requester notice (${outcome}) failed: ${err}`));
 }
 
 function deferRepoCardWithdraw(larkAppId: string | undefined, messageId: string | undefined): void {
@@ -1314,6 +1335,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       : (value.target_open_id ? [value.target_open_id] : []);
     const grantChatId = value.chat_id;
     const nonce = value.nonce;
+    // 转投管理员私聊的申请卡：申请人看不到这张卡，处置结果要另发回原会话。
+    const delivery: GrantCardDelivery | undefined = value.delivery === 'dm_p2p' || value.delivery === 'dm_group'
+      ? value.delivery
+      : undefined;
+    const originChatName = typeof value.chat_name === 'string' ? value.chat_name : undefined;
     // 全部 target 都得仍 pending 且 nonce 匹配，否则视为整卡失效。
     if (!targets.length || !grantChatId || !nonce || !targets.every(tt => checkNonce(larkAppId, grantChatId, tt, nonce))) {
       return { toast: { type: 'error', content: t('card.grant.toast_expired', undefined, loc) } };
@@ -1345,6 +1371,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // 返回原始卡 body，由 dispatcher 包成 in-place patch（不再走 updateMessage 双写）。
     if (value.action === 'grant_deny') {
       for (const tt of targets) markDenied(larkAppId, grantChatId, tt);
+      if (delivery) {
+        const denyNames: string[] = Array.isArray(value.target_names) ? value.target_names : [];
+        notifyGrantRequesterInOrigin(larkAppId, grantChatId, 'deny', delivery, targets, denyNames, loc);
+      }
       return JSON.parse(buildGrantResultCard('deny', loc));
     }
     const formValue = action?.form_value;
@@ -1429,7 +1459,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // 「已授权」结果态、又 ping 到被授权人——无需再单独发通知卡、也无需撤回原卡（申晗 2026-07-31
     // 反馈：直接在原卡更新即可）。同步返回该 body 即完成 in-place patch，避免 deleteMessage 与
     // callback 响应竞态导致客户端 300000。仅「部分失败」仍走后台补一条文字告知。
-    const resultCardBody = JSON.parse(buildGrantResultCard(kind, loc, quota, expiresAt, notifyTargets));
+    const resultCardBody = JSON.parse(buildGrantResultCard(
+      kind, loc, quota, expiresAt, notifyTargets,
+      delivery ? { delivery, chatName: originChatName } : undefined,
+    ));
+    if (delivery) {
+      const grantedNotice = buildGrantRequesterNoticeCard(kind, delivery, notifyTargets, loc, quota, expiresAt);
+      sendMessage(larkAppId, grantChatId, grantedNotice, 'interactive')
+        .catch(err => logger.warn(`grant requester notice (granted) failed: ${err}`));
+    }
     if (cardMessageId && failed.length > 0) {
       let replyInThread = true;
       try {
@@ -2388,7 +2426,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     );
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'retry_turn', 'purge_images_continue', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', 'stop_turn', 'compact_session', 'quote_confirm'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'retry_turn', 'purge_images_continue', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', 'stop_turn', 'compact_session', 'quote_confirm', 'set_reasoning_effort'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -2856,6 +2894,34 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (voicedCardIds.size > 5000) { voicedCardIds.clear(); voicedCardIds.add(dedupeKey); }
       logger.info(`[${tag(ds)}] voice_summary triggered by ${operatorOpenId ?? '?'}`);
       return { toast: { type: 'success', content: t('card.voice.toast_wait', undefined, locDs) } };
+    }
+
+    if (actionType === 'set_reasoning_effort') {
+      const loc = localeForBot(ds?.larkAppId ?? larkAppId);
+      const warning = (key: string) => ({
+        toast: { type: 'warning', content: t(key, undefined, loc) },
+        // A rejected dropdown selection must not keep displaying the unsaved value.
+        ...(ds && ds.streamCardId === cardMessageId ? {
+          card: { type: 'raw' as const, data: JSON.parse(buildStreamingCardJson(ds, ds.session.suspendedColdResume ? 'idle' : undefined)) },
+        } : {}),
+      });
+      if (!ds || !operatorOpenId || !canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) {
+        return warning('card.effort.unavailable');
+      }
+      const mutation = await tryWithBotTurnMutation(ds.larkAppId, 1000, () => {
+        const current = getSessionByActionValue(activeSessions, rootId, ds.larkAppId, value.session_id, actionType);
+        if (current !== ds || value.session_id !== ds.session.sessionId
+          || !cardMessageId || cardMessageId !== ds.streamCardId
+          || value.card_nonce !== ds.streamCardNonce
+          || value.expected_effort !== (ds.session.reasoningEffort ?? '')) return 'stale' as const;
+        return setSessionReasoningEffort(ds, data.action?.option);
+      });
+      if (!mutation.acquired) return warning('card.effort.busy');
+      if (mutation.value !== 'saved') return warning(`card.effort.${mutation.value}`);
+      return {
+        toast: { type: 'success', content: t('card.effort.saved', undefined, loc) },
+        card: { type: 'raw' as const, data: JSON.parse(buildStreamingCardJson(ds, ds.session.suspendedColdResume ? 'idle' : undefined)) },
+      };
     }
 
     if (actionType === 'restart' && ds) {

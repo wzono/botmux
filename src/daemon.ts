@@ -640,7 +640,7 @@ import {
   submitCustomReply,
 } from './core/ask-broker.js';
 import { createAskPersistStore } from './core/ask-persist-store.js';
-import { parseAskBody } from './core/ask-api.js';
+import { parseAskBody, registerAskForResponse } from './core/ask-api.js';
 import { shouldReturnAskStartupNotReady } from './core/ask-types.js';
 import { computeCocoPickerKeys } from './core/coco-picker-keys.js';
 import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
@@ -4231,10 +4231,15 @@ async function notifyQuotaExhausted(
   limit: number | undefined,
 ): Promise<void> {
   if (typeof limit !== 'number') return;
+  let autoReapply = false;
+  try {
+    const cfg = getBot(larkAppId).config;
+    autoReapply = cfg.grantRequestToOwnerDm === true && cfg.autoGrantRequestCards !== false;
+  } catch { /* bot 不在 registry：沿用默认文案 */ }
   try {
     await sessionReply(
       anchor,
-      buildQuotaExhaustedCard(senderOpenId, limit, localeForBot(larkAppId)),
+      buildQuotaExhaustedCard(senderOpenId, limit, localeForBot(larkAppId), autoReapply),
       'interactive',
       larkAppId,
     );
@@ -7073,9 +7078,6 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // p2pOpen 的 bot 在私聊里会出现「对方点不动按钮」，留痕便于排查。
     logger.warn(`[ask:${boundAsk.larkAppId}] no active session for ${boundAsk.sessionId.substring(0, 8)}; chatType unknown (p2pOpen answer gate falls back to allowlist)`);
   }
-  // 显式 `botmux ask --mention <open_id>`：卡片不像回复消息天然带 @，daemon 在
-  // 问题正文前注入真实 `<at>` 让被点名的人收到通知。但飞书卡片禁止 at bot
-  //（100290 整卡拒收），命中已知 peer bot 集合时静默剔除该 @（选项卡照发）。
   let askMentionedOpenId: string | undefined;
   if (boundAsk.mentionedOpenId) {
     if (knownBotOpenIdsForAsk(boundAsk.larkAppId).has(boundAsk.mentionedOpenId)) {
@@ -7086,7 +7088,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
       askMentionedOpenId = boundAsk.mentionedOpenId;
     }
   }
-  const result = await registerAskBroker({
+  const result = await registerAskForResponse({
     larkAppId: boundAsk.larkAppId,
     chatId: boundAsk.chatId,
     rootMessageId: boundAsk.rootMessageId,
@@ -7105,7 +7107,8 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // a restart-surviving mux backend (tmux/herdr/zellij/zmx) is resumable.
     backendSurvivesRestart:
       !!askSession && getSessionPersistentBackendType(askSession) !== undefined,
-  });
+  }, res);
+  if (res.destroyed) return;
 
   // CoCo 专属：它的 hook 不能用 directive 代答（hook 客户端永远 passthrough，CoCo 会
   // 渲染原生 picker）。这里在 ask 结算为「已作答」时，把答案翻成按键序列下发给该会话
@@ -18069,6 +18072,68 @@ function settlePrincipalLaneDispatchUnknown(
   }
 }
 
+const PRINCIPAL_LANE_DISPATCH_RETRY_BASE_MS = 100;
+const PRINCIPAL_LANE_DISPATCH_RETRY_MAX_MS = 5_000;
+
+function clearPrincipalLaneDispatchRetry(ds: DaemonSession, turnId?: string): void {
+  const retry = ds.principalLaneDispatchRetry;
+  if (!retry || (turnId !== undefined && retry.turnId !== turnId)) return;
+  if (retry.timer) clearTimeout(retry.timer);
+  ds.principalLaneDispatchRetry = undefined;
+}
+
+/** Keep one rejected pre-IPC FIFO head live without relying on a later inbound
+ * event. The runtime/session/head checks make a stale timer a no-op after close,
+ * route replacement, or queue advancement; delay growth is capped so a
+ * transient quarantine can recover without creating a tight retry loop. */
+function schedulePrincipalLaneDispatchRetry(ds: DaemonSession, turnId: string): void {
+  let retry = ds.principalLaneDispatchRetry;
+  if (retry?.turnId !== turnId) {
+    clearPrincipalLaneDispatchRetry(ds);
+    retry = { turnId, attempt: 0 };
+    ds.principalLaneDispatchRetry = retry;
+  }
+  if (retry.timer) return;
+
+  const delay = Math.min(
+    PRINCIPAL_LANE_DISPATCH_RETRY_MAX_MS,
+    PRINCIPAL_LANE_DISPATCH_RETRY_BASE_MS * (2 ** Math.min(retry.attempt, 6)),
+  );
+  retry.attempt += 1;
+  const timer = setTimeout(() => {
+    if (ds.principalLaneDispatchRetry !== retry || retry.timer !== timer) return;
+    retry.timer = undefined;
+    const head = ds.session.principalLaneQueuedTurns?.[0];
+    if (ds.session.status !== 'active'
+        || activeSessions.get(activeSessionKey(ds)) !== ds
+        || !ds.session.principalLane
+        || ds.principalLaneRunningTurn
+        || ds.activeInteractiveTurn
+        || !head
+        || head.turnId !== turnId
+        || head.dispatchState !== 'queued') {
+      clearPrincipalLaneDispatchRetry(ds, turnId);
+      return;
+    }
+    try {
+      driveNextPrincipalLaneTurn(ds);
+    } catch (error) {
+      logger.error(
+        `[${tag(ds)}] Principal-lane queued turn retry failed `
+        + `turn=${turnId.slice(0, 12)}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      const currentHead = ds.session.principalLaneQueuedTurns?.[0];
+      if (currentHead?.turnId === turnId && currentHead.dispatchState === 'queued') {
+        schedulePrincipalLaneDispatchRetry(ds, turnId);
+      } else {
+        clearPrincipalLaneDispatchRetry(ds, turnId);
+      }
+    }
+  }, delay);
+  timer.unref?.();
+  retry.timer = timer;
+}
+
 /** Dispatch only the durable FIFO head.  The `attempting` write happens before
  * worker IPC, so a commit-unknown/restart can never replay a turn that may have
  * reached the CLI.  The head remains present until its exact terminal edge. */
@@ -18077,7 +18142,13 @@ function driveNextPrincipalLaneTurn(ds: DaemonSession): boolean {
       || ds.principalLaneRunningTurn
       || ds.activeInteractiveTurn) return false;
   const head = ds.session.principalLaneQueuedTurns?.[0];
-  if (!head || head.dispatchState === 'attempting') return false;
+  if (!head || head.dispatchState === 'attempting') {
+    clearPrincipalLaneDispatchRetry(ds);
+    return false;
+  }
+  if (ds.principalLaneDispatchRetry?.turnId !== head.turnId) {
+    clearPrincipalLaneDispatchRetry(ds);
+  }
 
   head.dispatchState = 'attempting';
   sessionStore.updateSession(ds.session);
@@ -18124,6 +18195,7 @@ function driveNextPrincipalLaneTurn(ds: DaemonSession): boolean {
         `[${tag(ds)}] Principal-lane queued turn was not dispatched; retained for retry `
         + `turn=${head.turnId.slice(0, 12)}: ${error instanceof Error ? error.message : String(error)}`,
       );
+      schedulePrincipalLaneDispatchRetry(ds, head.turnId);
       return false;
     }
     // Once the IPC boundary was crossed the outcome is unknowable. Keep the
@@ -18132,6 +18204,7 @@ function driveNextPrincipalLaneTurn(ds: DaemonSession): boolean {
       `[${tag(ds)}] Principal-lane queued turn dispatch became unknown `
       + `turn=${head.turnId.slice(0, 12)}: ${error instanceof Error ? error.message : String(error)}`,
     );
+    clearPrincipalLaneDispatchRetry(ds, head.turnId);
     settlePrincipalLaneDispatchUnknown(ds, head.turnId, undefined);
     return false;
   }
@@ -18142,9 +18215,11 @@ function driveNextPrincipalLaneTurn(ds: DaemonSession): boolean {
     }
     durableHead.dispatchState = 'queued';
     sessionStore.updateSession(ds.session);
+    schedulePrincipalLaneDispatchRetry(ds, head.turnId);
     return false;
   }
 
+  clearPrincipalLaneDispatchRetry(ds, head.turnId);
   beginNewTurn(ds, head.title, head.turnId);
   setActiveInteractiveTurn(ds, head.turnId, head.caller, head.title);
   rememberLastCliInput(ds, head.userPrompt, head.cliInput);
@@ -27125,6 +27200,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     getSessionWorkingDir,
     getActiveCount,
     prepareRawInputTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
+    onTriggerTurnStarted: (ds, title, turnId) => beginNewTurn(ds, title, turnId),
     closeSession(ds: DaemonSession): Promise<boolean> {
       // Route through the dashboard-aware helper so session.exited / session.update
       // events fire for withdrawn-message / crash / adopt-exit teardown paths too,

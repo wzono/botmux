@@ -1,4 +1,6 @@
 // src/core/dashboard-ipc-server.ts
+import { parseHandoffCardEvent } from './handoff-card-lifecycle.js';
+import { updateHandoffLiveCard } from './worker-pool.js';
 import { authorizeOwnerlessScheduleCreator } from './schedule-creator-authorization.js';
 import { readAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
@@ -2799,10 +2801,12 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
     const terminal = asyncTriggerStore.followSteerParkedChain(sessionId, persisted.result.steerParkedBy);
     if (terminal && owner) {
       const r = terminal.result;
-      const at = (r.status === 'completed' ? r.completedAt : r.failedAt) ?? Date.now();
+      const at = (r.status === 'completed' ? r.completedAt : r.status === 'interrupted' ? r.interruptedAt : r.failedAt) ?? Date.now();
       try {
         if (r.status === 'completed') {
           asyncTriggerStore.recordCompleted(sessionId, persisted.triggerId, r.content ?? '', at, owner);
+        } else if (r.status === 'interrupted') {
+          asyncTriggerStore.recordInterruptedStrict(sessionId, persisted.triggerId, at, owner);
         } else if (r.reason === 'turn_terminal' && r.terminalErrorCode) {
           asyncTriggerStore.recordTerminalFailureStrict(sessionId, persisted.triggerId, at, owner, r.terminalErrorCode);
         } else {
@@ -3656,6 +3660,24 @@ ipcRoute('GET', '/api/owner-profile', async (_req, res) => {
   if (!me.ownerUnionId) return jsonRes(res, 200, { ok: false, error: 'owner_unbound', name: me.ownerName ?? null });
   const p = await getUserProfile(cachedLarkAppId, me.ownerUnionId, 'union_id');
   jsonRes(res, 200, { ok: true, name: p?.name ?? me.ownerName ?? null, avatarUrl: p?.avatarUrl ?? null });
+});
+
+// Dashboard-authenticated connector event, not a user-message or model-output hook.
+ipcRoute('POST', '/api/sessions/:sessionId/live-stage', async (req, res, params) => {
+  let event;
+  try { event = parseHandoffCardEvent(await readJsonBody(req)); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_live_stage' }); }
+  const active = findActiveBySessionId(params.sessionId);
+  if (!active) return jsonRes(res, 409, { ok: false, error: 'session_not_active' });
+  if (sessionTransportDisabled(active) || active.scope !== 'chat' || active.chatType !== 'group') {
+    return jsonRes(res, 409, { ok: false, error: 'live_stage_unavailable' });
+  }
+  try {
+    await updateHandoffLiveCard(active, event);
+    return jsonRes(res, 200, { ok: true });
+  } catch (error) {
+    return jsonRes(res, 409, { ok: false, error: error instanceof Error ? error.message : 'live_stage_failed' });
+  }
 });
 
 // 会话重命名：dashboard 看板卡片就地编辑 Botmux 的 canonical title；运行中的
@@ -6255,6 +6277,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     restrictGrantCommands: grantPrefs.restrictGrantCommands,
     autoGrantRequestCards: grantPrefs.autoGrantRequestCards,
     p2pOpen: grantPrefs.p2pOpen,
+    grantRequestToOwnerDm: grantPrefs.grantRequestToOwnerDm,
     messageQuotaDefaultLimit: grantPrefs.messageQuotaDefaultLimit,
     grantDefaultDurationMs: grantPrefs.grantDefaultDurationMs,
     p2pMode,
@@ -6359,6 +6382,7 @@ ipcRoute('PUT', '/api/bot-quota-fallback', async (req, res) => {
 ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: {
+    thinkingCardToolResult?: unknown;
     usageDisplay?: unknown;
     replyCardMode?: unknown;
     disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
@@ -6373,6 +6397,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
 
   const patch: {
+    thinkingCardToolResult?: boolean;
     usageDisplay?: UsageDisplayMode;
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
     disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; cotEnabled?: boolean;
@@ -6412,6 +6437,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     }
     patch.codexBrowser = body.codexBrowser;
   }
+  if (typeof body.thinkingCardToolResult === 'boolean') patch.thinkingCardToolResult = body.thinkingCardToolResult;
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
   if (typeof body.cotEnabled === 'boolean') patch.cotEnabled = body.cotEnabled;
@@ -6565,6 +6591,7 @@ ipcRoute('PUT', '/api/bot-summary-trigger', async (req, res) => {
 //   • restrictGrantCommands: boolean       — 限制被授权人只能纯对话
 //   • autoGrantRequestCards: boolean       — 未授权 @ 被挡住时是否发 grant 申请卡
 //   • p2pOpen: boolean                     — 私聊对话全开（talk-only；管理权仍只认 allowedUsers）
+//   • grantRequestToOwnerDm: boolean       — 无管理员可点卡时申请卡转投 owner 私聊
 //   • messageQuotaDefaultLimit: number|null — 授权卡访客额度覆盖（null = 卡片内置 3 条）；Oncall 恒不限额、不读它
 //   • grantDefaultDurationMs: number|null   — 新授权默认有限时长（null = 产品默认 1 小时）
 ipcRoute('PUT', '/api/bot-grant-prefs', async (req, res) => {
@@ -6580,6 +6607,7 @@ ipcRoute('PUT', '/api/bot-grant-prefs', async (req, res) => {
     restrictGrantCommands?: unknown;
     autoGrantRequestCards?: unknown;
     p2pOpen?: unknown;
+    grantRequestToOwnerDm?: unknown;
     messageQuotaDefaultLimit?: unknown;
     grantDefaultDurationMs?: unknown;
   };
@@ -6588,12 +6616,14 @@ ipcRoute('PUT', '/api/bot-grant-prefs', async (req, res) => {
     restrictGrantCommands?: boolean;
     autoGrantRequestCards?: boolean;
     p2pOpen?: boolean;
+    grantRequestToOwnerDm?: boolean;
     messageQuotaDefaultLimit?: number | null;
     grantDefaultDurationMs?: number | null;
   } = {};
   if (typeof body.restrictGrantCommands === 'boolean') patch.restrictGrantCommands = body.restrictGrantCommands;
   if (typeof body.autoGrantRequestCards === 'boolean') patch.autoGrantRequestCards = body.autoGrantRequestCards;
   if (typeof body.p2pOpen === 'boolean') patch.p2pOpen = body.p2pOpen;
+  if (typeof body.grantRequestToOwnerDm === 'boolean') patch.grantRequestToOwnerDm = body.grantRequestToOwnerDm;
   // null（含 JSON null）= 恢复内置额度策略；number = 设定覆盖值（store 内校验 1–1000）。
   if (body.messageQuotaDefaultLimit === null) patch.messageQuotaDefaultLimit = null;
   else if (typeof body.messageQuotaDefaultLimit === 'number') patch.messageQuotaDefaultLimit = body.messageQuotaDefaultLimit;
