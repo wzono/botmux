@@ -1,3 +1,4 @@
+import { resolveWorkspace } from './workspace-metadata.js';
 // src/core/dashboard-ipc-server.ts
 import { parseHandoffCardEvent } from './handoff-card-lifecycle.js';
 import { updateHandoffLiveCard } from './worker-pool.js';
@@ -325,6 +326,12 @@ import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { refreshSessionIdentity } from './cli-identity.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
 import {
+  ASK_OPTION_LAYOUT_REQUEST_MAX_BYTES,
+  isAskOptionLayout,
+  normalizeAskOptionLayout,
+  type AskOptionLayout,
+} from '../im/lark/ask-option-layout.js';
+import {
   normalizeSparseReplyStyleConfig,
   REPLY_STYLE_REQUEST_MAX_BYTES,
 } from '../dashboard/reply-style.js';
@@ -464,6 +471,10 @@ function rejectProtectedSessionMutation(
 }
 
 ipcRoute('POST', SUPERVISOR_SHUTDOWN_ROUTE, async (req, res) => {
+  // CONTRACT: accepting a shutdown here is an intentional stop. External
+  // callers bypassing `botmux stop` must write the watchdog stop-intent
+  // marker themselves (markWatchdogStopped in autostart.ts); otherwise the
+  // watchdog will resurrect the fleet as if it had crashed.
   // The production server-wide HMAC gate records trusted requests here. Keep
   // an explicit route-local check: shutdown is never a bare loopback API.
   if (!isTrustedHostIpcRequest(req)) {
@@ -1267,6 +1278,23 @@ ipcRoute('GET', '/api/sessions', (_req, res) => {
   // left detached, then closed history. Persisted-active must never be projected
   // through composeRowFromClosed: teardown uncertainty is not a close.
   jsonRes(res, 200, { sessions: composeDashboardSessionRows({ includeTokenUsage: false }) });
+});
+
+// Host-authenticated, session-bound lookup: callers cannot supply arbitrary paths.
+ipcRoute('GET', '/api/sessions/:sessionId/workspace', async (req, res, params) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { error: 'trusted_host_required' });
+  const ds = findActiveBySessionId(params.sessionId);
+  const persisted = ds?.session ?? sessionStore.listSessions().find(s => s.sessionId === params.sessionId);
+  if (!persisted) return jsonRes(res, 404, { error: 'not_found' });
+  const workingDir = ds ? ds.workingDir : persisted.workingDir;
+  // Match the backend identity published on the dashboard row. In particular,
+  // a remote session can retain a local-looking initConfig fallback while its
+  // persisted spawn stamp is `riff`/`mojo`; probing that cwd on this host would
+  // assign the remote session a false local workspace identity.
+  const backend = persisted.backendType;
+  const force = new URL(req.url!, 'http://localhost').searchParams.get('force') === '1';
+  const workspace = await resolveWorkspace(workingDir ?? '', backend, force);
+  jsonRes(res, 200, { workingDir, workspace });
 });
 
 ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
@@ -2764,7 +2792,7 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
   const persistedRaw = asyncTriggerStore.lookup(sessionId, triggerId);
 
   // Cross-bot isolation (fail-closed / positive-proof) — see decideAsyncOwnership.
-  // Both sessionStore.getSession() (cross-scans every bot's sessions-*.json) and
+  // Both sessionStore.getSession() (cross-scans every bot's SQLite store) and
   // the async store (machine-wide shared dir) can surface another bot's data for
   // a sessionId routed to THIS daemon; keep only sources positively proven ours.
   const decision = decideAsyncOwnership({
@@ -6041,6 +6069,12 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     replyStyle = normalized.config ?? null;
     for (const warning of normalized.warnings) logger.warn(`[reply-style] ${warning}`);
   } catch { /* missing registry entry → built-in defaults */ }
+  let askOptionLayout: AskOptionLayout | null = null;
+  try {
+    const normalized = normalizeAskOptionLayout((getBot(cachedLarkAppId).config as any).askOptionLayout);
+    askOptionLayout = normalized.layout ?? null;
+    for (const warning of normalized.warnings) logger.warn(`[ask-option-layout] ${warning}`);
+  } catch { /* missing registry entry → built-in compact default */ }
   let p2pMode: 'thread' | 'chat' | 'group' = 'chat';
   try {
     const configured = getBot(cachedLarkAppId).config.p2pMode;
@@ -6226,6 +6260,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     autoboundChatCount: autoboundChats.length,
     brandLabel: brandStore.getBotBrandLabel(cachedLarkAppId) ?? null,
     replyStyle,
+    askOptionLayout,
     sandbox: sandboxStore.getBotSandbox(cachedLarkAppId),
     codexAuthSync,
     sandboxPaths: sandboxStore.getBotSandboxPaths(cachedLarkAppId) ?? null,
@@ -6698,6 +6733,47 @@ ipcRoute('PUT', '/api/bot-reply-style', async (req, res) => {
       replyStyle: persisted.result,
       ...(normalized.warnings.length > 0 ? { warnings: normalized.warnings } : {}),
     });
+  } catch (err: any) {
+    jsonRes(res, 500, { ok: false, error: err?.message ?? String(err) });
+  }
+});
+
+// Per-bot ask 选项按钮布局。Body `{ askOptionLayout: 'compact' | 'vertical' | null }`。
+// 'compact'（默认）与 null 都会从 bots.json 删除该键（稀疏存储，缺省即紧凑）；
+// 非法值直接 400——读取路径 fail-soft，但写入路径要让笔误显式失败。
+ipcRoute('PUT', '/api/bot-ask-option-layout', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: unknown;
+  try { body = await readJsonBody<unknown>(req, ASK_OPTION_LAYOUT_REQUEST_MAX_BYTES); }
+  catch (err) {
+    if (err instanceof JsonBodyTooLargeError) {
+      return jsonRes(res, 413, { ok: false, error: 'body_too_large' });
+    }
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  if (!hasExactSafeJsonKeys(body, ['askOptionLayout'])) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_body' });
+  }
+  const raw = body.askOptionLayout;
+  if (raw !== null && raw !== undefined && !isAskOptionLayout(raw)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_layout' });
+  }
+  const next = raw === 'vertical' ? 'vertical' : null;
+  try {
+    const persisted = await rmwBotEntry(cachedLarkAppId, (entry: any) => {
+      if (next) entry.askOptionLayout = next;
+      else delete entry.askOptionLayout;
+      return { write: true, result: next };
+    });
+    if (!persisted.ok) return jsonRes(res, 400, { ok: false, error: persisted.reason });
+    // 与磁盘保持一致：ask 卡片在 daemon 进程内渲染，lookup 立即读到新值，
+    // 无需重启任何 worker。
+    try {
+      const liveConfig = getBot(cachedLarkAppId).config as any;
+      if (next) liveConfig.askOptionLayout = next;
+      else delete liveConfig.askOptionLayout;
+    } catch { /* disk remains authoritative */ }
+    jsonRes(res, 200, { ok: true, askOptionLayout: persisted.result });
   } catch (err: any) {
     jsonRes(res, 500, { ok: false, error: err?.message ?? String(err) });
   }

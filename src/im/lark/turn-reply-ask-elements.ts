@@ -1,5 +1,6 @@
 import type { ReplyCardAsk } from '../../services/turn-reply-card.js';
 import { t, type Locale } from '../../i18n/index.js';
+import { askOptionLayoutForBot } from './ask-option-layout.js';
 
 const safe = (text: string) => text.replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, '[mention]')
   .replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -16,6 +17,13 @@ export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 
   const row = (buttons: Array<Record<string, any>>) => ({ tag: 'column_set', flex_mode: 'flow', columns: buttons.map(b => ({
     tag: 'column', width: 'auto', elements: [b],
   })) });
+  // vertical：与独立卡同款的一行一按钮（单列 weighted、不被同排挤压）。内嵌形态是
+  // Card JSON 2.0，字段形态与独立卡 1.0 不同，不能复用 appendActionRows。
+  const verticalRow = (b: Record<string, any>) => ({
+    tag: 'column_set', flex_mode: 'none', horizontal_spacing: 'small',
+    columns: [{ tag: 'column', width: 'weighted', weight: 1, elements: [b] }],
+  });
+  const optionLayout = askOptionLayoutForBot(ask.larkAppId);
   ask.questions.forEach((q, i) => {
     // 显式 `botmux ask --mention` 的点名（daemon 已剔除 bot open_id）：嵌入
     // turn-reply 卡时同样要保留真实 <at>，不能走 safe()——safe 会把 at 抹成
@@ -32,7 +40,11 @@ export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 
       ),
       ...(submit ? { icon: { tag: 'standard_icon', token: selected.has(option.key) ? 'check_outlined' : 'rectangle_outlined' } } : {}),
     }));
-    for (let start = 0; start < buttons.length; start += 3) elements.push(row(buttons.slice(start, start + 3)));
+    if (optionLayout === 'vertical') {
+      for (const b of buttons) elements.push(verticalRow(b));
+    } else {
+      for (let start = 0; start < buttons.length; start += 3) elements.push(row(buttons.slice(start, start + 3)));
+    }
     // 选项详细说明（Claude Code AskUserQuestion options[].description）：按钮无副标题，
     // 在按钮行下用小字列出。safe() 已做转义，这里仅按 label 加粗。缺省不渲染。
     const described = q.options.filter(option => option.description?.trim());
