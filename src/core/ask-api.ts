@@ -195,7 +195,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
   // a different kind of Ask. Identity claims remain on the raw body for the
   // route's authorization checks; options/prompt are normalized above.
   const routeFields = new Set(['prompt', 'options', 'originCapability', 'originTurnId', 'originDispatchAttempt']);
-  if (Object.keys(r).some(key => r[key] !== undefined && !Object.hasOwn(parsed, key) && !routeFields.has(key))) {
+  if (Object.keys(r).some(key => r[key] !== undefined && r[key] !== null && !Object.hasOwn(parsed, key) && !routeFields.has(key))) {
     return { error: 'unsupported_fields' };
   }
   return parsed;
