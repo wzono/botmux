@@ -104,6 +104,13 @@ import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
+import { initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
+import { startDurableInboxShadowConsumer } from './services/durable-inbox-shadow-consumer.js';
+import {
+  createDurableSessionFacade,
+  type DurableSessionFacade,
+} from './services/durable-session-facade.js';
+import { durableSessionShadowProjection } from './services/durable-session-shadow.js';
 import { shouldRecordFailedTurn, buildFailedTurnRecord } from './services/failed-turn-retry.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
@@ -837,6 +844,52 @@ import { loopbackFetch } from './core/loopback-fetch.js';
 // ─── State ───────────────────────────────────────────────────────────────────
 
 const activeSessions = new Map<string, DaemonSession>();
+let durableSessionShadowFacade: DurableSessionFacade | undefined;
+
+/**
+ * Mirror only an explicitly committed Session projection. The synchronous
+ * SQLite row and activeSessions registry remain authoritative in shadow mode;
+ * provider failures are observable but never roll back or delay live routing.
+ */
+function mirrorDurableSessionShadow(session: Session): void {
+  const facade = durableSessionShadowFacade;
+  if (!facade) return;
+  let projection: ReturnType<typeof durableSessionShadowProjection>;
+  try {
+    projection = durableSessionShadowProjection(session);
+  } catch (error) {
+    logger.warn(
+      `[durable-session] shadow projection refused: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+    return;
+  }
+  void facade.write(projection.sessionKey, projection.value).then(result => {
+    if (result.kind === 'written' || result.kind === 'unchanged') {
+      logger.debug(
+        `[durable-session] shadow ${result.kind} ${projection.sessionKey} `
+        + `(revision=${result.record.revision}, coalesced=${result.coalescedCount})`,
+      );
+      return;
+    }
+    if (result.kind === 'occupied') {
+      logger.info(
+        `[durable-session] shadow occupied ${projection.sessionKey} `
+        + `(epoch=${result.epoch}, leaseUntil=${result.leaseUntil})`,
+      );
+      return;
+    }
+    logger.warn(
+      `[durable-session] shadow ${result.kind} ${projection.sessionKey} `
+      + `(coalesced=${result.coalescedCount})`,
+    );
+  }).catch(error => {
+    logger.warn(
+      `[durable-session] shadow write failed for ${projection.sessionKey}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+  });
+}
 /** False until restoreActiveSessions() finishes. During the startup window the
  *  IPC server is already listening but activeSessions is empty, so a reconnecting
  *  ask hook would fail session lookup and get a 403 origin_unproven — which the
@@ -22835,6 +22888,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     }
     return;
   }
+  mirrorDurableSessionShadow(ds.session);
   // transcript 模式的 solo 判定：在 fork 之前算好，让下面所有开场分支（立即 fork /
   // repo 卡片 / auto-worktree 之后的 commit）经 buildReservedInitialInput 与
   // worker-pool init 读到同一个值。send 模式零额外 API。
@@ -25374,6 +25428,7 @@ async function handleThreadReplyAdmitted(
       }
       return;
     }
+    mirrorDurableSessionShadow(newDs.session);
     // transcript 模式的 solo 判定（同 handleNewTopicAdmitted）：fork 前算好。
     await resolveSoloSessionForTurn(newDs, autoCreateChatType, autoCreateSender);
     if (newDs.pendingRepo) {
@@ -27541,6 +27596,45 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // is a backstop for the next missed `.catch`, not permission to omit them.
   installDaemonRejectionGuard(logger);
 
+  // Optional provider-neutral coordination process. `shadow` proves the
+  // configured provider speaks the public contract and keeps its connection
+  // alive for later staged wiring; it does not replace the SQLite Session path.
+  // `primary` remains fail-closed in the runtime factory until inbox, Session
+  // facade and outbox pump are all wired, so a deployment cannot accidentally
+  // scale two independent SQLite owners by setting one premature flag.
+  const durableCoordinationRuntime = await initializeDurableCoordinationRuntime();
+  const durableSessionFacade = durableCoordinationRuntime
+    ? createDurableSessionFacade({ store: durableCoordinationRuntime.store })
+    : undefined;
+  durableSessionShadowFacade = durableSessionFacade;
+  const durableInboxShadowConsumer = durableCoordinationRuntime
+    ? startDurableInboxShadowConsumer({
+      store: durableCoordinationRuntime.store,
+      workerId: `shadow-inbox:${getDaemonBootId()}`,
+      onObserved: observation => {
+        logger.debug(
+          `[durable-inbox:${observation.larkAppId}] shadow observed ${observation.eventId} `
+          + `(attempt=${observation.attempts})`,
+        );
+      },
+      onError: error => {
+        logger.warn(
+          `[durable-inbox] shadow consumer error: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+      },
+    })
+    : undefined;
+  if (durableCoordinationRuntime) {
+    logger.info(
+      `[durable-coordination] ${durableCoordinationRuntime.mode} provider ready: `
+      + durableCoordinationRuntime.provider,
+    );
+    void durableInboxShadowConsumer?.ready.then(() => {
+      logger.info('[durable-inbox] shadow consumer ready');
+    });
+  }
+
   // Repair a shared tmux server polluted by an older botmux immediately on
   // daemon startup. This must not depend on restoring/spawning a bmx-* session:
   // a user-held tmux server can outlive every botmux pane and still leak stale
@@ -28915,6 +29009,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         cfg.larkAppSecret,
         botEventHandlers,
         normalizeBrand(cfg.brand),
+        durableCoordinationRuntime?.store,
       ));
     }
 
@@ -29828,6 +29923,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // Dispatcher stop always receives the hard-clamped remaining budget (never
     // its internal 5s default), success or failure path alike.
     await feedbackWebhookDispatcher?.stop(remainingBudget());
+    await durableInboxShadowConsumer?.stop(remainingBudget());
+    const durableSessionStop = await durableSessionFacade?.stop(remainingBudget());
+    if (durableSessionStop?.kind === 'timed_out') {
+      logger.warn(
+        `[durable-session] shadow facade stop timed out `
+        + `(pending=${durableSessionStop.pendingSessionKeys.length}, `
+        + `unreleased=${durableSessionStop.unreleasedSessionKeys.length})`,
+      );
+    }
+    if (durableSessionShadowFacade === durableSessionFacade) {
+      durableSessionShadowFacade = undefined;
+    }
 
     // Flush any pending identity-cache writes before exit. The cache uses a
     // 2s debounce on disk persistence to dedupe writes from chatty groups; on
@@ -29835,6 +29942,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     flushIdentityCacheSync();
 
     try { sessionStore.releaseOccupancyLease({ bootId: getDaemonBootId() }); } catch { /* exit handler retries */ }
+    try {
+      await durableCoordinationRuntime?.close();
+    } catch (error) {
+      logger.warn(
+        `[durable-coordination] provider close failed during shutdown: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+      durableCoordinationRuntime?.terminate();
+    }
     removePidFile();
     process.exit(gracefulProcessExitCode());
       },
@@ -29876,6 +29992,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(sessionOwnerReminderTimer);
     clearInterval(docCommentPollTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
+    durableInboxShadowConsumer?.terminate();
+    durableSessionFacade?.terminate();
+    if (durableSessionShadowFacade === durableSessionFacade) {
+      durableSessionShadowFacade = undefined;
+    }
+    durableCoordinationRuntime?.terminate();
     try { sessionStore.releaseOccupancyLease({ bootId: getDaemonBootId() }); } catch { /* best effort */ }
     removeDaemonDescriptor(cfg.larkAppId, desc.bootInstanceId);
     // Plain-exit path (uncaught fatal, manual process.exit) bypasses the

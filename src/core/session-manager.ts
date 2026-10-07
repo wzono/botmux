@@ -1324,7 +1324,7 @@ function buildNewTopicBlocks(
   // nothing to the prompt. Claude-family (injectsSessionContext) inject skills
   // via --plugin-dir, so they're excluded.
   let skillBlock = '';
-  if (!adapter.injectsSessionContext && adapter.skillsDir) {
+  if (!adapter.injectsSessionContext && adapter.skillsDir && !adapter.pluginDir) {
     const mode = resolveSkillInjectionModeForApp(opts?.larkAppId);
     if (mode === 'prompt') {
       // history/quoted/bots are fully covered by <botmux_routing>; send stays in

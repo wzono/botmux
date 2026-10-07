@@ -314,6 +314,7 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/Users/u/.botmux/.dashboard-port').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/bin/botmux').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/claude-plugin/x').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/cursor-plugin/x').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/omp-plugin/x').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/pi-skills/x').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/pi-skills/extensions/pi-turn-boundary-extension.js').access).toBe('readOnly');
