@@ -7,8 +7,9 @@
 
 import type { ServerResponse } from 'node:http';
 import { registerAsk } from './ask-broker.js';
+import { parseOption, parseAskQuestions } from './ask-questions.js';
+export { parseAskQuestions } from './ask-questions.js';
 import type { CreateAskInput, AskResult, AskOption, AskQuestion } from './ask-types.js';
-
 export interface AskApiBody {
   sessionId: string;
   chatId: string;
@@ -48,55 +49,10 @@ export type AskApiBodyError =
   | 'bad_questions'
   | 'bad_question_shape'
   | 'bad_multiSelect'
+  | 'bad_defaultSelectedKeys'
   | 'bad_requestId'
   | 'bad_originKind'
   | 'bad_mentionedOpenId';
-
-/** 选项说明长度上限（卡片渲染还会再截到 400 字，这里只给 IPC/持久化兜底）。 */
-const MAX_OPTION_DESCRIPTION = 1000;
-
-/** 校验单个 option 对象，返回解析后的 AskOption 或错误码。 */
-function parseOption(o: unknown): AskOption | AskApiBodyError {
-  if (!o || typeof o !== 'object') return 'bad_option_shape';
-  const oo = o as Record<string, unknown>;
-  if (typeof oo.key !== 'string' || !oo.key.trim()) return 'bad_option_key';
-  if (typeof oo.label !== 'string') return 'bad_option_label';
-  // 可选 description（Claude Code/OpenCode 的 AskUserQuestion 把选项详细解释放
-  // 这里）。此前该校验器只回 {key,label}，把 hook 已透传的说明静默丢弃——卡片
-  // 渲染端永远拿不到，用户只看到按钮。空白归一化为 undefined（与 hook 适配器
-  // 一致），非字符串/超长 fail loud。
-  let description: string | undefined;
-  if (oo.description !== undefined && oo.description !== null) {
-    if (typeof oo.description !== 'string') return 'bad_option_description';
-    const trimmed = oo.description.trim();
-    if (trimmed.length > MAX_OPTION_DESCRIPTION) return 'bad_option_description';
-    if (trimmed) description = trimmed;
-  }
-  return description ? { key: oo.key, label: oo.label, description } : { key: oo.key, label: oo.label };
-}
-
-/** 校验 questions[] 数组，返回解析后的 AskQuestion[] 或错误码。 */
-function parseQuestions(arr: unknown[]): AskQuestion[] | AskApiBodyError {
-  const result: AskQuestion[] = [];
-  for (const q of arr) {
-    if (!q || typeof q !== 'object' || Array.isArray(q)) return 'bad_question_shape';
-    const qq = q as Record<string, unknown>;
-    if (typeof qq.prompt !== 'string' || !qq.prompt.trim()) return 'bad_question_shape';
-    if (typeof qq.multiSelect !== 'boolean') return 'bad_multiSelect';
-    if (!Array.isArray(qq.options) || qq.options.length < 2) return 'bad_options';
-    const opts: AskOption[] = [];
-    const seen = new Set<string>();
-    for (const o of qq.options) {
-      const parsed = parseOption(o);
-      if (typeof parsed === 'string') return parsed;
-      if (seen.has(parsed.key)) return 'duplicate_option_key';
-      seen.add(parsed.key);
-      opts.push(parsed);
-    }
-    result.push({ prompt: qq.prompt, multiSelect: qq.multiSelect, options: opts });
-  }
-  return result;
-}
 
 /** Validate the request body. Returns either the parsed body or an error code
  *  ready to be sent back as `{ ok: false, error }` with HTTP 400.
@@ -156,7 +112,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
   if (Array.isArray(r.questions)) {
     // 新格式：questions[] 多问多选
     if (r.questions.length === 0) return { error: 'bad_questions' };
-    const parsed = parseQuestions(r.questions);
+    const parsed = parseAskQuestions(r.questions);
     if (typeof parsed === 'string') return { error: parsed };
     questions = parsed;
   } else if (Array.isArray(r.options) && typeof r.prompt === 'string' && r.prompt.trim()) {

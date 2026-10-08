@@ -10,9 +10,13 @@ import { canonicalJson } from '../utils/canonical-input-hash.js';
 
 export type DurableSessionFacadeStore = DurableSessionLeaseStore & DurableSessionStateStore;
 
+export type DurableSessionExactValueBuilder = (
+  current: DurableSessionRecord | undefined,
+) => DurableJson;
+
 export type DurableSessionFacadeWriteResult =
-  | { kind: 'written'; record: DurableSessionRecord; coalescedCount: number }
-  | { kind: 'unchanged'; record: DurableSessionRecord; coalescedCount: number }
+  | { kind: 'written'; lease: SessionLease; record: DurableSessionRecord; coalescedCount: number }
+  | { kind: 'unchanged'; lease: SessionLease; record: DurableSessionRecord; coalescedCount: number }
   | {
       kind: 'occupied';
       ownerId: string;
@@ -36,7 +40,15 @@ export interface DurableSessionFacadeStopResult {
 
 export interface DurableSessionFacade {
   readonly ownerId: string;
+  /** Shadow snapshots may collapse queued updates to the newest value. */
   write(sessionKey: string, value: DurableJson): Promise<DurableSessionFacadeWriteResult>;
+  /** Admission writes are FIFO and are never merged across distinct events. */
+  writeExact(sessionKey: string, value: DurableJson): Promise<DurableSessionFacadeWriteResult>;
+  /** Build one exact FIFO value from the leased current record inside the Session lane. */
+  writeExactFromCurrent(
+    sessionKey: string,
+    buildValue: DurableSessionExactValueBuilder,
+  ): Promise<DurableSessionFacadeWriteResult>;
   stop(timeoutMs?: number): Promise<DurableSessionFacadeStopResult>;
   terminate(): void;
 }
@@ -49,17 +61,21 @@ export interface DurableSessionFacadeOptions {
   shutdownMs?: number;
 }
 
-interface PendingWrite {
-  value: DurableJson;
+interface PendingWriteBase {
   waiters: Array<{
     resolve: (result: DurableSessionFacadeWriteResult) => void;
     reject: (error: unknown) => void;
   }>;
 }
 
+type PendingWrite = PendingWriteBase & (
+  | { mode: 'coalesced' | 'exact'; value: DurableJson }
+  | { mode: 'exact-current'; buildValue: DurableSessionExactValueBuilder }
+);
+
 interface SessionLane {
   sessionKey: string;
-  pending?: PendingWrite;
+  pending: PendingWrite[];
   running?: Promise<void>;
   lease?: SessionLease;
 }
@@ -91,6 +107,10 @@ function cloneDurableJson(value: DurableJson): DurableJson {
   const encoded = JSON.stringify(value);
   if (encoded === undefined) throw new Error('durable session value is not JSON-serializable');
   return JSON.parse(encoded) as DurableJson;
+}
+
+function cloneDurableSessionRecord(record: DurableSessionRecord): DurableSessionRecord {
+  return { ...record, value: cloneDurableJson(record.value) };
 }
 
 function sameDurableJson(left: DurableJson, right: DurableJson): boolean {
@@ -167,7 +187,7 @@ export function createDurableSessionFacade(
 
   const performWrite = async (
     lane: SessionLane,
-    value: DurableJson,
+    batch: PendingWrite,
     coalescedCount: number,
   ): Promise<DurableSessionFacadeWriteResult> => {
     if (isStopping()) return { kind: 'stopped', coalescedCount };
@@ -193,8 +213,11 @@ export function createDurableSessionFacade(
     try {
       const current = await options.store.readSession(lane.sessionKey);
       if (isStopping()) return await stopAfterReleasing(lane, acquired.lease, coalescedCount);
-      if (current && sameDurableJson(current.value, value)) {
-        return { kind: 'unchanged', record: current, coalescedCount };
+      const value = batch.mode === 'exact-current'
+        ? cloneDurableJson(batch.buildValue(current ? cloneDurableSessionRecord(current) : undefined))
+        : batch.value;
+      if (batch.mode === 'coalesced' && current && sameDurableJson(current.value, value)) {
+        return { kind: 'unchanged', lease: acquired.lease, record: current, coalescedCount };
       }
       const written = await options.store.writeSession({
         lease: acquired.lease,
@@ -203,7 +226,7 @@ export function createDurableSessionFacade(
       });
       if (isStopping()) return await stopAfterReleasing(lane, acquired.lease, coalescedCount);
       if (written.kind === 'written') {
-        return { kind: 'written', record: written.record, coalescedCount };
+        return { kind: 'written', lease: acquired.lease, record: written.record, coalescedCount };
       }
       if (written.kind === 'conflict') {
         return { kind: 'conflict', current: written.current, coalescedCount };
@@ -217,12 +240,11 @@ export function createDurableSessionFacade(
   };
 
   const runLane = async (lane: SessionLane): Promise<void> => {
-    while (lane.pending) {
-      const batch = lane.pending;
-      lane.pending = undefined;
+    while (lane.pending.length > 0) {
+      const batch = lane.pending.shift()!;
       let result: DurableSessionFacadeWriteResult;
       try {
-        result = await performWrite(lane, batch.value, batch.waiters.length);
+        result = await performWrite(lane, batch, batch.waiters.length);
       } catch (error) {
         for (const waiter of batch.waiters) waiter.reject(error);
         continue;
@@ -235,7 +257,7 @@ export function createDurableSessionFacade(
     if (lane.running) return;
     lane.running = runLane(lane).finally(() => {
       lane.running = undefined;
-      if (lane.pending && !terminated) startLane(lane);
+      if (lane.pending.length > 0 && !terminated) startLane(lane);
     });
   };
 
@@ -281,23 +303,58 @@ export function createDurableSessionFacade(
       }
       let lane = lanes.get(sessionKey);
       if (!lane) {
-        lane = { sessionKey };
+        lane = { sessionKey, pending: [] };
         lanes.set(sessionKey, lane);
       }
       return new Promise<DurableSessionFacadeWriteResult>((resolve, reject) => {
-        if (lane!.pending) {
-          lane!.pending!.value = value;
-          lane!.pending!.waiters.push({ resolve, reject });
+        const tail = lane!.pending.at(-1);
+        if (tail?.mode === 'coalesced') {
+          tail.value = value;
+          tail.waiters.push({ resolve, reject });
         } else {
-          lane!.pending = { value, waiters: [{ resolve, reject }] };
+          lane!.pending.push({ mode: 'coalesced', value, waiters: [{ resolve, reject }] });
         }
+        startLane(lane!);
+      });
+    },
+    writeExact: (rawSessionKey, rawValue) => {
+      const sessionKey = validateSessionKey(rawSessionKey);
+      const value = cloneDurableJson(rawValue);
+      if (!accepting || terminated) {
+        return Promise.resolve({ kind: 'stopped', coalescedCount: 1 });
+      }
+      let lane = lanes.get(sessionKey);
+      if (!lane) {
+        lane = { sessionKey, pending: [] };
+        lanes.set(sessionKey, lane);
+      }
+      return new Promise<DurableSessionFacadeWriteResult>((resolve, reject) => {
+        lane!.pending.push({ mode: 'exact', value, waiters: [{ resolve, reject }] });
+        startLane(lane!);
+      });
+    },
+    writeExactFromCurrent: (rawSessionKey, buildValue) => {
+      const sessionKey = validateSessionKey(rawSessionKey);
+      if (typeof buildValue !== 'function') {
+        return Promise.reject(new Error('durable exact Session value builder must be a function'));
+      }
+      if (!accepting || terminated) {
+        return Promise.resolve({ kind: 'stopped', coalescedCount: 1 });
+      }
+      let lane = lanes.get(sessionKey);
+      if (!lane) {
+        lane = { sessionKey, pending: [] };
+        lanes.set(sessionKey, lane);
+      }
+      return new Promise<DurableSessionFacadeWriteResult>((resolve, reject) => {
+        lane!.pending.push({ mode: 'exact-current', buildValue, waiters: [{ resolve, reject }] });
         startLane(lane!);
       });
     },
     stop: (timeoutMs = shutdownMs) => {
       if (stopPromise) return stopPromise;
-      accepting = false;
       const budget = boundedInteger(timeoutMs, 'timeoutMs', 0, 300_000);
+      accepting = false;
       stopPromise = (async () => {
         const deadline = Date.now() + budget;
         const running = [...lanes.values()].flatMap(lane => lane.running ? [lane.running] : []);
@@ -312,7 +369,7 @@ export function createDurableSessionFacade(
         }
         const release = await releaseLeases(deadline);
         const pendingSessionKeys = [...lanes.values()]
-          .filter(lane => !!lane.running || !!lane.pending)
+          .filter(lane => !!lane.running || lane.pending.length > 0)
           .map(lane => lane.sessionKey);
         return {
           kind: drained && !release.timedOut && release.unreleased.length === 0
@@ -328,14 +385,14 @@ export function createDurableSessionFacade(
       accepting = false;
       terminated = true;
       for (const lane of lanes.values()) {
-        const pending = lane.pending;
-        lane.pending = undefined;
-        if (!pending) continue;
-        const result: DurableSessionFacadeWriteResult = {
-          kind: 'stopped',
-          coalescedCount: pending.waiters.length,
-        };
-        for (const waiter of pending.waiters) waiter.resolve(result);
+        const pending = lane.pending.splice(0);
+        for (const batch of pending) {
+          const result: DurableSessionFacadeWriteResult = {
+            kind: 'stopped',
+            coalescedCount: batch.waiters.length,
+          };
+          for (const waiter of batch.waiters) waiter.resolve(result);
+        }
       }
     },
   };

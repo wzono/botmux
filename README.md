@@ -20,10 +20,6 @@
   <a href="README.en.md">English</a>
 </p>
 
-<p align="center">
-  <img src="docs/assets/botmux-product-panorama.png" width="1000" alt="botmux 产品全景：飞书话题连接实时卡片、Web 终端、多 Bot 编排与 20+ CLI / Agent">
-</p>
-
 ---
 
 Daemon 监听飞书消息，为每个新会话自动 spawn 一个独立的会话进程，把 AI 编程 CLI / Agent 的输出实时流式回传成飞书卡片，并提供可交互的 Web 终端。它**不重造 Agent 能力**，而是直接桥接你已经在用的工具（**20+ CLI / Agent 适配器**，见 [支持的 CLI / Agent](#支持的-cli--agent)）。
@@ -199,3 +195,5 @@ botmux 不重新实现记忆、上下文管理、工具调用、权限体系—�
 - 📄 **License**：[MIT](LICENSE)
 
 <p align="center">好用的话，顺手点个 ⭐ Star 吧 → <a href="https://github.com/deepcoldy/botmux">deepcoldy/botmux</a></p>
+
+[建群参数与默认配置](docs/guide/group-creation.md)

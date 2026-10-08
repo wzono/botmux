@@ -394,7 +394,7 @@ content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestio
     // 未 settle：只用 action/buttons，避免 form+select 被飞书服务端静默丢弃。
     elements.push({ tag: 'hr' });
 
-    const requiresSubmit = ask.questions.length > 1 || ask.questions.some((q) => q.multiSelect);
+    const requiresSubmit = ask.questions.length > 1 || ask.questions.some((q) => q.multiSelect || q.defaultSelectedKeys !== undefined);
     const selections = ask.selections ?? ask.questions.map(() => []);
 
     for (let i = 0; i < ask.questions.length; i++) {

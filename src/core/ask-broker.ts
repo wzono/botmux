@@ -277,7 +277,7 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
 
   return new Promise<AskResult>((resolve) => {
     const selections = new Map<number, Set<string>>();
-    for (let i = 0; i < input.questions.length; i++) selections.set(i, new Set<string>());
+    for (let i = 0; i < input.questions.length; i++) selections.set(i, new Set(input.questions[i]!.defaultSelectedKeys ?? []));
 
     const ask: InternalPending = {
       askId,
@@ -379,6 +379,7 @@ function questionsShape(qs: PendingAsk['questions']): string {
     qs.map((q) => ({
       p: q.prompt,
       m: !!q.multiSelect,
+      d: q.defaultSelectedKeys,
       o: q.options.map((o) => [o.key, o.label, o.description ?? null]),
     })),
   );

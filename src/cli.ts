@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError } from './cli/topic-send-guard.js';
+import { assertMessageTopicAvailable, assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from './cli/topic-send-guard.js';
+import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 /**
  * CLI entry point for botmux.
  *
@@ -163,6 +164,7 @@ import {
   PM2_DAEMON_RESTART_DELAY_MS,
 } from './core/shutdown-budgets.js';
 import { describeSendFailure, dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateSlashSend, validateVideoAttachments } from './cli/send-dispatch.js';
+import { dispatchDurableSessionMessage, durablePrimaryFinalProviderUuid } from './cli/durable-session-send.js';
 import { buildCardPatchSuccessOutput, CARD_COMMAND_USAGE, CARD_PATCH_USAGE, cardPatchArgsWantHelp, executeCardPatch, parseCardPatchArgs, readCardPatchInput } from './cli/card-dispatch.js';
 import {
   buildCardStreamSuccessOutput,
@@ -182,6 +184,8 @@ import { parseCardRuntimeStatusArgs } from './cli/card-runtime-status-dispatch.j
 import { readCardStreamUsageSnapshot } from './cli/card-stream-usage.js';
 import { CardStreamStore } from './services/card-stream-store.js';
 import { TurnReplyCardStore } from './services/turn-reply-card.js';
+import { patchPublishedGroupCard, readGroupContextAuthorOrigin } from './services/group-context-publication.js';
+import { markGroupContextCardPurpose } from './im/lark/group-context-card.js';
 import { TurnSendLedger, type TurnSendKind } from './services/turn-send-ledger.js';
 import { buildTurnReplyCard, replyCardPresentation } from './im/lark/turn-reply-card.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
@@ -716,7 +720,7 @@ function printRemainingSteps(appId: string, brand: 'feishu' | 'lark', redirectUr
   console.log(`     配置链接: ${home}/capability/bot`);
   console.log('');
 
-  console.log('  2. 事件与回调切到「使用长连接接收事件」，并订阅 im.message.receive_v1 / im.message.updated_v1 / card.action.trigger');
+  console.log('  2. 事件与回调切到「使用长连接接收事件」，并订阅 im.message.receive_v1 / im.message.updated_v1 / im.message.recalled_v1 / card.action.trigger');
   console.log(`     配置链接: ${home}/dev-config/event-sub`);
   console.log('');
 
@@ -3891,7 +3895,7 @@ interface SessionData {
   /** Per-turn reply targets（见 Session.replyTargets in types.ts）——排队/并发轮次各自的回复锚点。 */
   replyTargets?: Record<string, { rootMessageId?: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: import('./types.js').TurnParticipant[] }>;
   /** Frozen per-turn reply contexts（见 Session.turnReplyContexts in types.ts）。
-   *  `botmux send` 只读其中的 `inThread`：判断本轮 quote 目标当初是否从**顶层**
+   *  `botmux send` 读取发送人类型，并用 `inThread` 判断 quote 目标当初是否从**顶层**
    *  进来，据此拦住「顶层 @ 之后那条消息才被开成话题」时 quote 把回复带进话题。 */
   turnReplyContexts?: Record<string, {
     target?: { mode?: string; chatId?: string; rootMessageId?: string };
@@ -3923,6 +3927,7 @@ interface SessionData {
   // here, so they're typed loosely. Used by cmdList to avoid reporting an
   // unconfirmed /adopt scratch as a crashed CLI session.
   cliId?: string;
+  cliLaunchSnapshot?: import('./types.js').Session['cliLaunchSnapshot'];
   /** CLI-native resume id when it differs from botmux's Session id. */
   cliSessionId?: string;
   /** Frozen file-sandbox decision from the persisted session (tri-state). */
@@ -5625,7 +5630,7 @@ async function cmdSuspend(): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project' | 'continuation',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project' | 'continuation' | 'durable-send',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -6795,6 +6800,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               在宿主终端注册、查看或清除 desktop device 凭证（AI CLI 会话内拒绝）
   actor current --json
               返回当前 BotMux turn 的已验证企业用户名，不暴露 open_id/邮箱；脱离当前进程树时拒绝
+  execution current --json
+              只读核验当前进程所属的 bot/session/turn、执行尝试和 Worker 代次
   auth request [--scope "<scope1 scope2,...>"] [--json]
               为本轮发起人生成飞书授权链接，返回 JSON；由 Agent 将链接发给用户
   auth wait --request-id <id> [--json]
@@ -6809,6 +6816,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               --plain  纯文本表格输出（管道/脚本场景）
   observe [--session <id>] [--lark-app <appId>] [--include-raw]
               通过 daemon 实时 IPC 输出 canonical worker/session JSON；失败保持 unknown，不回退缓存
+  interaction-context --bot <appId> --session <id> [--actor <openId>]
+              宿主只读查询真实会话来源及当前回答权限（不恢复会话）
   delete <id>      关闭指定会话（支持 ID 前缀匹配）
   delete all       关闭所有活跃会话
   delete stopped   清理所有进程已退出的僵尸会话
@@ -6907,6 +6916,7 @@ ${SEND_HELP_BODY}
   quoted <message_id> [--raw]          按消息 id 拉取单条消息 (JSON) 并下载附件到本地；id 取自引用提示行或 history 输出，
                                        --raw 附原始内容（卡片 → cardJson，其它 → rawContent）
   input-capture register|inspect|revoke|revoke-set --bot <appId> --session <id> ...
+  ask buttons --questions-file <file>   多题卡片，支持 defaultSelectedKeys 预选；底部提交，返回 JSON
   ask buttons [--multi] --options "a,b" "<问题>"
                                        把选择题做成按钮卡片抛给飞书；--multi 返回逗号分隔的多个 key
                                        （无 hook 的 CLI 用它把决策引到人；也可省略 buttons 走裸别名）
@@ -9657,7 +9667,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error(
       `不能把 stdin（${stdinAlias}）当作 --file/--image/--video 附件：botmux send 已从 stdin 读取消息正文，\n` +
       `同一个 stdin 没法既当正文又当附件（第二次读到的是 EOF）。\n` +
-      `要发送管道内容，先落到临时文件：  数据来源 > /tmp/x && botmux send --files /tmp/x …`,
+      `要发送管道内容，先落到会话临时文件：  数据来源 > "\${TMPDIR:-/tmp}/x" && botmux send --files "\${TMPDIR:-/tmp}/x" …`,
     );
     process.exit(1);
   }
@@ -9722,6 +9732,22 @@ async function cmdSend(rest: string[]): Promise<void> {
   });
   if (managedControlError) {
     console.error(`botmux send refused for a managed VC turn: ${managedControlError}`);
+    process.exit(2);
+  }
+  const durableCoordinationPrimary = process.env.BOTMUX_COORDINATION_MODE === 'primary';
+  if (durableCoordinationPrimary && (
+    asVoice
+    || images.length > 0
+    || files.length > 0
+    || videoAttachments.length > 0
+    || attention.requested
+    || urgent.requested
+    || !!vcMeetingManagedSendOrigin
+  )) {
+    console.error(
+      'botmux send: durable primary 当前只支持单条文本/卡片消息；'
+      + '语音、附件、attention、urgent 和 managed VC 输出尚未接入 durable outbox',
+    );
     process.exit(2);
   }
   if (customCardRequested && asVoice) {
@@ -9847,6 +9873,11 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Prefer the exact per-turn reply anchor; the latest single slot is only a
   // compatibility fallback for sessions persisted before replyTargets.
   const turnReplyTarget = pickTurnReplyTarget(s, currentTurnId);
+  if (privateReplyEnabled(s) && (sendInto || overrideChatId)) {
+    console.error('当前群角色已启用私聊回复，请移除 --into / --chat-id 后发送给本轮提问人。');
+    process.exit(2);
+  }
+
 
   const exactOriginDispatch = (() => {
     const unsettledOriginDispatches = originSession?.codexAppDispatchLedger ?? [];
@@ -9935,12 +9966,8 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Re-challenge immediately before observable provider effects so lengthy
   // local parsing/card preparation cannot carry an old capability across a
   // worker restart, turn rotation, or Codex ledger settlement.
-  let checkSendTopics: (() => Promise<void>) | undefined;
-  let resetTopicLookup: (() => void) | undefined;
-  let topicEffectChecked = false;
-  const revalidateIsolatedOriginBeforeEffect = async (): Promise<ManagedOriginAttestation | undefined> => {
-    if (!topicEffectChecked) { resetTopicLookup?.(); topicEffectChecked = true; }
-    await checkSendTopics?.();
+  let checkSendTopics: ((lookup?: TopicMessageLookup) => Promise<void>) | undefined;
+  const revalidateIsolatedOrigin = async (): Promise<ManagedOriginAttestation | undefined> => {
     if (!isolatedAttestationContext || !isolatedManagedOriginCtx) return undefined;
     const fresh = await attestManagedOrigin({
       context: isolatedAttestationContext,
@@ -9972,8 +9999,17 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
     return fresh;
   };
-  const fenceIsolatedOriginBeforeEffect = async (): Promise<void> => {
-    await revalidateIsolatedOriginBeforeEffect();
+  const revalidateIsolatedOriginBeforeEffect = async (
+    lookup?: TopicMessageLookup,
+  ): Promise<ManagedOriginAttestation | undefined> => {
+    await checkSendTopics?.(lookup);
+    return revalidateIsolatedOrigin();
+  };
+  const fenceIsolatedOriginBeforeEffect = async (lookup?: TopicMessageLookup): Promise<void> => {
+    await revalidateIsolatedOriginBeforeEffect(lookup);
+  };
+  const fenceIsolatedOrigin = async (): Promise<void> => {
+    await revalidateIsolatedOrigin();
   };
   const isolatedHookOrigin = isolatedAttestationContext?.ipcPortFallback
     && isolatedManagedOriginCtx
@@ -9987,21 +10023,33 @@ async function cmdSend(rest: string[]): Promise<void> {
           : {}),
       }
     : undefined;
+  // Selecting another destination session never grants that conversation
+  // native authorship of this command's output.
+  const groupContextAuthorOrigin = originSessionId === sid && originSession?.larkAppId === s.larkAppId
+    ? readGroupContextAuthorOrigin({
+        appId: s.larkAppId, chatId: originSession.chatId, sessionId: sid, turnId: currentTurnId,
+        nativeSessionId: originSession.cliSessionId,
+        cliId: originSession.cliLaunchSnapshot?.cliId ?? originSession.cliId,
+        workerGeneration: originSession.workerGeneration,
+      }, resolveDataDir()) : undefined;
   // Outbound hooks are a distinct post-provider effect. Preserve normal hook
   // behavior, but bind it to a fresh challenge of this command's original
   // protected claim. The Lark client treats fence failure as hook-only loss so
   // an already-delivered primary is never reported failed and duplicated.
-  const outboundMessageOptions = (suppressHook = false) =>
-    suppressHook
+  const outboundMessageOptions = (suppressHook = false) => {
+    const hookOptions = suppressHook
       ? { suppressHook: true as const }
       : isolatedAttestationContext
         ? isolatedHookOrigin
-          ? {
-              beforeHook: fenceIsolatedOriginBeforeEffect,
-              hookOrigin: isolatedHookOrigin,
-            }
+          ? { beforeHook: fenceIsolatedOriginBeforeEffect, hookOrigin: isolatedHookOrigin }
           : { suppressHook: true as const }
         : undefined;
+    return {
+      beforeWrite: fenceIsolatedOriginBeforeEffect,
+      ...(hookOptions ?? {}),
+      ...(groupContextAuthorOrigin ? { groupContextAuthorOrigin } : {}),
+    };
+  };
 
   // A document-comment turn has exactly one supported observable effect: a
   // plain text reply to its frozen origin target.  Validate the complete shape
@@ -10271,7 +10319,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
 
   if (!customCard && !content.trim() && !asChoice && images.length === 0 && files.length === 0 && videoAttachments.length === 0) {
-    console.error('没有内容可发送。用法:\n  echo "消息" | botmux send\n  botmux send "消息"\n  botmux send --content-file /tmp/msg.md --images /tmp/chart.png\n  botmux send --videos /tmp/replay.mp4 --video-covers /tmp/cover.png --no-mention "视频预览"');
+    console.error('没有内容可发送。用法:\n  echo "消息" | botmux send\n  botmux send "消息"\n  botmux send --content-file "${TMPDIR:-/tmp}/msg.md" --images "${TMPDIR:-/tmp}/chart.png"\n  botmux send --videos "${TMPDIR:-/tmp}/replay.mp4" --video-covers "${TMPDIR:-/tmp}/cover.png" --no-mention "视频预览"');
     process.exit(1);
   }
 
@@ -10423,29 +10471,37 @@ async function cmdSend(rest: string[]): Promise<void> {
   if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
 
   const { getMessageDetail: getTopicMessageDetail } = await import('./im/lark/client.js');
+  const lookupTopic: TopicMessageLookup = (app, id) =>
+    getTopicMessageDetail(app, id, { userCardContent: false, timeoutMs: 10000 });
   // Source routing deliberately ignores explicit destination overrides.
-  const sourceTopicTarget = frozenTurnReplyTarget ?? resolveSendTarget({
-    topLevel: false, chatScope: s.scope === 'chat', chatId: s.chatId,
-    rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId,
-    replyTargetTurnId: turnReplyTarget?.turnId,
-    replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId,
+  // Destination overrides do not transfer the source's policy or identity.
+  const topicSourceSession = originSession ?? s;
+  const topicSourceTurnId = originSession ? originTurnId : currentTurnId;
+  const topicSourceTurn = pickTurnReplyTarget(topicSourceSession, topicSourceTurnId);
+  const sourceTopicTarget = exactOriginDispatch?.replyTarget ?? resolveSendTarget({
+    topLevel: false, chatScope: topicSourceSession.scope === 'chat', chatId: topicSourceSession.chatId,
+    rootMessageId: topicSourceSession.rootMessageId, replyTargetRootId: topicSourceTurn?.rootMessageId,
+    replyTargetTurnId: topicSourceTurn?.turnId,
+    replyTargetQuoteOnly: topicSourceTurn?.quoteOnly, currentTurnId: topicSourceTurnId,
   });
-  const topicLookup = createTopicMessageLookupCache(getTopicMessageDetail);
-  resetTopicLookup = topicLookup.clear;
-  topicEffectChecked = false;
-  checkSendTopics = async () => {
-    if (getBot(appId).config.topicUnavailablePolicy !== 'stop') return;
-    const scheduledRoot = reusableDeferredTopicRoot({
-      session: s as SessionData & { larkAppId: string },
-      binding: readDeferredTopicBinding(dataDir, s.sessionId),
-      explicitTopLevel: false,
-    });
-    await assertSendTopicsAvailable(appId, [
-      scheduledRoot,
-      !s.deferredScheduleRun && (sourceTopicTarget.mode === 'thread' || sourceTopicTarget.mode === 'quote')
-        ? sourceTopicTarget.rootMessageId : undefined,
-      sendInto,
-    ], topicLookup.lookup, 'stop');
+  checkSendTopics = async (lookup = createTopicMessageLookupCache(lookupTopic).lookup) => {
+    const sourceAppId = topicSourceSession.larkAppId ?? appId;
+    if (getBot(sourceAppId).config.topicUnavailablePolicy === 'stop') {
+      const scheduledRoot = reusableDeferredTopicRoot({
+        session: { ...topicSourceSession, larkAppId: sourceAppId },
+        binding: readDeferredTopicBinding(dataDir, topicSourceSession.sessionId),
+        explicitTopLevel: false,
+      });
+      await assertSendTopicsAvailable(sourceAppId, [scheduledRoot],
+        lookup, 'stop');
+      if (!topicSourceSession.deferredScheduleRun && sourceTopicTarget.mode !== 'plain') {
+        await assertMessageTopicAvailable(sourceAppId, sourceTopicTarget.rootMessageId,
+          lookup);
+      }
+    }
+    await assertSendTopicsAvailable(appId, [sendInto],
+      lookup,
+      getBot(appId).config.topicUnavailablePolicy);
   };
   await checkSendTopics();
   // Resolve sender-scoped bot identities before the early voice return. Voice
@@ -10536,7 +10592,13 @@ async function cmdSend(rest: string[]): Promise<void> {
           revalidateVcMeetingManagedSend();
           const managedProviderOptions = outboundMessageOptions(!!prepared);
           const deliveryUuid = prepared?.providerKey ?? providerUuid;
-          const deferred = !sendInto && (!overrideChatId || overrideChatId === s.chatId)
+          await revalidateIsolatedOriginBeforeEffect();
+          const privateMessageId = !sendInto && !overrideChatId
+            ? await sendPrivateReply(s, currentTurnId, canonicalOutput.content, canonicalOutput.msgType, deliveryUuid)
+            : undefined;
+          const deferred = privateMessageId !== undefined
+            ? { handled: true, messageId: privateMessageId, materializedNow: false, rootMessageId: undefined }
+            : !sendInto && (!overrideChatId || overrideChatId === s.chatId)
             ? await dispatchDeferredTopicSend({
                 dataDir: resolveDataDir(),
                 session: s as SessionData & { larkAppId: string },
@@ -10547,15 +10609,15 @@ async function cmdSend(rest: string[]): Promise<void> {
                 msgType: canonicalOutput.msgType,
                 uuid: deliveryUuid,
                 sendRoot: async (body, type, uuid) => {
-                  await revalidateIsolatedOriginBeforeEffect();
+                  await revalidateIsolatedOrigin();
                   return sendMessage(appId, targetChatId, body, type, uuid, undefined, managedProviderOptions);
                 },
                 sendTitleSeed: async (title, uuid) => {
-                  await revalidateIsolatedOriginBeforeEffect();
-                  return sendMessage(appId, targetChatId, title, 'text', uuid);
+                  await revalidateIsolatedOrigin();
+                  return sendMessage(appId, targetChatId, title, 'text', uuid, undefined, outboundMessageOptions(true));
                 },
                 replyRoot: async (root, body, type, uuid) => {
-                  await revalidateIsolatedOriginBeforeEffect();
+                  await revalidateIsolatedOrigin();
                   return replyMessage(appId, root, body, type, true, uuid, undefined, managedProviderOptions);
                 },
               })
@@ -10578,7 +10640,7 @@ async function cmdSend(rest: string[]): Promise<void> {
                   replyTargetQuoteOnly: turnReplyTarget?.quoteOnly,
                   currentTurnId,
                 });
-            await revalidateIsolatedOriginBeforeEffect();
+            await revalidateIsolatedOrigin();
             deliveredMessageId = canonicalTarget.mode === 'plain'
               ? await sendMessage(
                   appId, canonicalTarget.chatId, canonicalOutput.content, canonicalOutput.msgType,
@@ -10610,6 +10672,7 @@ async function cmdSend(rest: string[]): Promise<void> {
             sentAtMs,
             messageId,
             responseKind: effectiveResponseKind,
+            terminalCarrier: 'non_patchable',
             ...(originTurnId ? { turnId: originTurnId } : {}),
             ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
           };
@@ -11080,6 +11143,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     // This closure also carries attachments, so every Lark call re-checks the
     // exact durable attempt/member instead of inheriting the early cmd gate.
     revalidateVcMeetingManagedSend();
+    if (!sendInto && !overrideChatId) {
+      const privateMessageId = await sendPrivateReply(s, currentTurnId, content, msgType, uuid);
+      if (privateMessageId !== undefined) return privateMessageId;
+    }
     if (!sendInto && (!overrideChatId || overrideChatId === s.chatId)) {
       const deferred = await dispatchDeferredTopicSend({
         dataDir: resolveDataDir(),
@@ -11091,7 +11158,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         msgType,
         uuid,
         sendRoot: async (body, type, rootUuid) => {
-          await revalidateIsolatedOriginBeforeEffect();
+          await revalidateIsolatedOrigin();
           return sendMessage(
             appId,
             targetChatId,
@@ -11106,11 +11173,11 @@ async function cmdSend(rest: string[]): Promise<void> {
         // its first reply. Do not emit a user outbound hook for presentation-
         // only seed text; the alert itself still goes through the hook path.
         sendTitleSeed: async (title, rootUuid) => {
-          await revalidateIsolatedOriginBeforeEffect();
-          return sendMessage(appId, targetChatId, title, 'text', rootUuid);
+          await revalidateIsolatedOrigin();
+          return sendMessage(appId, targetChatId, title, 'text', rootUuid, undefined, outboundMessageOptions(true));
         },
         replyRoot: async (root, body, type, replyUuid) => {
-          await revalidateIsolatedOriginBeforeEffect();
+          await revalidateIsolatedOrigin();
           return replyMessage(
             appId,
             root,
@@ -11129,7 +11196,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         return deferred.messageId;
       }
     }
-    await revalidateIsolatedOriginBeforeEffect();
+    await revalidateIsolatedOrigin();
     return sendTarget.mode === 'plain'
       ? await sendMessage(
           appId,
@@ -11157,10 +11224,15 @@ async function cmdSend(rest: string[]): Promise<void> {
     uuid?: string,
     suppressHook?: boolean,
   ): Promise<string> => {
-    await revalidateIsolatedOriginBeforeEffect();
+    await revalidateIsolatedOrigin();
     return dispatchAfterOriginGate(content, msgType, uuid, suppressHook);
   };
-  const recordBridgeSendMarker = (sentAtMs: number, messageId: string, sentContent: string): void => {
+  const recordBridgeSendMarker = (
+    sentAtMs: number,
+    messageId: string,
+    sentContent: string,
+    terminalCarrier?: 'standard_reply_card' | 'non_patchable',
+  ): void => {
     try {
       const markerDir = join(resolveDataDir(), 'turn-sends');
       if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
@@ -11172,6 +11244,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
         ...(unifiedReplyUsed ? { replyCardResponseKind: effectiveResponseKind } : {}),
         ...(remoteRunnerOutbound ? { terminalIndependent: true } : {}),
+        ...(terminalCarrier ? { terminalCarrier } : {}),
       };
       Object.assign(marker, buildBridgeSendMarkerContent(sentContent));
       const line = JSON.stringify(marker) + '\n';
@@ -11243,6 +11316,64 @@ async function cmdSend(rest: string[]): Promise<void> {
       throw new Error(`VC listener assistant reply refused (${prepared.reason}): ${prepared.detail}`);
     }
     const canonicalOutput = prepared?.canonicalOutput ?? proposedOutput;
+    if (durableCoordinationPrimary) {
+      if (!currentTurnId) {
+        throw new Error('durable primary send requires a bound current turn');
+      }
+      if (prepared) {
+        throw new Error('durable primary send does not yet support managed listener output');
+      }
+      if (deferredBinding && !deferredRoot) {
+        throw new Error('durable primary send cannot materialize a deferred topic root yet');
+      }
+      const durableTarget = canonicalOutput.quoteTargetId
+        ? {
+            kind: 'reply' as const,
+            messageId: canonicalOutput.quoteTargetId,
+            replyInThread: false,
+          }
+        : deferredRoot
+          ? { kind: 'reply' as const, messageId: deferredRoot, replyInThread: true }
+          : sendTarget.mode === 'plain'
+            ? { kind: 'send' as const, chatId: canonicalOutput.targetChatId }
+            : {
+                kind: 'reply' as const,
+                messageId: sendTarget.rootMessageId,
+                replyInThread: sendTarget.mode === 'thread',
+              };
+      const durableIpcPort = resolveDaemonIpcPort(
+        undefined,
+        process.env.BOTMUX_DAEMON_IPC_PORT,
+      );
+      if (!durableIpcPort) {
+        throw new Error('durable primary send requires the owning daemon IPC port');
+      }
+      const messageId = await dispatchDurableSessionMessage({
+        post: (sessionId, route, payload) => postSessionCliIpc(
+          durableIpcPort,
+          sessionId,
+          route,
+          payload,
+        ),
+      }, {
+        sessionId: sid,
+        turnId: currentTurnId,
+        target: durableTarget,
+        content: canonicalOutput.content,
+        msgType: canonicalOutput.msgType,
+        providerUuid: effectiveResponseKind === 'final'
+          ? durablePrimaryFinalProviderUuid({
+              larkAppId: appId,
+              scope: s.scope === 'chat' ? 'chat' : 'thread',
+              anchor: s.scope === 'chat' ? s.chatId : s.rootMessageId,
+              turnId: currentTurnId,
+            })
+          : uuid ?? `dms_${randomUUID().replace(/-/g, '')}`,
+        hookContext,
+      });
+      primaryQuotedId = canonicalOutput.quoteTargetId ?? null;
+      return messageId;
+    }
     if (prepared?.outputMismatch) {
       console.error(
         `⚠️ VC listener reply output_mismatch action=${prepared.ref.actionId} `
@@ -11276,6 +11407,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         // outbound hooks, including its first provider attempt.
         ...(prepared ? { suppressHook: true } : {}),
         hookContext,
+        ...(groupContextAuthorOrigin ? { groupContextAuthorOrigin } : {}),
         MessageWithdrawnError,
         ...(isolatedHookOrigin
           ? {
@@ -11300,9 +11432,10 @@ async function cmdSend(rest: string[]): Promise<void> {
               );
             }
           : dispatchAfterOriginGate,
+        beforeWrite: fenceIsolatedOriginBeforeEffect,
         beforeEffect: originAlreadyRevalidated
           ? undefined
-          : fenceIsolatedOriginBeforeEffect,
+          : fenceIsolatedOrigin,
         beforeQuoteFallback: async () => {
           if (getBot(appId).config.topicUnavailablePolicy === 'stop') {
             throw new TopicSendError('TOPIC_SEND_BLOCKED', '引用目标已撤回，按机器人配置停止发送，不改发其他位置。');
@@ -11790,7 +11923,8 @@ async function cmdSend(rest: string[]): Promise<void> {
       // relay). Match the daemon's sandbox exclusion instead of reviving it.
       const replyCardSandboxed = s.sandbox === true || s.sandbox === 'oncall' || s.sandbox === 'scratch' || process.env.BOTMUX_READ_ISOLATION === '1'
         || process.env.BOTMUX_SANDBOX === '1';
-      const canUseReplyCard = replyKey && !replyCardSandboxed && !sendTopLevel && !overrideChatId && !sendInto
+      const canUseReplyCard = replyKey && !durableCoordinationPrimary
+        && !privateReplyEnabled(s) && !replyCardSandboxed && !sendTopLevel && !overrideChatId && !sendInto
         && !vcMeetingManagedSendOrigin && !attention.requested && !explicitQuote && !noQuote
         && effectiveResponseKind !== 'auxiliary' && onlyRequesterMentions && !containsLarkAtTag(text)
         && (effectiveResponseKind === 'final' || (imageKeys.length === 0 && files.length === 0 && videoAttachments.length === 0));
@@ -11805,10 +11939,12 @@ async function cmdSend(rest: string[]): Promise<void> {
             : { kind: 'progress', text }, {
             beforeEffect: async () => { await revalidateIsolatedOriginBeforeEffect(); revalidateVcMeetingManagedSend(); },
             send: (body, uuid) => dispatchPrimaryUnlocked(body, 'interactive', undefined, uuid ?? providerUuid),
-            patch: async (id, body) => {
-              const { updateMessage } = await import('./im/lark/client.js');
-              await updateMessage(appId, id, body);
-            },
+            patch: (id, body) => patchPublishedGroupCard(appId, targetChatId, id, body, replyRecord.rootId,
+              effectiveResponseKind === 'final' ? groupContextAuthorOrigin : undefined,
+              async (lookup) => {
+                await revalidateIsolatedOriginBeforeEffect(lookup);
+                revalidateVcMeetingManagedSend();
+              }),
             isWithdrawn: error => error instanceof MessageWithdrawnError,
             render: record => buildTurnReplyCard(record, {
               ...replyCardPresentation(getBot(appId).config, targetChatId), locale: localeForBot(appId), workingDir: s.workingDir,
@@ -11834,7 +11970,9 @@ async function cmdSend(rest: string[]): Promise<void> {
         }
         messageId = replyDelivery.messageId;
       } else {
-        messageId = await dispatchPrimary(replyCardJson, 'interactive');
+        const standaloneCard = responseKind === undefined ? replyCardJson
+          : markGroupContextCardPurpose(replyCardJson, responseKind === 'progress' ? 'runtime' : 'message');
+        messageId = await dispatchPrimary(standaloneCard, 'interactive');
       }
     }
 
@@ -11844,6 +11982,16 @@ async function cmdSend(rest: string[]): Promise<void> {
     // after waiting. Stop here so the losing process cannot repeat indexing,
     // attachments, urgency, bridge markers, or attention side effects.
     if (turnPrimaryReplayed) {
+      if (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput) {
+        recordBridgeSendMarker(
+          Date.now(),
+          messageId,
+          text,
+          customCard || pureFileSend || pureVideoSend || files.length > 0 || videoAttachments.length > 0
+            ? 'non_patchable'
+            : 'standard_reply_card',
+        );
+      }
       console.error(`✓ 已复用本轮最终回答 ${messageId}`);
       console.log(JSON.stringify({
         success: true,
@@ -11936,7 +12084,14 @@ async function cmdSend(rest: string[]): Promise<void> {
     // cover the same final answer; detoured sends suppress only when they
     // closed a pending response card for this turn.
     if (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput) {
-      recordBridgeSendMarker(sentAtMs, messageId, text);
+      recordBridgeSendMarker(
+        sentAtMs,
+        messageId,
+        text,
+        !customCard && !pureFileSend && !pureVideoSend
+          ? 'standard_reply_card'
+          : 'non_patchable',
+      );
     }
 
     // Send attachments as separate messages — best-effort. The primary message
@@ -11955,6 +12110,17 @@ async function cmdSend(rest: string[]): Promise<void> {
       );
       failedVideoAttachments = videoResult.failed;
       videoMessageIds = videoResult.sent;
+    }
+    // Attachments are independent Lark messages posted after the main reply
+    // card. Record the actual bottom-most carrier so terminal auto mode never
+    // PATCHes an earlier card and leaves a file/voice/custom carrier below it
+    // looking like the unfinished tail of the turn. This second append is an
+    // ordered carrier refinement; the first marker above remains the early
+    // fallback-suppression proof if the process dies during attachment work.
+    const trailingCarrierMessageId = videoMessageIds.at(-1) ?? attachmentMessageIds.at(-1);
+    if (trailingCarrierMessageId
+      && (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput)) {
+      recordBridgeSendMarker(Date.now(), trailingCarrierMessageId, '', 'non_patchable');
     }
     for (const f of failedAttachments) {
       console.error(`⚠️ 附件未发送（主消息已送达 ${messageId}，请勿重发）: ${f.path} — ${f.error}`);
@@ -12143,6 +12309,7 @@ async function cmdCard(rest: string[]): Promise<void> {
             input.content,
             input.sequence,
             input.uuid,
+            input.messageId,
           ),
           patchElement: input => patchCardStreamElement(
             input.larkAppId,
@@ -12151,6 +12318,7 @@ async function cmdCard(rest: string[]): Promise<void> {
             input.partialElement,
             input.sequence,
             input.uuid,
+            input.messageId,
           ),
         });
         const authority = { sessionId: sid, larkAppId, chatId: session.chatId };
@@ -12238,6 +12406,7 @@ async function cmdCard(rest: string[]): Promise<void> {
         input.content,
         input.sequence,
         input.uuid,
+        input.messageId,
       ),
       patchElement: input => patchCardStreamElement(
         input.larkAppId,
@@ -12246,6 +12415,7 @@ async function cmdCard(rest: string[]): Promise<void> {
         input.partialElement,
         input.sequence,
         input.uuid,
+        input.messageId,
       ),
     });
     const deps = {
@@ -12257,6 +12427,7 @@ async function cmdCard(rest: string[]): Promise<void> {
         ),
       resolveCardId: resolveCardKitId,
       updateSettings: async (input: {
+        messageId: string;
         larkAppId: string;
         cardId: string;
         streamingMode: boolean;
@@ -12266,6 +12437,7 @@ async function cmdCard(rest: string[]): Promise<void> {
         print?: { frequencyMs: number; step: number; strategy: 'fast' };
       }) => updateCardStreamingSettings(input.larkAppId, input.cardId, input),
       updateElementContent: async (input: {
+        messageId: string;
         larkAppId: string;
         cardId: string;
         elementId: string;
@@ -12279,6 +12451,7 @@ async function cmdCard(rest: string[]): Promise<void> {
         input.content,
         input.sequence,
         input.uuid,
+        input.messageId,
       ),
       moveRuntimeBinding: (previousStreamId: string, currentStreamId: string) =>
         runtimeBridge.reanchor(previousStreamId, currentStreamId, authority),
@@ -12709,7 +12882,8 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const sid = sessionIdArg ?? findAncestorSessionId();
+  const dispatchContext = resolveSessionContext(resolveDataDir(), process.env.BOTMUX_SESSION_ID);
+  const sid = sessionIdArg ?? dispatchContext?.sessionId;
   if (!sid) {
     console.error('无法推断 session-id。请在 Lark 话题内的 CLI 会话中运行，或传 --session-id <id>。');
     process.exit(1);
@@ -12721,6 +12895,27 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   // no-transport turn may not originate a Feishu topic/write). Closes the
   // `dispatch --session-id <virtual> --chat-id oc_real` env-only gap.
   assertSessionTransportOrExit({ chatId: s.chatId, larkAppId: s.larkAppId }, 'dispatch');
+
+  // The repo-prime reply is a direct CLI write. An explicit source session or
+  // new destination must not replace the process-tree execution origin.
+  const dispatchOrigin = dispatchContext?.sessionId && dispatchContext.sessionId !== sid
+    ? await requireSessionById(dispatchContext.sessionId) : s;
+  const dispatchTurnId = dispatchContext?.sessionId === dispatchOrigin.sessionId
+    ? dispatchContext.turnId : undefined;
+  const dispatchTurn = pickTurnReplyTarget(dispatchOrigin, dispatchTurnId);
+  const dispatchSourceAppId = dispatchOrigin.larkAppId!;
+  const dispatchSource = resolveSendTarget({
+    topLevel: false, chatScope: (dispatchOrigin.scope ?? 'thread') === 'chat', chatId: dispatchOrigin.chatId,
+    rootMessageId: dispatchOrigin.rootMessageId, replyTargetRootId: dispatchTurn?.rootMessageId,
+    replyTargetTurnId: dispatchTurn?.turnId, replyTargetQuoteOnly: dispatchTurn?.quoteOnly, currentTurnId: dispatchTurnId,
+  });
+  const dispatchWriteOptions = { beforeWrite: async () => {
+    const { getBot } = await import('./bot-registry.js');
+    if (getBot(dispatchSourceAppId).config.topicUnavailablePolicy !== 'stop' || dispatchSource.mode === 'plain') return;
+    const { getMessageDetail } = await import('./im/lark/client.js');
+    await assertMessageTopicAvailable(dispatchSourceAppId, dispatchSource.rootMessageId,
+      (appId, id) => getMessageDetail(appId, id, { userCardContent: false, timeoutMs: 10000 }));
+  } };
 
   const targetChatId = overrideChatId ?? s.chatId;
   if (!targetChatId) { console.error(`session ${sid} 缺少 chatId，且未提供 --chat-id`); process.exit(1); }
@@ -12948,7 +13143,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     let primeId: string | undefined;
     if (repo) {
       const prime = buildRepoPrimeText({ path: repo, bots });
-      primeId = await replyMessage(appId, seedId, prime.text, 'text', true);
+      primeId = await replyMessage(appId, seedId, prime.text, 'text', true, undefined, undefined, dispatchWriteOptions);
     }
 
     // 3. Brief kickoff — reply_in_thread @-ing the bots so each spawns its own
@@ -13227,6 +13422,28 @@ async function cmdReport(rest: string[]): Promise<void> {
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
   const sessions = loadSessions();
 
+  // Destination overrides cannot erase the original session/turn source.
+  const reportOrigin = reportContext?.sessionId && reportContext.sessionId !== sid
+    ? await requireSessionById(reportContext.sessionId) : s;
+  const reportOriginTurnId = reportContext?.sessionId === reportOrigin.sessionId
+    ? reportContext.turnId : undefined;
+  const reportOriginTurn = pickTurnReplyTarget(reportOrigin, reportOriginTurnId);
+  const reportSourceAppId = reportOrigin.larkAppId!;
+  const reportSource = resolveSendTarget({
+    topLevel: false, chatScope: (reportOrigin.scope ?? 'thread') === 'chat', chatId: reportOrigin.chatId,
+    rootMessageId: reportOrigin.rootMessageId, replyTargetRootId: reportOriginTurn?.rootMessageId,
+    replyTargetTurnId: reportOriginTurn?.turnId,
+    replyTargetQuoteOnly: reportOriginTurn?.quoteOnly, currentTurnId: reportOriginTurnId,
+  });
+  const reportWriteOptions = { beforeWrite: async () => {
+    const { getBot } = await import('./bot-registry.js');
+    if (getBot(reportSourceAppId).config.topicUnavailablePolicy !== 'stop' || reportSource.mode === 'plain') return;
+    const { getMessageDetail } = await import('./im/lark/client.js');
+    await assertMessageTopicAvailable(reportSourceAppId, reportSource.rootMessageId,
+      (appId, id) => getMessageDetail(appId, id, { userCardContent: false, timeoutMs: 10000 }));
+  } };
+
+
   const { readPeerCrossRef } = await import('./services/peer-cross-ref-store.js');
   let recipientResolution: ReturnType<typeof resolveReportRecipientForSession>;
   try {
@@ -13303,7 +13520,7 @@ async function cmdReport(rest: string[]): Promise<void> {
               alreadyInReview: result.alreadyInReview,
               ...(url ? { issueUrl: url } : {}),
             }),
-            'interactive',
+            'interactive', undefined, undefined, reportWriteOptions,
           );
           delivered = true;
         } catch (e: any) {
@@ -13433,7 +13650,7 @@ async function cmdReport(rest: string[]): Promise<void> {
   try {
     let msgId: string;
     if (placement.target.mode === 'plain') {
-      msgId = await sendMessage(appId, placement.target.chatId, postJson, 'post');
+      msgId = await sendMessage(appId, placement.target.chatId, postJson, 'post', undefined, undefined, reportWriteOptions);
     } else {
       msgId = await replyMessage(
         appId,
@@ -13441,6 +13658,7 @@ async function cmdReport(rest: string[]): Promise<void> {
         postJson,
         'post',
         placement.target.mode === 'thread',
+        undefined, undefined, reportWriteOptions,
       );
     }
     const messageTarget = placement.target.mode === 'plain'
@@ -14092,7 +14310,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     process.exit(2);
   }
 
-  const { findMissingAskEnv, parseAskOptions, parseAskTimeoutSeconds, parseAskMention, AskArgsError } =
+  const { findMissingAskEnv, parseAskOptions, parseAskQuestionsFile, parseAskTimeoutSeconds, parseAskMention, AskArgsError } =
     await import('./core/ask-args.js');
   type AskJsonOutput = import('./core/ask-types.js').AskJsonOutput;
   const { toLegacySelected, isCustomReply } = await import('./core/ask-types.js');
@@ -14106,18 +14324,30 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     process.exit(2);
   }
 
+  const hasQuestionsFile = rest.some(arg => arg === '--questions-file' || arg.startsWith('--questions-file='));
+  const questionsFile = argValue(rest, '--questions-file');
   const optionsRaw = argValue(rest, '--options');
   const timeoutRaw = argValue(rest, '--timeout');
   const mentionRaw = argValue(rest, '--mention');
-  const useJson = rest.includes('--json');
+  const useJson = rest.includes('--json') || questionsFile !== undefined;
   const multiSelect = rest.includes('--multi');
   const positionalArgs = positionals(rest, ['--json', '--multi']);
 
   let options;
+  let questions;
   let timeoutMs;
   let mentionedOpenId;
   try {
-    options = parseAskOptions(optionsRaw);
+    if (hasQuestionsFile && (!questionsFile || rest.some(arg => arg === '--options' || arg.startsWith('--options=')) || multiSelect || positionalArgs.length)) {
+      throw new AskArgsError('questions_invalid', '--questions-file 需要文件路径，且不能与 --options、--multi 或位置参数混用');
+    }
+    if (questionsFile) {
+      const { readFileSync } = await import('node:fs');
+      let raw: string;
+      try { raw = readFileSync(questionsFile, 'utf8'); }
+      catch { throw new AskArgsError('questions_invalid', '--questions-file 无法读取'); }
+      questions = parseAskQuestionsFile(raw);
+    } else options = parseAskOptions(optionsRaw);
     timeoutMs = parseAskTimeoutSeconds(timeoutRaw);
     mentionedOpenId = parseAskMention(mentionRaw);
   } catch (err) {
@@ -14129,7 +14359,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   }
 
   const prompt = positionalArgs.join(' ').trim();
-  if (!prompt) {
+  if (!questions && !prompt) {
     console.error(
       'botmux ask: 缺少 prompt。用法: botmux ask buttons --options "yes,no" "继续发版吗？"',
     );
@@ -14151,7 +14381,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     chatId: process.env.BOTMUX_CHAT_ID!,
     larkAppId,
     rootMessageId: process.env.BOTMUX_ROOT_MESSAGE_ID || null,
-    ...(multiSelect
+    ...(questions ? { questions } : multiSelect
       ? { questions: [{ prompt, options, multiSelect: true }] }
       : { options, prompt }),
     timeoutMs,
@@ -14188,7 +14418,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
       // 恰好 1 问且恰好 1 个 key）。`--multi` 下调用方明确按多选语义读 `answers[0]`，
       // 此时 `selected` 必须恒为 null——否则「多选恰好 1 项」会因形状巧合退化出一个
       // key，令 `selected` 的含义随选中数量漂移（违反公开契约）。
-      selected: multiSelect ? null : selected,
+      selected: multiSelect || questions?.some(q => q.multiSelect) ? null : selected,
       answers: result.kind === 'answered' ? (result.answers as string[][]) : null,
       by: result.kind === 'answered' ? result.by : null,
       comment: result.kind === 'answered' ? result.comment : null,
@@ -16711,7 +16941,7 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
 // managed origin → NOT gated: the operator keeps full access. per-command +
 // daemon-side getBotClient/larkTransportEnabled gates remain authoritative.
 const LARK_FACING_COMMANDS = new Set([
-  'input-capture', 'send', 'dispatch', 'card', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread',
+  'input-capture', 'send', 'dispatch', 'card', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread', 'interaction-context',
   'vc-agent', 'report', 'actor', 'auth',
 ]);
 if (LARK_FACING_COMMANDS.has(command) && managedOriginHasNoTransport()) {
@@ -16747,6 +16977,24 @@ switch (command) {
       break;
     }
     process.stdout.write(`${JSON.stringify(botmuxCapabilities())}\n`);
+    break;
+  }
+  case 'execution': {
+    const { CURRENT_EXECUTION_SCHEMA, parseCurrentExecutionArgs, resolveCurrentExecution } = await import('./cli/current-execution.js');
+    if (!parseCurrentExecutionArgs(process.argv.slice(3))) {
+      console.error('用法: botmux execution current --json');
+      process.exitCode = 2;
+      break;
+    }
+    try {
+      const { resolveBotmuxAncestorContext } = await import('./cli/current-actor.js');
+      const document = await resolveCurrentExecution(resolveBotmuxAncestorContext());
+      process.stdout.write(`${JSON.stringify(document)}\n`);
+    } catch {
+      process.stdout.write(`${JSON.stringify({ schema: CURRENT_EXECUTION_SCHEMA,
+        status: 'blocked', error: 'current_execution_unverified' })}\n`);
+      process.exitCode = 2;
+    }
     break;
   }
   case 'actor': {
@@ -16904,6 +17152,22 @@ switch (command) {
   case 'preview': await cmdPreview(process.argv.slice(3)); break;
   case 'continuation': await cmdContinuation(process.argv.slice(3)); break;
   case 'schedule': await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); break;
+  case 'interaction-context': {
+    try {
+      const { parseInteractionContextCommand } = await import('./cli/interaction-context.js');
+      const command = parseInteractionContextCommand(process.argv.slice(3));
+      const daemon = findDaemon(command.larkAppId);
+      if (!daemon) throw new Error('Bot daemon is unavailable');
+      const response = await fetchDaemonIpc(daemon.ipcPort, command.path,
+        { ...command.init, signal: AbortSignal.timeout(15_000) }, loadDaemonIpcSecret());
+      console.log(JSON.stringify(await response.json()));
+      if (!response.ok) process.exitCode = 1;
+    } catch (error) {
+      console.error(`botmux interaction-context: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
+    break;
+  }
   case 'trigger-registration': {
     try {
       if (process.env.BOTMUX_SEND_RELAY || findAncestorSessionId()) throw new Error('Host context required');

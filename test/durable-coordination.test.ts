@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { SessionLease } from '../src/services/durable-coordination.js';
 import { SqliteDurableCoordinationStore } from '../src/services/sqlite-durable-coordination.js';
+import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 
 const tempDirs: string[] = [];
 
@@ -140,6 +141,70 @@ describe('SQLite durable coordination contract', () => {
     expect(await store.claimNextInbox({ workerId: 'worker-c', leaseDurationMs: 10 }))
       .toMatchObject({ event: { eventId: 'event-2' } });
     await store.close();
+  });
+
+  it('orders one partition by store insertion sequence instead of client timestamps or ids', async () => {
+    let now = 10;
+    const store = makeStore(() => now);
+    await store.enqueueInbox({
+      eventId: 'event-z-first', partitionKey: 'chat-a', payload: { order: 1 },
+      visibleAt: 0, createdAt: 9_000,
+    });
+    await store.enqueueInbox({
+      eventId: 'event-a-second', partitionKey: 'chat-a', payload: { order: 2 },
+      visibleAt: 0, createdAt: 1,
+    });
+
+    const first = await store.claimNextInbox({ workerId: 'worker-a', leaseDurationMs: 20 });
+    expect(first?.event.eventId).toBe('event-z-first');
+    expect(await store.claimNextInbox({ workerId: 'worker-b', leaseDurationMs: 20 })).toBeUndefined();
+    now = 11;
+    expect(await store.completeInboxClaim(first!)).toEqual({ kind: 'applied' });
+    const second = await store.claimNextInbox({ workerId: 'worker-b', leaseDurationMs: 20 });
+    expect(second?.event.eventId).toBe('event-a-second');
+    await store.close();
+  });
+
+  it('backfills deterministic inbox and outbox sequence rows when reopening a version-1 store', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-durable-sequence-migration-'));
+    tempDirs.push(dir);
+    const path = join(dir, 'coordination.db');
+    const first = new SqliteDurableCoordinationStore(path, { now: () => 10 });
+    await first.enqueueInbox({
+      eventId: 'legacy-b', partitionKey: 'chat-a', payload: { order: 2 }, visibleAt: 0, createdAt: 2,
+    });
+    await first.enqueueInbox({
+      eventId: 'legacy-a', partitionKey: 'chat-a', payload: { order: 1 }, visibleAt: 0, createdAt: 1,
+    });
+    const lease = acquired(await first.acquireSessionLease({
+      sessionKey: 'legacy-session', ownerId: 'legacy-worker', leaseDurationMs: 100,
+    }));
+    await first.enqueueOutbox({
+      lease,
+      message: {
+        messageId: 'legacy-outbox-b', sessionKey: 'legacy-session', payload: { order: 2 },
+        visibleAt: 0, createdAt: 2,
+      },
+    });
+    await first.enqueueOutbox({
+      lease,
+      message: {
+        messageId: 'legacy-outbox-a', sessionKey: 'legacy-session', payload: { order: 1 },
+        visibleAt: 0, createdAt: 1,
+      },
+    });
+    await first.close();
+
+    const raw = openDatabaseSyncOrThrow(path);
+    raw.exec('DROP TABLE durable_inbox_order; DROP TABLE durable_outbox_order;');
+    raw.close();
+
+    const reopened = new SqliteDurableCoordinationStore(path, { now: () => 10 });
+    const claim = await reopened.claimNextInbox({ workerId: 'worker-a', leaseDurationMs: 20 });
+    expect(claim?.event.eventId).toBe('legacy-a');
+    const reservation = await reopened.reserveNextOutbox({ workerId: 'sender-a', leaseDurationMs: 20 });
+    expect(reservation?.record.messageId).toBe('legacy-outbox-a');
+    await reopened.close();
   });
 
   it('retries claimed inbox work only after the requested visibility time', async () => {
@@ -284,6 +349,40 @@ describe('SQLite durable coordination contract', () => {
     expect(await store.enqueueOutbox({
       lease, message: { ...message, messageId: 'late-message' },
     })).toEqual({ kind: 'stale_lease' });
+    await store.close();
+  });
+
+  it('orders one Session outbox by store insertion sequence instead of client timestamps or ids', async () => {
+    let now = 10;
+    const store = makeStore(() => now);
+    const lease = acquired(await store.acquireSessionLease({
+      sessionKey: 'session-order', ownerId: 'worker-a', leaseDurationMs: 100,
+    }));
+    await store.enqueueOutbox({
+      lease,
+      message: {
+        messageId: 'message-z-first', sessionKey: 'session-order', payload: { order: 1 },
+        visibleAt: 0, createdAt: 9_000,
+      },
+    });
+    await store.enqueueOutbox({
+      lease,
+      message: {
+        messageId: 'message-a-second', sessionKey: 'session-order', payload: { order: 2 },
+        visibleAt: 0, createdAt: 1,
+      },
+    });
+
+    const first = await store.reserveNextOutbox({ workerId: 'sender-a', leaseDurationMs: 20 });
+    expect(first?.record.messageId).toBe('message-z-first');
+    const attempt = await store.beginOutboxAttempt({ reservation: first! });
+    if (attempt.kind !== 'applied') throw new Error('expected first outbox attempt');
+    now = 11;
+    expect(await store.completeOutboxAttempt({
+      attempt: attempt.attempt, receipt: { platformMessageId: 'om_first' },
+    })).toMatchObject({ kind: 'applied', record: { state: 'delivered' } });
+    const second = await store.reserveNextOutbox({ workerId: 'sender-b', leaseDurationMs: 20 });
+    expect(second?.record.messageId).toBe('message-a-second');
     await store.close();
   });
 

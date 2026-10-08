@@ -69,6 +69,7 @@ import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js'
 import { ActiveTurnAuthority, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
+import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.js';
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
@@ -314,6 +315,7 @@ import {
   resolveRenderDimensions,
 } from './utils/render-dimensions.js';
 import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
+import { cliAdapterBindsOwnershipPid } from './adapters/cli/ownership-pid.js';
 import { resolveCodexUpgradeCommand } from './services/codex-upgrade-target.js';
 import {
   CodexSessionUpgradeMonitor, hasCodexAutonomousGoal, isCodexProcess, isRestartableCodexHelper,
@@ -1457,6 +1459,11 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         try { engine.stop(); } catch { /* best effort */ }
         return 'not-engaged';
       }
+      if (first.outcome === 'accepted') {
+        // Acknowledged (or rollout-evidenced) first turn on the fresh thread.
+        // 'ambiguous' stays on the terminal fallback: dispatched is not accepted.
+        acknowledgeNativeInputConsumed(cfg.turnId, 'codex_rpc_turn_start', engine.activeThreadId, first.nativeTurnId);
+      }
       // Fresh RPC delivery bypasses flushPending(), which is the normal owner
       // of this durable head-of-line gate. Claim it here only after the frame is
       // known dispatched (accepted or ambiguous); the not-sent branch above
@@ -2407,6 +2414,23 @@ function replyDeliveryMode(): 'send' | 'transcript' {
 function zeroPromptTerminalSync(): boolean {
   return lastInitConfig?.promptInjection === 'none' && !lastInitConfig.adoptMode
     && !lastInitConfig.apiOnly;
+}
+
+/** Claude-family transcript proof: the owned session's JSONL holds a user or
+ *  dequeued queued_command record whose normalised text contains the whole
+ *  marked input. Fingerprint-prefix / truncation binds attribute replies but
+ *  do not prove envelope consumption, so they stay on the terminal fallback. */
+function notifyNativeTranscriptConsumedLarkTurn(
+  turn: { turnId: string; isLocal?: boolean; isScheduled?: boolean },
+  evidence: { fullContentMatch: boolean; sourceJsonlPath?: string },
+): void {
+  if (!evidence.fullContentMatch || turn.isLocal || turn.isScheduled) return;
+  if (!cliAdapter?.claudeDataDir || lastInitConfig?.adoptMode) return;
+  const base = evidence.sourceJsonlPath ? basename(evidence.sourceJsonlPath) : '';
+  const nativeSessionId = base.endsWith('.jsonl') && /^[A-Za-z0-9-]{8,128}\.jsonl$/.test(base)
+    ? base.slice(0, -'.jsonl'.length)
+    : undefined;
+  acknowledgeNativeInputConsumed(turn.turnId, 'claude_transcript_user_record', nativeSessionId ?? lastInitConfig?.cliSessionId);
 }
 
 function notifyTerminalTurnStarted(turn: { turnId: string; markTimeMs?: number; replyContextTurnId?: string }): void {
@@ -4829,6 +4853,7 @@ const bridgeQueue = new BridgeTurnQueue(
     persistScheduledTaskAnchor(taskId, anchor);
     syncCronTaskAnchorsToDaemon();
   },
+  notifyNativeTranscriptConsumedLarkTurn,
 );
 /** Counts background Agent/Task dispatches whose completion notification has
  *  not yet arrived. Consulted at the PTY idle edge (markPromptReady): a main
@@ -5372,6 +5397,7 @@ function notifyExplicitRepliesObserved(
       turnId,
       ...(marker.messageId ? { messageId: marker.messageId } : {}),
       ...(marker.responseKind ? { responseKind: marker.responseKind } : {}),
+      ...(marker.terminalCarrier ? { terminalCarrier: marker.terminalCarrier } : {}),
     });
   }
 }
@@ -6809,6 +6835,23 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
       continue;
     }
 
+    // Carrier discovery is independent of transcript text. A successful
+    // explicit `botmux send` can be followed by an empty assistant-final block;
+    // still publish its marker before turn_terminal so daemon auto mode can
+    // PATCH the actual visible reply instead of mistaking the turn for bodyless.
+    const carrierGateInput = {
+      markTimeMs: turn.markTimeMs,
+      isLocal: turn.isLocal,
+      isScheduled: turn.isScheduled,
+      forwardLocalFinal: zeroPromptTerminalSync(),
+    };
+    notifyExplicitRepliesObserved(
+      turn.turnId,
+      attributableExplicitReplyMarkersForTurnWindow(
+        turn.turnId, carrierGateInput, nextBoundaryMs, markers, adoptMode,
+      ),
+    );
+
     const path = turn.sourceJsonlPath ?? bridgeJsonlPath;
     if (!path) continue;
     let drained = cache.get(path);
@@ -6830,12 +6873,6 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
 
     const gateInput = { markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, isScheduled: turn.isScheduled, finalText: assistantText,
       forwardLocalFinal: zeroPromptTerminalSync() };
-    notifyExplicitRepliesObserved(
-      turn.turnId,
-      attributableExplicitReplyMarkersForTurnWindow(
-        turn.turnId, gateInput, nextBoundaryMs, markers, adoptMode,
-      ),
-    );
     if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
       // Completed turn whose output went out via `botmux send` (or deliberate
       // silence) — see the codex bridge's twin for why this must arm here.
@@ -8913,7 +8950,11 @@ function emitReadyCodexTurns(): void {
       // Failure-fallback notice (not a model answer): lets the daemon add a
       // human @mention so e.g. a model-gateway outage doesn't scroll by
       // silently in bot-to-bot sessions.
-      ...(fallbackKind === 'failed' ? { turnFailed: true } : {}),
+      ...(fallbackKind === 'failed' ? {
+        turnFailed: true,
+        turnFailureCode: turn.terminalErrorCode || 'worker_turn_failed',
+        turnFailureNotice: failedBridgeFailureText(turn.terminalErrorCode, turn.terminalErrorSummary),
+      } : {}),
     });
   }
   for (const turn of ready) {
@@ -11682,6 +11723,7 @@ async function runAmbiguousSubmissionTransaction<T>(
 type VerifiableSubmissionResult = void | {
   submitted: boolean;
   cliSessionId?: string;
+  ownershipProven?: boolean;
   failureReason?: string;
   recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
 };
@@ -11714,6 +11756,11 @@ async function settleVerifiableSubmissionForJournal(
       && typeof recheck.cliSessionId === 'string'
     ) {
       result.cliSessionId = recheck.cliSessionId;
+    }
+    // The positive ownership proof decides whether the later history match may
+    // become a native input consumption receipt; a settled result must keep it.
+    if (typeof recheck === 'object' && recheck && recheck.ownershipProven === true) {
+      result.ownershipProven = true;
     }
     return true;
   } catch (err) {
@@ -12772,6 +12819,12 @@ function scheduleSubmitFailureNotify(
           if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId);
           void syncFreshCodexNativeSessionTitle(cliSessionId, codexRpcEngine);
         }
+        // A late exact history match is the same owned-log evidence as an
+        // immediate one; other CLIs' rechecks stay on the terminal fallback.
+        if (settlement.ownershipProven === true && codexHistoryMatchProvesConsumption()) {
+          acknowledgeNativeInputConsumed(turnIdentity?.turnId, 'codex_history_match',
+            cliSessionId ?? lastInitConfig?.cliSessionId);
+        }
         onConfirmed?.(cliSessionId);
         log(`Deferred recheck found submit in ${transcriptLabel} — suppressing warning. preview="${preview}"`);
         redriveRejectedStructuredReady();
@@ -13544,9 +13597,10 @@ async function flushPending(): Promise<void> {
           // renders. No tmux paste → the history.jsonl verify/retry/recover
           // machinery is bypassed. A throw here falls into the catch below and
           // surfaces as a normal submit-failure notice.
+          let rpcNativeTurnId: string | undefined;
           await runAfterAmbiguousSubmissionWrites(writeBackend, async () => {
             prepareNormalWrite();
-            await writeRpcEngine.sendTurn(msg, rpcTurnIdentity!);
+            rpcNativeTurnId = (await writeRpcEngine.sendTurn(msg, rpcTurnIdentity!)).nativeTurnId;
           });
           // The await may overlap an engine/pane replacement. Fence the captured
           // generation BEFORE touching the global bridge queue; a stale ack must
@@ -13563,6 +13617,10 @@ async function flushPending(): Promise<void> {
             break;
           }
           result = { submitted: true };
+          // The app-server acknowledged turn/start for this exact input on
+          // the engine's active thread, fenced to the current generation.
+          acknowledgeNativeInputConsumed(item.turnId, 'codex_rpc_turn_start',
+            writeRpcEngine.activeThreadId ?? lastInitConfig?.cliSessionId, rpcNativeTurnId);
           // Only the ACKed, still-current generation may create bridge state.
           // While turn/start was pending, codexBridgeIngest left its cursor
           // untouched; marking now therefore still precedes replay of any
@@ -13828,6 +13886,15 @@ async function flushPending(): Promise<void> {
         // Late-attach now so subsequent assistant_final events get
         // attributed to this turn.
         if (codexBridgeActive) codexBridgeNotifyCliSessionId(result.cliSessionId);
+      }
+      // Exact owned history match: the model's own log holds this input.
+      // Sent after any session id persistence so the daemon resolves the
+      // same native conversation that the match was attributed to.
+      // `submitted` keeps its meaning (an exact same-text line appeared); only a
+      // POSITIVELY owned line proves this pane consumed the input.
+      if (result?.submitted === true && result.ownershipProven === true && codexHistoryMatchProvesConsumption()) {
+        acknowledgeNativeInputConsumed(item.turnId, 'codex_history_match',
+          result.cliSessionId ?? lastInitConfig?.cliSessionId);
       }
       if (lastInitConfig?.cliId === 'codex' && result?.submitted !== false) {
         const threadId = result?.cliSessionId
@@ -14752,6 +14819,13 @@ async function spawnCli(
   const proxyError = networkProxyError(cfg.sandboxNetworkPolicy, { ...process.env, ...cfg.env });
   if (proxyError) throw new Error(proxyError);
   const spawnGeneration = ++cliSpawnGeneration;
+  const isolationRuntimeDataDir = process.env.SESSION_DATA_DIR
+    ?? join(homedir(), '.botmux', 'data');
+  const sessionScratchDir = ensureSessionTempDir(isolationRuntimeDataDir, cfg.sessionId);
+  // A worker owns exactly one logical session. Pin its own os.tmpdir() before
+  // constructing any backend so FIFOs, launch configs and CLI descendants all
+  // share the same collectable scratch tree.
+  applySessionTempEnv(process.env, sessionScratchDir);
   if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy' && cfg.backendType === 'tmux') {
     TmuxBackend.assertInstanceIdentity(TmuxBackend.sessionName(cfg.sessionId), codexInstanceIdentity(cfg.cliInstanceBinding, cfg.cliRuntime));
   }
@@ -15457,8 +15531,6 @@ async function spawnCli(
   }
   if (sandboxRequested) appliedIsolationCapabilities.push('read', 'write');
   currentCliCredentialIsolated = appliedIsolationCapabilities.includes('credential');
-  const isolationRuntimeDataDir = process.env.SESSION_DATA_DIR
-    ?? join(defaultBotmuxHome, 'data');
   // The unified Darwin sandbox enforces both read and write isolation. Keep
   // the legacy marker fields because a live persistent pane carries the
   // compiled Seatbelt policy in-process and may only be reattached when that
@@ -15483,9 +15555,7 @@ async function spawnCli(
         ].map(canonicalPolicyPath),
         readOnlyExtraPaths: (cfg.sandboxPaths?.readOnly ?? []).map(canonicalPolicyPath),
         readWriteExtraPaths: (cfg.sandboxPaths?.readWrite ?? []).map(canonicalPolicyPath),
-        writeAllowExtraPaths: process.env.TMPDIR
-          ? [canonicalPolicyPath(process.env.TMPDIR)]
-          : [],
+        writeAllowExtraPaths: [canonicalPolicyPath(sessionScratchDir)],
         workingDir: canonicalPolicyPath(cfg.workingDir),
         homeDir: canonicalPolicyPath(homedir()),
         osUserHomeDir: canonicalPolicyPath(userInfo().homedir),
@@ -16813,6 +16883,8 @@ async function spawnCli(
   // bare creds (forkWorker) for lark-upload. See utils/child-env.ts.
   const childEnv = buildSessionChildEnv(process.env, cfg.envPolicy);
   if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(childEnv);
+  // buildSessionChildEnv preserves TMPDIR/TMP/TEMP in both inheritance modes.
+  // The worker pin above is the single source for CLI and worker scratch.
   childEnv[PLUGIN_CARD_ACTION_CAPABILITIES_ENV] = cardActionCapabilities;
   if (sessionMcpGatewayHost) {
     childEnv[MCP_GATEWAY_SOCKET_ENV] = sessionMcpGatewayHost.socketPath;
@@ -16919,6 +16991,9 @@ async function spawnCli(
   // never less. Mirrors what the riff path already does via mergedEnv.
   if (cfg.apiOnly) childEnv.BOTMUX_API_ONLY = '1';
   else delete childEnv.BOTMUX_API_ONLY;
+  // Scope and topic identity come from this Worker, after configurable envs.
+  childEnv.BOTMUX_SESSION_SCOPE = cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat';
+  // Ask/browser approval require this anchor for both thread and chat sessions.
   childEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
   applySessionOwnerEnv(childEnv, cfg.ownerOpenId);
   // This bot's resolved brandLabel template, injected so a SANDBOXED `botmux
@@ -17563,7 +17638,7 @@ async function spawnCli(
       ]),
       botmuxInstallRoot,
       outbox,
-      extraWritePaths: keepExisting([process.env.TMPDIR, canonicalManagedSessionDir]),
+      extraWritePaths: keepExisting([sessionScratchDir, canonicalManagedSessionDir]),
       userPaths,
       serviceCredentialReadOnlyPaths,
       mandatoryDenyPaths,
@@ -17674,6 +17749,7 @@ async function spawnCli(
         home: sandboxHome,
         cliBin: cliAdapter.resolvedBin,
         cliArgs: args,
+        tempDir: canonical(sessionScratchDir),
         trustedBotmuxCommandPaths: [defaultGatewayEntry().command],
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
         larkCliDataDir: childLarkDataRoot,
@@ -18636,11 +18712,14 @@ async function spawnCli(
   //     it fails closed to the launcher pid when no leaf is found yet (the async
   //     retry below re-resolves once bwrap has forked traex).
   //   - reasonix: identify the lease owned by this process tree
+  //   - codex: findCodexRolloutSetByPid → positive ownership proof for the
+  //     paste-mode history match; without it submits are confirmed but never
+  //     proven, so no early native input consumption receipt is emitted.
   // Claude's sessionId is set ONCE at process start (2.1.123); a `--resume`
   // lookup will surface here, but in-pane `/clear` won't. The pinned
   // claudeJsonlPath above is still the initial guess; the resolver corrects
   // it on first write when Claude was started with `--resume`.
-  if (cliPid && (claudeDataDir || cfg.cliId === 'grok' || cfg.cliId === 'traex' || cfg.cliId === 'reasonix' || cfg.cliId === 'antigravity')) {
+  if (cliPid && cliAdapterBindsOwnershipPid(cfg.cliId, claudeDataDir)) {
     // TRAE under bwrap/Forge launcher: best-effort immediate resolve (leaf may
     // already be forked), then a bounded retry below covers the not-yet-forked case.
     const wiredPid = cfg.cliId === 'traex' ? resolveTraexOwnershipPid(cliPid, traexLauncherActive) : cliPid;
@@ -18674,7 +18753,7 @@ async function spawnCli(
             log(`Failed to write CLI PID marker (async): ${err.message}`);
           }
         }
-        if (claudeDataDir || cfg.cliId === 'grok' || cfg.cliId === 'traex' || cfg.cliId === 'reasonix' || cfg.cliId === 'antigravity') {
+        if (cliAdapterBindsOwnershipPid(cfg.cliId, claudeDataDir)) {
           const wiredPid = cfg.cliId === 'traex' ? resolveTraexOwnershipPid(pid, traexLauncherActive) : pid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
@@ -21978,6 +22057,31 @@ function acknowledgeTurnInputCommitted(turnId?: string): void {
 
 function acknowledgeTurnInputReceived(turnId?: string): void {
   if (turnId) send({ type: 'turn_input_received', turnId });
+}
+
+/** Native acceptance proof for shared group background coverage. Emitted only
+ * from boundaries where the CLI itself evidenced this exact input: Codex's
+ * exact owned history line, a Codex RPC turn/start acknowledgement, or a
+ * Claude transcript user record whose full normalised content matched. Never
+ * from IPC arrival, queue ownership or a generic adapter `submitted` flag. */
+function acknowledgeNativeInputConsumed(
+  turnId: string | undefined,
+  proofKind: Extract<WorkerToDaemon, { type: 'native_input_consumed' }>['proofKind'],
+  nativeSessionId?: string,
+  nativeTurnId?: string,
+): void {
+  if (!turnId) return;
+  send({
+    type: 'native_input_consumed', turnId, proofKind,
+    ...(nativeSessionId ? { nativeSessionId } : {}),
+    ...(nativeTurnId ? { nativeTurnId } : {}),
+  });
+}
+
+/** Codex tmux/paste mode proves acceptance by matching the exact submitted
+ * text in the owned history.jsonl. RPC and adopted panes have other owners. */
+function codexHistoryMatchProvesConsumption(): boolean {
+  return lastInitConfig?.cliId === 'codex' && !lastInitConfig.adoptMode && !codexRpcEngine;
 }
 
 function receiveOrdinaryImTurn(turnId: string): 'new' | 'inflight' | 'committed' {
