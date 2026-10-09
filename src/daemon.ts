@@ -641,7 +641,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
 import { isBotMentioned, getGroupStats, probeBotOpenId, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
-import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, normalizeDocNativeWatchSubscription, putDocSubscription, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
+import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
 import { normalizeBrand } from './im/lark/lark-hosts.js';
@@ -7628,16 +7628,17 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
         error: verified.error,
       });
     }
-    // A session capability authenticates exactly one daemon session; it does
-    // not let the caller choose another bot/chat/root. Bind every observable
-    // ask route to that authenticated session before registering the card.
+  }
+  // Authentication and routing are separate: host HMAC callers must also use
+  // the live session route, never a stale/manually supplied project-card root.
+  if (askSession) {
     boundAsk = bindSessionScopedIpcIdentity(parsed, {
-      sessionId: askSession!.session.sessionId,
-      larkAppId: askSession!.larkAppId,
-      chatId: askSession!.chatId,
-      rootMessageId: askSession!.session.scope === 'chat'
+      sessionId: askSession.session.sessionId,
+      larkAppId: askSession.larkAppId,
+      chatId: askSession.chatId,
+      rootMessageId: askSession.session.scope === 'chat'
         ? null
-        : askSession!.session.rootMessageId,
+        : askSession.session.rootMessageId,
     });
   }
   if (askSession?.session.vcMeetingReceiver) {
@@ -27415,6 +27416,9 @@ async function retryPendingDocCommentDeliveries(
         const retained = latest?.pendingDocCommentDeliveries?.some(candidate =>
           (candidate.replyId || candidate.commentId) === key);
         if (retained) acceptedKeys.add(`${snapshot.fileToken}:${key}`);
+        // 无论 --all（留 acceptedAt 等游标提交）还是 mention-only（直接移除），此刻
+        // daemon 已真接纳 ⟹ 记一次投递。
+        recordDocWatchActivity(config.session.dataDir, larkAppId, snapshot.fileToken, { outcome: 'dispatched' });
         logger.info(`[doc-comment-retry] accepted file=${snapshot.fileToken.slice(0, 12)} reply=${key.slice(0, 12)}`);
       } catch (err) {
         blockedFiles.add(snapshot.fileToken);
@@ -27527,12 +27531,17 @@ async function pollWatchedDocComments(larkAppId: string): Promise<void> {
               },
               true,
             );
+            recordDocWatchActivity(config.session.dataDir, larkAppId, current.fileToken, { outcome: 'dispatched' });
             return true;
           },
           (reply) => { commitDocCommentPollCursor(config.session.dataDir, larkAppId, current.fileToken, reply); },
         );
       } catch (err) {
-        logger.warn(`[doc-comment-poll] file=${snapshot.fileToken.slice(0, 12)} failed: ${err instanceof Error ? err.message : String(err)}`);
+        const message = err instanceof Error ? err.message : String(err);
+        logger.warn(`[doc-comment-poll] file=${snapshot.fileToken.slice(0, 12)} failed: ${message}`);
+        // 应用身份读不到这篇文档（权限撤销 / 文档被删 / 网络）——功能「配着」却从此
+        // 一条都不触发，是 owner 最需要在界面上看到的静默故障。
+        recordDocWatchActivity(config.session.dataDir, larkAppId, snapshot.fileToken, { outcome: 'poll-failed', error: message });
       }
     }
   } finally {
@@ -29153,6 +29162,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         if (!ds || ds.session.vcMeetingReceiver || !['chat', 'thread'].includes(ds.scope)) return undefined;
         return { sessionId: id, larkAppId: ds.larkAppId, chatId: ds.chatId,
           anchor: ds.scope === 'chat' ? ds.chatId : ds.session.rootMessageId,
+          scope: ds.scope, chatType: ds.chatType,
           ownerOpenId: ds.ownerOpenId ?? ds.session.ownerOpenId ?? '', active: ds.session.status === 'active' };
       },
       pluginEnabled: id => resolveEffectivePluginIds(getBot(cfg.larkAppId).config, readGlobalConfig()).includes(id)

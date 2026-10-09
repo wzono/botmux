@@ -1,4 +1,5 @@
 import type { CodexAppTurnInput, TrustedCaller } from '../../types.js';
+import type { TriggerUserAuthConfig } from '../../services/trigger-user-auth.js';
 
 export interface PtyHandle {
   /** `false` means the backend rejected the write before it could confirm
@@ -47,6 +48,12 @@ export interface PtyHandle {
   /** Working directory the CLI was spawned in; cross-checked against the pid file's
    *  cwd field to reject pid reuse / unrelated processes. */
   cliCwd?: string;
+  /**
+   * Whether this session is an adopted external pane (via /adopt).
+   * Owned sessions directly managed by botmux set this to false, allowing
+   * legacy submit without requiring a visible statusline thread ID.
+   */
+  isAdopt?: boolean;
 }
 
 export type SubmitRecheckResult = boolean | {
@@ -190,7 +197,7 @@ export interface CliAdapter {
      *  system prompt: the session acts with ONE person's credentials while the
      *  on-disk store holds everyone else's, and nothing in the OS currently
      *  stops an agent from reading those files. Off → no extra prompt text. */
-    triggerUserAuth?: boolean;
+    triggerUserAuth?: TriggerUserAuthConfig;
     /** Env the CLI must forward to the SHELL COMMANDS it runs, not merely hold
      *  itself. Codex does not pass its own environment to shell subprocesses,
      *  so the trigger-user wrapper vars (BOTMUX_IDENTITY_BIN / ZDOTDIR /

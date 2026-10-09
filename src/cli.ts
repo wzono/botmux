@@ -3468,7 +3468,7 @@ async function cmdUpgrade(args: string[] = []): Promise<void> {
   // Unsupported（实测真实 v3.18.4 二进制就是这条）。改为先按「二进制装在哪」
   // 判形态：npm 子包形态交回 npm/pnpm/bun，install.sh 形态自己换二进制。
   const strategy = currentUpdateStrategy(botmuxInstallRoot());
-  if (strategy.kind === 'self-replace') {
+  if (strategy.kind === 'self-replace' || strategy.kind === 'install-release') {
     try {
       const resolvedVersion = await fetchDistTagVersion(target.tag);
       if (!resolvedVersion) {
@@ -3477,8 +3477,14 @@ async function cmdUpgrade(args: string[] = []): Promise<void> {
       }
       const current = resolveCurrentVersion();
       const decision = shouldApplySelfUpdate(target, resolvedVersion, current);
-      if (!decision.proceed) {
-        if (decision.reason === 'already_latest') {
+      // install-release 允许同版本平迁到官方版；无参数 update 时当前自构版本若
+      // 不低于官方最新版则不隐式降级，切换旧版需显式指定目标版本。
+      const releaseMigration = strategy.kind === 'install-release'
+        && !isNewerVersion(current, resolvedVersion);
+      if (!decision.proceed && !releaseMigration) {
+        if (strategy.kind === 'install-release') {
+          console.log(`✅ 当前自部署版本 ${current} 不低于官方最新版 ${resolvedVersion}，未执行更新；如需切换到官方版请显式指定：botmux update ${resolvedVersion}`);
+        } else if (decision.reason === 'already_latest') {
           console.log(`✅ 已是最新版本（${current}）。`);
         } else {
           console.log(`✅ 当前已是版本 ${current}。`);
@@ -3496,7 +3502,13 @@ async function cmdUpgrade(args: string[] = []): Promise<void> {
         await withFileLock(lockTarget, async () => {
           acquired = true;
           const r = await replaceStandaloneBinary(resolvedVersion, strategy.target);
-          console.log(`✅ 升级完成：${r.asset} → ${r.target}（${current} → ${resolvedVersion}）。运行 botmux restart 以应用更新。`);
+          // install-release 的新二进制落在默认 launcher 路径，shell 里的 botmux
+          // 可能仍解析到旧自构二进制（PATH 顺序或 launcher 不在 PATH），这里必须
+          // 给出绝对路径，让 restart driver 确定是新版本，fleet 才会整体迁移。
+          const restartCommand = strategy.kind === 'install-release'
+            ? `"${r.target}" restart`
+            : 'botmux restart';
+          console.log(`✅ 升级完成：${r.asset} → ${r.target}（${current} → ${resolvedVersion}）。运行 ${restartCommand} 以应用更新。`);
         }, { maxWaitMs: 2_000 });
       } catch (error) {
         // ⚠️ 三态，不是二态。`withFileLock` 拿不到锁时是**抛异常**不是安静返回，
@@ -6738,7 +6750,7 @@ const SEND_HELP_BODY = [
   '                                       显式允许该已启用插件声明的 callback action',
   '       --layout result|progress|risk|blocked|handoff',
   '                                       可选回复卡卡头薄壳；只在关键结果/进度/风险/阻塞/交接节点显式使用',
-  '       --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈',
+  '       --response-kind progress|final|auxiliary  可选；未声明按 progress/非 final，只有 final 挂反馈与页脚签名',
   '       --expected-link <url>           要求最终渲染正文原样包含该 URL（可重复）；缺失时在任何外部副作用前拒发',
   '       --as independent|suggestion     对方任务正在跑时声明处理方式：另开任务 / 留给当前任务',
   '       --mention <id:name>             @提及（可重复）。id 默认是 open_id；bot 配置开启',
@@ -11819,8 +11831,9 @@ async function cmdSend(rest: string[]): Promise<void> {
       // the session owner). Bot recipients are filtered out so footer chrome
       // cannot accidentally wake a sibling bot.
       // Brand segment honours this bot's configured brandLabel (unset →
-      // default botmux, '' → suppressed, else custom). Same resolver/rule as
-      // the daemon's card builders so both send paths render identically.
+      // default botmux, '' → suppressed, else custom). Only attached to final
+      // replies (or top-level broadcasts); interim sends (progress / auxiliary)
+      // omit brand to avoid noisy repeated signatures across turns.
       // All real mentions land on one footer line: human addressee first, then
       // explicit @ targets (incl. handoff bots), then cc. Ids already inlined in
       // the body prose are skipped. Top-level publish keeps sendTo empty.
@@ -11831,8 +11844,12 @@ async function cmdSend(rest: string[]): Promise<void> {
         inlinedIds: usedIds,
       });
       const usageSnapshot = await readCardUsageSnapshotForSend(s, appId);
+      const shouldRenderBrand = effectiveResponseKind === 'final' || sendTopLevel;
+      const footerBrand = shouldRenderBrand
+        ? renderBrandTemplate(resolveBrandLabel(appId), s.workingDir)
+        : '';
       const footer = buildReplyCardFooter({
-        brand: renderBrandTemplate(resolveBrandLabel(appId), s.workingDir),
+        brand: footerBrand,
         recipientOpenIds: footerRecipients,
         usage: usageSnapshot,
         locale: localeForBot(appId),
@@ -14380,7 +14397,9 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     sessionId: askSessionId,
     chatId: process.env.BOTMUX_CHAT_ID!,
     larkAppId,
-    rootMessageId: process.env.BOTMUX_ROOT_MESSAGE_ID || null,
+    rootMessageId: process.env.BOTMUX_SESSION_SCOPE === 'chat'
+      ? null
+      : process.env.BOTMUX_ROOT_MESSAGE_ID || null,
     ...(questions ? { questions } : multiSelect
       ? { questions: [{ prompt, options, multiSelect: true }] }
       : { options, prompt }),

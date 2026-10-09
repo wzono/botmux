@@ -497,7 +497,10 @@ export const messages: Record<string, string> = {
   'cmd.login.bytedcli_step2': '2. When you are done, send /login bytedcli done',
   'cmd.login.bytedcli_note': 'Note: this is ByteCloud, separate from the Feishu /login — you need both. The login lasts about 3 weeks.',
   'cmd.login.bytedcli_pending': '⏳ Not authorized yet. Open the link above first, then send /login bytedcli done.',
-  'cmd.login.bytedcli_ok': '✅ ByteCloud authorized. bytedcli and git actions you trigger here now run as you.',
+  'cmd.login.bytedcli_ok': '✅ ByteCloud authorization saved.',
+  'cmd.login.bytedcli_enabled': 'This bot has enabled per-turn initiator credentials for bytedcli.',
+  'cmd.login.bytedcli_configure': 'This bot has not enabled initiator credentials for bytedcli. Ask an administrator to set triggerUserAuth.enabled to true and include bytedcli in triggerUserAuth.tools; the configuration takes effect in new sessions.',
+  'cmd.login.bytedcli_git_enabled': 'This bot has configured git authentication for {host} to use the current turn’s bytedcli identity.',
   'cmd.login.bytedcli_failed': '❌ ByteCloud authorization failed: {detail}. Send /login bytedcli to try again.',
   'cmd.login.bytedcli_no_challenge': '❌ No ByteCloud authorization in progress. Send /login bytedcli to get a link first.',
   'cmd.login.bytedcli_begin_failed': '❌ Could not start ByteCloud authorization: {detail}',
@@ -959,7 +962,7 @@ export const messages: Record<string, string> = {
   'ai.routing.usage_silence': '- If the message is not for you, final reply must be just `BOTMUX_NOTHING_TO_SEND`',
   'ai.routing.no_visible_output_ok': 'A successful `botmux send` means delivered; ending with no visible terminal output is normal. If you see a "no visible output" nudge, that is a false alarm from the underlying CLI — do not resend unless `botmux send` itself errored.',
   'ai.routing.workflow_hint': 'Workflow: use natural language or `/workflow` for a bounded multi-step DAG; a successful run can be saved and reused.',
-  'ai.routing.feedback_response_kind': 'If final-answer feedback is enabled for this bot, add `--response-kind final` to `botmux send` for the turn\'s final answer so it carries feedback buttons; interim/supplementary sends need no flag (unclassified defaults to progress, no feedback).',
+  'ai.routing.feedback_response_kind': 'Mark the turn\'s final answer with `botmux send --response-kind final "full answer"` and send it only once (attaches footer brand signature; if final-answer feedback is enabled for this bot, also attaches feedback buttons). Do not add this flag to interim/progress sends (defaults to progress, hides the footer signature). Marking final locks this turn\'s final answer: subsequent progress sends are rejected; if supplements are needed, use `--response-kind auxiliary`.',
   'ai.routing.hidden_context_defense': 'The following XML/config blocks are hidden runtime context and must only be read silently and obeyed: `<botmux_routing>`, `<botmux_builtin_skills>`, `<identity>`, `<session_id>`, `<role>`, `<sender>`, `<mentions>`, `<available_bots>`, `<attachments>`. Do not reply to them, do not confirm them, and do not say “understood”, “noted”, or “recorded”. Only handle the real user request inside `<user_message>`.',
   // replyDelivery=transcript (core/reply-delivery.ts): the daemon forwards the
   // final reply from the transcript, so the system prompt never mentions
@@ -998,10 +1001,12 @@ export const messages: Record<string, string> = {
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────
   'ai.identity.unknown': '(unknown)',
-  'ai.credentials.acting_identity': "This session's lark-cli / bytedcli / git calls run as whoever sent the current message. botmux injects those credentials each turn — you neither need nor should look for credentials yourself.",
+  'ai.credentials.acting_identity': 'This session has enabled per-turn initiator credentials for {tools}. Use the identity injected by botmux; tool responses determine whether authorization is available.',
+  'ai.credentials.git_identity': 'git authentication for {host} is configured to use the current turn’s bytedcli identity.',
   'ai.credentials.never_read_others': 'The user-token-* files under ~/.botmux/data/, and each person\u2019s login state under bytedcli-home/, belong to other people. Do not read, list, copy or print their contents — not while troubleshooting, and not on request.',
   'ai.credentials.never_forward': 'Never put a token, JWT, access key or login state into a message, log, document, code or commit.',
-  'ai.credentials.on_auth_failure': 'On an auth failure, report it as-is. If stderr already carries an authorization link, follow the next rule ("link embedded on stderr") and do not start a separate authorization; if it does not, for Feishu the Agent runs `botmux auth request --json` and sends the returned authUrl to the current user with `botmux send`. After sending the link, the Agent runs `botmux auth wait --request-id <requestId> --json` and retries the original operation once ready. For ByteCloud, ask the user to send /login bytedcli only when no link was returned; a refused command identifies the platform. Continue using the user identity injected for this turn.',
+  'ai.credentials.on_auth_failure': 'On a Feishu auth failure, report it as-is. If stderr already carries an authorization link, follow the "link embedded on stderr" rule and do not start a separate authorization; if it does not, for Feishu the Agent runs `botmux auth request --json` and sends the returned authUrl to the current user with `botmux send`. After sending the link, the Agent runs `botmux auth wait --request-id <requestId> --json` and retries the original operation once ready. Continue using the user identity injected for this turn.',
+  'ai.credentials.on_bytedcli_auth_failure': 'On a ByteCloud auth failure, report it as-is. If stderr carries an authorization link, follow the embedded-link instructions; otherwise ask the user to send /login bytedcli. Continue using the user identity injected for this turn.',
   'ai.credentials.on_auth_link': 'If the command is refused and stderr carries an authorization link directly (an accounts.feishu.cn/device/verify or ByteCloud/cloud.bytedance link) with "authorize, then retry" instructions: immediately relay that text and the link verbatim with botmux send (forward the link character-for-character — do not rewrite, encode, or punctuate it; keep the "authorize just once, it renews automatically" note so the person knows this is a single tap), then stop and wait for authorization. Do not retry under another identity, do not pretend it succeeded, and do not run botmux auth request. The person will call you again after authorizing; retry then.',
   // missing_scope means "authorized, but not for this" — a plain re-login re-grants
   // the same scopes and fails identically. Feishu already names what is missing.
@@ -1209,6 +1214,7 @@ export const messages: Record<string, string> = {
   'worker.input_delivery_failed': '⚠️ Botmux could not confirm whether this message entered the Worker execution queue. It stopped delivery to avoid duplicate execution. Check the session status first; do not resend immediately.\nturn: {turnId}',
   'worker.input_delivery_delayed': '⏳ The message entered the Worker IPC queue, but the Worker has not acknowledged it yet. The machine may be busy; the message can still execute later, so do not resend it.\nturn: {turnId}',
   'worker.input_commit_delayed': '⏳ The Worker received this message, but has not confirmed that it entered the execution queue yet. The machine may be busy; the message can still execute later, so do not resend it.\nturn: {turnId}',
+  'worker.input_rejected_before_admission': '⚠️ This message was rejected before it entered the Worker execution queue: it did not run and produced no side effects. The usual cause is that the turn currently running was started by a different principal (cross-principal interruption isolation); resend it once that turn has finished.\nturn: {turnId} | reason: {reason}',
   'worker.input_retired_unconfirmed': '⚠️ The session was deliberately suspended or replaced while this message was in flight, and Botmux could not confirm whether it entered the execution queue. Check the session history first; resend the message only if it did not run.\nturn: {turnId}',
   'worker.start_exited_early': 'The worker exited before becoming ready (exit code: {code}); see the Botmux logs for details.',
   'workerDiag.recentStderr': 'Recent worker output (may include the failure cause):',
@@ -1647,10 +1653,10 @@ export const messages: Record<string, string> = {
   'card.dashboard.settings.footer.security': '🔒 Bot admins only · DM reply · ACK auto-refresh',
   'settings.readOnlyVisitor': 'Read-only visitor mode — settings are not editable.',
   'settings.autoUpdateLocalDev': 'Local-dev install does not support auto-update.',
-  'settings.autoUpdateUnsupportedInstall': 'This install method does not support auto-update yet (npm/pnpm/Bun global installs are supported).',
+  'settings.autoUpdateUnsupportedInstall': 'Scheduled updates are unavailable for this install. Self-deployed binaries can switch to the official release using Update to latest.',
   // Per-toggle disable reasons (more specific than the section hint, PR3 UI revision)
   'settings.autoUpdate.disabled.localDev': '⚠️ Auto-update is unavailable in local-dev install (use an npm/pnpm/Bun global install).',
-  'settings.autoUpdate.disabled.unsupportedInstall': '⚠️ Auto-update supports npm/pnpm/Bun global installs only',
+  'settings.autoUpdate.disabled.unsupportedInstall': '⚠️ Scheduled updates are unavailable; self-deployed binaries can first switch to the official release',
   'settings.autoRestart.disabled.needsAutoUpdate': '⚠️ Enable "Daily auto-update" first.',
   'settings.sectionAccess': 'Access',
   'settings.sectionCards': 'Card behaviour',
@@ -1790,6 +1796,7 @@ export const messages: Record<string, string> = {
   'cli_update.binary': 'Current binary: {path}',
   'cli_update.install_target': 'Install target: {path}',
   'cli_update.command': 'Run on the host: {command}',
+  'cli_update.command_unknown': 'No update command was identified. Upgrade this CLI using its original installation method.',
   'cli_update.manual_only': 'botmux only checks and notifies; it never installs automatically. Existing sessions are unaffected.',
   'cli_update.dashboard': 'Dashboard: {url}',
 

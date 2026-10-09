@@ -137,6 +137,7 @@ import { remoteWorkerShutdownInputBlocker } from './core/remote-worker-shutdown-
 import { sendRemoteRunnerOutboundMessage } from './services/remote-runner-outbound-send.js';
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
+import { spawnHasStartupWork } from './core/initial-native-rename.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
 import { botInjectedEnv, buildSessionChildEnv } from './core/env-policy.js';
 import { envPolicyRequiresColdStart, readEnvPolicyStamp, writeEnvPolicyStamp } from './services/env-policy-stamp.js';
@@ -2135,6 +2136,7 @@ let lastSpawnOuterBwrapActive = false;
 // includes bwrap and Forge; keep it separate from lastSpawnOuterBwrapActive
 // because prompt-readiness code has bwrap-specific shell handling.
 let lastSpawnTraexLauncherActive = false;
+let lastSpawnCodexLauncherActive = false;
 /**
  * True only when {@link shouldArmSpawnArgvInitialPromptBusy} says so: argv-
  * baked first prompt + SessionStart ready (Grok-class). First markPromptReady
@@ -2654,6 +2656,12 @@ const codexUpgradeMonitor = new CodexSessionUpgradeMonitor({
   upgrade: autoUpgradeCodex,
   report: (state, reason) => log(`Codex session upgrade ${state}: ${reason}`),
 });
+/** Worker-lifetime one-shot for `initialNativeRename`. Unlike hasRunStartupCommands,
+ *  spawnCli must NOT re-arm this: an in-worker CLI restart replays `/effort` and
+ *  the like, but replaying `/rename` would overwrite a session name the user
+ *  changed inside the CLI after the first spawn. */
+let hasRunInitialNativeRename = false;
+
 /** Per-spawn one-shot: have this spawn's bot.startupCommands been typed in yet?
  *  Reset in spawnCli so a restart/resume (which re-spawns the CLI) re-applies
  *  them — needed because session-only settings like `/effort ultracode` are lost
@@ -2957,6 +2965,35 @@ async function runStartupCommands(): Promise<void> {
   // Commands consumed turns and reset idle; treat the first user prompt fresh.
   isPromptReady = false;
   idleDetector?.reset();
+}
+
+/** Type the fresh-spawn `/rename` once per worker. Not part of startupCommands,
+ *  so the re-arm in spawnCli cannot replay it. Once an attempt actually starts,
+ *  a later restart must not apply the original title over a name the user may
+ *  already have changed. A restart that is already in progress does not consume
+ *  the command; the replacement flush does. */
+async function runInitialNativeRename(): Promise<void> {
+  const cmd = lastInitConfig?.initialNativeRename?.trim();
+  if (!cmd || hasRunInitialNativeRename) return;
+  // A restart that began while startup commands were still typing owns the next
+  // flush. Leave the command in place so that flush can apply it once; consuming
+  // it here would rename the process already being torn down and then skip the
+  // replacement.
+  if (cliRestartInProgress) return;
+  hasRunInitialNativeRename = true;
+  if (lastInitConfig) lastInitConfig.initialNativeRename = undefined;
+  if (lastInitConfig?.adoptMode || !backend) return;
+  if (isRemoteBackendType(effectiveBackendType)) {
+    log(`Skipping initial native rename — ${effectiveBackendType} backend has no PTY to drive`);
+    return;
+  }
+  try {
+    await sendRawCommandLineWithRecoveryFence(backend, cmd);
+    await awaitPtyQuiescence(STARTUP_CMD_QUIET_MS, STARTUP_CMD_CAP_MS);
+    log(`Initial native rename sent: ${cmd}`);
+  } catch (e: any) {
+    log(`Initial native rename failed (${cmd}): ${e?.message ?? e}`);
+  }
 }
 
 const freshnessInputQueue = new CodexRunnerFreshnessInputQueue<
@@ -5058,6 +5095,7 @@ let codexBridgeDrainState: CodexDrainState | undefined;
 let codexBridgePendingTail = '';
 let codexBridgeBaselineDone = false;
 let codexAdoptRecoveryAttempted = false;
+let structuredBridgeRecoveryAttempted = false;
 let publishedActiveRuntime: TraexRuntimeSnapshot = {};
 let activeRuntimePublished = false;
 const codexBridgeQueue = new CodexBridgeQueue(Date.now, notifyTerminalTurnStarted);
@@ -5254,6 +5292,13 @@ function bridgeTurnJournalFilePath(): string | undefined {
   return join(process.env.SESSION_DATA_DIR, 'turn-marks', `${sessionId}.json`);
 }
 
+function structuredBridgeJournalPath(): string | undefined {
+  const base = bridgeTurnJournalFilePath();
+  if (!base || !codexBridgeFallbackActive()) return undefined;
+  if (lastInitConfig?.adoptMode && structuredBridgeIsCodex()) return undefined;
+  return `${base}.structured`;
+}
+
 function codexAdoptJournalPath(): string | undefined {
   const base = bridgeTurnJournalFilePath();
   return base && lastInitConfig?.adoptMode && structuredBridgeIsCodex() ? `${base}.codex-adopt` : undefined;
@@ -5266,6 +5311,13 @@ function checkpointCodexAdoptRecovery(): void {
   if (!path || !codexBridgeRolloutPath || !codexAdoptRecoveryAttempted) return;
   try { checkpointCodexAdoptTurns(path, codexBridgeRolloutPath, codexBridgeQueue); }
   catch (error: unknown) { log(`Codex adopt checkpoint failed: ${error instanceof Error ? error.message : String(error)}`); }
+}
+
+function checkpointStructuredBridgeRecovery(): void {
+  const path = structuredBridgeJournalPath();
+  if (!path || !codexBridgeRolloutPath || !structuredBridgeRecoveryAttempted) return;
+  try { checkpointCodexAdoptTurns(path, codexBridgeRolloutPath, codexBridgeQueue); }
+  catch (error: unknown) { log(`Structured bridge checkpoint failed: ${error instanceof Error ? error.message : String(error)}`); }
 }
 
 /** Per-session durable file of built-in CronCreate task → topic anchors.
@@ -5351,6 +5403,7 @@ function clearBridgeTurnJournalFile(): void {
   if (!path) return;
   try { clearBridgeTurnJournal(path); } catch { /* best-effort — session is closing */ }
   try { clearBridgeTurnJournal(`${path}.codex-adopt`); } catch { /* best-effort */ }
+  try { clearBridgeTurnJournal(`${path}.structured`); } catch { /* best-effort */ }
 }
 
 function readSendMarkers(): BridgeSendMarker[] {
@@ -7489,6 +7542,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     codexBridgeOffset = 0;
     codexBridgePendingTail = '';
     codexBridgeBaselineDone = true;
+    structuredBridgeRecoveryAttempted = true;
     log(`Codex bridge fresh-empty: ${rolloutPath}`);
   } else if (mode === 'split-live' && existsSync(rolloutPath)) {
     // Adopt mode: drain everything, then split by adoptStartMs. History
@@ -7501,12 +7555,15 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     // "iTerm 手动输入飞书没收到" symptom under late-attach.
     const result = structuredBridgeIngestPath(rolloutPath, 0);
     const cutoff = (codexAdoptStartMs ?? Date.now()) - 5_000;
-    const journalPath = codexAdoptJournalPath();
+    const journalPath = codexAdoptJournalPath() ?? structuredBridgeJournalPath();
     const recover = journalPath && !codexAdoptRecoveryAttempted;
     const { history, live, restored } = recover
       ? restoreCodexAdoptTurns(journalPath, rolloutPath, codexBridgeQueue, result.events, cutoff)
       : { ...splitCodexEventsByCutoff(result.events, cutoff), restored: 0 };
-    if (journalPath) codexAdoptRecoveryAttempted = true;
+    if (journalPath) {
+      codexAdoptRecoveryAttempted = true;
+      structuredBridgeRecoveryAttempted = true;
+    }
     codexBridgeQueue.absorb(history);
     codexBridgeQueue.ingest(live);
     if (restored > 0) log(`Codex adopt restored ${restored} pending turn(s) without re-submitting input`);
@@ -7550,6 +7607,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     codexBridgeOffset = 0;
     codexBridgePendingTail = '';
     codexBridgeBaselineDone = true;
+    structuredBridgeRecoveryAttempted = true;
     log(`Codex bridge split-live degraded to fresh (file missing): ${rolloutPath}`);
   } else if (mode === 'baseline-existing-skip-tail' && existsSync(rolloutPath)) {
     let size = 0;
@@ -7557,19 +7615,60 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     codexBridgeOffset = size;
     codexBridgePendingTail = '';
     codexBridgeBaselineDone = true;
+    structuredBridgeRecoveryAttempted = true;
     log(`Codex bridge baselined: ${rolloutPath} (offset=${codexBridgeOffset}, skipTail=true)`);
   } else if (existsSync(rolloutPath)) {
-    const cursor = baselineJsonlCursor(rolloutPath);
-    codexBridgeOffset = cursor.newOffset;
-    codexBridgePendingTail = cursor.pendingTail;
-    codexBridgeBaselineDone = true;
-    log(`Codex bridge baselined: ${rolloutPath} (offset=${codexBridgeOffset})`);
+    const journalPath = structuredBridgeJournalPath() ?? codexAdoptJournalPath();
+    // Cursor's JSONL transcript lacks per-event timestamps and stamps wall-clock Date.now() on drain;
+    // timestamp-cutoff replay cannot partition Cursor history, so Cursor stays on the offset EOF baseline.
+    const canRecover = journalPath && !structuredBridgeRecoveryAttempted && !codexBridgeIsCursor();
+    const restorable = canRecover ? selectRestorableBridgeTurns(readBridgeTurnJournal(journalPath), { currentJsonlPath: rolloutPath }) : [];
+    if (journalPath) structuredBridgeRecoveryAttempted = true;
+    if (restorable.length > 0 && journalPath) {
+      const result = structuredBridgeIngestPath(rolloutPath, 0);
+      const minMarkTime = Math.min(...restorable.map(e => e.markTimeMs));
+      const cutoff = minMarkTime - 5_000;
+      const { history, live, restored } = restoreCodexAdoptTurns(journalPath, rolloutPath, codexBridgeQueue, result.events, cutoff);
+      codexBridgeQueue.absorb(history);
+      codexBridgeQueue.ingest(live);
+      if (restored > 0) log(`Structured bridge baseline-existing restored ${restored} pending turn(s) without re-submitting input`);
+      emitReadyCodexTurns();
+      if (live.some(event => event.kind === 'assistant_final')) {
+        idleDetector?.fireIdle();
+      }
+      codexBridgeOffset = result.newOffset;
+      codexBridgePendingTail = result.pendingTail;
+      codexBridgeBaselineDone = true;
+      if (structuredBridgeIsCodex()) {
+        const codex = result as CodexDrainResult;
+        codexServiceTierTracker.observe(rolloutPath, codex.latestThreadSettings);
+        publishActiveRuntime({
+          model: codex.latestModel,
+          reasoningEffort: codex.latestReasoningEffort,
+        });
+      }
+      if (structuredBridgeIsTraex()) {
+        const traex = result as TraexDrainResult;
+        publishActiveRuntime({
+          model: traex.latestModel,
+          reasoningEffort: traex.latestReasoningEffort,
+        });
+      }
+      log(`Structured bridge baseline-existing recovered: ${rolloutPath} (history=${history.length}, live=${live.length}, cutoff=${cutoff}, offset=${codexBridgeOffset})`);
+    } else {
+      const cursor = baselineJsonlCursor(rolloutPath);
+      codexBridgeOffset = cursor.newOffset;
+      codexBridgePendingTail = cursor.pendingTail;
+      codexBridgeBaselineDone = true;
+      log(`Codex bridge baselined: ${rolloutPath} (offset=${codexBridgeOffset})`);
+    }
   } else {
     // baseline-existing requested but file missing — degrade to fresh
     // semantics so the lazy-appearing file isn't accidentally absorbed.
     codexBridgeOffset = 0;
     codexBridgePendingTail = '';
     codexBridgeBaselineDone = true;
+    structuredBridgeRecoveryAttempted = true;
     log(`Codex bridge transcript not yet present at ${rolloutPath}; treating as fresh`);
   }
   if (
@@ -7608,6 +7707,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
   // 在 macOS 上会卡死，永远收不到模型回复。Linux 上 poller 多 tick 也无害
   // （codexBridgeIngest 在 offset 未推进时是 no-op）。
   codexBridgeStartTimer();
+  checkpointStructuredBridgeRecovery();
 }
 
 type CursorAttachMode = 'baseline-existing' | 'fresh-empty';
@@ -7744,9 +7844,11 @@ function codexBridgeDetachFile(): void {
 /** Resolve the pid of the Codex process this worker observes (spawned child or
  *  adopted pane), mirroring the grok/traex pid-follow resolution order. */
 function currentCodexObservedPid(): number | undefined {
-  return (backend as { cliPid?: number } | null)?.cliPid
-    ?? backend?.getChildPid?.()
-    ?? codexAdoptPendingPid;
+  const wired = (backend as { cliPid?: number } | null)?.cliPid;
+  if (wired) return wired;
+  const child = backend?.getChildPid?.();
+  if (child) return resolveCodexOwnershipPid(child, lastSpawnCodexLauncherActive);
+  return codexAdoptPendingPid;
 }
 
 /** The live cursor-agent pid holding the chat's store.db open. backend.cliPid
@@ -7821,6 +7923,20 @@ function codexHistorySidOwnedByCurrentPid(cliSessionId: string): boolean {
     log(`Codex session id ${cliSessionId} not owned by pid ${pid ?? '?'} (open rollouts: ${ownedRollouts ? [...ownedRollouts].join(',') || 'none' : 'unknown'})`);
   }
   return owned;
+}
+
+/** Resolve the pid that actually holds a Codex rollout open, given a candidate
+ *  that may be a bwrap supervisor. Under the file/scratch sandbox, botmux launches
+ *  `bwrap --unshare-pid -- codex`, so the tmux pane leaf / getChildPid() is the
+ *  bwrap process — its /proc/<pid>/fd holds no rollout, and the ownership gate
+ *  would fail. The real codex leaf is host-visible across the pid ns
+ *  (ps -A ppid links), so a comm-based BFS descends to it. Outside launcher
+ *  shapes (or if codex hasn't been forked yet) the candidate already is the
+ *  leaf, so we return it unchanged — fail closed to the launcher pid rather
+ *  than guess. */
+function resolveCodexOwnershipPid(candidatePid: number, launcherActive: boolean): number {
+  if (!launcherActive || !candidatePid) return candidatePid;
+  return findLaunchedCliPid(candidatePid, 'codex') ?? candidatePid;
 }
 
 /** Resolve the pid that actually holds a TRAE rollout open, given a candidate
@@ -8401,6 +8517,7 @@ function codexBridgeMarkPendingTurn(
   const turnId = preferredTurnId ?? `codex-${randomBytes(8).toString('hex')}`;
   codexBridgeQueue.mark(turnId, messageText, markTimeMs, dispatchAttempt);
   checkpointCodexAdoptRecovery();
+  checkpointStructuredBridgeRecovery();
   return turnId;
 }
 
@@ -8806,6 +8923,7 @@ function drainReliableTerminalBeforeInterrupt(): void {
 function emitReadyCodexTurns(): void {
   const ready = codexBridgeQueue.drainEmittable();
   checkpointCodexAdoptRecovery();
+  checkpointStructuredBridgeRecovery();
   if (ready.length === 0) return;
   // Turns suppressed as GENUINE SILENCE (model terminated with a bare
   // nothing-to-send sentinel, no `botmux send`). Tracked by object identity —
@@ -11551,9 +11669,11 @@ function settleBackendScreenBeforeIdle(
 /** Submission writes must surface ZMX's explicit false result, while its
  * best-effort navigation/startup keystrokes keep their non-throwing contract. */
 function adapterInputHandle(target: SessionBackend): PtyHandle {
-  return target instanceof ZmxBackend
+  const handle: PtyHandle = target instanceof ZmxBackend
     ? strictInputHandle(target)
     : target;
+  handle.isAdopt = Boolean(lastInitConfig?.adoptMode);
+  return handle;
 }
 
 function codexAdoptComposerConflict(target: SessionBackend): string | undefined {
@@ -13268,6 +13388,7 @@ async function flushPending(): Promise<void> {
     if (!hasRunStartupCommands) {
       hasRunStartupCommands = true;
       await runStartupCommands();
+      await runInitialNativeRename();
     }
     // Commands deferred behind a previous rename run before the latest pending
     // rename. Some passthroughs (/clear, /new) can rotate the native session;
@@ -16576,7 +16697,7 @@ async function spawnCli(
     ? cliAdapter.captureInitialPromptArgSubmission?.() ?? null
     : undefined;
   const deferInitialPrompt = shouldDeferInitialPromptForStartup({
-    hasStartupCommands: !!cfg.startupCommands?.length,
+    hasStartupCommands: spawnHasStartupWork(cfg.startupCommands, cfg.initialNativeRename),
     adoptMode: cfg.adoptMode === true,
     passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
   }) || shouldDeferArgsBakedDurablePrompt({
@@ -16760,7 +16881,7 @@ async function spawnCli(
     // block. It is a behavioral rule, not a control: nothing in the OS stops the
     // agent from reading another person's token file today, and the likeliest
     // way that happens is an agent grepping the data dir to debug an auth error.
-    triggerUserAuth: cfg.triggerUserAuth?.enabled === true,
+    triggerUserAuth: cfg.triggerUserAuth,
     // Codex and TraeX explicitly set these in tool shells instead of depending
     // on the CLI's default inheritance policy; other adapters inherit normally.
     ...(Object.keys(identityShellEnv).length ? { shellSubprocessEnv: identityShellEnv } : {}),
@@ -17936,6 +18057,7 @@ async function spawnCli(
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
         childEnvForce: { CODEX_HOME: nativeCodexHome, TRAE_HOME: nativeTraeHome },
         readOnlyCarvePaths: scratchReadOnlyCarves,
+        useBwrapArgsFile: effectiveBackendType === 'tmux',
       });
       if (!sbx) {
         throw new Error('scratch sandbox requested but could not be established (overlay/bwrap setup failed, or the tmpfs upper was lost in a reboot) — start a new session; never bare-running');
@@ -18618,6 +18740,7 @@ async function spawnCli(
     // filter (which would reject the correct App Server submission).
     (backend as PtyHandle).expectedCodexSessionId = cfg.cliSessionId;
   }
+  (backend as PtyHandle).isAdopt = Boolean(cfg.adoptMode);
   publishLocalProcessAttestation(cliPid ?? undefined);
   if (cliPid && process.env.SESSION_DATA_DIR) {
     const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
@@ -18648,7 +18771,8 @@ async function spawnCli(
   // MARKER inference is unaffected (the launcher-pid marker is still a valid
   // ancestor of an in-CLI `botmux send`, and the env fallback covers it too).
   const startWrapperRealPidResolve = (launcherPid: number): void => {
-    if (!cfg.wrapperCli || !cfg.wrapperCli.trim() || sandboxRequested || !claudeDataDir) return;
+    // Codex also needs the real execution root, even without a Claude JSONL bridge.
+    if (!cfg.wrapperCli || !cfg.wrapperCli.trim() || sandboxRequested || (!claudeDataDir && cfg.cliId !== 'codex')) return;
     const targetCliId = cfg.cliId as CliId;
     scheduleWrapperRealCliPid(launcherPid, {
       findRealPid: (lp) => findLaunchedCliPid(lp, targetCliId),
@@ -18681,6 +18805,8 @@ async function spawnCli(
   lastSpawnOuterBwrapActive = outerBwrapActive;
   const traexLauncherActive = outerBwrapActive || cfg.cliLaunchMode === 'forge-traex';
   lastSpawnTraexLauncherActive = traexLauncherActive;
+  const codexLauncherActive = outerBwrapActive;
+  lastSpawnCodexLauncherActive = codexLauncherActive;
   const startTraexLauncherPidResolve = (launcherPid: number): void => {
     if (cfg.cliId !== 'traex' || !traexLauncherActive) return;
     scheduleWrapperRealCliPid(launcherPid, {
@@ -18689,6 +18815,21 @@ async function spawnCli(
       getChildPid: () => backend?.getChildPid?.(),
       applyRealPid: (realPid) => {
         log(`TRAE launcher: resolved real traex leaf pid ${realPid} under launcher ${launcherPid}; rewiring ownership pid`);
+        (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
+        (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
+        publishLocalProcessAttestation(realPid);
+      },
+      schedule: (fn, ms) => { setTimeout(fn, ms); },
+    });
+  };
+  const startCodexLauncherPidResolve = (launcherPid: number): void => {
+    if (cfg.cliId !== 'codex' || !codexLauncherActive) return;
+    scheduleWrapperRealCliPid(launcherPid, {
+      findRealPid: (lp) => findLaunchedCliPid(lp, 'codex'),
+      getBackend: () => backend,
+      getChildPid: () => backend?.getChildPid?.(),
+      applyRealPid: (realPid) => {
+        log(`Codex launcher: resolved real codex leaf pid ${realPid} under launcher ${launcherPid}; rewiring ownership pid`);
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
         publishLocalProcessAttestation(realPid);
@@ -18720,12 +18861,17 @@ async function spawnCli(
   // claudeJsonlPath above is still the initial guess; the resolver corrects
   // it on first write when Claude was started with `--resume`.
   if (cliPid && cliAdapterBindsOwnershipPid(cfg.cliId, claudeDataDir)) {
-    // TRAE under bwrap/Forge launcher: best-effort immediate resolve (leaf may
+    // TRAE/Codex under bwrap/launcher: best-effort immediate resolve (leaf may
     // already be forked), then a bounded retry below covers the not-yet-forked case.
-    const wiredPid = cfg.cliId === 'traex' ? resolveTraexOwnershipPid(cliPid, traexLauncherActive) : cliPid;
+    const wiredPid = cfg.cliId === 'traex'
+      ? resolveTraexOwnershipPid(cliPid, traexLauncherActive)
+      : cfg.cliId === 'codex'
+        ? resolveCodexOwnershipPid(cliPid, codexLauncherActive)
+        : cliPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
     if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(cliPid);
+    if (cfg.cliId === 'codex' && codexLauncherActive) startCodexLauncherPidResolve(cliPid);
   }
 
   // Async pid fallback: tmux/pty resolve the CLI pid synchronously above, but
@@ -18754,10 +18900,15 @@ async function spawnCli(
           }
         }
         if (cliAdapterBindsOwnershipPid(cfg.cliId, claudeDataDir)) {
-          const wiredPid = cfg.cliId === 'traex' ? resolveTraexOwnershipPid(pid, traexLauncherActive) : pid;
+          const wiredPid = cfg.cliId === 'traex'
+            ? resolveTraexOwnershipPid(pid, traexLauncherActive)
+            : cfg.cliId === 'codex'
+              ? resolveCodexOwnershipPid(pid, codexLauncherActive)
+              : pid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
           if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(pid);
+          if (cfg.cliId === 'codex' && codexLauncherActive) startCodexLauncherPidResolve(pid);
         }
         // wrapperCli under a late-pid backend (zellij): `pid` here is still the
         // LAUNCHER. Kick the descendant resolver so the bridge gets the real CLI

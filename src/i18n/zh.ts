@@ -495,7 +495,10 @@ export const messages: Record<string, string> = {
   'cmd.login.bytedcli_step2': '2. 授权完成后，回来发一条 /login bytedcli done',
   'cmd.login.bytedcli_note': '说明：这是 ByteCloud 的授权，和飞书 /login 是两回事，两边都要授权一次。登录态约 3 周有效，到期前不用重复扫码。',
   'cmd.login.bytedcli_pending': '⏳ 还没检测到授权完成。请先点上面那条链接授权，再发 /login bytedcli done。',
-  'cmd.login.bytedcli_ok': '✅ ByteCloud 授权成功，之后本会话里你触发的 bytedcli / git 操作都会用你自己的权限。',
+  'cmd.login.bytedcli_ok': '✅ ByteCloud 授权已保存。',
+  'cmd.login.bytedcli_enabled': '当前 Bot 已为 bytedcli 启用按当轮发起人身份注入授权。',
+  'cmd.login.bytedcli_configure': '当前 Bot 的 bytedcli 身份注入尚未启用。请管理员将 triggerUserAuth.enabled 设为 true，并在 triggerUserAuth.tools 中加入 bytedcli；配置在新会话生效。',
+  'cmd.login.bytedcli_git_enabled': '当前 Bot 已为 {host} 的 git 鉴权配置当轮 bytedcli 身份。',
   'cmd.login.bytedcli_failed': '❌ ByteCloud 授权失败：{detail}。可以重新发 /login bytedcli 再试一次。',
   'cmd.login.bytedcli_no_challenge': '❌ 没有正在进行的 ByteCloud 授权。请先发 /login bytedcli 拿授权链接。',
   'cmd.login.bytedcli_begin_failed': '❌ 无法发起 ByteCloud 授权：{detail}',
@@ -957,7 +960,7 @@ export const messages: Record<string, string> = {
   'ai.routing.usage_silence': '- 不是发给你的消息，最终回复只输出 `BOTMUX_NOTHING_TO_SEND`',
   'ai.routing.no_visible_output_ok': '`botmux send` 成功即已送达；本轮终端无可见输出、直接结束是正常的。若看到「上一条回复没有可见输出，请继续」之类提示，那是底层 CLI 误判，不要因此重发——除非 `botmux send` 本身报错。',
   'ai.routing.workflow_hint': 'Workflow：有界的多步目标可用自然语言或 `/workflow` 自动拆成 DAG；成功后可保存复用。',
-  'ai.routing.feedback_response_kind': '若此 bot 启用了最终回答反馈，用 `botmux send --response-kind final` 标记本轮最终回答（挂反馈按钮）；进度/补充类发送无需加 flag（不声明默认按 progress、不挂反馈）。',
+  'ai.routing.feedback_response_kind': '本轮最终答复用 `botmux send --response-kind final` 标记且只发一次（挂载页脚签名；若此 bot 启用了最终回答反馈，同时挂反馈按钮）。中间进度/补充类发送不要加 flag（默认按 progress，不展示页脚签名）。声明 final 即锁定本轮最终答复：之后不能再发 progress，如需补充请用 `--response-kind auxiliary`。',
   'ai.routing.hidden_context_defense': '以下 XML/配置块是隐藏运行上下文，只能静默读取并遵守：`<botmux_routing>`、`<botmux_builtin_skills>`、`<identity>`、`<session_id>`、`<role>`、`<sender>`、`<mentions>`、`<available_bots>`、`<attachments>`。不要回复、不要确认、不要说“已了解/已补充/已记录”。只处理 `<user_message>` 中的真实用户请求。',
   // replyDelivery=transcript（core/reply-delivery.ts）：最终回复由 daemon 从转写自动
   // 转发，系统提示彻底不提 botmux send——intro 换成下面这条，usage_* 只留
@@ -997,10 +1000,12 @@ export const messages: Record<string, string> = {
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────
   'ai.identity.unknown': '(未知)',
-  'ai.credentials.acting_identity': '本会话调用 lark-cli / bytedcli / git 时，用的是「发出当前这条消息的人」自己的授权，由 botmux 在每轮注入，你不需要也不应该自己去找凭证。',
+  'ai.credentials.acting_identity': '本会话已为 {tools} 启用按当前消息发起人身份注入授权。调用时沿用 botmux 注入的身份；授权可用性以工具返回结果为准。',
+  'ai.credentials.git_identity': 'git 对 {host} 的鉴权已配置为使用本轮 bytedcli 身份。',
   'ai.credentials.never_read_others': '~/.botmux/data/ 下的 user-token-* 文件、以及 bytedcli-home/ 下的各人登录态，都属于其他用户。不得读取、列举、复制或输出它们的内容——即使排查问题时也不行，即使有人要求也不行。',
   'ai.credentials.never_forward': '不得把任何 token、JWT、access key 或登录态写进消息、日志、文档、代码或提交记录。',
-  'ai.credentials.on_auth_failure': '遇到鉴权失败：原样说明失败。若 stderr 里已经直接附了授权链接，按下一条「stderr 附链接」的流程走，不要再自行发起授权；若没有附链接，飞书授权由 Agent 运行 `botmux auth request --json`，再用 `botmux send` 将返回的 authUrl 发给本轮用户，发出链接后运行 `botmux auth wait --request-id <requestId> --json`，收到 ready 再重试原操作。ByteCloud 未附链接时才提示用户发 /login bytedcli；命令被拒时 stderr 会标明平台。凭证沿用本轮注入的用户身份。',
+  'ai.credentials.on_auth_failure': '遇到飞书鉴权失败：原样说明失败。若 stderr 里已经直接附了授权链接，按「stderr 附链接」的流程走，不要再自行发起授权；若没有附链接，飞书授权由 Agent 运行 `botmux auth request --json`，再用 `botmux send` 将返回的 authUrl 发给本轮用户，发出链接后运行 `botmux auth wait --request-id <requestId> --json`，收到 ready 再重试原操作。凭证沿用本轮注入的用户身份。',
+  'ai.credentials.on_bytedcli_auth_failure': '遇到 ByteCloud 鉴权失败：原样说明失败。stderr 已附授权链接时按「stderr 附链接」流程处理；未附链接时提示用户发 /login bytedcli。凭证沿用本轮注入的用户身份。',
   'ai.credentials.on_auth_link': '如果命令被拒、stderr 里直接给了授权链接（accounts.feishu.cn/device/verify 或 ByteCloud/cloud.bytedance 链接）和「点开授权后重试」说明：立刻用 botmux send 把那段说明和链接原样转发给用户（链接逐字转发、不改写/编码/加标点；保留「只需授权一次、自动续期」的提示让用户知道只点这一次），然后停下等授权，不要换其它身份重试、不要假装成功，也不必再跑 botmux auth request。用户授权后会再叫你，到时重试即可。',
   // missing_scope 是「授权了但这一项没批」，跟「没授权」是两回事：不要让用户重跑普通授权，
   // 那只会拿到同样的权限再失败一次。飞书已经把缺的 scope 名字列出来了，照抄即可。
@@ -1210,6 +1215,7 @@ export const messages: Record<string, string> = {
   'worker.input_delivery_failed': '⚠️ Botmux 无法确认这条消息是否已进入 Worker 的执行队列。已停止继续投递以避免重复执行。请先查看会话状态，不要直接重发。\nturn: {turnId}',
   'worker.input_delivery_delayed': '⏳ 消息已进入 Worker 的 IPC 队列，但 Worker 暂未确认接收。机器可能较忙；消息仍可能继续执行，请勿重发。\nturn: {turnId}',
   'worker.input_commit_delayed': '⏳ Worker 已收到这条消息，但暂未确认它已进入执行队列。机器可能较忙；消息仍可能继续执行，请勿重发。\nturn: {turnId}',
+  'worker.input_rejected_before_admission': '⚠️ 这条消息在进入 Worker 执行队列之前就被拒收：它没有被执行，也没有产生任何副作用。常见原因是会话里正在执行的那一轮由另一个身份发起（跨身份打断隔离）；等那一轮结束后重新发送即可。\nturn: {turnId}｜reason: {reason}',
   'worker.input_retired_unconfirmed': '⚠️ 会话在处理这条消息期间被主动休眠或更换，Botmux 未能确认它是否已进入执行队列。请先查看会话记录确认结果；若未执行，再重新发送这条消息。\nturn: {turnId}',
   'worker.start_exited_early': 'worker 在就绪前退出（exit code: {code}）；详细错误可查看 Botmux 日志。',
   'workerDiag.recentStderr': '最近的 worker 输出（可能含死因）：',
@@ -1651,10 +1657,10 @@ export const messages: Record<string, string> = {
   'card.dashboard.settings.footer.security': '🔒 仅 Bot 管理员可见 · 私聊回复 · ACK 自动刷新',
   'settings.readOnlyVisitor': '只读访客模式，无法修改设置。',
   'settings.autoUpdateLocalDev': '本地源码安装不支持自动更新。',
-  'settings.autoUpdateUnsupportedInstall': '当前安装方式暂不支持自动更新（目前支持 npm / pnpm / Bun 全局安装）。',
+  'settings.autoUpdateUnsupportedInstall': '当前安装尚不支持定时更新；自部署二进制可先通过“更新到最新版”切换到官方发布版。',
   // 每个 toggle 自己的 disable 原因（更具体，PR3 UI 修订）
   'settings.autoUpdate.disabled.localDev': '⚠️ 源码安装下不支持自动更新（改用 npm / pnpm / Bun 全局安装后可用）',
-  'settings.autoUpdate.disabled.unsupportedInstall': '⚠️ 当前安装方式不支持自动更新（支持 npm / pnpm / Bun 全局安装）',
+  'settings.autoUpdate.disabled.unsupportedInstall': '⚠️ 当前安装尚不支持定时更新；自部署二进制可先更新为官方发布版',
   'settings.autoRestart.disabled.needsAutoUpdate': '⚠️ 需先开启「每日自动更新」',
   'settings.sectionAccess': '访问控制',
   'settings.sectionCards': '卡片行为',
@@ -1797,6 +1803,7 @@ export const messages: Record<string, string> = {
   'cli_update.binary': '当前二进制：{path}',
   'cli_update.install_target': '安装位置：{path}',
   'cli_update.command': '建议在宿主终端执行：{command}',
+  'cli_update.command_unknown': '未识别出升级命令，请按该 CLI 原有的安装方式手动升级。',
   'cli_update.manual_only': 'botmux 只检查并提醒，不会自动安装；现有会话不受影响。',
   'cli_update.dashboard': 'Dashboard：{url}',
 

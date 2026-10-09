@@ -128,6 +128,7 @@ interface UpdateStatus {
   /** Local-dev checkout is a git worktree → self-update via git pull + build. */
   localDevUpdatable?: boolean;
   updateSupported: boolean;
+  releaseInstallRequired?: boolean;
   // 'binary' = 编译版独立二进制（install.sh 形态），不归任何包管理器所有，
   // 自己下载 release 资产替换自身。
   updateManager: 'npm' | 'pnpm' | 'yarn' | 'bun' | 'binary' | 'unknown';
@@ -1967,6 +1968,7 @@ function UpdateCard(props: {
         {s.runningDaemonRestartHint ? <p className="hint-warn">{s.runningDaemonRestartHint}</p> : null}
         {!s.node.ok ? <p className="hint-warn">{tr('update.nodeWarn', { version: s.node.version, required: s.node.required })}</p> : null}
         {!s.localDevInstall && !s.updateSupported ? <p className="hint-warn">{tr('update.unsupportedInstall')}</p> : null}
+        {s.releaseInstallRequired ? <p className="hint">{tr('update.installReleaseHint')}</p> : null}
         {s.localDevInstall ? <p className="hint">{s.localDevUpdatable ? tr('update.localDevUpdatable') : tr('update.localDev')}</p> : null}
         {s.installs.multiple ? <MultiInstallWarning entries={s.installs.entries} /> : null}
         <div className="update-actions">
@@ -2005,7 +2007,7 @@ function UpdateCard(props: {
   );
 }
 
-function CliRuntimeUpdates(props: { entries: CliRuntimeUpdateStatus[] }) {
+export function CliRuntimeUpdates(props: { entries: CliRuntimeUpdateStatus[] }) {
   const tr = useT();
   return (
     <div className="cli-runtime-updates">
@@ -2030,6 +2032,8 @@ function CliRuntimeUpdates(props: { entries: CliRuntimeUpdateStatus[] }) {
             <code>{entry.binPath}</code>
             {entry.updateAvailable && entry.updateCommand ? (
               <small>{tr('update.runtimeCommand')}: <code>{entry.updateCommand}</code></small>
+            ) : entry.updateAvailable ? (
+              <small>{tr('update.runtimeCommandUnknown')}</small>
             ) : null}
           </li>
         ))}
