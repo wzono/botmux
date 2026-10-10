@@ -1091,6 +1091,8 @@ interface ResolvedDashboardSettings {
    *  Codex-family plain-TUI launches. Default ON (only an explicit false disables). */
   bypassCodexHookTrust: boolean;
   hideCodexRateLimitModelNudge: boolean;
+  /** Machine-wide reply-card footer brand signature switch. Default ON. */
+  cardBrandLabel: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -1704,6 +1706,9 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     // default ON — only an explicit stored false disables (matches config.ts getter)
     bypassCodexHookTrust: dashboard.bypassCodexHookTrust !== false,
     hideCodexRateLimitModelNudge: dashboard.hideCodexRateLimitModelNudge !== false,
+    // default ON — machine-wide footer brand signature switch; only an explicit
+    // stored false suppresses brand rendering for every bot (matches bot-registry).
+    cardBrandLabel: dashboard.cardBrandLabel !== false,
     codexNotifier: {
       enabled: codexNotifier.enabled,
       targetBotAppId: codexNotifier.targetBotAppId ?? null,

@@ -7964,7 +7964,7 @@ export async function closeSessionForBackgroundCleanup(
 
 export async function closeSession(
   sessionId: string,
-  opts?: { awaitWorkerExit?: boolean; cardVisibility?: 'private' | 'public' },
+  opts?: { awaitWorkerExit?: boolean; workspaceRetirement?: Session['workspaceRetirement']; cardVisibility?: 'private' | 'public' },
 ): Promise<CloseSessionResult> {
   // `awaitWorkerExit` (default true): whether to block on the worker process
   // actually exiting before returning. A busy CLI wedges in node-pty teardown
@@ -8099,6 +8099,7 @@ export async function closeSession(
       // earlier — one layer up.
       sessionStore.closeSession(sessionId, {
         cleanupBridgeMarkers: !hadLiveWorker,
+        ...(opts?.workspaceRetirement ? { workspaceRetirement: opts.workspaceRetirement } : {}),
         ...(prepared.parkMojoLineage ? { parkMojoLineage: prepared.parkMojoLineage } : {}),
         // Park a LOCAL residual so an idempotent re-close still reports it — the
         // journal (its runtime home) is wiped by this same transaction.
@@ -8166,6 +8167,7 @@ export async function closeSession(
       // SUCCESSFUL save, and skipped when the two are the same object anyway, so
       // the runtime view cannot end up carrying a park the disk does not have.
       if (after && after !== ds.session) {
+        ds.session.workspaceRetirement = after.workspaceRetirement;
         ds.session.mojoCloseJournal = after.mojoCloseJournal;
         if (clearMojoLineage || prepared.parkMojoLineage) {
           ds.session.riffParentTaskId = after.riffParentTaskId;
@@ -8617,13 +8619,14 @@ function removeInactiveRegistration(
   key: string,
   ds: DaemonSession,
 ): boolean {
-  if (ds.session.status === 'active') return false;
+  if (ds.session.status === 'active' && !ds.session.workspaceRetirement) return false;
   // Only remove our exact stale object. A newer session may already own the
   // same routing key and must never be evicted by this continuation.
   if (map.get(key) === ds) map.delete(key);
   logger.warn(
-    `[${tag(ds)}] Refusing to register an inactive session ` +
-    `(status=${ds.session.status})`,
+    ds.session.workspaceRetirement
+      ? `[${tag(ds)}] Refusing to register a workspace-retired session (status=${ds.session.status}, operationId=${ds.session.workspaceRetirement.operationId})`
+      : `[${tag(ds)}] Refusing to register an inactive session (status=${ds.session.status})`,
   );
   return true;
 }
@@ -8735,12 +8738,7 @@ export async function setActiveSessionSafe(
     // to a non-active status while an async creator/restore awaited Lark/project
     // metadata. Never publish that now-inactive row back into the live map; drop
     // only our exact stale object so a newer owner of the same key is untouched.
-    if (ds.session.status !== 'active') {
-      if (map.get(key) === ds) map.delete(key);
-      logger.warn(
-        `[setActiveSessionSafe] refusing to register inactive session `
-        + `${ds.session.sessionId.substring(0, 8)} (status=${ds.session.status})`,
-      );
+    if (removeInactiveRegistration(map, key, ds)) {
       return {
         accepted: false,
         reason: 'inactive_incoming',
@@ -8902,12 +8900,7 @@ const transferInputGates = new WeakMap<DaemonSession, TransferInputGate>();
 // cannot forge an option that bypasses the transfer gate.
 const transferReplacementForkBypass = new WeakSet<DaemonSession>();
 
-// IPC transport and worker acknowledgement are separate stages. A transport
-// timeout may retry because the parent never confirmed enqueue; an ACK timeout
-// is only a delayed/ambiguous state because the child may still execute later.
 const ORDINARY_IM_TRANSPORT_TIMEOUT_MS = 2_000;
-const ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS = 2_000;
-const ORDINARY_IM_INIT_COMMIT_TIMEOUT_MS = 90_000;
 const ORDINARY_IM_MAX_ATTEMPTS = 2;
 
 type OrdinaryImDelivery = {
@@ -8920,7 +8913,6 @@ type OrdinaryImDelivery = {
   attempt: number;
   received: boolean;
   transportConfirmed: boolean;
-  delayNotified: boolean;
   /** At most one daemon ownership handoff may run for a logical delivery.
    * Duplicate worker reject events join this promise instead of creating a
    * second durable record. */
@@ -8932,6 +8924,15 @@ type OrdinaryImDelivery = {
  * daemon event has already been claimed by Lark dedup at this point, so losing
  * this in-memory delivery without retry would permanently drop the message. */
 const pendingOrdinaryImDeliveries = new Map<string, OrdinaryImDelivery>();
+
+/** A cached idle screen does not prove that a just-admitted message has been
+ * committed by the worker. Automatic workspace recycling must preserve it. */
+export function hasPendingOrdinaryImDelivery(ds: DaemonSession): boolean {
+  for (const delivery of pendingOrdinaryImDeliveries.values()) {
+    if (delivery.ds === ds) return true;
+  }
+  return false;
+}
 
 function ordinaryImDeliveryKey(ds: DaemonSession, turnId: string, workerGeneration: number): string {
   return `${ds.session.sessionId}:${workerGeneration}:${turnId}`;
@@ -9002,56 +9003,11 @@ function failOrdinaryImDelivery(
   ));
 }
 
-function delayOrdinaryImDelivery(record: OrdinaryImDelivery): void {
-  if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
-  // A delayed notice is only an intermediate status. Keep the delivery record
-  // so a later explicit rejection or worker exit can still produce the real
-  // terminal outcome instead of silently dropping the turn after telling the
-  // user not to resend it.
-  clearOrdinaryImDeliveryTimer(record);
-  if (record.delayNotified) return;
-  record.delayNotified = true;
-  logger.warn(
-    `[${tag(record.ds)}] Ordinary IM input is still waiting for the worker after IPC enqueue `
-    + `turn=${record.turnId.substring(0, 16)} generation=${record.workerGeneration} `
-    + `attempt=${record.attempt}`,
-  );
-  if (
-    record.turnId.startsWith('bmx-recovery-')
-    || isMeetingDrivenTurn(record.ds, record.turnId)
-    || isSilentScheduledTurn(record.ds, record.turnId)
-  ) return;
-  const loc = botLocale(getBot(record.ds.larkAppId).config);
-  const messageKey = record.received
-    ? 'worker.input_commit_delayed'
-    : 'worker.input_delivery_delayed';
-  if (replyCardModeFor(record.ds, record.turnId) !== 'legacy') {
-    // The turn card already represents queued/working state. A slow worker
-    // receipt must not create a second message (or expose progress in final-only).
-    void updateTurnReplyCard(record.ds, record.turnId, { kind: 'refresh' },
-      (body, type, uuid, beforeWrite) => requireCallbacks().sessionReply(
-        sessionAnchorId(record.ds), body, type, record.ds.larkAppId, record.turnId, { uuid, beforeWrite },
-      )).catch(err => logger.warn(`[${tag(record.ds)}] reply-card delivery wait: ${err.message}`));
-    return;
-  }
-  void requireCallbacks().sessionReply(
-    sessionAnchorId(record.ds),
-    tr(messageKey, { turnId: record.turnId.substring(0, 16) }, loc),
-    'text',
-    record.ds.larkAppId,
-    record.turnId,
-  ).catch(err => logger.error(
-    `[${tag(record.ds)}] Failed to report delayed ordinary IM worker delivery: `
-    + `${err instanceof Error ? err.message : String(err)}`,
-  ));
-}
-
 function retryOrFailOrdinaryImDelivery(
   record: OrdinaryImDelivery,
   reason: string,
   failureMessageKey?: OrdinaryImFailureMessageKey,
-): void {
-  if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
+): void {  if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
   if (
     record.attempt < ORDINARY_IM_MAX_ATTEMPTS
     && record.ds.worker === record.worker
@@ -9110,10 +9066,6 @@ function sendOrdinaryImDeliveryAttempt(record: OrdinaryImDelivery): boolean {
         `[${tag(record.ds)}] Ordinary IM input enqueued to worker IPC `
         + `turn=${record.turnId.substring(0, 16)} generation=${record.workerGeneration} attempt=${attempt}`,
       );
-      record.timer = setTimeout(() => {
-        delayOrdinaryImDelivery(record);
-      }, ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS);
-      record.timer.unref?.();
     });
   } catch (err) {
     queueMicrotask(() => retryOrFailOrdinaryImDelivery(
@@ -9187,7 +9139,6 @@ function sendOrdinaryImDeliveryTracked(
     attempt: 0,
     received: false,
     transportConfirmed: false,
-    delayNotified: false,
   };
   pendingOrdinaryImDeliveries.set(key, record);
   onIpcDispatchAttempted?.();
@@ -9225,19 +9176,6 @@ function acknowledgeOrdinaryImDeliveryReceipt(
   if (!record.received) {
     record.received = true;
     clearOrdinaryImDeliveryTimer(record);
-    // Cold start (worker not ready yet) must await web server bind, plugin prep,
-    // and spawnCli before any turn can commit. Native Codex also commits after
-    // history confirms submission rather than on enqueue. Keep the short
-    // settlement budget for steady-state IPC enqueue, not for multi-second process startup.
-    const isColdStart = ds.workerReady !== true;
-    const isNativeCodex = ds.initConfig?.cliId === 'codex' && !ds.initConfig.codexRpcInput;
-    const commitWaitMs = (isColdStart || isNativeCodex)
-      ? ORDINARY_IM_INIT_COMMIT_TIMEOUT_MS
-      : ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS;
-    record.timer = setTimeout(() => {
-      delayOrdinaryImDelivery(record);
-    }, commitWaitMs);
-    record.timer.unref?.();
   }
   logger.info(
     `[${tag(ds)}] Ordinary IM input received by worker `

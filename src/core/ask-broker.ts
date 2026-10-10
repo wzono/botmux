@@ -380,6 +380,7 @@ function questionsShape(qs: PendingAsk['questions']): string {
       p: q.prompt,
       m: !!q.multiSelect,
       d: q.defaultSelectedKeys,
+      input: q.inputMode,
       o: q.options.map((o) => [o.key, o.label, o.description ?? null]),
     })),
   );
