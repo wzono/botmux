@@ -98,6 +98,7 @@ import type {
   DurableInboxPrimaryDispatchContext,
 } from '../../services/durable-inbox-primary-consumer.js';
 import type { DurableLarkCanonicalHandlerResult } from '../../services/durable-lark-canonical-dispatch.js';
+import { isInputCaptureTerminalRejection } from '../../core/plugins/input-capture/runtime.js';
 
 // 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
 const hallEchoReplied = new Set<string>();
@@ -5522,7 +5523,11 @@ export function createLarkEventDispatcherRuntime(
     'im.message.receive_v1': (data: any) => {
       // The SDK acknowledges when this callback returns. Capture before the
       // ordinary ACK-safe async scheduler, or a crash could lose accepted input.
-      if (handlers.captureHumanInput?.(data)) {
+      // Durable primary is the exception: its callback must first persist the
+      // complete event in Inbox. The claimed consumer performs capture below,
+      // so a crash before ACK cannot lose accepted input and a crash after ACK
+      // cannot bypass the provider-neutral retry/fencing path.
+      if (!runtimeOptions.enqueuePrimary && handlers.captureHumanInput?.(data)) {
         if (data?.message?.message_id) markMessageTriggered(larkAppId, data.message.message_id);
         return;
       }
@@ -5725,9 +5730,34 @@ export function createLarkEventDispatcherRuntime(
       const primary = { message, context };
       const result = await serializeByAnchor(
         message.partitionKey,
-        () => message.eventType === 'lark.im.message.updated_v1'
-          ? processMessageUpdatedEvent(message.data, primary)
-          : processMessageEvent(message.data, undefined, primary),
+        () => {
+          // The legacy path captures synchronously before SDK ACK. Primary has
+          // already persisted this exact event before ACK, so capture belongs
+          // inside the claimed partition lane. InputCaptureRuntime is
+          // message-id idempotent; a claim retry after an uncertain process
+          // outcome therefore cannot duplicate the accepted answer.
+          if (message.eventType === 'lark.im.message.receive_v1') {
+            try {
+              if (handlers.captureHumanInput?.(message.data)) {
+                markMessageTriggered(larkAppId, message.messageId);
+                return Promise.resolve({
+                  kind: 'ignored' as const,
+                  reason: 'durable primary captured human input',
+                });
+              }
+            } catch (error) {
+              if (!isInputCaptureTerminalRejection(error)) throw error;
+              markMessageTriggered(larkAppId, message.messageId);
+              return Promise.resolve({
+                kind: 'ignored' as const,
+                reason: `durable primary input capture rejected: ${error.code}`,
+              });
+            }
+          }
+          return message.eventType === 'lark.im.message.updated_v1'
+            ? processMessageUpdatedEvent(message.data, primary)
+            : processMessageEvent(message.data, undefined, primary);
+        },
         0,
       );
       return result ?? { kind: 'ignored', reason: 'message was filtered before canonical admission' };
