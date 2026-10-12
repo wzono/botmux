@@ -95,9 +95,15 @@ import {
   type DurableLarkMessageClaim,
 } from '../../services/durable-inbox-shadow.js';
 import type {
-  DurableInboxPrimaryDispatchContext,
-} from '../../services/durable-inbox-primary-consumer.js';
-import type { DurableLarkCanonicalHandlerResult } from '../../services/durable-lark-canonical-dispatch.js';
+  DurableLarkCanonicalHandlerContext,
+  DurableLarkCanonicalHandlerResult,
+  DurableLarkPostAdmissionOutput,
+} from '../../services/durable-lark-canonical-dispatch.js';
+import type { DurableInboxPrimaryDispatchContext } from '../../services/durable-inbox-primary-consumer.js';
+import {
+  durableLarkSessionControlEventId,
+  durableLarkSessionControlPartition,
+} from '../../services/durable-lark-session-control.js';
 import { isInputCaptureTerminalRejection } from '../../core/plugins/input-capture/runtime.js';
 
 // 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
@@ -2614,6 +2620,8 @@ export interface RoutingContext {
    *  也能被最外层 ingress catch 看到。admitted 为 true 后该 catch 不得再提示
    *  重发——本轮已进 durable queue / worker，重发会让同一任务再次入队执行。 */
   ingressAdmission?: { admitted: boolean };
+  /** Durable-primary only: queue one provider effect behind fenced Session admission. */
+  queuePostAdmissionOutput?: (output: DurableLarkPostAdmissionOutput) => void;
 }
 
 interface PendingForwardTopicPayload {
@@ -4007,7 +4015,7 @@ export interface LarkEventDispatcherRuntime {
   close(): void;
   processDurableMessage(
     message: DurableLarkMessageClaim,
-    context: DurableInboxPrimaryDispatchContext,
+    context: DurableLarkCanonicalHandlerContext,
   ): Promise<DurableLarkCanonicalHandlerResult>;
 }
 
@@ -4018,11 +4026,18 @@ export interface LarkEventDispatcherRuntimeOptions {
     partitionKey: string;
     data: unknown;
   }) => Promise<unknown>;
+  enqueuePrimaryControl?: (input: {
+    eventId: string;
+    partitionKey: string;
+    data: unknown;
+  }) => Promise<unknown>;
+  /** ACK 前的同步权限/生命周期预检；consumer 仍会在副作用前再次验证。 */
+  authorizePrimaryControl?: (data: unknown) => boolean;
 }
 
 interface PrimaryProcessContext {
   message: DurableLarkMessageClaim;
-  context: DurableInboxPrimaryDispatchContext;
+  context: DurableLarkCanonicalHandlerContext;
 }
 
 /** Build routing once; leadership decides whether this replica connects WS. */
@@ -5159,6 +5174,17 @@ export function createLarkEventDispatcherRuntime(
         substituteTrigger,
         messageListener,
         forwardSeedData: pairedForwardSeed?.payload.data,
+        ...(
+          primary
+          && typeof (primary.context as Partial<DurableLarkCanonicalHandlerContext>)
+            .queuePostAdmissionOutput === 'function'
+            ? {
+                queuePostAdmissionOutput: (
+                  primary.context as DurableLarkCanonicalHandlerContext
+                ).queuePostAdmissionOutput,
+              }
+            : {}
+        ),
       };
       if (explicitlyMentionedThisBot) {
         const before = await handlers.beforeSessionTurn?.(data, ctx, { senderOpenId, explicitlyMentionedThisBot });
@@ -5498,6 +5524,53 @@ export function createLarkEventDispatcherRuntime(
         && actionType
         && PRIMARY_UNSAFE_SESSION_LIFECYCLE_ACTIONS.has(actionType)
       ) {
+        if (
+          runtimeOptions.enqueuePrimaryControl
+          && runtimeOptions.authorizePrimaryControl?.(data) === true
+          && (actionType === 'close' || actionType === 'resume')
+          && data?.action?.value?.visibility !== 'private'
+          && getBot(larkAppId).config.privateCard !== true
+        ) {
+          try {
+            const stableEventId = eventIdForKey(data);
+            const sessionId = data?.action?.value?.session_id;
+            if (typeof stableEventId !== 'string' || !stableEventId.trim()
+                || typeof sessionId !== 'string' || !sessionId.trim()) {
+              throw new Error('stable card interaction/session identity is missing');
+            }
+            const eventId = durableLarkSessionControlEventId(larkAppId, stableEventId);
+            const partitionKey = durableLarkSessionControlPartition(larkAppId, sessionId);
+            return runtimeOptions.enqueuePrimaryControl({ eventId, partitionKey, data }).then(
+              () => ({
+                toast: {
+                  type: 'info',
+                  content: t('toast.action_received_bg', undefined, localeForBot(larkAppId)),
+                },
+              }),
+              error => {
+                logger.error(
+                  `[card-action] durable primary control enqueue failed: app=${larkAppId} `
+                  + `action=${actionType} error=${error instanceof Error ? error.message : String(error)}`,
+                );
+                return {
+                  toast: {
+                    type: 'warning',
+                    content: t(
+                      'card.action.primary_lifecycle_unavailable',
+                      undefined,
+                      localeForBot(larkAppId),
+                    ),
+                  },
+                };
+              },
+            );
+          } catch (error) {
+            logger.warn(
+              `[card-action] durable primary rejected invalid session control: app=${larkAppId} `
+              + `action=${actionType} error=${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
         logger.warn(
           `[card-action] durable primary rejected unfenced session lifecycle action: `
           + `app=${larkAppId} action=${actionType}`,

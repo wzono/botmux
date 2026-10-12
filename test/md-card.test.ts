@@ -278,6 +278,23 @@ describe('buildCardBodyElements', () => {
     expect(elements[2].content).toBe('### Details\n\nFirst paragraph\n\nSecond paragraph');
   });
 
+  it('keeps source indentation of multi-paragraph list items when no code is lifted', () => {
+    // The startLine > map[0] guard must keep the generic source-slice path
+    // for paragraphs before any lifted code: stripping their indentation here
+    // would make CommonMark render the later paragraphs outside the list item.
+    const input = '- a\n\n  p1\n\n  p2';
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '- a\n\n  p1\n\n  p2' },
+    ]);
+  });
+
+  it('keeps source markers of multi-paragraph quotes when no code is lifted', () => {
+    const input = '> q\n>\n> p1\n>\n> p2';
+    expect(buildCardBodyElements(input)).toEqual([
+      { tag: 'markdown', content: '> q\n>\n> p1\n>\n> p2' },
+    ]);
+  });
+
   it('Bug B: 3-backtick nested fences don\'t corrupt later prose', () => {
     // CommonMark treats this as TWO adjacent code blocks (the "outer" closes
     // at the first inner ```). markdown-it parses the same way. The

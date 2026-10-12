@@ -1093,6 +1093,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime: ReturnType<typeof createLarkEventDispatcherRuntime>,
     data: ReturnType<typeof makeUserMessageEvent>,
     messageId: string,
+    queuePostAdmissionOutput?: (output: unknown) => void,
   ) => runtime.processDurableMessage({
     eventType: 'lark.im.message.receive_v1',
     eventId: `im.message.receive_v1:${MY_APP_ID}:${messageId}`,
@@ -1111,6 +1112,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
       workerId: 'primary-worker', claimEpoch: 1, claimUntil: 60_000, attempts: 1,
     },
     signal: new AbortController().signal,
+    queuePostAdmissionOutput: queuePostAdmissionOutput ?? (() => undefined),
   });
 
   it('routes without opening WS and returns the admitted canonical Session', async () => {
@@ -1140,6 +1142,44 @@ describe('Lark event dispatcher — durable primary processor', () => {
       session: { sessionId: 'session-primary' },
     });
     expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    runtime.close();
+  });
+
+  it('exposes the canonical post-admission output queue to the routed handler', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    const handlers = makeHandlers();
+    handlers.handleNewTopic.mockImplementation(async (_data: any, ctx: any) => {
+      ctx.queuePostAdmissionOutput({
+        target: { kind: 'reply', messageId: 'om_primary_output', replyInThread: true },
+        content: 'blocked',
+        providerUuid: 'primary_output',
+      });
+      ctx.ingressAdmission = { admitted: true };
+    });
+    handlers.resolveDurableSession = vi.fn(() => ({
+      sessionId: 'session-primary-output', chatId: 'chat-primary', rootMessageId: 'om_primary_output',
+      scope: 'thread', title: 'Primary output', status: 'active',
+      createdAt: '2026-10-06T00:00:00.000Z', larkAppId: MY_APP_ID,
+    }));
+    const queued = vi.fn();
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA hello' }),
+      messageId: 'om_primary_output',
+      chatId: 'chat-primary',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(runtime, data, 'om_primary_output', queued))
+      .resolves.toMatchObject({ kind: 'admitted' });
+    expect(queued).toHaveBeenCalledWith({
+      target: { kind: 'reply', messageId: 'om_primary_output', replyInThread: true },
+      content: 'blocked',
+      providerUuid: 'primary_output',
+    });
     runtime.close();
   });
 
@@ -1406,6 +1446,49 @@ describe('Lark event dispatcher — durable primary processor', () => {
           type: 'warning',
           content: expect.stringContaining('多副本持久模式'),
         },
+      });
+      expect(handlers.handleCardAction).not.toHaveBeenCalled();
+      expect(enqueuePrimary).not.toHaveBeenCalled();
+      runtime.close();
+    },
+  );
+
+  it.each(['close', 'resume'] as const)(
+    'persists a stable %s interaction before ACK when a control consumer is wired',
+    async action => {
+      setupBotState({ allowedUsers: [USER_OPEN_ID] });
+      const handlers = makeHandlers();
+      const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+      const enqueuePrimaryControl = vi.fn(async () => ({ kind: 'inserted' as const }));
+      const runtime = createLarkEventDispatcherRuntime(
+        MY_APP_ID,
+        'secret',
+        handlers,
+        'feishu',
+        undefined,
+        { enqueuePrimary, enqueuePrimaryControl, authorizePrimaryControl: () => true },
+      );
+      runtime.connect();
+
+      const data = {
+        event_id: `evt_${action}_1`,
+        action: {
+          value: {
+            action,
+            session_id: 'session-primary',
+            root_id: 'om_primary_root',
+          },
+        },
+        operator: { open_id: USER_OPEN_ID },
+        context: { open_message_id: 'om_primary_lifecycle' },
+      };
+      const result = await capturedHandlers['card.action.trigger'](data);
+
+      expect(result).toMatchObject({ toast: { type: 'info' } });
+      expect(enqueuePrimaryControl).toHaveBeenCalledWith({
+        eventId: `card.action.trigger:${MY_APP_ID}:evt_${action}_1`,
+        partitionKey: `lark-session-control:${MY_APP_ID}:session-primary`,
+        data,
       });
       expect(handlers.handleCardAction).not.toHaveBeenCalled();
       expect(enqueuePrimary).not.toHaveBeenCalled();

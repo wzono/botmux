@@ -3412,7 +3412,7 @@ describe('readyPattern', () => {
     // on this opt-in being present, so pin it (the worker reads it === true).
     const adapter = createTraexAdapter('/bin/traex');
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
-    expect(adapter.supportsTypeAhead).toBe(false);
+    expect(adapter.supportsTypeAhead).toBe(true);
     expect(adapter.postTerminalPromptFence).toBe(true);
     expect(adapter.quarantineUnconfirmedSubmits).toBe(true);
   });
@@ -4069,9 +4069,9 @@ describe('grok buildArgs', () => {
     expect(args.includes('--session-id')).toBe(false);
   });
 
-  it('enables type-ahead, ready-hook gate, and grok-hooks SessionStart install', () => {
+  it('enables type-ahead, disables ready-hook gate, and configures grok-hooks SessionStart install', () => {
     expect(adapter.supportsTypeAhead).toBe(true);
-    expect(adapter.injectsReadyHook).toBe(true);
+    expect(adapter.injectsReadyHook).toBeFalsy();
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
     expect(adapter.readyPattern?.test('│ ❯')).toBe(true);
     expect(adapter.hookInstall?.format).toBe('grok-hooks');
