@@ -12,8 +12,10 @@ import {
   AskArgsError,
   findMissingAskEnv,
   normalizeAskDispatch,
+  parseAskInto,
   parseAskMention,
   parseAskOptions,
+  parseAskTimeoutMode,
   parseAskTimeoutSeconds,
 } from '../src/core/ask-args.js';
 
@@ -96,6 +98,21 @@ describe('parseAskOptions', () => {
   });
 });
 
+describe('parseAskTimeoutMode', () => {
+  it.each([
+    [{ timeoutRaw: undefined, noTimeout: false }, 300_000],
+    [{ timeoutRaw: '30', noTimeout: false }, 30_000],
+    [{ timeoutRaw: undefined, noTimeout: true }, null],
+  ] as const)('parses %j as %j', (input, expected) => {
+    expect(parseAskTimeoutMode(input)).toBe(expected);
+  });
+
+  it('rejects --timeout with --no-timeout', () => {
+    expect(() => parseAskTimeoutMode({ timeoutRaw: '30', noTimeout: true }))
+      .toThrowError(AskArgsError);
+  });
+});
+
 describe('parseAskTimeoutSeconds', () => {
   it('defaults to 300s when unset', () => {
     expect(parseAskTimeoutSeconds(undefined)).toBe(300_000);
@@ -122,6 +139,20 @@ describe('parseAskTimeoutSeconds', () => {
     expect(() =>
       parseAskTimeoutSeconds('3', { default: 5, min: 1, max: 2 }),
     ).toThrowError(/范围/);
+  });
+});
+
+describe('parseAskInto', () => {
+  it('accepts an om_ root and trims whitespace', () => {
+    expect(parseAskInto('  om_topic_root-1  ')).toBe('om_topic_root-1');
+  });
+
+  it('returns undefined when absent', () => {
+    expect(parseAskInto(undefined)).toBeUndefined();
+  });
+
+  it.each(['', 'oc_chat', 'om_', 'om_has space'])('rejects invalid root %j', value => {
+    expect(() => parseAskInto(value)).toThrowError(AskArgsError);
   });
 });
 

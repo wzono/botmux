@@ -205,6 +205,32 @@ describe('click → reattach (durable handoff — codex P1-1)', () => {
   });
 });
 
+describe('permanent host ask restart', () => {
+  it('persists null deadline and remains answerable after a far-future restore', async () => {
+    const d1 = mockDispatcher();
+    setCardDispatcher(d1);
+    void registerHostAsk(makeInput({
+      originKind: 'host_explicit', requestId: 'permanent', timeoutMs: null,
+      rootMessageId: 'om_into', backendSurvivesRestart: undefined,
+    }));
+    await new Promise(resolve => setTimeout(resolve, 5));
+    const persisted = onlyPersisted();
+    expect(persisted).toMatchObject({ timeoutMs: null, deadlineAt: null, rootMessageId: 'om_into' });
+
+    _resetForTest(); bindStore();
+    const d2 = mockDispatcher(); setCardDispatcher(d2);
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner');
+    expect(restorePersistedAsks(Date.now() + 10 * 365 * 24 * 60 * 60 * 1000, 'cli_app')).toBe(1);
+    const result = registerHostAsk(makeInput({
+      originKind: 'host_explicit', requestId: 'permanent', timeoutMs: null,
+      rootMessageId: 'om_into', backendSurvivesRestart: undefined,
+    }));
+    expect(d2.sendCalls).toHaveLength(0);
+    expect(tryResolveAsk({ askId: persisted.askId, nonce: persisted.nonce, selected: 'yes', by: 'ou_owner' })).toBe('accepted');
+    await expect(result).resolves.toMatchObject({ kind: 'answered' });
+  });
+});
+
 describe('card re-send when restart precedes cardMessageId (codex P1-2)', () => {
   it('an undelivered host ask survives past its nominal timeout and starts timing after re-delivery', async () => {
     let resolveFirstSend!: (value: { messageId?: string }) => void;

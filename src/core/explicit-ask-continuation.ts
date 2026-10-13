@@ -15,6 +15,24 @@ export interface ExplicitAskReceipt {
   delivered?: boolean;
 }
 
+/** Recovery remains session/chat scoped. The Ask root may intentionally differ
+ * from the ambient session root after authenticated `--into` validation. */
+export function canResumeExplicitAskInSession(
+  receipt: ExplicitAskReceipt,
+  session: {
+    larkAppId: string;
+    chatId: string;
+    sessionId: string;
+    workerPresent: boolean;
+    lastScreenStatus?: string;
+  },
+): boolean {
+  return receipt.input.larkAppId === session.larkAppId
+    && receipt.input.chatId === session.chatId
+    && receipt.input.sessionId === session.sessionId
+    && (!receipt.result || !session.workerPresent || session.lastScreenStatus === 'idle');
+}
+
 /** Explicit asks have a daemon-owned claimant, independent of the waiting CLI.
  * Keep terminal receipts until acknowledged or durably dispatched to the SAME
  * session. A stable turn key makes a lost dispatch response safe to retry. */
