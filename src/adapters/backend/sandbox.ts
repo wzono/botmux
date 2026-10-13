@@ -709,6 +709,10 @@ export function prepareDirectSandbox(opts: {
   larkCliDataDir?: string | null;
   /** Keep the large bwrap option list out of tmux's command parser. */
   useBwrapArgsFile?: boolean;
+  /** mcode OAuth keys include the lexical data-directory path. Preserve that
+   * exact alias to its already-granted canonical directory on symlinked homes.
+   * Only the minimax worker supplies this; absent leaves the mount plan intact. */
+  minimaxDataDir?: string;
 }): DirectSandboxSpawn | null {
   if (process.platform !== 'linux') return null;
   const proxyError = networkProxyError(opts.networkPolicy, process.env);
@@ -724,6 +728,21 @@ export function prepareDirectSandbox(opts: {
   // filters using the repeatable form for this opt-in path.
   if (opts.networkPolicy) launch.args = launch.args.map(arg => arg === '--seccomp' ? '--add-seccomp-fd' : arg);
 
+  let minimaxAlias: { path: string; target: string } | undefined;
+  if (opts.minimaxDataDir) {
+    const path = resolve(opts.minimaxDataDir);
+    const target = realpathSync(path);
+    if (path !== target) {
+      const applicable = opts.policy.rules.filter(r => target === r.path || target.startsWith(`${r.path}/`))
+        .sort((a, b) => a.path.length - b.path.length);
+      if (!statSync(target).isDirectory() || applicable.at(-1)?.access !== 'readWrite'
+        || !opts.policy.rules.some(r => r.path === target && r.access === 'readWrite')
+        || opts.policy.rules.some(r => r.path === path || r.path.startsWith(`${path}/`))) {
+        throw new Error('mcode sandbox data alias requires its exact canonical writable grant');
+      }
+      minimaxAlias = { path, target };
+    }
+  }
   const dataDir = canonical(opts.dataDir);
   const sessionRoot = join(dataDir, 'sandboxes', opts.sessionId);
   const outbox = join(sessionRoot, 'outbox');
@@ -758,6 +777,14 @@ export function prepareDirectSandbox(opts: {
   }
 
   const compiled = compileToBwrap(opts.policy, { symlinks, emptyDir, emptiesDir: empties, filePaths, chdir: opts.chdir, skipPidNamespace: coreOnlyPidNamespaceDegrade() });
+  if (minimaxAlias) {
+    // After tmpfs setup and before any host binds. Parent directories are
+    // empty namespace scaffolding; the alias grants no additional host path.
+    const index = compiled.args.indexOf('/dev/shm') + 1;
+    if (!index) throw new Error('mcode sandbox data alias requires the initial tmpfs mount plan');
+    compiled.args.splice(index, 0,
+      '--dir', dirname(minimaxAlias.path), '--symlink', minimaxAlias.target, minimaxAlias.path);
+  }
   // The shared empty dir + every empty placeholder file are the ro-bind SOURCES
   // for deny masks: real content hidden + read-only. mode 000 additionally makes
   // the mask unlistable for a NON-root uid (a real deny, not a listable "empty");
@@ -1080,6 +1107,7 @@ export interface RelayRequest {
   contentFile?: unknown;
   preparedContentFile?: unknown;
   cardFile?: unknown;
+  completionProposalFile?: unknown;
   attachments?: unknown;
   videos?: unknown;
   videoCovers?: unknown;
@@ -1110,6 +1138,7 @@ export interface ValidatedRelay {
   contentName: string;
   preparedContentName?: string;
   cardName?: string;
+  completionProposalName?: string;
   attachmentNames: string[];
   videoNames: string[];
   videoCoverNames: string[];
@@ -1148,6 +1177,14 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       ? req.cardFile
       : null;
   if (cardName === null) return { ok: false, error: 'cardFile must be a plain outbox basename' };
+  const completionProposalName = req.completionProposalFile === undefined
+    ? undefined
+    : safeName(req.completionProposalFile)
+      ? req.completionProposalFile
+      : null;
+  if (completionProposalName === null) {
+    return { ok: false, error: 'completionProposalFile must be a plain outbox basename' };
+  }
   const attachmentNames: string[] = [];
   for (const a of Array.isArray(req.attachments) ? req.attachments : []) {
     if (!safeName(a)) return { ok: false, error: 'attachment must be a plain outbox basename' };
@@ -1172,6 +1209,7 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
   if (command === 'dispatch' && (
     preparedContentName !== undefined
     || cardName !== undefined
+    || completionProposalName !== undefined
     || attachmentNames.length > 0
     || videoNames.length > 0
     || videoCoverNames.length > 0
@@ -1269,6 +1307,7 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       contentName: req.contentFile,
       preparedContentName,
       cardName,
+      completionProposalName,
       attachmentNames,
       videoNames,
       videoCoverNames,
@@ -1432,6 +1471,15 @@ export function startOutboxWatcher(
         }
         staged.push(cardPath);
       }
+      let completionProposalPath: string | undefined;
+      if (v.value.completionProposalName) {
+        completionProposalPath = join(staging, `${id}.completion-proposal.json`);
+        if (!materializeOutboxFile(outbox, v.value.completionProposalName, completionProposalPath)) {
+          finish(id, reqPath, name, staged, 1, '', 'relay rejected: completion proposal not a regular file in outbox');
+          continue;
+        }
+        staged.push(completionProposalPath);
+      }
       let attBad = false;
       const attPaths: string[] = [];
       v.value.attachmentNames.forEach((an, i) => {
@@ -1465,6 +1513,9 @@ export function startOutboxWatcher(
         ...(v.value.command === 'dispatch'
           ? ['--brief-file', contentDest]
           : cardPath ? ['--card-file', cardPath] : ['--content-file', contentDest]),
+        ...(v.value.command === 'send' && completionProposalPath
+          ? ['--completion-proposal-file', completionProposalPath]
+          : []),
         ...(v.value.command === 'send' ? attPaths.flatMap(a => ['--files', a]) : []),
         ...(v.value.command === 'send' ? videoPaths.flatMap(a => ['--videos', a]) : []),
         ...(v.value.command === 'send' ? videoCoverPaths.flatMap(a => ['--video-covers', a]) : []),
