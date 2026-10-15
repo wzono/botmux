@@ -194,6 +194,26 @@ describe('bot-config store', () => {
     expect(store.coerceConfigValue(spec, '{"enabled":true,"audience":"all"}')).toEqual({ ok: false, reason: 'invalid_json' });
   });
 
+  it('defaults Codex capacity recovery off and round-trips its explicit opt-in', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex' });
+    expect(registry.getBot('app_default').config.codexCapacityRecovery).not.toBe(true);
+    const spec = store.findConfigField('codexCapacityRecovery')!;
+    expect(spec).toMatchObject({ kind: 'boolean', effect: 'immediate', clearable: true });
+    expect(store.coerceConfigValue(spec, 'on')).toEqual({ ok: true, value: true });
+    expect(store.coerceConfigValue(spec, 'off')).toEqual({ ok: true, value: false });
+    expect(store.coerceConfigValue(spec, 'sometimes').ok).toBe(false);
+    expect((await store.applyConfigField('app_default', spec, true)).ok).toBe(true);
+    expect(readConfig().codexCapacityRecovery).toBe(true);
+    expect(registry.getBot('app_default').config.codexCapacityRecovery).toBe(true);
+    expect(registry.loadBotConfigs()[0].codexCapacityRecovery).toBe(true);
+    expect((await store.applyConfigField('app_default', spec, false)).ok).toBe(true);
+    expect(registry.getBot('app_default').config.codexCapacityRecovery).not.toBe(true);
+    expect(registry.loadBotConfigs()[0].codexCapacityRecovery).not.toBe(true);
+    expect((await store.applyConfigField('app_default', spec, null)).ok).toBe(true);
+    expect(readConfig().codexCapacityRecovery).toBeUndefined();
+    expect(registry.getBot('app_default').config.codexCapacityRecovery).toBeUndefined();
+  });
+
   it('normalizes noProgressNotify JSON and rejects out-of-range or unknown fields', async () => {
     const { store } = await loaded();
     const spec = store.findConfigField('noProgressNotify')!;

@@ -7,9 +7,9 @@
  * loses. The in-pane relay answers the probe before forwarding the DA1 query.
  * The tmux test below checks that ordering against a real tmux server.
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -275,16 +275,28 @@ setTimeout(() => {
 }, 800);
 `;
 
+// Every case gets its OWN tmux server (fresh `-L` name per test). `kill-server`
+// returns before the server has finished exiting: while it tears down live panes
+// it still holds the socket open but closes every new connection, so a
+// `new-session` on the SAME name in that window fails with "server exited
+// unexpectedly" (exit 1) instead of starting a server. One shared name made the
+// next test's first command race the previous test's teardown — measured: 4/40
+// local runs and two master CI runs red at `new-session`, typically right after
+// the stty case, whose pane is still alive when that test ends.
 describe('OSC 7501 handshake ordering in a real tmux pane', () => {
   let dir = '';
-  const socket = `botmux-osc7501-${process.pid}`;
+  let socket = '';
   const tmux = (...args: string[]) => spawnSync('tmux', ['-L', socket, '-f', '/dev/null', ...args], {
     cwd: REPO_ROOT, encoding: 'utf8', timeout: 10_000,
     env: { ...process.env, TMUX: '' },
   });
+  beforeEach(() => {
+    socket = `botmux-osc7501-${process.pid}-${randomUUID()}`;
+  });
   afterEach(() => {
     tmux('kill-server');
     if (dir) rmSync(dir, { recursive: true, force: true });
+    dir = '';
   });
 
   async function runInPane(paneArgv: string[], resultFile: string): Promise<{ order: string[]; piped: string }> {
@@ -292,11 +304,18 @@ describe('OSC 7501 handshake ordering in a real tmux pane', () => {
     const created = tmux('new-session', '-d', '-s', 'p', '-x', '80', '-y', '24', '-c', REPO_ROOT, '--', ...paneArgv);
     expect(created.status, created.stderr).toBe(0);
     tmux('pipe-pane', '-O', '-t', 'p', `cat >> '${pipeLog}'`);
+    // Poll for the report's CONTENT, not its existence: the fake CLI publishes it
+    // with one writeFileSync, which truncate-creates the file a beat before the
+    // bytes land, so an existence check can read the empty window under load.
+    // A complete JSON array is the only thing that parses.
     const deadline = Date.now() + 15_000;
-    while (!existsSync(resultFile) && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
-    expect(existsSync(resultFile), 'fake CLI never reported').toBe(true);
-    const seen = JSON.parse(readFileSync(resultFile, 'utf8')) as Array<[string, number]>;
-    return { order: seen.map(([name]) => name), piped: existsSync(pipeLog) ? readFileSync(pipeLog, 'latin1') : '' };
+    let seen: Array<[string, number]> | undefined;
+    while (!seen && Date.now() < deadline) {
+      try { seen = JSON.parse(readFileSync(resultFile, 'utf8')) as Array<[string, number]>; }
+      catch { await new Promise(r => setTimeout(r, 50)); }
+    }
+    expect(seen, 'fake CLI never reported').toBeDefined();
+    return { order: seen!.map(([name]) => name), piped: existsSync(pipeLog) ? readFileSync(pipeLog, 'latin1') : '' };
   }
 
   it.skipIf(!hasTmux)('premise: without the relay tmux answers DA1 and nobody answers 7501 in time', async () => {

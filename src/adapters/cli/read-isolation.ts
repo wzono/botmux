@@ -382,7 +382,11 @@ export function buildSeatbeltProfile(
 // would be masked to /dev/null by this flavour's own `.dashboard-secret.*`
 // enumeration. A v15 pane carries neither the mount nor the env, so a warm
 // reattach would keep failing every send; it must cold-spawn once.
-export const ISOLATION_PANE_MARKER_VERSION = 16;
+// 17 adds BOTMUX_SEND_RELAY_SCOPE=send to the credential-only pane's wrapper env
+// (cmdDispatch routes by shape on it). A v16 pane never got it, so a warm
+// reattach would keep refusing the legacy --bot / --repo / --standby dispatch
+// forms; it must cold-spawn once.
+export const ISOLATION_PANE_MARKER_VERSION = 17;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 

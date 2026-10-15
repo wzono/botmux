@@ -40,10 +40,11 @@ describe('codex-app judgement lives behind the predicate in daemon / worker-pool
     // worker 侧：worker 当前 init 的 cliId 与会话库里的 cliId 任一为 Codex App 即按 ledger 精确校验。
     const worker = read('src/worker.ts');
     expect(worker).toMatch(/isCodexAppCliId\(lastInitConfig\?\.cliId\)\s*\|\|\s*isCodexAppCliId\(session\?\.cliId\)/);
-    // daemon 侧两处（/api/send 与 hook 路径）：initConfig.cliId 与 session.cliId 同理。
+    // daemon 侧四处（/api/send、hook 路径，以及 capability 直连 dispatch 的种子注册与投递路由）：
+    // initConfig.cliId 与 session.cliId 同理。
     const daemon = read('src/daemon.ts');
     const hits = daemon.match(/isCodexAppCliId\(ds!?\.initConfig\?\.cliId\) \|\| isCodexAppCliId\(ds!?\.session\.cliId\)/g) ?? [];
-    expect(hits).toHaveLength(2);
+    expect(hits).toHaveLength(4);
   });
 
   it('every session-level codex-app gate resolves the CLI snapshot-first (same priority as sessionCliId)', () => {

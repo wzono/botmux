@@ -124,7 +124,11 @@ const CONSUMERS: Record<string, Rule> = {
     category: 'user_surface',
     why: 'Close route: serialises the whole result; the closed-row fast path '
       + 'replays the residual.',
-    count: 4,
+    count: 2,
+  },
+  'core/dashboard-ipc-server.ts::closeCurrentGeneration::closeSession': {
+    category: 'infrastructure',
+    why: 'The close route returns the complete refusal/residual result unchanged; this wrapper only captures the pool-selected generation release ticket.',
   },
 
   // ── background: no UI, so refusal/residual must be logged ────────────────

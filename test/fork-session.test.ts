@@ -334,7 +334,7 @@ describe('forkSession — frozen launch posture inheritance', () => {
   // ── P2: the per-session reasoningEffort override + the agentFrozen marker
   //    must ride along, else sessionAgentConfig re-freezes from the live bot
   //    config and the clone silently drops the source's launch identity. ──
-  it('P2: reasoningEffort / backend variant / cliRuntime / cliPathOverride / wrapperCli / agentFrozen inherited', async () => {
+  it('P2: reasoningEffort / backend variant / cliRuntime / cliPathOverride / cliConfigDir / wrapperCli / agentFrozen inherited', async () => {
     const src = makeSourceDs({
       reasoningEffort: 'xhigh',
       modelBackendVariant: 'max',
@@ -346,6 +346,7 @@ describe('forkSession — frozen launch posture inheritance', () => {
         update: { provider: 'self' },
       },
       cliPathOverride: '/opt/custom/claude',
+      cliConfigDir: '~/.claude-api',
       wrapperCli: 'ttadk',
       agentFrozen: true,
     });
@@ -359,6 +360,8 @@ describe('forkSession — frozen launch posture inheritance', () => {
     expect(child.cliRuntime).toEqual(src.session.cliRuntime);
     expect(child.cliRuntime).not.toBe(src.session.cliRuntime);
     expect(child.cliPathOverride).toBe('/opt/custom/claude');
+    // The fork resumes the source transcript, which lives under the source profile.
+    expect(child.cliConfigDir).toBe('~/.claude-api');
     expect(child.wrapperCli).toBe('ttadk');
     expect(child.agentFrozen).toBe(true);
   });
@@ -905,5 +908,56 @@ describe('forkSession：等目标锁期间源会话变化', () => {
     });
     expect(res).toEqual({ ok: false, error: 'session_not_active' });
     expect(sessionStore.createSession).not.toHaveBeenCalled();
+  });
+});
+
+describe('sessionAgentConfig — cliConfigDir (Claude config profile) is frozen per session', () => {
+  it('freezes the bot profile on first fork and ignores later bot edits', () => {
+    const ds = makeSourceDs({ agentFrozen: false, cliConfigDir: undefined });
+    const first = sessionAgentConfig(ds, { cliId: 'claude-code', cliConfigDir: '~/.claude-api' });
+    expect(first.cliConfigDir).toBe('~/.claude-api');
+    expect(ds.session.cliConfigDir).toBe('~/.claude-api');
+    // The transcript lives in the frozen profile: a resume must not follow the bot.
+    const again = sessionAgentConfig(ds, { cliId: 'claude-code', cliConfigDir: '~/.claude-other' });
+    expect(again.cliConfigDir).toBe('~/.claude-api');
+  });
+
+  it('never back-fills a profile into a session frozen by an older build', () => {
+    const ds = makeSourceDs({ agentFrozen: true, cliConfigDir: undefined });
+    const cfg = sessionAgentConfig(ds, { cliId: 'claude-code', cliConfigDir: '~/.claude-api' });
+    expect(cfg.cliConfigDir).toBeUndefined();
+    expect(ds.session.cliConfigDir).toBeUndefined();
+  });
+
+  it('never hands a profile to an adopted session (it wraps an external CLI on the default root)', () => {
+    const adoptedFrom = { source: 'tmux' as const, tmuxTarget: 'ext-pane', cwd: '/repo' };
+    const fresh = makeSourceDs({ agentFrozen: false, cliConfigDir: undefined, adoptedFrom });
+    expect(sessionAgentConfig(fresh, { cliId: 'claude-code', cliConfigDir: '~/.claude-api' }).cliConfigDir).toBeUndefined();
+    expect(fresh.session.cliConfigDir).toBeUndefined();
+    // a row an older build froze with the bot profile must not reach the spawn either
+    const legacy = makeSourceDs({ agentFrozen: true, cliConfigDir: '~/.claude-api', adoptedFrom });
+    expect(sessionAgentConfig(legacy, { cliId: 'claude-code' }).cliConfigDir).toBeUndefined();
+  });
+
+  it('drops the profile for a CLI that does not support it', () => {
+    const ds = makeSourceDs({ cliId: 'codex', agentFrozen: false, cliConfigDir: undefined });
+    const cfg = sessionAgentConfig(ds, { cliId: 'codex', cliConfigDir: '~/.claude-api' });
+    expect(cfg.cliConfigDir).toBeUndefined();
+  });
+
+  it('does not hand the bot profile to a per-session /cli selection', () => {
+    const ds = makeSourceDs({
+      cliId: undefined,
+      cliSessionId: undefined,
+      agentFrozen: false,
+      model: undefined,
+      cliLaunchSnapshot: {
+        version: 1, state: 'pending', entryId: 'claude-code', cliId: 'claude-code', cliRuntime: null,
+        cliPathOverride: null, wrapperCli: null, model: null, reasoningEffort: null, launchShell: null, startupCommands: [],
+      } as any,
+    });
+    const cfg = sessionAgentConfig(ds, { cliId: 'claude-code', cliConfigDir: '~/.claude-api' });
+    expect(cfg.cliConfigDir).toBeUndefined();
+    expect(ds.session.cliConfigDir).toBeUndefined();
   });
 });

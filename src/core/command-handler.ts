@@ -2143,7 +2143,7 @@ export async function handleCommand(
           }
           let closeResult;
           try {
-            closeResult = await closeWorkerPoolSession(hydratedLane.session.sessionId);
+            closeResult = await closeWorkerPoolSession(hydratedLane.session.sessionId, { explicitClose: true, onArchiveError: error => sessionReply(rootId, `⚠️ Botmux 会话已关闭，Codex 归档失败：${error}`) });
           } catch (error) {
             return { status: 'close_failed' as const, error };
           }
@@ -2433,8 +2433,8 @@ export async function handleCommand(
               // cannot verify it. Surface that so the active record is kept
               // for retry instead of being silently dropped.
               const closeArgs: Parameters<typeof closeWorkerPoolSession> = privateCard
-                ? [targetSessionId, { cardVisibility: 'private' }]
-                : [targetSessionId];
+                ? [targetSessionId, { cardVisibility: 'private', explicitClose: true, onArchiveError: error => sessionReply(rootId, `⚠️ Botmux 会话已关闭，Codex 归档失败：${error}`) }]
+                : [targetSessionId, { explicitClose: true, onArchiveError: error => sessionReply(rootId, `⚠️ Botmux 会话已关闭，Codex 归档失败：${error}`) }];
               closeResult = await closeWorkerPoolSession(...closeArgs);
             } catch (err) {
               return { status: 'teardown_failed' as const, err };
@@ -2561,7 +2561,7 @@ export async function handleCommand(
               }
               if (sibling.larkAppId === ds.larkAppId) {
                 try {
-                  const result = await closeWorkerPoolSession(sibling.sessionId);
+                  const result = await closeWorkerPoolSession(sibling.sessionId, { explicitClose: true, onArchiveError: error => sessionReply(rootId, `⚠️ Botmux 会话已关闭，Codex 归档失败：${error}`) });
                   if (result.ok && result.outcome === 'closed') closedSiblings++;
                   else siblingCloseFailures.push(sibling.sessionId);
                 } catch (err) {
@@ -2579,6 +2579,7 @@ export async function handleCommand(
               try {
                 const res = await fetchDaemonIpc(daemon.ipcPort, `/api/sessions/${encodeURIComponent(sibling.sessionId)}/close`, { method: 'POST' });
                 const body = await res.json().catch(() => undefined);
+                if (body?.archiveError) await sessionReply(rootId, `⚠️ Botmux 会话已关闭，Codex 归档失败：${body.archiveError}`);
                 const residual = res.ok ? parseCloseResidual(body) : undefined;
                 if (res.ok && !residual) closedSiblings++;
                 else {
@@ -5711,20 +5712,26 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.fork.subtopic_usage', undefined, loc));
             break;
           }
-          if (ds.scope !== 'thread' || !ds.session.rootMessageId?.startsWith('om_')) {
-            await sessionReply(rootId, t('cmd.fork.subtopic_thread_only', undefined, loc));
-            break;
-          }
-          let chatMode: string | undefined;
-          try {
-            chatMode = await getChatModeStrict(forkAppId, ds.chatId);
-          } catch {
-            // Treat an unknown mode as unsupported: sending a top-level message
-            // to a regular group would not create the isolated topic we promise.
-          }
-          if (chatMode !== 'topic') {
-            await sessionReply(rootId, t('cmd.fork.subtopic_thread_only', undefined, loc));
-            break;
+          // 私聊（p2pMode chat/thread 均可）与话题群支持原地子话题分身。
+          // 私聊走 chatType 判定，不调 getChatModeStrict：DM 没有 chat_mode
+          // 概念，且该接口偶发 500，隐私敏感路径才用它（见本文件上方注释）。
+          const forkInPlaceIsP2p = ds.chatType === 'p2p';
+          if (!forkInPlaceIsP2p) {
+            if (ds.scope !== 'thread' || !ds.session.rootMessageId?.startsWith('om_')) {
+              await sessionReply(rootId, t('cmd.fork.subtopic_thread_only', undefined, loc));
+              break;
+            }
+            let chatMode: string | undefined;
+            try {
+              chatMode = await getChatModeStrict(forkAppId, ds.chatId);
+            } catch {
+              // Treat an unknown mode as unsupported: sending a top-level message
+              // to a regular group would not create the isolated topic we promise.
+            }
+            if (chatMode !== 'topic') {
+              await sessionReply(rootId, t('cmd.fork.subtopic_thread_only', undefined, loc));
+              break;
+            }
           }
 
           const result = await startForkSubtopicSession(argsLine, ds, message, forkAppId, forkChildOwnerOpenId);
@@ -6694,9 +6701,46 @@ export async function startForkSubtopicSession(
     ...(message.senderName ? { name: message.senderName } : {}),
   };
   const sourceOptions = forkSourceWriteOptions(appId, parentDs, message.messageId);
+  const forkInPlaceIsP2p = parentDs.chatType === 'p2p';
+  // DM 下命令消息不能安全充当新话题根的两种形态：
+  // 1) 已在某个真实话题内（thread_id 仅真实话题回复才带；引用气泡不带）——
+  //    飞书话题不可嵌套，对它 reply_in_thread 只会落回父话题，marker 记在
+  //    命令 id 上也永远命不中，分身会静默串进父会话；
+  // 2) DM 顶层但引用了别的消息（root_id 存在且不等于自身）——引用气泡能否
+  //    当话题根是未验证行为，不赌：同样新发一条顶层消息作锚点。
+  // 两种形态都改走 (a)：sendMessage 顶层 post + 对它 reply_in_thread 开话题。
+  const p2pAnchorIsForeign = forkInPlaceIsP2p
+    && (!!message.threadId || (!!message.rootId && message.rootId !== message.messageId));
   let anchorId: string | undefined;
+  // forkSession 成功后置位：之后任何抛错都不能再走 recallAnchor，否则会把
+  // 一个已经活着的分身话题连同 marker 一起撤掉，留下回复折回扁平、静默
+  // 失联的僵尸子会话。
+  let forked = false;
+  // 我们自己发出、失败时可以删除的消息。DM 顶层命令的锚点是用户的消息，
+  // 绝不能删；只有「话题内 / 引用形态」时新建的顶层锚点归我们所有。
+  let seedMessageId: string | undefined;
+  let anchorOwnedByBot = false;
 
   const recallAnchor = async (): Promise<boolean> => {
+    if (forkInPlaceIsP2p) {
+      const { removeP2pForceTopicRoot } = await import('../services/p2p-force-topic-store.js');
+      // 幂等：recall 的所有路径（含抛错路径）都可能调到。
+      removeP2pForceTopicRoot(appId, anchorId!, chatId);
+      const targets = [seedMessageId, anchorOwnedByBot ? anchorId : undefined]
+        .filter((id): id is string => !!id);
+      const results = await Promise.all(targets.map(async (id) => {
+        try {
+          return await deleteMessage(appId, id);
+        } catch (err) {
+          logger.warn(
+            `[${parentSession.sessionId.substring(0, 8)}] /fork DM message recall failed: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+          );
+          return false;
+        }
+      }));
+      return results.every(Boolean);
+    }
     if (!anchorId) return true;
     try {
       return await deleteMessage(appId, anchorId);
@@ -6711,7 +6755,9 @@ export async function startForkSubtopicSession(
 
   try {
     let parentThreadId = parentSession.larkThreadId ?? message.threadId;
-    if (!parentThreadId) {
+    // 扁平私聊会话的 rootMessageId 存的是 chatId（oc_ 开头），不是消息 id——
+    // 拿去查 getMessageDetail 必然落空。直接回落成 chat applink 即可。
+    if (!parentThreadId && parentSession.rootMessageId?.startsWith('om_')) {
       parentThreadId = (await getMessageThreadId(appId, parentSession.rootMessageId)) ?? undefined;
     }
     if (parentThreadId && parentSession.larkThreadId !== parentThreadId) {
@@ -6743,9 +6789,46 @@ export async function startForkSubtopicSession(
         ]],
       },
     });
-    anchorId = sourceOptions
-      ? await sendMessage(appId, chatId, seedPost, 'post', undefined, undefined, sourceOptions)
-      : await sendMessage(appId, chatId, seedPost, 'post');
+    // DM「话题内 / 引用」形态的顶层锚点只承载一行指引；完整分身展示
+    // （任务、附件、父话题链接）作为话题内第一条回复发出，与 (b) 同构。
+    const anchorPost = JSON.stringify({
+      [localeKey]: {
+        title: childTitle,
+        content: [[{ tag: 'text', text: t('cmd.fork.seed_anchor_line', undefined, loc) }]],
+      },
+    });
+    if (forkInPlaceIsP2p && !p2pAnchorIsForeign) {
+      // (b) 命令在 DM 顶层：锚点就是用户的命令消息，reply_in_thread 开出
+      // 新话题（与 /t 同构）。锚点归用户所有，失败时绝不删除。
+      anchorId = message.messageId;
+      seedMessageId = sourceOptions
+        ? await replyMessage(appId, anchorId, seedPost, 'post', true, undefined, undefined, sourceOptions)
+        : await replyMessage(appId, anchorId, seedPost, 'post', true);
+    } else if (forkInPlaceIsP2p) {
+      // (a) 命令在已有话题内或带引用：先新发顶层 post 作为锚点，再
+      // reply_in_thread 到它开出独立话题。两条消息都归 bot，失败可删。
+      anchorId = sourceOptions
+        ? await sendMessage(appId, chatId, anchorPost, 'post', undefined, undefined, sourceOptions)
+        : await sendMessage(appId, chatId, anchorPost, 'post');
+      anchorOwnedByBot = true;
+      seedMessageId = sourceOptions
+        ? await replyMessage(appId, anchorId, seedPost, 'post', true, undefined, undefined, sourceOptions)
+        : await replyMessage(appId, anchorId, seedPost, 'post', true);
+    } else {
+      // 群聊：顶层 post 本身就是话题锚点，无单独 seed。
+      anchorId = sourceOptions
+        ? await sendMessage(appId, chatId, seedPost, 'post', undefined, undefined, sourceOptions)
+        : await sendMessage(appId, chatId, seedPost, 'post');
+    }
+    // 私聊锚点必须登记 /t 同款溯源：扁平 DM 路由默认把 root_id+thread_id
+    // 回复折进 chat-scope 会话，只有命中 marker 才会 promote 到锚点的分身
+    // thread 会话。marker 在话题真正开出（seed 回复成功）之后记录：记早了
+    // 会留出「marker 已存在、分身会话未注册」的窗口，外部回复会在锚点上
+    // 新建普通话题会话而非分身。fork 失败由 recallAnchor 撤消息并删 marker。
+    if (forkInPlaceIsP2p) {
+      const { recordP2pForceTopicRoot } = await import('../services/p2p-force-topic-store.js');
+      recordP2pForceTopicRoot(appId, anchorId, chatId);
+    }
     const childThreadId = (await getMessageThreadId(appId, anchorId)) ?? undefined;
 
     const childIntro = t('cmd.fork.child_intro', {
@@ -6763,7 +6846,8 @@ export async function startForkSubtopicSession(
       parentSession.sessionId,
       chatId,
       anchorId,
-      'group',
+      // 私聊原地分身同样落在 p2p chat；群聊子话题保持 group。
+      parentDs.chatType,
       'thread',
       {
         childTitle,
@@ -6800,6 +6884,8 @@ export async function startForkSubtopicSession(
       const orphanTopic = !await recallAnchor();
       return { ok: false, error: forkResult.error, orphanTopic };
     }
+    // 提交点：分身会话已注册，后续失败只报错，不再撤话题。
+    forked = true;
 
     if (!parentSession.forkChildSessionIds?.includes(forkResult.childSessionId)) {
       parentSession.forkChildSessionIds = [
@@ -6838,7 +6924,9 @@ export async function startForkSubtopicSession(
     return {
       ok: false,
       error: anchorId ? 'fork_subtopic_failed' : 'topic_creation_failed',
-      orphanTopic: anchorId ? !await recallAnchor() : false,
+      // fork 已成功后的抛错绝不撤话题：已注册的分身必须保持可路由，
+      // recall 会删 marker 让其回复折回扁平、静默失联。
+      orphanTopic: forked ? false : (anchorId ? !await recallAnchor() : false),
     };
   }
 }
@@ -6879,8 +6967,12 @@ async function upsertForkPanelCard(
   // target and error, including inconclusive provider/network failures.
   const rootId = parentDs.session.rootMessageId?.startsWith('oc_')
     ? undefined : parentDs.session.rootMessageId;
+  // 扁平私聊（p2pMode=chat）的 /forklist：命令消息是 DM 顶层消息，对它
+  // reply_in_thread 会凭空开一个把面板装进去的新话题。父会话 root 又是
+  // chatId（oc_，无法 reply）。直接平坦发到 DM，与 /fork 成功时的面板同形。
+  const flatP2pParent = parentDs.chatType === 'p2p' && parentDs.scope === 'chat';
   const replyTargets: string[] = [];
-  if (opts?.preferredReplyToMessageId) replyTargets.push(opts.preferredReplyToMessageId);
+  if (!flatP2pParent && opts?.preferredReplyToMessageId) replyTargets.push(opts?.preferredReplyToMessageId);
   if (rootId && rootId !== opts?.preferredReplyToMessageId) replyTargets.push(rootId);
   let cardId: string | undefined;
   for (const target of replyTargets) {

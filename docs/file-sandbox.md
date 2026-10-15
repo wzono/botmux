@@ -244,11 +244,24 @@ daemon 不可达时，`delete` 等命令也不能退回离线写会话库。正�
   `BOTMUX*` 变量送进 pane，只靠 worker 的环境变量送不到）。
 - `<数据目录>/sandboxes` 整体被 tmpfs 遮住，只重新挂上本会话的 outbox：每个 outbox
   里都有该会话的 relay capability，不能让一个 pane 读到兄弟会话的。
-- 热重连（daemon 重启、话题转移、挂起恢复）复用原 outbox 目录并重新发布
-  capability；原目录已丢失时不重连，改为 kill + 冷启。
-- `botmux dispatch --into <om_根消息>` 也经 relay 执行，宿主侧投递前会核对该根消息
-  确实在目标群里（`dispatch_chat_mismatch`）。
-- 隔离 pane 标记版本因此升至 16，旧 pane 冷启动一次。
+- daemon 重启 / 父进程退出、话题转移、挂起时，持久 pane 仍在运行，outbox 保留；
+  只有真正关闭会话才删除。热重连复用原 outbox 目录并重新发布 capability；原目录
+  已丢失时不重连，改为 kill + 冷启。
+- bwrap 同时注入 `BOTMUX_SEND_RELAY_SCOPE=send`，标明这是 credential-only 的 relay。
+  `botmux send` 总是走 relay；`botmux dispatch` 按形态分流：
+  - `--bot-app` 形态（含 `--into`、`--chat-id`、`--delegate`）继续走 relay：宿主侧
+    持有 `.dashboard-secret`，负责建立 talk-only chat grant（pane 内该文件被遮住）；
+    relay 下的 `--into <om_根消息>` 由宿主侧投递路由核对该根消息确实在目标群里
+    （`dispatch_chat_mismatch`）。
+  - relay 不接受的 `--bot`、`--repo`、`--standby`、`--model`、`--reasoning-effort`
+    走直连：该形态下 `bots.json` 与 managed-origin capability 可读，直连全流程不依赖被
+    遮住的 secret。
+  - `--bot-app` 与上述直连选项混用时直接拒绝（两条路径都无法完成）。
+  - 直连同样受 Codex App 输出 sink 约束：daemon 的种子注册 / 投递路由对 capability 鉴权
+    的调用方（隔离 pane）复用 `/api/send` 的同一判定，本轮输出被限定到 `http_wait` /
+    `http_async` / `suppressed` 时拒绝（`origin_not_sendable`），与 relay 侧一致。
+  - 完整沙盒不注入该标记，dispatch 仍只走 relay。
+- 隔离 pane 标记版本因此升至 17（16 引入 outbox，17 引入 scope 标记），旧 pane 冷启动一次。
 
 **威胁模型 / 已知边界**：设备凭据隔离（包括 credential-only）防的是 agent **无意中
 读到**设备凭据，不是对抗恶意 agent 的代码完整性边界。credential-only pane 对 `/` 可写，

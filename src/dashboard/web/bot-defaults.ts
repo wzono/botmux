@@ -89,6 +89,8 @@ export type BotDefaultsRow = {
   /** dsh profile name; rendered as a dsh-only field. */
   dshProfile?: string | null;
   agentSelectionKey?: string;
+  /** CLI config profile dir (claude-code: CLAUDE_CONFIG_DIR); null/absent = CLI default. */
+  cliConfigDir?: string | null;
   defaultOncall?: { enabled?: boolean; workingDir?: string; since?: number };
   defaultWorkingDir?: string | null;
   /** 「仓库选择卡片」形态的工作目录，与 defaultWorkingDir 互斥。 */

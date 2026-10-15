@@ -740,6 +740,9 @@ import { runCompletionProposalContinuation } from './core/completion-proposal-co
 import { renderCompletionProposalCard } from './im/lark/completion-proposal-card.js';
 import { parseAskBody, registerAskForResponse } from './core/ask-api.js';
 import { resolveAskRootTarget } from './core/ask-into-target.js';
+import { resolveDocumentAskDelivery } from './core/doc-comment-ask.js';
+import { isHumanOpenId } from './im/lark/client.js';
+import { submitDocumentAskReply } from './core/ask-broker.js';
 import { shouldReturnAskStartupNotReady } from './core/ask-types.js';
 import { computeCocoPickerKeys } from './core/coco-picker-keys.js';
 import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
@@ -7111,6 +7114,23 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
     return jsonRes(res, 409, { ok: false, error: 'multi_topic_disabled' });
   }
 
+  // An isolated pane that calls this route directly (capability-authenticated,
+  // not trusted-host) must meet the SAME output-sink rule as its relay and as
+  // /api/send: a Codex App turn bound to http_wait / http_async / suppressed
+  // may not write to Lark. Relayed dispatches arrive as trusted-host re-execs
+  // and were already checked by the worker's authorizeManagedSend; ordinary
+  // host callers keep their existing behaviour.
+  if (!isTrustedHostIpcRequest(req)) {
+    const codexDecision = validateCodexAppManagedSendOrigin(
+      ds.session.codexAppDispatchLedger,
+      ds.managedTurnOrigin ?? {},
+      isCodexAppCliId(ds.initConfig?.cliId) || isCodexAppCliId(ds.session.cliId),
+    );
+    if (!codexDecision.ok) {
+      return jsonRes(res, 409, { ok: false, error: 'origin_not_sendable' });
+    }
+  }
+
   const sourceWriteOptions = sessionTopicWriteOptions(ds, ds.managedTurnOrigin?.turnId);
 
   const stringArray = (value: unknown): string[] => Array.isArray(value)
@@ -7279,6 +7299,22 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
   });
   if (!verified.ok || !ds || ds.larkAppId !== selfDaemonLarkAppId) {
     return jsonRes(res, 403, { ok: false, error: 'dispatch_origin_unproven' });
+  }
+  // An isolated pane that calls this route directly (capability-authenticated,
+  // not trusted-host) must meet the SAME output-sink rule as its relay and as
+  // /api/send: a Codex App turn bound to http_wait / http_async / suppressed
+  // may not write to Lark. Relayed dispatches arrive as trusted-host re-execs
+  // and were already checked by the worker's authorizeManagedSend; ordinary
+  // host callers keep their existing behaviour.
+  if (!isTrustedHostIpcRequest(req)) {
+    const codexDecision = validateCodexAppManagedSendOrigin(
+      ds.session.codexAppDispatchLedger,
+      ds.managedTurnOrigin ?? {},
+      isCodexAppCliId(ds.initConfig?.cliId) || isCodexAppCliId(ds.session.cliId),
+    );
+    if (!codexDecision.ok) {
+      return jsonRes(res, 409, { ok: false, error: 'origin_not_sendable' });
+    }
   }
   const sourceTurnId = ds.managedTurnOrigin?.turnId;
   const sourceWriteOptions = sessionTopicWriteOptions(ds, sourceTurnId);
@@ -8124,13 +8160,36 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
       askMentionedOpenId = boundAsk.mentionedOpenId;
     }
   }
+  let documentDelivery: Awaited<ReturnType<typeof resolveDocumentAskDelivery>>;
+  const askGeneration = askSession && captureRoutingGeneration(askSession);
+  const askWorker = askSession?.worker;
+  const askOrigin = askSession?.managedTurnOrigin;
+  try {
+    documentDelivery = askSession
+      ? await resolveDocumentAskDelivery(askSession, body.originTurnId,
+        async (appId, openId) => evaluateAskAnswerTalk(appId, askSession.chatId, openId, 'p2p')
+          && await isHumanOpenId(appId, openId))
+      : undefined;
+    if (documentDelivery && askGeneration && (!isCurrentRoutingGeneration(askGeneration)
+      || askSession!.worker !== askWorker || askSession!.managedTurnOrigin !== askOrigin)) {
+      return jsonRes(res, 409, { ok: false, error: 'origin_unproven',
+        detail: 'Document ask origin changed while resolving its recipient' });
+    }
+  } catch (error) {
+    return jsonRes(res, 422, {
+      ok: false, error: 'card_delivery_failed',
+      detail: error instanceof Error ? error.message : 'Confirmation card cannot be delivered',
+    });
+  }
   const askInput = {
     larkAppId: boundAsk.larkAppId,
     chatId: boundAsk.chatId,
     rootMessageId: boundAsk.rootMessageId,
     sessionId: boundAsk.sessionId,
     questions: boundAsk.questions,
-    replyCardTarget: replyCardAskTarget(askSession, boundAsk, body),
+    replyCardTarget: documentDelivery ? undefined : replyCardAskTarget(askSession, boundAsk, body),
+    deliveryTarget: documentDelivery,
+    ...(documentDelivery ? { answererOpenId: documentDelivery.openId } : {}),
     timeoutMs: boundAsk.timeoutMs,
     chatType: askChatType,
     ...(askMentionedOpenId ? { mentionedOpenId: askMentionedOpenId } : {}),
@@ -21184,6 +21243,7 @@ function cloneIndependentLaunchPosture(source: Session, child: Session): void {
     ? { ...source.cliRuntime, update: { ...source.cliRuntime.update } }
     : undefined;
   child.cliPathOverride = source.cliPathOverride;
+  child.cliConfigDir = source.cliConfigDir;
   child.wrapperCli = source.wrapperCli;
   child.cliLaunchMode = source.cliLaunchMode;
   child.agentFrozen = source.agentFrozen;
@@ -22888,7 +22948,21 @@ function shouldSeedSessionGroupTitle(content: string): boolean {
 
 
 
+/** Answer a document task without creating/steering an unrelated DM session.
+ * Only signed inbound plain-text replies to the exact delivered card qualify. */
+function handleDocumentAskTextReply(data: any, ctx: RoutingContext): boolean {
+  if (ctx.chatType !== 'p2p' || data.sender?.sender_type !== 'user'
+    || data.message?.message_type !== 'text') return false;
+  const { parsed, resources } = parseEventMessage(data);
+  if (resources.length || !parsed.senderId || !parsed.parentId) return false;
+  return submitDocumentAskReply({
+    larkAppId: ctx.larkAppId, chatType: 'p2p', by: parsed.senderId,
+    parentMessageId: parsed.parentId, text: parsed.content,
+  });
+}
+
 async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<void> {
+  if (handleDocumentAskTextReply(data, ctx)) return;
   await prepareGroupBackground(data, ctx);
   const { chatId, messageId, chatType, larkAppId, replyRootId, substituteTrigger, messageListener } = ctx;
   // Session-group birth re-homes the turn into the new group: replies/quotes
@@ -25162,6 +25236,7 @@ async function handleThreadReplyAdmitted(
   prepared?: PreparedThreadReply,
   replay?: { parsed: LarkMessage; resources: MessageResource[] },
 ): Promise<void> {
+  if (!replay && handleDocumentAskTextReply(data, ctx)) return;
   await prepareGroupBackground(data, ctx);
   const { chatId: ctxChatId, chatType: ctxChatType, scope, anchor, larkAppId, replyRootId, substituteTrigger } = ctx;
   const runtimeSessionKey = sessionKey(ctx.runtimeRoutingAnchor ?? anchor, larkAppId);
@@ -28688,7 +28763,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // 关键：adopt 路径会跳过 ensureCliSkills，若重启后第一次就是 adopt 一个外部
   // claude 会话，必须保证此时全局 ~/.claude/settings.json 已带 hook——否则"全局
   // hook 适配 adopt"不成立。这里幂等、best-effort，不阻塞启动。
-  try { ensureCliEnv(cfg.cliId, cfg.cliPathOverride); }
+  try { ensureCliEnv(cfg.cliId, cfg.cliPathOverride, { configDir: cfg.cliConfigDir }); }
   catch (err) { logger.warn(`[hook] startup ensureCliEnv failed for ${cfg.cliId}: ${err instanceof Error ? err.message : String(err)}`); }
   sessionStore.init(cfg.larkAppId, {
     groupDefaultModels: chatId => getBot(cfg.larkAppId).config.groupDefaultModels?.[chatId],

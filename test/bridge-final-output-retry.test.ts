@@ -700,6 +700,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       'tag', 0, onComplete, () => true);
     await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledOnce());
 
+    // Delivery continues asynchronously after sessionReply returns. Wait for
+    // its completion before changing policy to exercise the retained fence.
+    await vi.waitFor(() => expect(onComplete).toHaveBeenCalledWith(true, 'om_reply'));
     expect(beforeWrite).toBeTypeOf('function');
     bot.config.apiOnly = true;
     await expect(Promise.resolve().then(() => beforeWrite!()))

@@ -75,6 +75,7 @@ export interface PersistedAsk {
   answererDisplayName?: string;
   /** 显式 ask 要 @ 的人类 open_id，跨重启保留以保证重发卡片仍带通知。 */
   mentionedOpenId?: string;
+  deliveryTarget?: CreateAskInput['deliveryTarget'];
   questions: ReadonlyArray<AskQuestion>;
   createdAt: number;
   deadlineAt: number | null;

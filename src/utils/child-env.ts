@@ -553,8 +553,10 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   '__OWNER_OPEN_ID',
   // Unguessable pane/profile authority channel (daemon-rotated capability).
   'BOTMUX_ORIGIN_CHANNEL_ID',
-  // Sandbox send-relay directory — a per-session capability path.
+  // Sandbox send-relay directory — a per-session capability path — and the
+  // credential-only "relay serves `send` only" scope marker that rides with it.
   'BOTMUX_SEND_RELAY',
+  'BOTMUX_SEND_RELAY_SCOPE',
   // Session-scoped MCP gateway capability + fail-closed marker.
   'BOTMUX_MCP_GATEWAY_SOCKET',
   'BOTMUX_MCP_GATEWAY_REQUIRED',
