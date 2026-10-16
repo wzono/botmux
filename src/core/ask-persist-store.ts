@@ -74,11 +74,11 @@ export interface PersistedAsk {
   deliveryTarget?: CreateAskInput['deliveryTarget'];
   questions: ReadonlyArray<AskQuestion>;
   createdAt: number;
-  deadlineAt: number;
+  deadlineAt: number | null;
   /** Original relative timeout. Host-owned asks defer this clock until the
    *  interaction card is confirmed delivered; ordinary CLI asks start it at
    *  registration as before. Optional for backward-compatible v2 records. */
-  timeoutMs?: number;
+  timeoutMs?: number | null;
   /** True only for daemon-hosted asks whose responder cannot act before the
    *  card exists. An undelivered record must not expire during restore. */
   timeoutStartsAfterDelivery?: boolean;
