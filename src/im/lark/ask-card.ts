@@ -628,7 +628,8 @@ function renderAskCardWithCap(
     const noteLines: string[] = [];
     if (permanent) noteLines.push(t('card.ask.permanent', undefined, locale));
     noteLines.push(t(ask.deliveryTarget ? 'card.ask.document_reply_hint'
-      : textReplyRequired ? 'card.ask.text_reply_hint' : 'card.ask.custom_reply_hint', undefined, locale));
+      : ask.originKind === 'native-user-input-async' ? 'card.ask.async_reply_hint'
+        : textReplyRequired ? 'card.ask.text_reply_hint' : 'card.ask.custom_reply_hint', undefined, locale));
     elements.push({
       tag: 'note',
       elements: noteLines.map(content => ({ tag: 'plain_text', content })),
