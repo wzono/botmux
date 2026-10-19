@@ -672,7 +672,14 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       const http = createHttpServer((req, res) => {
         let body = ''; req.on('data', data => { body += data; });
         req.on('end', () => {
-          posts.push(JSON.parse(body));
+          // A loopback port-scanner probe (`GET /`, empty body) must not crash
+          // this fixture; only real POSTs to /api/asks carry a JSON body.
+          try {
+            posts.push(JSON.parse(body));
+          } catch {
+            res.writeHead(400).end();
+            return;
+          }
           expect(req.url).toBe('/api/asks');
           res.on('close', () => { closed = true; });
           respond = (result, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(result)); };

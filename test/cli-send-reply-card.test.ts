@@ -22,6 +22,7 @@ const presentation = { showProcess: true, showToolResults: true, canStop: true }
 
 describe('real CLI send into a running reply card', () => {
   it.each<{ cliId: string; configuredCliId: string; frozenCliId?: string; mode?: 'legacy' | 'unified'; layout?: 'result' }>([
+    { cliId: 'cursor', configuredCliId: 'cursor' },
     { cliId: 'minimax', configuredCliId: 'minimax' },
     { cliId: 'codex', configuredCliId: 'codex' },
     { cliId: 'traex', configuredCliId: 'traex' },
@@ -35,13 +36,16 @@ describe('real CLI send into a running reply card', () => {
   ])('repairs reply fences for $cliId (default $configuredCliId, launch $frozenCliId, mode $mode, layout $layout)', ({ cliId, configuredCliId, frozenCliId, mode = 'legacy', layout }) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-send-reply-markdown-'));
     const dataDir = join(root, 'data');
+    const runtime = cliId === 'cursor'
+      ? { model: 'claude-opus-5-5-high-fast' }
+      : { model: 'selected-model', reasoningEffort: 'high' };
     const content = [ ...(layout ? ['# 依赖检查完成', ''] : []), '实际进程：```plain_text', '123 update', '└ 456 download', '```', '', '配置： ```JSON', '{\"workingDir\":\"/workspace\"}', '```', '', '执行： ```bash', 'echo ready', '```', '', '**请选择：**', '1. 保持下载', '2. 清理残留'].join('\n');
     try {
       writeFileSync(join(root, 'bots.json'), JSON.stringify([{
         larkAppId: key.larkAppId, larkAppSecret: 'test-secret', cliId: configuredCliId, replyCardMode: mode,
       }]));
       seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
-        sessionId: key.sessionId, status: 'active', cliId, cliSessionId: 'native_reply',
+        sessionId: key.sessionId, status: 'active', cliId, cliSessionId: 'native_reply', ...runtime,
         larkAppId: key.larkAppId, chatId: 'oc_test', rootMessageId: 'om_root', scope: 'thread', chatType: 'group', workingDir: root,
         ...(frozenCliId ? { cliLaunchSnapshot: {
           version: 1, state: 'resolved', entryId: 'fixture', cliId: frozenCliId, cliRuntime: null,
@@ -70,6 +74,9 @@ describe('real CLI send into a running reply card', () => {
       expect(blocks.map(b => b.info.toLowerCase())).toEqual(['plain_text', 'json', 'bash']);
       expect(blocks[2].content).toBe('echo ready\n');
       expect(markdown).toContain('**请选择：**');
+      const footer = card.body.elements.find((e: any) => e.element_id === 'botmux_reply_footer');
+      expect(footer.content).toContain(`**${runtime.model}**`);
+      if (runtime.reasoningEffort) expect(footer.content).toContain('high');
       const store = openDatabaseSyncOrThrow(join(dataDir, 'session-stores', key.larkAppId, 'sessions.db'), { readOnly: true });
       try {
         const row = store.prepare('SELECT row FROM sessions WHERE session_id = ?').get(key.sessionId) as { row: string };
@@ -85,6 +92,9 @@ describe('real CLI send into a running reply card', () => {
   }>([
     { cliId: 'claude-code', args: ['--mention-back'], senderIsBot: false, merged: true },
     { cliId: 'codex', args: ['--mention-back'], senderIsBot: false, merged: true },
+    { cliId: 'grok', args: ['--mention-back'], senderIsBot: false, merged: true },
+    { cliId: 'grok', args: ['--no-mention'], senderIsBot: false, merged: true, responseKind: 'progress' },
+    { cliId: 'grok', args: ['--no-mention'], senderIsBot: false, merged: false, sandbox: true },
     { cliId: 'claude-code', args: ['--mention', 'ou_requester'], senderIsBot: false, merged: true },
     { cliId: 'claude-code', args: ['--no-mention'], senderIsBot: false, merged: true },
     { cliId: 'claude-code', args: ['--mention', 'ou_other'], senderIsBot: false, merged: false },
@@ -187,6 +197,12 @@ describe('real CLI send into a running reply card', () => {
       if (merged) {
         expect(requests[0]).toMatchObject({ method: 'PATCH', path: '/open-apis/im/v1/messages/om_original_card' });
         expect(requests[0].body.content).toContain('Hello! 这是完整答复。');
+        if (responseKind === 'progress') {
+          expect(store.read(key)?.progress).toContain('Hello! 这是完整答复。');
+          expect(store.read(key)?.finalDelivered).not.toBe(true);
+          expect(send).toHaveBeenCalledTimes(1);
+          return;
+        }
         const journal = openDatabaseSyncOrThrow(join(dataDir, 'group-context', `${key.larkAppId}.sqlite`));
         try {
           const published = journal.prepare('SELECT text, card_content_version FROM messages WHERE message_id = ? ORDER BY revision DESC LIMIT 1').get('om_original_card') as { text: string; card_content_version: number };
