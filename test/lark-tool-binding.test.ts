@@ -92,7 +92,9 @@ describe('managed lark-cli binding', () => {
       chatId: 'headless_hl_11111111-1111-4111-8111-111111111111', backendType: 'pty' as const,
       headless: { id: 'hl_11111111-1111-4111-8111-111111111111', source: 'cli' } };
     expect(usesLarkToolBinding(config, dir)).toBe(true);
-    expect(usesLarkToolBinding({ ...config, resume: true }, dir)).toBe(false);
+    // Same lifecycle as ordinary sessions: resume re-evaluates the bot switch.
+    expect(usesLarkToolBinding({ ...config, resume: true }, dir)).toBe(true);
+    expect(usesLarkToolBinding({ ...config, larkToolBinding: false }, dir)).toBe(false);
     expect(usesLarkToolBinding({ ...config, apiOnly: true }, dir)).toBe(false);
     expect(usesLarkToolBinding({ ...config, chatId: 'http_async_runner' }, dir)).toBe(false);
     expect(usesLarkToolBinding({ ...config, chatId: 'http_wait_runner' }, dir)).toBe(false);
@@ -103,9 +105,6 @@ describe('managed lark-cli binding', () => {
     expect(usesLarkToolBinding({ ...config, adoptMode: true }, dir)).toBe(false);
     expect(usesLarkToolBinding({ ...config, backendType: 'riff' }, dir)).toBe(false);
     expect(usesLarkToolBinding(config, dir, true)).toBe(false);
-    prepareLarkToolEnv({ env: { PATH: '/usr/bin:/bin' }, dataDir: dir,
-      sessionId: config.sessionId, appId: config.larkAppId });
-    expect(usesLarkToolBinding({ ...config, resume: true }, dir)).toBe(true);
   });
   it.each([
     ['--profile='], ['--as='], ['--as', 'owner'],
