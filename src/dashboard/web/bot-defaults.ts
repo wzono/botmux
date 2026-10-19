@@ -138,6 +138,8 @@ export type BotDefaultsRow = {
   readIsolation?: boolean;
   readIsolationSupported?: boolean;
   backendType?: string | null;
+  /** daemon 的默认后端：`backendType` 没有覆盖时会话实际用它（见 effectiveBackendType）。 */
+  defaultBackendType?: string | null;
   usageDisplay?: 'streaming' | 'footer' | 'off';
   usageSupported?: boolean;
   disableStreamingCard?: boolean;

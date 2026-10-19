@@ -165,6 +165,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
       : null,
     readIsolationSupported: j?.readIsolationSupported === true,
     backendType: typeof j?.backendType === 'string' ? j.backendType : null,
+    defaultBackendType: typeof j?.defaultBackendType === 'string' && j.defaultBackendType ? j.defaultBackendType : null,
     usageDisplay: normalizeUsageDisplay(j ?? {}),
     usageSupported: j?.usageSupported === true,
     disableStreamingCard: j?.disableStreamingCard === true || j?.replyCardMode === 'final-only',

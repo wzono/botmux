@@ -145,6 +145,7 @@ import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TUR
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
 import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
 import { config } from '../config.js';
+import { coordinationModeIsPrimary } from '../services/durable-coordination-runtime.js';
 import { buildSafeInsightConversation, buildSafeInsightOverview, buildSafeInsightReport, buildSafeInsightTurnDetail } from '../services/insight/report.js';
 import type { InsightConversationRole, InsightDetail, InsightSeverity, SafeSpanTag } from '../services/insight/types.js';
 import { readRawConfig, findEntryIndex, requireConfigPath, rmwBotEntry } from '../services/config-store.js';
@@ -389,6 +390,41 @@ export function setDurableSessionSendHandler(
 ): void {
   durableSessionSendHandler = handler;
 }
+
+export interface DurableSessionLifecycleRequest {
+  sessionId: string;
+  action: 'close' | 'resume';
+  /** 可选 canonical 路由锚点；用于本地副本已没有 Session 行的故障收口。 */
+  rootId?: string;
+}
+
+export type DurableSessionLifecycleResult =
+  | { ok: true; outcome: 'closed' | 'active'; alreadyClosed?: boolean }
+  | {
+      ok: true;
+      outcome: 'closed_with_residual';
+      residual: { reason?: string; taskId?: string };
+      alreadyClosed?: boolean;
+    }
+  | { ok: false; error: string };
+
+let durableSessionLifecycleHandler: ((
+  request: DurableSessionLifecycleRequest,
+) => Promise<DurableSessionLifecycleResult>) | null = null;
+
+export function setDurableSessionLifecycleHandler(
+  handler: ((request: DurableSessionLifecycleRequest) => Promise<DurableSessionLifecycleResult>) | null,
+): void {
+  durableSessionLifecycleHandler = handler;
+}
+
+let durableSessionListHandler: (() => Promise<Session[]>) | null = null;
+
+export function setDurableSessionListHandler(
+  handler: (() => Promise<Session[]>) | null,
+): void {
+  durableSessionListHandler = handler;
+}
 import {
   composeRowFromActive,
   composeRowFromClosed,
@@ -449,11 +485,12 @@ import {
   sessionPreviewDescriptor,
 } from './session-preview.js';
 import { clearSessionPreviewTarget } from './session-preview-registry.js';
-import { ChatRenameCooldown, ChatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
+import { ChatRenameCooldown, chatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
 import { executeChatRename } from './chat-rename-operation.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, isHttpVirtualSession, larkTransportEnabled, type DaemonSession } from './types.js';
 import { isRemoteBackendSession, persistentBackendTargetForSession, probePersistentBackendTarget } from './persistent-backend.js';
+import { recoverFailedTurn, parseFailedTurnRecoveryRequest } from './failed-turn-recovery.js';
 import { projectCoreOnlyHostFacts } from './core-only-host-facts.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
@@ -1410,7 +1447,23 @@ export { composeRowFromActive, composeRowFromClosed, composeRowFromPersistedActi
 // holder.
 export function setBotName(name: string): void { setRowsBotName(name); }
 
-function composeDashboardSessionRows(opts?: { includeTokenUsage?: boolean }): SessionRow[] {
+function composeDashboardSessionRows(
+  opts?: { includeTokenUsage?: boolean },
+  canonicalSessions?: Session[],
+): SessionRow[] {
+  if (canonicalSessions) {
+    const activeById = new Map(
+      listActiveSessions().map(ds => [ds.session.sessionId, ds]),
+    );
+    return canonicalSessions.map(session => {
+      const live = activeById.get(session.sessionId);
+      return live && session.status === 'active'
+        ? composeRowFromActive(live, opts)
+        : session.status === 'active'
+          ? composeRowFromPersistedActive(session, opts)
+          : composeRowFromClosed(session, opts);
+    });
+  }
   const active = listActiveSessions().map((ds) => composeRowFromActive(ds, opts));
   const activeIds = new Set(active.map(row => row.sessionId));
   const persisted = sessionStore.listSessions();
@@ -1502,11 +1555,27 @@ ipcRoute('POST', '/api/asks/answer', async (req, res) => {
   return jsonRes(res, 200, { ok: true, outcome });
 });
 
-ipcRoute('GET', '/api/sessions', (_req, res) => {
+ipcRoute('GET', '/api/sessions', async (_req, res) => {
   // Runtime active first, then persisted active rows that restore deliberately
   // left detached, then closed history. Persisted-active must never be projected
   // through composeRowFromClosed: teardown uncertainty is not a close.
-  jsonRes(res, 200, { sessions: composeDashboardSessionRows({ includeTokenUsage: false }) });
+  if (coordinationModeIsPrimary()) {
+    if (!durableSessionListHandler) {
+      return jsonRes(res, 503, { ok: false, error: 'durable_primary_unavailable' });
+    }
+    try {
+      const sessions = await durableSessionListHandler();
+      return jsonRes(res, 200, {
+        sessions: composeDashboardSessionRows({ includeTokenUsage: false }, sessions),
+      });
+    } catch (error) {
+      return jsonRes(res, 503, {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return jsonRes(res, 200, { sessions: composeDashboardSessionRows({ includeTokenUsage: false }) });
 });
 
 // This route deliberately has NO session-capability/public allowlist entry.
@@ -1760,6 +1829,30 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
   const ds = findActiveBySessionId(params.sessionId);
   const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
   if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (coordinationModeIsPrimary()) {
+    // 副本本地 close 可能已经返回成功，但 PostgreSQL primary 行仍是 active。
+    // 只有通过鉴权的宿主/Dashboard 请求可以进入持久 lifecycle lane；
+    // 会话内 capability 不能据此获得 trusted-host 权限。
+    if (!isTrustedHostIpcRequest(req)) {
+      return jsonRes(res, 409, { ok: false, error: 'durable_primary_requires_host_control' });
+    }
+    if (!durableSessionLifecycleHandler) {
+      return jsonRes(res, 503, { ok: false, error: 'durable_primary_unavailable' });
+    }
+    try {
+      const result = await durableSessionLifecycleHandler({
+        sessionId: params.sessionId,
+        action: 'close',
+        ...(typeof body.rootId === 'string' ? { rootId: body.rootId } : {}),
+      });
+      return jsonRes(res, result.ok ? 200 : 409, result);
+    } catch (error) {
+      return jsonRes(res, 503, {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
   const initial = findSessionRecord(params.sessionId);
   const initiallyClosed = initial?.status === 'closed';
   let codexArchiveReleaseTicket: CodexCleanupReleaseTicket | undefined;
@@ -2171,6 +2264,35 @@ function postRestartNotice(ds: DaemonSession, fresh: boolean): void {
       .catch(err => logger.debug(`[restart] failed to post thread-scope restart notice: ${err}`));
   }
 }
+
+/** Privileged host recovery: worker capabilities and request actor claims do not authorize this route. */
+ipcRoute('GET', '/api/sessions/:sessionId/failure-recovery', (req, res, params) => {
+  if (!isTrustedHostIpcRequest(req) && !ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  const ds = findActiveBySessionId(params.sessionId);
+  const row = ds?.session ?? sessionStore.getOwnedSession(params.sessionId);
+  const failure = row?.lastFailedTurn;
+  if (!failure) return jsonRes(res, 404, { ok: false, error: 'failure_not_found' });
+  return jsonRes(res, 200, { ok: true, sessionId: params.sessionId, failure: {
+    turnId: failure.turnId, failedAt: failure.failedAt, errorCode: failure.errorCode,
+    originalTurnId: failure.originalTurnId ?? failure.turnId,
+    actorBound: !!failure.trustedCaller, recovery: failure.recovery,
+  } });
+});
+
+ipcRoute('POST', '/api/sessions/:sessionId/failure-recovery', async (req, res, params) => {
+  if (!isTrustedHostIpcRequest(req) && !ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  let body: unknown;
+  try { body = await readBoundedJsonBody(req, 4096, 1000); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'invalid_recovery_request' }); }
+  const request = parseFailedTurnRecoveryRequest(body);
+  if (!request) return jsonRes(res, 400, { ok: false, error: 'invalid_recovery_request' });
+  try {
+    const result = await recoverFailedTurn(params.sessionId, request);
+    return jsonRes(res, result.ok ? 200 : 409, result);
+  } catch {
+    return jsonRes(res, 503, { ok: false, error: 'recovery_persistence_unavailable' });
+  }
+});
 
 ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) => {
   const initial = findActiveBySessionId(params.sessionId);
@@ -2931,7 +3053,6 @@ ipcRoute('POST', '/api/sessions/:sessionId/slash', async (req, res, params) => {
 });
 
 const proactiveChatRenameCooldown = new ChatRenameCooldown();
-const chatRenameSerialQueue = new ChatRenameSerialQueue();
 /** Session-scoped external mutation used by the botmux-chat-rename Skill. */
 ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params) => {
   const body = await readJsonBody<{ name?: unknown; proactive?: unknown } & Record<string, unknown>>(req)
@@ -7295,6 +7416,9 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     // disables the toggle wherever the worker would fail-close on it.
     readIsolationSupported: readIsolationEnforceable(cachedLarkAppId),
     backendType: backendTypeStore.getBotBackendType(cachedLarkAppId) ?? null,
+    // 没有覆盖时会话实际用的后端（BACKEND_TYPE / 自动探测）。Dashboard 判断零注入等
+    // 依赖后端的能力时按「覆盖值，否则这个默认值」算生效后端。
+    defaultBackendType: config.daemon.backendType,
     usageDisplay: cardPrefs.usageDisplay,
     // Whether this bot's CLI can produce native usage at all. When false the
     // dashboard hides the usage-display control (offering it would be a knob
@@ -7914,7 +8038,9 @@ ipcRoute('PUT', '/api/bot-description', requireBoundBot(async (req, res) => {
 
 // Per-bot agent launch settings. Body `{ cliId, model, cliRuntime? }` where `cliId` is the
 // dashboard selection key (plain adapter id or a wrapper option such as
-// `ttadk-x-codex`). Changes affect the next spawned CLI session; existing
+// `ttadk-x-codex`). `replaceCliSelection: true` explicitly reapplies even the
+// same key; omission preserves the locked launch shape on same-key saves.
+// Changes affect the next spawned CLI session; existing
 // sessions frozen on a different cliId/wrapperCli are closed immediately, so
 // a later lazy resume can't resurrect the old CLI (#346 covered the restart
 // path; this covers the hot-switch path).
@@ -7922,6 +8048,7 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
   const larkAppId = cachedLarkAppId;
   const body = await readJsonBodyOrBadJson<{
     cliId?: unknown;
+    replaceCliSelection?: unknown;
     model?: unknown;
     modelBackendVariant?: unknown;
     reasoningEffort?: unknown;
@@ -7943,6 +8070,10 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
   } catch (err: any) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_cli', message: ipcErrorText(err) });
   }
+  if (body.replaceCliSelection !== undefined && typeof body.replaceCliSelection !== 'boolean') {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_replace_cli_selection' });
+  }
+  const requestedSelection = selected;
   const model = typeof body.model === 'string' ? body.model.trim() : '';
   const modelBackendVariantFieldPresent = Object.prototype.hasOwnProperty.call(body, 'modelBackendVariant');
   let modelBackendVariant: 'standard' | 'max' | undefined;
@@ -7961,7 +8092,6 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
   if (body.reasoningEffort !== undefined && body.reasoningEffort !== '' && reasoningEffort === null) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_reasoning_effort' });
   }
-  const currentBotConfig = getBot(larkAppId).config;
   const supportsReasoningEffort = isConfigurableReasoningCliId(selected.cliId);
   const serviceTierFieldPresent = Object.prototype.hasOwnProperty.call(body, 'serviceTier');
   const serviceTier = isCodexServiceTier(body.serviceTier) ? body.serviceTier : null;
@@ -8060,113 +8190,15 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       if (!check.ok) return jsonRes(res, 400, { ok: false, error: 'invalid_cli_config_dir', message: check.error });
     }
   }
-  const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
-  const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId, currentBotConfig.wrapperCli, currentBotConfig.cliLaunchMode);
-  const selectionChanged = key !== currentSelectionKey;
   let nextRuntime: CliRuntimeConfig | undefined;
   let nextLegacyPath: string | undefined;
-  if (runtimeFieldPresent) {
-    if (body.cliRuntime !== null) {
-      if (selected.cliId !== 'codex') {
-        return jsonRes(res, 400, { ok: false, error: 'runtime_requires_codex' });
-      }
-      if (selected.wrapperCli || selected.cliLaunchMode) {
-        return jsonRes(res, 400, { ok: false, error: selected.wrapperCli ? 'runtime_wrapper_conflict' : 'runtime_launch_mode_conflict' });
-      }
-      try {
-        nextRuntime = normalizeCliRuntimeConfig(body.cliRuntime, 'cliRuntime');
-      } catch (err) {
-        return jsonRes(res, 400, {
-          ok: false,
-          error: 'invalid_cli_runtime',
-          message: ipcErrorText(err),
-        });
-      }
-    }
-    // null explicitly means built-in runtime; both structured and legacy
-    // executable overrides are cleared.
-  } else if (!selectionChanged) {
-    // Old dashboard clients know only `{cliId, model}`. Preserve the runtime on
-    // same-agent saves so editing a model cannot silently erase new config.
-    nextRuntime = currentBotConfig.cliRuntime;
-    nextLegacyPath = nextRuntime ? undefined : currentBotConfig.cliPathOverride;
-  }
-  const effectivePath = nextRuntime?.executable ?? nextLegacyPath;
-  const availability = checkCliAvailability({
-    cliId: selected.cliId,
-    wrapperCli: selected.wrapperCli,
-    cliPathOverride: effectivePath,
-    cliLaunchMode: selected.cliLaunchMode,
-  });
-  // dsh-tui mode spawns the dsh-tui binary instead of the dsh runner. Check it
-  // separately so a missing dsh-tui install surfaces as a save-time warning
-  // rather than a spawn-time ENOENT crash-loop.
-  let dshTuiAvailability: { available: boolean; command?: string; reason?: string } | undefined;
-  if (supportsDshRuntime && nextDshRuntime === 'tui') {
-    dshTuiAvailability = checkCliAvailability({ cliId: 'dsh-tui' });
-  }
+  let availability!: ReturnType<typeof checkCliAvailability>;
+  let availabilityWarning: string | undefined;
   let runtimeProbe: { version: string; updateProvider: string } | undefined;
-  if (runtimeFieldPresent && nextRuntime) {
-    if (!availability.available) {
-      return jsonRes(res, 400, {
-        ok: false,
-        error: 'runtime_unavailable',
-        message: availability.reason ?? 'runtime executable is unavailable',
-      });
-    }
-    try {
-      const raw = execFileSync(availability.resolvedPath ?? nextRuntime.executable, ['--version'], {
-        encoding: 'utf8',
-        timeout: 5_000,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        maxBuffer: 2 * 1024 * 1024,
-      }).trim();
-      const version = raw.match(/\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/)?.[0];
-      if (!version) throw new Error(`无法识别 --version 输出：${raw.slice(0, 120)}`);
-      runtimeProbe = { version, updateProvider: nextRuntime.update?.provider ?? 'auto' };
-    } catch (err) {
-      return jsonRes(res, 400, {
-        ok: false,
-        error: 'runtime_version_probe_failed',
-        message: ipcErrorText(err),
-      });
-    }
-  }
-  // Existing Bot edits remain saveable (operators may intentionally configure
-  // first and install second), but the response is explicit so Dashboard never
-  // claims a missing Agent was saved successfully without qualification.
-  let availabilityWarning = availability.available
-    ? undefined
-    : `配置已保存，但所选 Agent 当前无法启动：${availability.reason ?? '本地启动依赖不可用'}。请先在 daemon 所在机器安装或修正 PATH / CLI 路径。`;
-  if (dshTuiAvailability && !dshTuiAvailability.available) {
-    const tuiWarning = `配置已保存，但 dsh-tui 未安装（${dshTuiAvailability.reason ?? 'dsh-tui 二进制不在 PATH'}）。请在 daemon 所在机器安装 @deepseek-harness-tui/dsh-tui。`;
-    availabilityWarning = availabilityWarning ? `${availabilityWarning} ${tuiWarning}` : tuiWarning;
-  }
-  const effectiveServiceTier = supportsServiceTier
-    ? (serviceTierFieldPresent ? serviceTier ?? undefined : currentBotConfig.serviceTier)
-    : undefined;
-  if (effectiveServiceTier && effectiveServiceTier !== 'default') {
-    const codexAvailability = checkCliAvailability({ cliId: 'codex', cliPathOverride: effectivePath });
-    const tierCheck = await validateCodexServiceTier({
-      cliBin: codexAvailability.resolvedPath ?? codexAvailability.command ?? 'codex',
-      env: {
-        ...buildSessionChildEnv(process.env, currentBotConfig.envPolicy),
-        ...botInjectedEnv(currentBotConfig.env, currentBotConfig.envPolicy),
-      },
-      model,
-      serviceTier: effectiveServiceTier,
-    });
-    if (!tierCheck.ok) {
-      return jsonRes(res, 400, {
-        ok: false,
-        error: `service_tier_${tierCheck.error}`,
-      });
-    }
-  }
 
   return withBotTurnMutation(larkAppId, async () => {
-    // Agent selection can replace every live worker generation and may also
-    // auto-clear readIsolation. Close admission and drain in-flight acceptance
+    // Agent selection can replace every live worker generation. Close admission
+    // and drain in-flight acceptance
     // before inspecting both the registry and restart source of truth. A
     // settings mutation is not an explicit abandon boundary: an unsettled
     // Codex App FIFO must survive unchanged for recovery.
@@ -8180,22 +8212,145 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       ...persistedActiveBotSessions,
     ])) return;
 
-    // If the new CLI/wrapper can no longer enforce a currently-on read isolation,
-    // auto-clear the flag here so the next session doesn't fail-close on it. (The
-    // read-isolation toggle validates at enable time; changing the agent afterwards
-    // is the other way a bot could end up configured-but-unenforceable.)
-    let readIsolationCleared = false;
+    // Resolve and validate against the current disk entry before any mutation.
     let codexBrowserCleared = false;
     const r = await rmwBotEntry<{
-      error?: 'reasoning_effort_not_supported_by_model' | 'launch_mode_sandbox_conflict';
+      error?: string;
+      message?: string;
       nextReasoningEffort?: typeof reasoningEffort;
       nextServiceTier?: CodexServiceTier;
       nextModelBackendVariant?: 'standard' | 'max';
       nextNativeSubagentRuntimeState?: NativeSubagentRuntimeConfigState;
-    }>(larkAppId, (entry) => {
+    }>(larkAppId, async (entry) => {
+      const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
+      const currentSelectionKey = selectionKeyForBot(entry.cliId, entry.wrapperCli, entry.cliLaunchMode);
+      const selectionChanged = body.replaceCliSelection === true || key !== currentSelectionKey;
+      // Runtime edits explicitly choose a distribution (null chooses the official
+      // executable). Otherwise preserve the server's locked launch configuration,
+      // including wrappers that have no registered Dashboard selection key.
+      selected = !selectionChanged && !runtimeFieldPresent
+        ? { cliId: requestedSelection.cliId, wrapperCli: entry.wrapperCli, cliLaunchMode: entry.cliLaunchMode }
+        : requestedSelection;
+      if (runtimeFieldPresent) {
+        if (body.cliRuntime !== null) {
+          if (selected.cliId !== 'codex') {
+            return { write: false, result: { error: 'runtime_requires_codex' } };
+          }
+          if (selected.wrapperCli || selected.cliLaunchMode) {
+            return { write: false, result: { error: selected.wrapperCli ? 'runtime_wrapper_conflict' : 'runtime_launch_mode_conflict' } };
+          }
+          try {
+            nextRuntime = normalizeCliRuntimeConfig(body.cliRuntime, 'cliRuntime');
+          } catch (err) {
+            return { write: false, result: {
+              error: 'invalid_cli_runtime',
+              message: ipcErrorText(err),
+            } };
+          }
+        }
+        // null explicitly means built-in runtime; both structured and legacy
+        // executable overrides are cleared.
+      } else if (!selectionChanged) {
+        // Old dashboard clients know only `{cliId, model}`. Preserve the runtime on
+        // same-agent saves so editing a model cannot silently erase new config.
+        nextRuntime = entry.cliRuntime;
+        nextLegacyPath = nextRuntime ? undefined : entry.cliPathOverride;
+      }
+      if (nextRuntime && selected.wrapperCli) return { write: false, result: { error: 'runtime_wrapper_conflict' } };
+      if (nextRuntime && selected.cliLaunchMode) return { write: false, result: { error: 'runtime_launch_mode_conflict' } };
+      if (selected.wrapperCli && selected.cliLaunchMode) return { write: false, result: { error: 'wrapper_launch_mode_conflict' } };
+      if (selected.wrapperCli && sandboxBoolValue(entry.sandbox)) {
+        return { write: false, result: { error: 'wrapper_sandbox_conflict' } };
+      }
+      if (selected.wrapperCli && entry.readIsolation === true) {
+        return { write: false, result: { error: 'wrapper_read_isolation_conflict' } };
+      }
+      if (selected.wrapperCli && selected.cliId === 'codex' && entry.codexAuthSync === 'isolated') {
+        return { write: false, result: { error: 'wrapper_isolated_auth_conflict' } };
+      }
       if (selected.cliLaunchMode && (sandboxBoolValue(entry.sandbox) || entry.readIsolation === true)) {
         return { write: false, result: { error: 'launch_mode_sandbox_conflict' } };
       }
+      if (selected.cliLaunchMode && nextLegacyPath) {
+        return { write: false, result: { error: 'launch_mode_path_conflict' } };
+      }
+      const effectivePath = nextRuntime?.executable ?? nextLegacyPath;
+      if (entry.readIsolation === true && !readIsolationEnforceableFor({
+        ...selected, cliPathOverride: effectivePath,
+      })) {
+        return { write: false, result: { error: 'read_isolation_unsupported' } };
+      }
+      availability = checkCliAvailability({
+        cliId: selected.cliId,
+        wrapperCli: selected.wrapperCli,
+        cliPathOverride: effectivePath,
+        cliLaunchMode: selected.cliLaunchMode,
+      }, { shellFallback: !selected.wrapperCli });
+      // dsh-tui mode spawns the dsh-tui binary instead of the dsh runner. Check it
+      // separately so a missing dsh-tui install surfaces as a save-time warning
+      // rather than a spawn-time ENOENT crash-loop.
+      let dshTuiAvailability: { available: boolean; command?: string; reason?: string } | undefined;
+      if (supportsDshRuntime && nextDshRuntime === 'tui') {
+        dshTuiAvailability = checkCliAvailability({ cliId: 'dsh-tui' });
+      }
+      if (runtimeFieldPresent && nextRuntime) {
+        if (!availability.available) {
+          return { write: false, result: {
+            error: 'runtime_unavailable',
+            message: availability.reason ?? 'runtime executable is unavailable',
+          } };
+        }
+        try {
+          const raw = execFileSync(availability.resolvedPath ?? nextRuntime.executable, ['--version'], {
+            encoding: 'utf8',
+            timeout: 5_000,
+            stdio: ['ignore', 'pipe', 'pipe'],
+            maxBuffer: 2 * 1024 * 1024,
+          }).trim();
+          const version = raw.match(/\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/)?.[0];
+          if (!version) throw new Error(`无法识别 --version 输出：${raw.slice(0, 120)}`);
+          runtimeProbe = { version, updateProvider: nextRuntime.update?.provider ?? 'auto' };
+        } catch (err) {
+          return { write: false, result: {
+            error: 'runtime_version_probe_failed',
+            message: ipcErrorText(err),
+          } };
+        }
+      }
+      // Existing Bot edits remain saveable (operators may intentionally configure
+      // first and install second), but the response is explicit so Dashboard never
+      // claims a missing Agent was saved successfully without qualification.
+      availabilityWarning = availability.available
+        ? undefined
+        : `配置已保存，但所选 Agent 当前无法启动：${availability.reason ?? '本地启动依赖不可用'}。请先在 daemon 所在机器安装或修正 PATH / CLI 路径。`;
+      if (dshTuiAvailability && !dshTuiAvailability.available) {
+        const tuiWarning = `配置已保存，但 dsh-tui 未安装（${dshTuiAvailability.reason ?? 'dsh-tui 二进制不在 PATH'}）。请在 daemon 所在机器安装 @deepseek-harness-tui/dsh-tui。`;
+        availabilityWarning = availabilityWarning ? `${availabilityWarning} ${tuiWarning}` : tuiWarning;
+      }
+      const effectiveServiceTier = supportsServiceTier
+        ? (serviceTierFieldPresent ? serviceTier ?? undefined : entry.serviceTier)
+        : undefined;
+      if (effectiveServiceTier && effectiveServiceTier !== 'default') {
+        // A bare Codex catalog cannot attest a wrapper-selected provider/profile.
+        // Never execute arbitrary wrappers or hooks as a capability probe.
+        if (selected.wrapperCli) return { write: false, result: { error: 'service_tier_catalog_unavailable' } };
+        const codexAvailability = checkCliAvailability({ cliId: 'codex', cliPathOverride: effectivePath });
+        const tierCheck = await validateCodexServiceTier({
+          cliBin: codexAvailability.resolvedPath ?? codexAvailability.command ?? 'codex',
+          env: {
+            ...buildSessionChildEnv(process.env, entry.envPolicy),
+            ...botInjectedEnv(entry.env, entry.envPolicy),
+          },
+          model,
+          serviceTier: effectiveServiceTier,
+        });
+        if (!tierCheck.ok) {
+          return { write: false, result: {
+            error: `service_tier_${tierCheck.error}`,
+          } };
+        }
+      }
+
       const storedModelBackendVariant = entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max'
         ? entry.modelBackendVariant
         : undefined;
@@ -8297,11 +8452,6 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
         if (nextCliConfigDir !== undefined) entry.cliConfigDir = nextCliConfigDir;
         else delete entry.cliConfigDir;
       }
-      if (entry.readIsolation === true &&
-          !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: effectivePath, wrapperCli: selected.wrapperCli, cliLaunchMode: selected.cliLaunchMode })) {
-        delete entry.readIsolation;
-        readIsolationCleared = true;
-      }
       // 远端 CLI（riff / mojo）→ backendType 自动设为同名后端（否则 spawn 走 pty 后端，
       // 而它们的 resolvedBin 是空串）。mojo 加入后这里必须按「是否远端」判断，不能再
       // 硬编码 riff。
@@ -8327,7 +8477,9 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       return jsonRes(res, 400, {
         ok: false,
         error: r.result.error,
-        message: `模型 ${model || '（Agent 默认模型）'} 不支持当前思考强度`,
+        message: r.result.message ?? (r.result.error === 'reasoning_effort_not_supported_by_model'
+          ? `模型 ${model || '（Agent 默认模型）'} 不支持当前思考强度`
+          : r.result.error),
       });
     }
 
@@ -8363,7 +8515,6 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
     // sessions pick this up, so a profile change never closes running sessions.
     if (!supportsCliConfigDir) bot.config.cliConfigDir = undefined;
     else if (cliConfigDirFieldPresent) bot.config.cliConfigDir = nextCliConfigDir;
-    if (readIsolationCleared) bot.config.readIsolation = false;
     if (codexBrowserCleared) bot.config.codexBrowser = undefined;
     if (isRemoteCliId(selected.cliId)) {
       bot.config.backendType = selected.cliId as typeof bot.config.backendType;
@@ -8400,12 +8551,11 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       closedMismatchedSessions: closedMismatchedSessions.closed,
       closedMismatchedResidual: closedMismatchedSessions.residual,
       closedMismatchedFailed: closedMismatchedSessions.failed,
-      // Report the (possibly auto-cleared) read-isolation state + whether the new
-      // agent can still enforce it, so the dashboard updates its toggle immediately
-      // instead of showing a stale enabled/supported state until a full refetch.
+      // Report isolation capabilities for the saved launch shape. Conflicts are
+      // rejected above; retain the legacy cleared flag for older clients.
       readIsolation: bot.config.readIsolation === true,
       readIsolationSupported: readIsolationEnforceableFor(bot.config),
-      readIsolationCleared,
+      readIsolationCleared: false,
       codexBrowserCleared,
       agentAvailable: availability.available,
       availabilityWarning,
@@ -8586,7 +8736,13 @@ botConfigPutRoute<{ promptInjection?: unknown }>('/api/bot-prompt-injection', 'p
   normalize: body => body.promptInjection === 'none' || body.promptInjection === 'default'
     ? fieldOk(body.promptInjection)
     : fieldInvalid('invalid_prompt_injection'),
-  respond: value => ({ ok: true, promptInjection: value }),
+  // 零注入会强制 transcript 回传：同时带回写入后的回复投递**生效值**，Dashboard 旁边的
+  // 回复投递开关据此刷新，不用猜（Bot 也可能显式配置了 transcript）。
+  respond: value => {
+    let cliId: string | undefined;
+    try { cliId = getBot(cachedLarkAppId).config.cliId; } catch { cliId = undefined; }
+    return { ok: true, promptInjection: value, replyDelivery: effectiveReplyDelivery(cachedLarkAppId, cliId) };
+  },
 });
 
 botConfigPutRoute<{ replyDelivery?: unknown }>('/api/bot-reply-delivery', 'replyDelivery', {
