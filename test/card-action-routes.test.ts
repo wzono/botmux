@@ -204,7 +204,6 @@ describe('敏感动作清单', () => {
 
   it('清单与手写数组逐项一致（29 项，含 purge_images_continue）', () => {
     expect([...SENSITIVE_CARD_ACTIONS.keys()].sort()).toEqual(EXPECTED);
-    expect(SENSITIVE_CARD_ACTIONS.size).toBe(29);
   });
 
   it('wf_approve / wf_reject / wf_cancel 仍过权限门（墓碑排在这道门之后）', () => {

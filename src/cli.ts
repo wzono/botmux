@@ -201,8 +201,26 @@ import { markGroupContextCardPurpose } from './im/lark/group-context-card.js';
 import { TurnSendLedger, type TurnSendKind } from './services/turn-send-ledger.js';
 import { buildTurnReplyCard, replyCardPresentation } from './im/lark/turn-reply-card.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
-import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
-import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
+import {
+  dispatchDeferredTopicSend,
+  localDeferredTopicBindingStore,
+  reusableDeferredTopicRoot,
+  type DeferredScheduleRunData,
+  type DeferredTopicBindingStore,
+  type DeferredTopicSendSession,
+} from './cli/deferred-topic-send.js';
+import {
+  peekRemoteDeferredTopicBinding,
+  remoteDeferredTopicBindingStore,
+  resolveDeferredTopicIpcPort,
+  type DeferredTopicClaimPost,
+} from './cli/deferred-topic-remote-store.js';
+import {
+  probeDeferredTopicBindingWritable,
+  readDeferredTopicBinding,
+  type DeferredTopicBinding,
+} from './core/deferred-topic-binding.js';
+import { DEFERRED_TOPIC_CLAIM_ROUTE, type DeferredTopicClaimResponse } from './core/deferred-topic-claim.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
 import { ensureDevboxDashboardExport } from './platform/devbox-dashboard-export.js';
 import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from './platform/binding.js';
@@ -5785,7 +5803,7 @@ async function cmdSuspend(): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project' | 'continuation' | 'durable-send' | 'turn-delivery',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project' | 'continuation' | 'durable-send' | 'turn-delivery' | typeof DEFERRED_TOPIC_CLAIM_ROUTE,
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -5815,6 +5833,60 @@ async function postSessionCliIpc(
   return hostSecret
     ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
     : loopbackFetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+}
+
+let deferredTopicSidecarWritable: boolean | undefined;
+
+/** The daemon's deferred-topic claim route, or undefined when no daemon port is
+ * known. Used only when this process cannot write the host binding sidecar. */
+function deferredTopicClaimPost(sessionId: string): DeferredTopicClaimPost | undefined {
+  const claim = readManagedOriginCapability(
+    resolveDataDir(),
+    sessionId,
+    process.env.BOTMUX_SEND_RELAY,
+    process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+  );
+  const ipcPort = resolveDeferredTopicIpcPort(claim?.ipcPort, process.env.BOTMUX_DAEMON_IPC_PORT);
+  if (!ipcPort) return undefined;
+  return async (request) => {
+    const res = await postSessionCliIpc(ipcPort, sessionId, DEFERRED_TOPIC_CLAIM_ROUTE, { ...request });
+    const parsed = await res.json().catch(() => undefined) as DeferredTopicClaimResponse | { ok?: false; error?: string } | undefined;
+    if (res.ok && parsed && parsed.ok === true) return parsed as DeferredTopicClaimResponse;
+    return {
+      ok: false,
+      status: (res.status === 400 || res.status === 404 || res.status === 409 || res.status === 502 ? res.status : 409),
+      error: (parsed && 'error' in parsed && typeof parsed.error === 'string') ? parsed.error : `HTTP ${res.status}`,
+    };
+  };
+}
+
+function deferredTopicUsesDaemon(dataDir: string): boolean {
+  deferredTopicSidecarWritable ??= probeDeferredTopicBindingWritable(dataDir);
+  return !deferredTopicSidecarWritable;
+}
+
+/** Binding store for a silent fresh-topic schedule run. A sandboxed /
+ * read-isolated CLI cannot create `<dataDir>/deferred-topics` (EPERM), so the
+ * first-message claim goes through the daemon, which keeps the binding
+ * host-owned. Every other process keeps the local sidecar unchanged. */
+function resolveDeferredTopicStore(dataDir: string, session: DeferredTopicSendSession): DeferredTopicBindingStore {
+  if (deferredTopicUsesDaemon(dataDir)) {
+    const post = deferredTopicClaimPost(session.sessionId);
+    if (post) return remoteDeferredTopicBindingStore(session, post);
+  }
+  return localDeferredTopicBindingStore(dataDir, session.sessionId);
+}
+
+/** Read-only binding lookup for advisory routing checks. Falls back to the
+ * daemon only for a deferred run whose sidecar this process cannot use. */
+async function readDeferredTopicBindingForSend(
+  dataDir: string,
+  session: DeferredTopicSendSession,
+): Promise<DeferredTopicBinding | undefined> {
+  const local = readDeferredTopicBinding(dataDir, session.sessionId);
+  if (local || !session.deferredScheduleRun || !deferredTopicUsesDaemon(dataDir)) return local;
+  const post = deferredTopicClaimPost(session.sessionId);
+  return post ? peekRemoteDeferredTopicBinding(session, post) : undefined;
 }
 
 async function cmdContinuation(argv: string[]): Promise<void> {
@@ -6315,6 +6387,29 @@ async function readCardUsageSnapshotForSend(
   } catch {
     return configuredRuntime;
   }
+}
+
+/** A render snapshot owns display policy and timing independently from usage. */
+async function readReplyCardRenderSnapshotForSend(
+  session: SessionData, larkAppId: string, turnId?: string, dispatchAttempt?: number,
+): Promise<ReplyCardRenderSnapshot> {
+  try {
+    const port = findDaemon(larkAppId)?.ipcPort ?? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT);
+    if (port) {
+      const query = new URLSearchParams();
+      if (turnId) query.set('turnId', turnId);
+      if (dispatchAttempt !== undefined) query.set('dispatchAttempt', String(dispatchAttempt));
+      const response = await fetchDaemonIpc(port, `/api/sessions/${encodeURIComponent(session.sessionId)}/reply-render-snapshot?${query}`, {
+        method: 'GET', signal: AbortSignal.timeout(1_500),
+      });
+      if (response.ok) {
+        const body = await response.json() as { snapshot?: unknown };
+        const snapshot = normalizeReplyCardRenderSnapshot(body.snapshot);
+        if (snapshot) return snapshot;
+      }
+    }
+  } catch { /* old/offline/isolated: retain local policy, omit unknown timing */ }
+  return { usage: await readCardUsageSnapshotForSend(session, larkAppId), footerPreferences: resolveReplyFooterPreferences(larkAppId) };
 }
 
 /**
@@ -8775,12 +8870,15 @@ function withCustomCardMentionFooter(
   card: Record<string, unknown>,
   mentionOpenIds: readonly string[],
   locale?: Locale,
+  presentation?: ReplyCardPresentation,
 ): { ok: true; card: Record<string, unknown> } | { ok: false; error: string } {
   if (mentionOpenIds.length === 0) return { ok: true, card };
   const deduped = [...new Set(mentionOpenIds.filter(Boolean))];
+  if (!buildReplyCardFooterElements({ brand: '', recipientOpenIds: deduped, presentation, locale }).length) return { ok: true, card };
   const cloned = appendReplyCardFooterToV2Card(card, {
     brand: '',
     recipientOpenIds: deduped,
+    presentation,
     locale,
   });
   if (!cloned) {
@@ -8798,7 +8896,7 @@ function withCustomCardMentionFooter(
 import {
   appendReplyCardFooterToV2Card,
   buildImageCardElements,
-  buildReplyCardFooter,
+  buildReplyCardFooterElements,
   buildCardBodyElements,
   CARD_LATE_CHROME_RESERVE_BYTES,
   createReplyCard,
@@ -8839,7 +8937,11 @@ import {
   resolveBrandLabel,
   resolveReplyStyleConfig,
   resolveUsageDisplay,
+  resolveReplyFooterPreferences,
 } from './bot-registry.js';
+import type { ReplyCardPresentation, ReplyCardRenderSnapshot } from './services/reply-card-render.js';
+import { normalizeReplyCardRenderSnapshot } from './cli/reply-card-render-normalize.js';
+import { parseReplyFooterEnv } from './services/reply-footer.js';
 import { resolvePricingConfig, type ResolvedModelPricing } from './services/model-pricing.js';
 import { config } from './config.js';
 import { loadCompanionSecret } from './dashboard/companion-api.js';
@@ -9409,6 +9511,7 @@ async function registerSelfFromCredFile(): Promise<void> {
     brand: cred.brand as 'feishu' | 'lark' | undefined,
     feedback: cred.feedback,
     replyStyle: resolveReplyStyleConfig(appId),
+    ...resolveReplyFooterPreferences(appId),
     usageDisplay:
       process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
       process.env.BOTMUX_USAGE_DISPLAY === 'footer' ||
@@ -9495,6 +9598,8 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
     allowedUsers: [],
     feedback,
     replyStyle: resolveReplyStyleConfig(appId),
+    // This env-only session belongs to the host. Warm sandbox config may be stale.
+    ...parseReplyFooterEnv(process.env.BOTMUX_REPLY_FOOTER),
     usageDisplay:
       process.env.BOTMUX_USAGE_DISPLAY === 'streaming' ||
       process.env.BOTMUX_USAGE_DISPLAY === 'footer' ||
@@ -11012,7 +11117,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (getBot(sourceAppId).config.topicUnavailablePolicy === 'stop') {
       const scheduledRoot = reusableDeferredTopicRoot({
         session: { ...topicSourceSession, larkAppId: sourceAppId },
-        binding: readDeferredTopicBinding(dataDir, topicSourceSession.sessionId),
+        binding: await readDeferredTopicBindingForSend(dataDir, { ...topicSourceSession, larkAppId: sourceAppId }),
         explicitTopLevel: false,
       });
       await assertSendTopicsAvailable(sourceAppId, [scheduledRoot],
@@ -11124,6 +11229,7 @@ async function cmdSend(rest: string[]): Promise<void> {
             : !sendInto && (!overrideChatId || overrideChatId === s.chatId)
             ? await dispatchDeferredTopicSend({
                 dataDir: resolveDataDir(),
+                store: () => resolveDeferredTopicStore(resolveDataDir(), s as SessionData & { larkAppId: string }),
                 session: s as SessionData & { larkAppId: string },
                 currentTurnId,
                 explicitTopLevel: sendTopLevel,
@@ -11664,7 +11770,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
   }
   const deferredBinding = !sendInto && (!overrideChatId || overrideChatId === s.chatId)
-    ? readDeferredTopicBinding(dataDir, s.sessionId)
+    ? await readDeferredTopicBindingForSend(dataDir, s as SessionData & { larkAppId: string })
     : undefined;
   const deferredRoot = reusableDeferredTopicRoot({
     session: s as SessionData & { larkAppId: string },
@@ -11775,6 +11881,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!sendInto && (!overrideChatId || overrideChatId === s.chatId)) {
       const deferred = await dispatchDeferredTopicSend({
         dataDir: resolveDataDir(),
+        store: () => resolveDeferredTopicStore(resolveDataDir(), s as SessionData & { larkAppId: string }),
         session: s as SessionData & { larkAppId: string },
         currentTurnId,
         explicitTopLevel: sendTopLevel,
@@ -12292,6 +12399,8 @@ async function cmdSend(rest: string[]): Promise<void> {
           hasExplicitBotMention: explicitKnownBotMention,
           knownBotOpenIds,
         });
+    let replyRenderSnapshot: ReplyCardRenderSnapshot | undefined;
+    const readReplyRenderSnapshot = async () => replyRenderSnapshot ??= await readReplyCardRenderSnapshotForSend(s, appId, currentTurnId, originDispatchAttempt);
     let customCardUsedIds = new Set<string>();
     if (customCard) {
       const inlineResult = applyInlineMentionsToCard(customCard, mentions);
@@ -12307,6 +12416,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         customCard,
         mentionFooter,
         localeForBot(appId),
+        { footerPreferences: (await readReplyRenderSnapshot()).footerPreferences },
       );
       if (!withFooter.ok) { console.error(`botmux send: ${withFooter.error}`); process.exit(2); }
       customCard = withFooter.card;
@@ -12472,68 +12582,32 @@ async function cmdSend(rest: string[]): Promise<void> {
         cc: footerAddressing.cc,
         inlinedIds: usedIds,
       });
-      const usageSnapshot = await readCardUsageSnapshotForSend(s, appId);
+      const renderSnapshot = await readReplyRenderSnapshot();
+      const usageSnapshot = renderSnapshot.usage;
       const shouldRenderBrand = effectiveResponseKind === 'final' || sendTopLevel;
       const footerBrand = shouldRenderBrand
         ? renderBrandTemplate(resolveBrandLabel(appId), s.workingDir)
         : '';
-      const footer = buildReplyCardFooter({
-        brand: footerBrand,
-        recipientOpenIds: footerRecipients,
-        usage: shouldRenderBrand ? usageSnapshot : { ...usageSnapshot, model: undefined },
-        locale: localeForBot(appId),
-      });
-      // Footer line (brand 个性签名 + 发送给) and the optional 🔊 语音总结 button
-      // share ONE row: footer text on the left (weighted, fills), button pinned
-      // to the far right (auto width). When voice isn't configured the footer
-      // renders alone, as before. Button only on a reply (not --top-level).
-      // v2 cards put buttons inside column_set/column — never the 1.x
-      // `tag:'action'` container (Feishu rejects it, error 200861).
-      let voiceOn = false;
-      // A managed receiver card has no callback controls: a voice-summary
-      // button would open a second, unledgered model/output action when clicked.
+      // The caller supplies voice capability; the shared composer owns visibility.
+      let voiceButton: Record<string, unknown> | undefined;
       if (!sendTopLevel && !vcMeetingManagedSendOrigin) {
         try {
           const { isVoiceConfigured } = await import('./services/voice/index.js');
-          voiceOn = isVoiceConfigured(appId);
-        } catch { /* voice module/config unavailable → no button */ }
+          if (isVoiceConfigured(appId)) {
+            const anchorId = (isChatScope ? s.chatId : s.rootMessageId) ?? s.chatId;
+            voiceButton = {
+              tag: 'button', text: { tag: 'plain_text', content: '🔊 语音总结' }, type: 'default',
+              behaviors: [{ type: 'callback', value: { action: 'voice_summary', session_id: sid, root_id: anchorId, lark_app_id: appId, chat_id: targetChatId } }],
+            };
+          }
+        } catch { /* voice module/config unavailable */ }
       }
-      const footerContent = footer?.content ?? '';
-      if (footerContent || voiceOn) {
-        elements.push({ tag: 'hr' });
-        if (voiceOn) {
-          const anchorId = (isChatScope ? s.chatId : s.rootMessageId) ?? s.chatId;
-          elements.push({
-            tag: 'column_set',
-            flex_mode: 'none',
-            horizontal_spacing: 'default',
-            columns: [
-              {
-                tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
-                elements: [footer?.element ?? {
-                  tag: 'markdown',
-                  text_size: 'notation',
-                  content: ' ',
-                }],
-              },
-              {
-                tag: 'column', width: 'auto', vertical_align: 'center',
-                elements: [{
-                  tag: 'button',
-                  text: { tag: 'plain_text', content: '🔊 语音总结' },
-                  type: 'default',
-                  behaviors: [{
-                    type: 'callback',
-                    value: { action: 'voice_summary', session_id: sid, root_id: anchorId, lark_app_id: appId, chat_id: targetChatId },
-                  }],
-                }],
-              },
-            ],
-          });
-        } else {
-          if (footer) elements.push(footer.element);
-        }
-      }
+      elements.push(...buildReplyCardFooterElements({
+        brand: footerBrand, recipientOpenIds: footerRecipients,
+        usage: shouldRenderBrand ? usageSnapshot : { ...usageSnapshot, model: undefined },
+        presentation: shouldRenderBrand ? renderSnapshot : { ...renderSnapshot, timing: undefined },
+        locale: localeForBot(appId), voiceButton,
+      }));
 
       // Preserve caller-owned layout/header/config; only the host sections and
       // multi-user updates join the canonical lifecycle. Never flatten to Markdown.
