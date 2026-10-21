@@ -181,8 +181,8 @@ export function larkToolPrompt(appId: string, locale?: string, noTransport = fal
     ? `lark-cli uses application ${appId}. Calls default to this bot. This headless session has no human authorization channel; --as user is unavailable. If the bot lacks access, report the blocked resource through the session result channel so the caller can resolve it. Do not change profiles or repeat writes whose result is uncertain.`
     : `lark-cli 固定使用当前机器人的应用 ${appId}，默认以 bot 身份调用。本后台会话没有真人授权通道，--as user 不可用。bot 无权时，通过会话结果通道报告受阻资源，由调用方处理权限。不要切换 profile，也不要重复执行结果尚不确定的写操作。`;
   return locale === 'en'
-    ? `lark-cli uses application ${appId} by default and calls default to this bot. For personal resources or a bot permission denial, use --as user with the current user's authorization to this same application. To use a different application or profile, specify --profile <profile>. If needed, run botmux auth request --scope "<required scopes>" --json. Do not repeat writes whose result is uncertain.`
-    : `lark-cli 固定使用当前机器人的应用 ${appId} 作为默认，默认以 bot 身份调用。需要个人资源或 bot 无权时，可用 --as user 使用当前用户对同一应用的授权；若需使用其他应用或 profile，可显式指定 --profile <profile>。缺授权时运行 botmux auth request --scope "<所需权限>" --json。不要重复执行结果尚不确定的写操作。`;
+    ? `lark-cli uses application ${appId} by default and calls default to this bot. For personal resources or a bot permission denial, use --as user to act as the current user; botmux picks that person's authorization (their grant to this application, or their botmux platform authorization). To use a different application or profile, specify --profile <profile>. If authorization is missing, run botmux auth request --scope "<required scopes>" --json and pass the link or platform page it returns to the user. Do not repeat writes whose result is uncertain.`
+    : `lark-cli 固定使用当前机器人的应用 ${appId} 作为默认，默认以 bot 身份调用。需要个人资源或 bot 无权时，可用 --as user 以当前用户身份调用，用谁的哪份授权由 botmux 决定（该用户对本应用的授权，或其在 botmux 中心化平台的授权）；若需使用其他应用或 profile，可显式指定 --profile <profile>。缺授权时运行 botmux auth request --scope "<所需权限>" --json，把返回的链接或平台页面发给用户。不要重复执行结果尚不确定的写操作。`;
 }
 
 export function larkToolPromptFromEnv(
@@ -206,7 +206,8 @@ export function larkToolPassthroughEnv(inherited: NodeJS.ProcessEnv): NodeJS.Pro
 
 export function larkToolChildEnv(
   inherited: NodeJS.ProcessEnv, binding: LarkToolBinding,
-  identity?: { mode: 'bot' | 'user'; credential: string },
+  /** `appId` is set only for a platform-issued user grant (a different application by design). */
+  identity?: { mode: 'bot' | 'user'; credential: string; appId?: string },
 ): NodeJS.ProcessEnv {
   const env = { ...inherited };
   for (const key of Object.keys(env)) {
@@ -215,7 +216,7 @@ export function larkToolChildEnv(
   }
   env.LARKSUITE_CLI_CONFIG_DIR = binding.configDir;
   env.LARKSUITE_CLI_DATA_DIR = join(binding.configDir, 'data');
-  env.LARKSUITE_CLI_APP_ID = binding.appId;
+  env.LARKSUITE_CLI_APP_ID = identity?.mode === 'user' && identity.appId ? identity.appId : binding.appId;
   env.LARKSUITE_CLI_BRAND = binding.brand;
   env.LARKSUITE_CLI_NO_UPDATE_NOTIFIER = '1';
   env.LARKSUITE_CLI_NO_SKILLS_NOTIFIER = '1';
