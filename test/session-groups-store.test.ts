@@ -38,7 +38,6 @@ import {
   markSessionGroupTitled,
   markSessionGroupTitleFailed,
   removeSessionGroup,
-  listSessionGroups,
 } from '../src/services/session-groups-store.js';
 import { sanitizeTitleOutput, buildTitlePrompt, buildOneShotEnv, resolveOneShotCommand, ONE_SHOT_ARGV, oneShotTitleAllowed, oneShotProfileEnv } from '../src/services/session-group-title.js';
 import {
@@ -141,7 +140,6 @@ describe('session-groups-store', () => {
     registerSessionGroup('oc_a', { ownerOpenId: 'ou_owner', lastSessionId: '' });
     removeSessionGroup('oc_a');
     expect(isSessionGroup('oc_a')).toBe(false);
-    expect(listSessionGroups()).toHaveLength(0);
   });
 
   it('never throws when not initialised', async () => {
@@ -150,7 +148,6 @@ describe('session-groups-store', () => {
     initSessionGroups('cli_testapp');
     expect(isSessionGroup('oc_x')).toBe(false);
     expect(getSessionGroup('oc_x')).toBeUndefined();
-    expect(listSessionGroups()).toEqual([]);
   });
 });
 
@@ -260,6 +257,16 @@ describe('resolveOneShotCommand (PR review: full buildWrappedLaunch parity)', ()
 
   it('falls back to the template verbatim', () => {
     expect(resolveOneShotCommand({}, template)).toEqual({ argv: ['claude', '-p'] });
+  });
+
+  it('pins claude-code to dontAsk so a bypassPermissions profile cannot leak in', () => {
+    const argv = ONE_SHOT_ARGV['claude-code'];
+    expect(argv).toEqual(['claude', '-p', '--permission-mode', 'dontAsk']);
+    // Wrappers forward the pin to the underlying claude.
+    expect(resolveOneShotCommand({ wrapperCli: 'aiden x claude' }, argv).argv)
+      .toEqual(['aiden', 'x', 'claude', '-p', '--permission-mode', 'dontAsk']);
+    expect(resolveOneShotCommand({ cliPathOverride: '/opt/claude' }, argv).argv)
+      .toEqual(['/opt/claude', '-p', '--permission-mode', 'dontAsk']);
   });
 
   it('supports antigravity in ONE_SHOT_ARGV with agy -p', () => {

@@ -1,5 +1,6 @@
 import { defaultSummaryRangePrefs, summaryRangeFromLegacyContentTriggers } from '../services/summary-range-store.js';
 import { selectionKeyForBot } from '../setup/cli-selection.js';
+import { normalizeReplyFooter } from '../services/reply-footer.js';
 import { normalizeUsageDisplay, normalizeCotEnabled } from '../bot-registry.js';
 import { normalizeHiddenStreamingCardButtons } from '../im/lark/streaming-card-buttons.js';
 import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
@@ -166,6 +167,8 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     readIsolationSupported: j?.readIsolationSupported === true,
     backendType: typeof j?.backendType === 'string' ? j.backendType : null,
     defaultBackendType: typeof j?.defaultBackendType === 'string' && j.defaultBackendType ? j.defaultBackendType : null,
+    ...normalizeReplyFooter(j),
+    showReplyTiming: j?.showReplyTiming === true,
     usageDisplay: normalizeUsageDisplay(j ?? {}),
     usageSupported: j?.usageSupported === true,
     disableStreamingCard: j?.disableStreamingCard === true || j?.replyCardMode === 'final-only',
@@ -180,6 +183,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     privateCard: j?.privateCard === true,
     cotEnabled: normalizeCotEnabled(j),
     senderTag: j?.senderTag !== false,
+    senderTagHideEmail: j?.senderTagHideEmail === true,
     overloadAlert: j?.overloadAlert === true,
     botToBotSameDir: j?.botToBotSameDir !== false,
     quotaFallbackBot: normalizeQuotaFallbackBotConfig(j?.quotaFallbackBot, bot.larkAppId).config ?? null,
@@ -191,6 +195,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     groupJoinCommandEnabled: j?.groupJoinCommandEnabled === true,
     groupJoinCommand: typeof j?.groupJoinCommand === 'string' ? j.groupJoinCommand : '',
     autoStartOnNewTopic: j?.autoStartOnNewTopic === true,
+    chatManagerEnabled: j?.chatManagerEnabled === true,
     autoStartExcludedChats: Array.isArray(j?.autoStartExcludedChats) ? j.autoStartExcludedChats : [],
     summaryRange: j?.summaryRange
       ?? summaryRangeFromLegacyContentTriggers(j?.contentTriggers)
@@ -254,6 +259,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     envPolicy: envPolicyForClient(j?.envPolicy),
     riff: j?.riff && typeof j.riff === 'object' ? j.riff : null,
     remoteRunner: j?.remoteRunner && typeof j.remoteRunner === 'object' ? j.remoteRunner : null,
+    herdr: j?.herdr && typeof j.herdr === 'object' && !Array.isArray(j.herdr) ? j.herdr : null,
     skills: j?.skills && typeof j.skills === 'object' ? j.skills : null,
   };
 }

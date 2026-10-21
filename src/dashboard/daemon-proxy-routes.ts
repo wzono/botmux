@@ -84,7 +84,7 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('ask-option-layout', { kind: 'json', maxBytes: ASK_OPTION_LAYOUT_REQUEST_MAX_BYTES }),
   // startup-commands：`{ startupCommands: string }`（逗号/换行分隔，'' = 清除）。
   putBotConfig('startup-commands'),
-  // custom-passthrough：`{ customPassthroughCommands: string }`（逗号/空格分隔，'' = 清除）。
+  // custom-passthrough：`{ customPassthroughCommands: string }`（逗号/换行或“空格+/”分隔，名字内空格归一为连字符，'' = 清除）。
   putBotConfig('custom-passthrough'),
   // cantalk-daemon-commands：`{ canTalkDaemonCommands: string }`（逗号/空格分隔，'' = 清除）。
   putBotConfig('cantalk-daemon-commands'),
@@ -120,6 +120,8 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   },
   // riff：`{ riff: string }`（原始 JSON 文本，'' = 清除）。
   putBotConfig('riff'),
+  // herdr：`{ herdr: string }`（原始 JSON 文本，'' = 清除）。
+  putBotConfig('herdr'),
   // sandbox-network-policy：与其它 PUT 不同，空 body 不回落为 '{}'，原样转发空串。
   {
     ...putBotConfig('sandbox-network-policy', { kind: 'raw', emptyAs: '' }),

@@ -132,6 +132,11 @@ vi.mock('../src/services/session-lifecycle-hooks.js', () => ({
   setSessionLifecycleShutdown: vi.fn(),
 }));
 
+const linkRefRuntime = vi.hoisted(() => ({ current: undefined as any }));
+vi.mock('../src/services/link-ref-runtime.js', () => ({
+  getLinkRefRuntime: () => linkRefRuntime.current,
+}));
+
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   Client: class { constructor() {} },
   WSClient: class { start() {} },
@@ -141,6 +146,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 import {
   getDaemonReplyCardUsageSnapshot,
+  getDaemonReplyCardRenderSnapshot,
   initWorkerPool,
   postTurnStartingCard,
   pruneSteerFanoutState,
@@ -155,7 +161,7 @@ import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import { EventEmitter } from 'node:events';
 import { homedir, tmpdir } from 'node:os';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   acceptVcMeetingDelivery,
@@ -168,7 +174,7 @@ import {
 import { listVcMeetingActions } from '../src/services/vc-meeting-action-store.js';
 import { listVcMeetingListenerMessageIds } from '../src/services/vc-meeting-listener-message-store.js';
 import { getSessionUsageSnapshot } from '../src/core/cost-calculator.js';
-import { getBot, getBotClient, getOwnerOpenId, resolveReplyDelivery, resolveUsageDisplay } from '../src/bot-registry.js';
+import { getBot, getBotClient, getOwnerOpenId, resolveBrandLabel, resolveReplyDelivery, resolveUsageDisplay } from '../src/bot-registry.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 import {
   clearMessageListenerRunPreviewStore,
@@ -315,7 +321,33 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     setActiveSessionsRegistry(undefined);
     rmSync(config.session.dataDir, { recursive: true, force: true });
     clearMessageListenerRunPreviewStore();
+    linkRefRuntime.current = undefined;
     vi.useRealTimers();
+  });
+
+  it('expands LinkRefs before markdown card rendering and keeps the worker IPC immutable', async () => {
+    const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+    const clearPendingDraft = vi.fn();
+    const fullUrl = 'https://auth.example.test/approve' + '?code=keep&state=ready';
+    linkRefRuntime.current = {
+      prepareFinalDraft: vi.fn(() => ({ content: `授权：${fullUrl}`, draftPending: true })),
+      clearPendingDraft,
+    };
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    const unresolved = '授权：{{botmux_link:lr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}}';
+    const msg = { ...finalOutputMsg(), content: unresolved, linkRefMode: 'enabled' as const };
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+
+    deliver(ds, msg, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(sessionReply.mock.calls[0][1]).toContain(fullUrl);
+    expect(sessionReply.mock.calls[0][1]).not.toContain('{{botmux_link:');
+    expect(clearPendingDraft).toHaveBeenCalledOnce();
+    expect(msg.content).toBe(unresolved);
   });
 
   it.each(['bridge', 'local-turn', 'local-turn-headless'] as const)(
@@ -341,7 +373,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
   );
 
   it.each((['bridge', 'local-turn', 'local-turn-headless'] as const).flatMap(kind =>
-    (['minimax', 'traex', 'codex', 'claude-code'] as const).map(cliId => ({ kind, cliId }))))('repairs reply fences for $cliId $kind final delivery', async ({ kind, cliId }) => {
+    (['minimax', 'traex', 'codex', 'claude-code', 'dsh'] as const).map(cliId => ({ kind, cliId }))))('repairs reply fences for $cliId $kind final delivery', async ({ kind, cliId }) => {
     const content = ['实际进程：```plain_text', '123 update', '└ 456 download', '```', '', '**请选择：**', '1. 保持下载', '2. 清理残留'].join('\n');
     const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
@@ -433,6 +465,52 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply.mock.calls[0][1]).toContain('[Image omitted] [Input]');
   });
 
+  describe.each(['claude-code', 'codex'] as const)('%s adopt_preamble footer controls', cliId => {
+    it.each([
+      { name: 'default enabled', preferences: {}, brand: true, model: true, usage: true, recipients: true },
+      { name: 'master disabled with enabled blocks', preferences: { replyFooterEnabled: false, replyFooterBrand: true, replyFooterModel: true, replyFooterUsage: true, replyFooterRecipients: true }, brand: false, model: false, usage: false, recipients: false },
+      { name: 'brand disabled', preferences: { replyFooterBrand: false }, brand: false, model: true, usage: true, recipients: true },
+      { name: 'model disabled', preferences: { replyFooterModel: false }, brand: true, model: false, usage: true, recipients: true },
+      { name: 'usage disabled', preferences: { replyFooterUsage: false }, brand: true, model: true, usage: false, recipients: true },
+      { name: 'recipients disabled', preferences: { replyFooterRecipients: false }, brand: true, model: true, usage: true, recipients: false },
+      { name: 'all available blocks disabled', preferences: { replyFooterBrand: false, replyFooterModel: false, replyFooterUsage: false, replyFooterRecipients: false }, brand: false, model: false, usage: false, recipients: false },
+    ])('respects $name without changing the quoted exchange', async scenario => {
+      const bot = getBot('app_test');
+      Object.assign(bot.config, scenario.preferences);
+      vi.mocked(resolveBrandLabel).mockReturnValueOnce('adopt-footer-brand');
+      const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.session.cliId = cliId;
+      ds.session.ownerOpenId = 'ou_adopt_owner';
+      if (!ds.worker) throw new Error('Missing fixture worker');
+      __testOnly_setupWorkerHandlers(ds, ds.worker);
+      ds.activeModel = 'adopt-footer-model';
+      ds.activeReasoningEffort = 'high';
+      ds.worker.emit('message', {
+        type: 'adopt_preamble', turnId: 'turn-adopt',
+        userText: 'Previous user request', assistantText: 'Previous assistant answer',
+      });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(sessionReply).toHaveBeenCalledOnce();
+      const card = JSON.parse(sessionReply.mock.calls[0][1]);
+      const footer = card.body.elements.find((element: any) => element.element_id === 'botmux_reply_footer');
+      const content = footer?.content ?? '';
+      expect(content.includes('adopt-footer-brand')).toBe(scenario.brand);
+      expect(content.includes('adopt-footer-model')).toBe(scenario.model);
+      expect(content.includes('12%')).toBe(scenario.usage);
+      expect(content.includes('<at id=ou_adopt_owner></at>')).toBe(scenario.recipients);
+      const hasFooter = scenario.brand || scenario.model || scenario.usage || scenario.recipients;
+      expect(Boolean(footer)).toBe(hasFooter);
+      // The contextual body always separates the user and assistant with one divider.
+      expect(card.body.elements.filter((element: any) => element.tag === 'hr')).toHaveLength(hasFooter ? 2 : 1);
+      expect(sessionReply.mock.calls[0][1]).toContain('Previous user request');
+      expect(sessionReply.mock.calls[0][1]).toContain('Previous assistant answer');
+      // Rendering must preserve saved block choices when the master is off.
+      expect(bot.config).toMatchObject(scenario.preferences);
+    });
+  });
+
   it.each(['non-adopted', 'sandbox', 'read-isolation', 'remote', 'api-only'])(
     'does not add host image uploads to %s sessions', async mode => {
       writeFileSync(`${config.session.dataDir}/preview.png`, Buffer.from('89504e470d0a1a0a', 'hex'));
@@ -470,6 +548,22 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply.mock.calls[0][1]).toContain('img_v3_uploaded_preview');
     expect(sessionReply.mock.calls[1][1]).toBe(sessionReply.mock.calls[0][1]);
     expect(sessionReply.mock.calls[1][5].uuid).toBe(sessionReply.mock.calls[0][5].uuid);
+  });
+
+  it('retries a transient Lark failure for a DSH final without changing the reply', async () => {
+    const sessionReply = vi.fn().mockRejectedValueOnce(new Error('network error')).mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.cliId = 'dsh';
+    ds.adoptedFrom = undefined;
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+
+    deliver(ds, { ...finalOutputMsg(), content: 'DSH completed' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls[1][1]).toBe(sessionReply.mock.calls[0][1]);
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
   });
 
   it('delivers the body when the automatic image upload fails', async () => {
@@ -1413,7 +1507,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(JSON.stringify(delivery?.policy)).not.toContain('reviewer@example.com');
   });
 
-  it('does not render a reviewers card when every email is unresolved', async () => {
+  it('renders a fail-closed reviewers card when every email is unresolved', async () => {
     resolveAllowedUsersWithMapMock.mockResolvedValue({
       resolved: [],
       map: new Map(),
@@ -1432,7 +1526,83 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
     await vi.advanceTimersByTimeAsync(10);
 
+    expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
+  });
+
+  it('reuses the last-known-good reviewer id when contact resolution transiently fails', async () => {
+    // Seed a warm cache from a prior healthy send of the same reviewer list.
+    const { writeFeedbackReviewersCache } = await import('../src/utils/feedback-reviewers-cache.js');
+    writeFeedbackReviewersCache(config.session.dataDir, 'app_test', {
+      map: new Map([['oncall@example.com', 'ou_oncall_cached']]),
+      retainKeys: ['oncall@example.com'],
+    });
+    // The contact API now blips: every email staged transient with an empty map.
+    resolveAllowedUsersWithMapMock.mockResolvedValue({
+      resolved: [],
+      map: new Map(),
+      errored: true,
+      entryStatus: new Map([['oncall@example.com', 'transient' as const]]),
+    });
+    const sessionReply = vi.fn(async () => 'om_transient_feedback');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.feedbackPolicy = normalizeFeedbackPolicy({
+      enabled: true,
+      audience: 'reviewers',
+      reviewers: ['oncall@example.com'],
+    });
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
+
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    // The card still ships (control visible) and the snapshot keeps the cached
+    // id, so the configured real reviewer is not rejected.
+    expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
+    const delivery = (await getSkillFeedbackStore(config.session.dataDir))
+      .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_transient_feedback');
+    expect(delivery?.policy?.reviewers).toEqual(['ou_oncall_cached']);
+  });
+
+  it('drops the feedback control on a cold-cache transient failure instead of shipping an empty snapshot', async () => {
+    resolveAllowedUsersWithMapMock.mockResolvedValue({
+      resolved: [],
+      map: new Map(),
+      errored: true,
+      entryStatus: new Map([['oncall@example.com', 'transient' as const]]),
+    });
+    const sessionReply = vi.fn(async () => 'om_cold_transient_feedback');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.feedbackPolicy = normalizeFeedbackPolicy({
+      enabled: true,
+      audience: 'reviewers',
+      reviewers: ['oncall@example.com'],
+    });
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
     expect(String(sessionReply.mock.calls[0][1])).not.toContain('botmux_feedback');
+  });
+
+  it('renders a fail-closed reviewers card when no reviewers are configured', async () => {
+    const sessionReply = vi.fn(async () => 'om_empty_reviewers_feedback');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.feedbackPolicy = normalizeFeedbackPolicy({ enabled: true, audience: 'reviewers' });
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    const { getSkillFeedbackStore } = await import('../src/services/skill-feedback-store.js');
+
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(String(sessionReply.mock.calls[0][1])).toContain('botmux_feedback');
+    expect((await getSkillFeedbackStore(config.session.dataDir))
+      .findDeliveryByPlatformMessage('lark', ds.larkAppId, 'om_empty_reviewers_feedback'))
+      .toMatchObject({ policy: { audience: 'reviewers', reviewers: [] } });
   });
 
   it('keeps feedback disabled by default but still records the turn-completion delivery', async () => {
@@ -2267,6 +2437,40 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(ds.lastBridgeEmittedUuid).toBeUndefined();
   });
 
+  it('clears a LinkRef draft when the provider confirms delivery before ownership changes', async () => {
+    let owned = true;
+    const clearPendingDraft = vi.fn();
+    linkRefRuntime.current = {
+      prepareFinalDraft: vi.fn(() => ({ content: 'expanded answer', draftPending: true })),
+      clearPendingDraft,
+    };
+    const sessionReply = vi.fn(async () => {
+      owned = false;
+      return 'om_provider_confirmed';
+    });
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    const complete = vi.fn();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+
+    __testOnly_deliverFinalOutput(ds, {
+      ...finalOutputMsg(),
+      content: '{{botmux_link:lr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}}',
+      linkRefMode: 'enabled',
+    }, 'tag', 0, complete, () => owned);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(complete).toHaveBeenCalledWith(true);
+    expect(clearPendingDraft).toHaveBeenCalledOnce();
+  });
+
   it('keeps a shutdown drain registration until an ordinary bridge final finishes delivery', async () => {
     let resolveReply!: (messageId: string) => void;
     const sessionReply = vi.fn(() => new Promise<string>(resolve => {
@@ -2801,6 +3005,138 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(String(sessionReply.mock.calls[0][1])).toContain('<at id=ou_original_bot></at>');
   });
 
+  describe('zero-injection reply that names a peer bot in prose', () => {
+    // A zero-injection CLI cannot pass --mention; the daemon renders its final
+    // reply. A Pi bot wrote "@Dev(Claude) 请执行合并" for a turn a human started,
+    // and the card @-ed that human while the named bot never woke up.
+    function seedPeerBots(): void {
+      writeFileSync(join(config.session.dataDir, 'bots-info.json'), JSON.stringify([
+        { larkAppId: 'app_test', botName: 'Reviewer(pi)', cliId: 'pi', botOpenId: 'ou_bot' },
+        { larkAppId: 'cli_claude', botName: 'Dev(Claude)', cliId: 'claude-code', botOpenId: 'ou_claude_selfview' },
+        { larkAppId: 'cli_codex', botName: 'Dev(codex)', cliId: 'codex', botOpenId: 'ou_codex_selfview' },
+        { larkAppId: 'cli_unseen', botName: 'Other(pi)', cliId: 'pi', botOpenId: 'ou_unseen_selfview' },
+      ]));
+      // Open_ids as THIS app sees the peers; the self-view ids above are the wrong scope.
+      writeFileSync(join(config.session.dataDir, 'bot-openids-app_test.json'), JSON.stringify({
+        'Dev(Claude)': 'ou_claude_here',
+        'Dev(codex)': 'ou_codex_here',
+      }));
+    }
+
+    function zeroPromptDs(initiator: { openId: string; isBot: boolean }): DaemonSession {
+      const ds = makeDs();
+      ds.session.cliId = 'pi';
+      ds.session.promptInjection = 'none';
+      ds.session.turnReplyContexts = { 'turn-1': {
+        target: { mode: 'thread', rootMessageId: 'om_root' },
+        replyTargetSenderOpenId: initiator.openId, replyTargetSenderIsBot: initiator.isBot,
+      } };
+      return ds;
+    }
+
+    async function deliver(ds: DaemonSession, content: string, extra: Partial<Extract<WorkerToDaemon, { type: 'final_output' }>> = {}) {
+      const sessionReply = vi.fn(async () => 'om_reply');
+      const onZeroPromptFinal = vi.fn(async () => {});
+      initWorkerPool({ sessionReply, onZeroPromptFinal, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), content, ...extra }, 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(sessionReply).toHaveBeenCalledTimes(1);
+      return { card: String(sessionReply.mock.calls[0][1]), onZeroPromptFinal };
+    }
+
+    const ats = (card: string) => [...card.matchAll(/<at id=([^>]+)><\/at>/g)].map(m => m[1]);
+
+    it('@s the named bot where it is written instead of the human who started the turn', async () => {
+      seedPeerBots();
+      const content = '复审结论：可合。\n\n@Dev(Claude) 请按合码人口径执行合并。';
+      const { card, onZeroPromptFinal } = await deliver(zeroPromptDs({ openId: 'ou_human', isBot: false }), content);
+      expect(card).toContain('<at id=ou_claude_here></at> 请按合码人口径执行合并');
+      expect(ats(card)).toEqual(['ou_claude_here']);
+      // The automatic dispatch report still carries the model's own text.
+      expect(onZeroPromptFinal).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ content }));
+    });
+
+    it('still resolves the named bot when bots-info.json carries malformed rows', async () => {
+      seedPeerBots();
+      const path = join(config.session.dataDir, 'bots-info.json');
+      writeFileSync(path, JSON.stringify([
+        null,
+        { larkAppId: 'cli_bad', botName: 42 },
+        { larkAppId: 'cli_bad_cli', botName: 'Bad(cli)', cliId: 42 },
+        ...JSON.parse(readFileSync(path, 'utf8')),
+      ]));
+      const { card } = await deliver(zeroPromptDs({ openId: 'ou_human', isBot: false }), '@Dev(Claude) 请执行合并');
+      expect(ats(card)).toEqual(['ou_claude_here']);
+    });
+
+    it('keeps a bot initiator known only from the cross-ref when bots-info.json carries a null row', async () => {
+      seedPeerBots();
+      const path = join(config.session.dataDir, 'bots-info.json');
+      writeFileSync(path, JSON.stringify([null, ...JSON.parse(readFileSync(path, 'utf8'))]));
+      const ds = zeroPromptDs({ openId: 'ou_claude_here', isBot: true });
+      // No recorded bot flag: whether the initiator is a bot comes from the cross-ref alone.
+      delete ds.session.turnReplyContexts!['turn-1'].replyTargetSenderIsBot;
+      const { card } = await deliver(ds, '@Dev(codex) 你那条也核实了');
+      expect(ats(card).sort()).toEqual(['ou_claude_here', 'ou_codex_here']);
+    });
+
+    it('@s nobody rather than the human when the named bot cannot be resolved', async () => {
+      seedPeerBots();
+      const { card } = await deliver(zeroPromptDs({ openId: 'ou_human', isBot: false }), '@Other(pi) 请执行合并');
+      expect(card).toContain('@Other(pi) 请执行合并');
+      expect(ats(card)).toEqual([]);
+    });
+
+    it('keeps the @ of a bot initiator alongside the bot the reply names', async () => {
+      seedPeerBots();
+      const { card, onZeroPromptFinal } = await deliver(
+        zeroPromptDs({ openId: 'ou_claude_here', isBot: true }), '复审通过。@Dev(codex) 你那条也核实了');
+      expect(card).toContain('<at id=ou_codex_here></at> 你那条也核实了');
+      expect(ats(card).sort()).toEqual(['ou_claude_here', 'ou_codex_here']);
+      // The initiating bot still receives the result through its @, not a second HTTP report.
+      expect(onZeroPromptFinal).not.toHaveBeenCalled();
+    });
+
+    it('@s a bot initiator named in the reply only once', async () => {
+      seedPeerBots();
+      const { card } = await deliver(zeroPromptDs({ openId: 'ou_claude_here', isBot: true }), '@Dev(Claude) 复审通过');
+      expect(ats(card)).toEqual(['ou_claude_here']);
+      expect(card).toContain('<at id=ou_claude_here></at> 复审通过');
+    });
+
+    it('leaves replies that name no peer bot exactly as before', async () => {
+      seedPeerBots();
+      const content = '示例 `@Dev(Claude)`，我是 @Reviewer(pi)，邮件 a@Dev(Claude)';
+      const { card } = await deliver(zeroPromptDs({ openId: 'ou_human', isBot: false }), content);
+      expect(ats(card)).toEqual(['ou_human']);
+    });
+
+    it('keeps the requester-only feedback control when the reply is addressed to a bot', async () => {
+      seedPeerBots();
+      const ds = zeroPromptDs({ openId: 'ou_human', isBot: false });
+      ds.feedbackPolicy = normalizeFeedbackPolicy({ enabled: true });
+      const { card } = await deliver(ds, '@Dev(Claude) 请执行合并');
+      expect(ats(card)).toEqual(['ou_claude_here']);
+      expect(card).toContain('botmux_feedback');
+    });
+
+    it('does not change failed turns, private chats or ordinary sessions', async () => {
+      seedPeerBots();
+      const failed = await deliver(zeroPromptDs({ openId: 'ou_human', isBot: false }),
+        '⚠️ 执行失败 @Dev(Claude)', { turnFailed: true });
+      expect(ats(failed.card)).toEqual(['ou_human']);
+
+      const p2p = zeroPromptDs({ openId: 'ou_human', isBot: false });
+      p2p.chatType = 'p2p';
+      expect(ats((await deliver(p2p, '@Dev(Claude) 请执行合并')).card)).toEqual(['ou_human']);
+
+      const ordinary = makeDs();
+      ordinary.session.ownerOpenId = 'ou_owner';
+      expect(ats((await deliver(ordinary, '@Dev(Claude) 请执行合并')).card)).toEqual(['ou_owner']);
+    });
+  });
+
   it('addresses Mira daemon fallback output back to the bot dispatcher', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
@@ -2985,6 +3321,29 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       await vi.advanceTimersByTimeAsync(2000);
       expect(String(sessionReply.mock.calls[0][1])).not.toContain('ou_dispatcher_bot');
       expect(onZeroPromptFinal).toHaveBeenCalledWith(ds, { turnId: 'turn-1', content: 'final answer', dispatchRoot: 'om_root' });
+    });
+
+    it('does not @ the dispatcher even when the zero-prompt reply names it', async () => {
+      await bindTopicToDispatcher();
+      writeFileSync(join(config.session.dataDir, 'bots-info.json'), JSON.stringify([
+        { larkAppId: 'cli_orchestrator', botName: 'Orchestrator', cliId: 'claude-code', botOpenId: 'ou_orch_selfview' },
+      ]));
+      writeFileSync(join(config.session.dataDir, 'bot-openids-app_test.json'), JSON.stringify({ Orchestrator: 'ou_dispatcher_bot' }));
+      const sessionReply = vi.fn(async () => 'om_reply');
+      const onZeroPromptFinal = vi.fn(async () => {});
+      initWorkerPool({ sessionReply, onZeroPromptFinal, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      ds.session.cliId = 'antigravity';
+      ds.session.promptInjection = 'none';
+      ds.session.quoteTargetId = 'turn-1';
+      ds.session.quoteTargetSenderOpenId = 'ou_dispatcher_bot';
+      ds.session.quoteTargetSenderIsBot = true;
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), content: '@Orchestrator 做完了' }, 'tag', 0);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(String(sessionReply.mock.calls[0][1])).not.toContain('ou_dispatcher_bot');
+      expect(onZeroPromptFinal).toHaveBeenCalledWith(ds, { turnId: 'turn-1', content: '@Orchestrator 做完了', dispatchRoot: 'om_root' });
     });
 
     it('falls back to the bot admin for a failed zero-prompt turn in a dispatched topic', async () => {
@@ -4106,6 +4465,71 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       if (previousSessionDataDir === undefined) delete process.env.SESSION_DATA_DIR;
       else process.env.SESSION_DATA_DIR = previousSessionDataDir;
       rmSync(sandboxRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('observes native starts per worker generation and exact dispatch attempt', async () => {
+    const bot = getBot('app_test');
+    bot.config.showReplyTiming = true;
+    bot.config.replyFooterEnabled = false;
+    vi.mocked(getBot).mockReturnValue(bot);
+    const ds = makeDs();
+    ds.workerGeneration = 1; ds.session.workerGeneration = 1;
+    ds.turnReceivedAtMs = new Map([['turn-observed', Date.now() - 6000]]);
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_reply'), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', { type: 'turn_execution_started', turnId: 'turn-observed', startedAtMs: Date.now() - 4000 });
+    await vi.advanceTimersByTimeAsync(0);
+    const snapshot = getDaemonReplyCardRenderSnapshot(ds, { turnId: 'turn-observed' });
+    expect(snapshot.timing).toEqual({ executionDurationMs: 4000, waitingDurationMs: 2000, executionInProgress: true });
+    expect(snapshot.footerPreferences.replyFooterEnabled).toBe(false);
+    expect(snapshot.usage).not.toHaveProperty('replyFooter');
+    expect(getDaemonReplyCardRenderSnapshot(ds, { turnId: 'other' }).timing).toBeUndefined();
+    expect(getDaemonReplyCardRenderSnapshot(ds, { turnId: 'turn-observed', dispatchAttempt: 2 }).timing).toBeUndefined();
+    ds.workerGeneration = (ds.workerGeneration ?? 0) + 1; ds.session.workerGeneration = ds.workerGeneration;
+    (ds.worker as any).emit('message', { type: 'turn_execution_started', turnId: 'turn-observed', startedAtMs: Date.now() - 1000 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(getDaemonReplyCardRenderSnapshot(ds, { turnId: 'turn-observed' }).timing).toBeUndefined();
+  });
+
+  it('freezes timing and its display setting across final reply retries', async () => {
+    const bot = getBot('app_test'); bot.config.showReplyTiming = true;
+    vi.mocked(getBot).mockReturnValue(bot);
+    const sessionReply = vi.fn().mockRejectedValueOnce(new Error('transient')).mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.turnReceivedAtMs = new Map([['turn-1', Date.now() - 7000]]);
+    const msg = { ...finalOutputMsg(), durationMs: 5000, executionStartedAtMs: Date.now() - 5000 };
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, msg, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(0);
+    bot.config.showReplyTiming = false;
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls[0][1]).toContain('5.0');
+    expect(sessionReply.mock.calls[0][1]).toContain('2.0');
+    expect(sessionReply.mock.calls[1][1]).toBe(sessionReply.mock.calls[0][1]);
+  });
+
+  it('keeps the entire footer hidden across daemon final-output retries', async () => {
+    const bot = getBot('app_test');
+    bot.config.replyFooterEnabled = false;
+    vi.mocked(getBot).mockReturnValue(bot);
+    const sessionReply = vi.fn().mockRejectedValueOnce(new Error('transient')).mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.activeModel = 'observed-model';
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(0);
+    // A retry must use the first render policy, even if settings later change.
+    bot.config.replyFooterEnabled = true;
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    for (const call of sessionReply.mock.calls) {
+      expect(call[1]).not.toContain('botmux_reply_footer');
+      expect(call[1]).not.toContain('observed-model');
+      expect(call[1]).not.toContain('"tag":"hr"');
     }
   });
 

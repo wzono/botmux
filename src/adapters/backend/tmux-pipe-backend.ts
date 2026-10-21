@@ -296,6 +296,18 @@ export function __testOnly_liveFifoReaderCount(): number {
   return liveFifoReaders.size;
 }
 
+/** `<server pid> <session id> <created>`: session ids restart at `$0` with
+ *  every new tmux server, so the server pid and creation time are part of it. */
+const SESSION_IDENTITY_FORMAT = '#{pid} #{session_id} #{session_created}';
+
+const RETIRE_KILLED = 'botmux-retired-own-session';
+const RETIRE_KEPT = 'botmux-kept-session';
+
+function parseSessionIdentity(raw: string): string | null {
+  const identity = raw.trim();
+  return /^\d+ \$\d+ \d+$/.test(identity) ? identity : null;
+}
+
 export class TmuxPipeBackend implements SessionBackend {
   readonly supportsRawCommandPasteLine = true;
   /** Real tmux pane address (e.g. "0:2.0") or botmux session name (bmx-*). */
@@ -360,6 +372,11 @@ export class TmuxPipeBackend implements SessionBackend {
   private exited = false;
   /** Set after pipe-pane subscription is active so kill() knows to cancel it. */
   private pipeAttached = false;
+  /** Identity of the session THIS spawn() created (`<server pid> <session id>
+   *  <created>`), so a spawn that fails after creating it can retire exactly
+   *  that session — never a same-named one another generation created. The
+   *  server pid matters: session ids restart at `$0` with every new server. */
+  private createdSession: { id: string; identity: string } | null = null;
   private readonly createSession: boolean;
   private readonly ownsSession: boolean;
   private readonly _isReattach: boolean;
@@ -399,6 +416,12 @@ export class TmuxPipeBackend implements SessionBackend {
   /** spawn() sets up the pipe-pane subscription + fifo reader. In managed
    *  mode it first creates a detached bmx-* tmux session that runs the CLI. */
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
+    const instanceIdentity = opts.env?.BOTMUX_CODEX_INSTANCE_BINDING;
+    if (this.ownsSession && !this.createSession && instanceIdentity) {
+      // Fence managed reattachment before options or pipe-pane can touch the
+      // existing session. User-owned adopted panes need no Botmux marker.
+      TmuxBackend.assertInstanceIdentity(this.paneTarget, instanceIdentity);
+    }
     // Self-heal a server polluted by a pre-upgrade botmux before we touch it
     // (once per daemon process; no-op on a server this build booted clean).
     // TmuxPipeBackend is the live backend on this path, so the scrub must be
@@ -1123,6 +1146,14 @@ export class TmuxPipeBackend implements SessionBackend {
   }
 
   private createDetachedSession(bin: string, args: string[], opts: SpawnOpts): void {
+    const instanceIdentity = opts.env?.BOTMUX_CODEX_INSTANCE_BINDING;
+    // `new-session -e` only exists since tmux 3.2 (3.0/3.1 reject it with
+    // "unknown flag", a deterministic non-retryable launch failure). On older
+    // or unparsable versions the binding is written with set-environment after
+    // a proven-fresh creation instead. Unknown version deliberately takes the
+    // conservative path (never send a flag the server may not understand).
+    const tmuxVersion = getTmuxVersionCached();
+    const newSessionAcceptsE = tmuxVersionAtLeast(tmuxVersion, 3, 2);
     const shellSpec = opts.strictEnv ? { shell: '/bin/sh', flags: [] } : resolveUserShell(process.env, opts.launchShell);
     const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv);
     const script = shellWrapperScript(
@@ -1132,9 +1163,16 @@ export class TmuxPipeBackend implements SessionBackend {
     const argv = [
       'new-session',
       '-d',
+      // Have tmux print the identity of the session THIS command created,
+      // atomically with creating it (see createdSession).
+      '-P', '-F', SESSION_IDENTITY_FORMAT,
       '-s', this.paneTarget,
       '-x', String(opts.cols),
       '-y', String(opts.rows),
+      // On >= 3.2 mark atomically at creation, so a session whose creating
+      // reply was lost to a timeout still carries the binding and can be
+      // adopted via the duplicate path below.
+      ...(instanceIdentity && newSessionAcceptsE ? ['-e', `BOTMUX_CODEX_INSTANCE_BINDING=${instanceIdentity}`] : []),
       '--',
       ...(opts.strictEnv ? strictPaneCommand(bin, args, opts) : shellCommandArgv(shellSpec, script, [
         opts.cwd,
@@ -1148,19 +1186,23 @@ export class TmuxPipeBackend implements SessionBackend {
     // (bad option, …) is re-thrown at once. "duplicate session" on a RETRY
     // means an earlier timed-out attempt actually created the session
     // server-side → treat as success.
+    let createdIdentity: string | null = null;
     for (let attempt = 0; ; attempt++) {
       try {
-        execFileSync('tmux', argv, {
+        const printed = execFileSync('tmux', argv, {
           cwd: opts.cwd,
-          stdio: ['ignore', 'ignore', 'pipe'],
+          stdio: ['ignore', 'pipe', 'pipe'],
           timeout: 5000,
           env: tmuxEnv(opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : opts.env),
         });
+        createdIdentity = parseSessionIdentity(String(printed ?? ''));
         break;
       } catch (err: any) {
         const stderrText = (err?.stderr?.toString?.() ?? '').trim();
         if (attempt > 0 && /duplicate session/i.test(stderrText)) {
           if (opts.strictEnv) throw new Error('Refusing unverified strict tmux-pipe generation after a startup retry');
+          // Either an earlier timed-out attempt of ours or a racing creator made
+          // it — unprovable, so this spawn never claims (or retires) it.
           break;
         }
         if (!isRetryableStartupTmuxFailure(err) || attempt >= STARTUP_TMUX_RETRY_DELAYS_MS.length) {
@@ -1173,7 +1215,63 @@ export class TmuxPipeBackend implements SessionBackend {
         startupRetrySleepFn(STARTUP_TMUX_RETRY_DELAYS_MS[attempt]);
       }
     }
+    // Only the identity tmux printed for the creating command proves
+    // ownership; a by-name lookup could return a racing creator's session.
+    this.createdSession = createdIdentity
+      ? { id: createdIdentity.split(' ')[1]!, identity: createdIdentity }
+      : null;
+    // Pre-3.2 (or unknown) tmux: persist the binding in the session
+    // environment AFTER a proven-fresh creation, since new-session could not
+    // set it atomically. set-environment exists on every supported tmux and
+    // writes only this session's table (never -g). A duplicate (a timed-out
+    // earlier create or a concurrent creator) is never written to — it must
+    // pass assertInstanceIdentity first, otherwise we could stamp our binding
+    // onto another instance's session. If this write fails the assert below
+    // fails too, spawn throws, and the worker retires the session we created.
+    if (this.createdSession && instanceIdentity && !newSessionAcceptsE) {
+      execFileSync('tmux',
+        ['set-environment', '-t', this.paneTarget, 'BOTMUX_CODEX_INSTANCE_BINDING', instanceIdentity],
+        { stdio: ['ignore', 'ignore', 'pipe'], timeout: 5000, env: tmuxEnv() });
+    }
+    // Fence both shapes before changing options or subscribing output: a
+    // duplicate must carry the expected binding; on the fresh path this also
+    // re-reads the marker just written/created (redundant but fail-closed —
+    // only a millisecond-scale server stall right after creation can make it
+    // throw, and the next worker cycle reattaches with the pane preserved).
+    if (instanceIdentity) TmuxBackend.assertInstanceIdentity(this.paneTarget, instanceIdentity);
     this.applySessionOptions();
+  }
+
+  /**
+   * After spawn() threw: kill the tmux session this very spawn() created, if
+   * any. Used by the worker before it rolls back the session's sandbox tree;
+   * the caller re-probes by name to decide (anything but an authoritative
+   * `missing` keeps the tree). Returns whether our own session was killed.
+   *
+   * The identity check and the kill are ONE server-side command (`if-shell -F`
+   * evaluates the condition and runs the kill in the same server's queue): with
+   * a check-then-kill pair, a server that exits in between could be replaced by
+   * one that hands the saved id (`$0`) to an unrelated session, and the kill
+   * would land there. A different server fails the `#{pid}` comparison.
+   */
+  retireSessionCreatedBySpawn(): boolean {
+    const created = this.createdSession;
+    if (!created) return false;
+    const [serverPid, sessionId, createdAt] = created.identity.split(' ');
+    const ours = `#{&&:#{==:#{pid},${serverPid}},#{&&:#{==:#{session_id},${sessionId}},#{==:#{session_created},${createdAt}}}}`;
+    let outcome = '';
+    try {
+      outcome = execFileSync('tmux', [
+        'if-shell', '-F', '-t', sessionId!, ours,
+        `display-message -p ${RETIRE_KILLED} ; kill-session -t '${sessionId}'`,
+        `display-message -p ${RETIRE_KEPT}`,
+      ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000, env: tmuxEnv() });
+    } catch {
+      return false;
+    }
+    if (!outcome.split('\n').includes(RETIRE_KILLED)) return false;
+    this.createdSession = null;
+    return true;
   }
 
   private applySessionOptions(): void {

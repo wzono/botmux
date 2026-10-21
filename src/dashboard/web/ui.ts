@@ -51,8 +51,9 @@ class DashboardUiState {
   // Effective dashboard sharing policy. When enabled, tokenless visitors may
   // read allow-listed dashboard data; it does not downgrade authenticated users.
   publicReadOnly = false;
-  // 「终端」页（宿主 shell）只对本机 legacy 管理身份开放——比 `authed` 窄：平台协管者
-  // authed 但不能拿宿主 shell。服务端 /api/settings 的 `hostTerminal` 写入，默认关。
+  // 「终端」页（宿主 shell）只对本机 legacy 管理身份开放——比 `authed` 窄：带平台角色头
+  // 的协管者 authed 但不能拿宿主 shell（平台机器 Dashboard `m-` 反代不带角色头，那里进来
+  // 的机器主人和协管者就是 legacy 身份）。服务端 /api/settings 的 `hostTerminal` 写入，默认关。
   hostTerminal = false;
   private listeners = new Set<UiListener>();
   private translate = createDashboardTranslator(this.locale);
@@ -336,6 +337,13 @@ export function overrideBotAvatar(larkAppId: string, name: string | undefined, u
   persistAvatarCache();
 }
 
+/** 名称 / 头像映射每次从服务端刷新成功就 +1；按会话行缓存展示文本的地方（⌘K 面板）据此失效。 */
+let nameMapsGeneration = 0;
+
+export function nameMapsVersion(): number {
+  return nameMapsGeneration;
+}
+
 export function loadNameMaps(): Promise<void> {
   nameMapsPromise ??= (async () => {
     try {
@@ -364,6 +372,7 @@ export function loadNameMaps(): Promise<void> {
         if (c.chatId && c.avatar) chatAvatarById.set(c.chatId, String(c.avatar));
       }
       persistAvatarCache(); // 刷新本地缓存，下次冷加载首屏即出头像
+      nameMapsGeneration += 1;
     } catch {
       // 失败不缓存（dashboard 刚启动 /api/groups 可能短暂 503）——
       // 清掉 memo，下一个页面 mount / strip 重绘再重试；期间显示原始 id。
@@ -376,6 +385,11 @@ export function loadNameMaps(): Promise<void> {
 /** 按 larkAppId 查注册表友好名（含 localStorage 回灌的缓存）；查不到返回 undefined。 */
 export function botNameForAppId(appId?: string): string | undefined {
   return appId ? botNameByAppId.get(appId) : undefined;
+}
+
+/** 注册表里已知友好名的全部 bot（⌘K 面板的「机器人」条目）；loadNameMaps / 本地缓存回灌后才有。 */
+export function knownBots(): Array<{ larkAppId: string; name: string }> {
+  return [...botNameByAppId.entries()].map(([larkAppId, name]) => ({ larkAppId, name }));
 }
 
 /** 会话所属 bot 的显示名：注册表友好名 → 会话自带 botName（非 id 时）→ id。 */

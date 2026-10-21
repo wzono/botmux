@@ -9,7 +9,7 @@ import {
 } from './reply-card-footer-signature.js';
 import { hasBotmuxCallbackMarker } from './callback-button-marker.js';
 import { extractFeishuCardMarkdownImageKeys } from './card-markdown-image-references.js';
-import { stripTrailingGroupContextCardPurposeMarker } from './group-context-card.js';
+import { stripTrailingGroupContextCardPurposeMarker, hasTrailingGroupContextMediaPurposeMarker } from './group-context-card.js';
 
 // Event data structure from WSClient im.message.receive_v1
 // sender is at data top-level, NOT inside data.message
@@ -1381,7 +1381,8 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer, m
                 ? stripTrailingGroupContextCardPurposeMarker(node.text)
                 : node.text;
               if (visibleText !== node.text
-                && (paragraphIndex !== lastMeaningfulParagraphIndex || paragraphIndex === 0)) {
+                && (hasTrailingGroupContextMediaPurposeMarker(node.text)
+                  || paragraphIndex !== lastMeaningfulParagraphIndex || paragraphIndex === 0)) {
                 if (visibleText) textNodes.push(visibleText);
                 continue;
               }
@@ -1539,11 +1540,6 @@ export function isPlaceholderOnlyText(text: string): boolean {
     .replaceAll(CARD_EMBEDDED_PLACEHOLDER, '')
     .trim();
   return stripped === '';
-}
-
-/** Wrap merged text so extractCardContent returns it verbatim downstream. */
-export function wrapResolvedCardText(text: string): string {
-  return JSON.stringify({ [RESOLVED_TEXT_KEY]: text });
 }
 
 /** Strip inline markup (font/text_tag tags, bold markers) but keep text,
@@ -1744,7 +1740,7 @@ const BOTMUX_INTERNAL_CARD_ACTIONS: ReadonlySet<string> = new Set([
   'toggle_stream', 'tui_keys', 'tui_text_input', 'voice_summary',
   // pendingRepo gates
   'repo_manual_submit', 'repo_worktree_submit', 'skip_repo',
-  'worktree_toggle_mode',
+  'worktree_toggle_mode', 'repo_rebuild_worktree',
   // config / grant / relay cards
   'config_toggle', 'config_set', 'config_quota', 'config_quota_open',
   'config_quota_save', 'config_text_open', 'config_text_save',
@@ -1866,7 +1862,7 @@ function extractCardHeaderTagTexts(header: unknown): string[] {
  *  table into extra rows. */
 function cardTableCellText(value: unknown): string {
   const text = nestedCardText(value);
-  return (text ?? '')
+  return stripTrailingGroupContextCardPurposeMarker(text ?? '')
     .replace(/\r\n?/g, '\n')
     .replace(/\\/g, '\\\\')
     .replace(/\|/g, '\\|')
@@ -2053,7 +2049,8 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   // alt is often the only machine-readable description of what the image shows.
   if (tag === 'img' || tag === 'image') {
     const k = el.image_key ?? el.img_key;
-    const alt = (typeof el.alt === 'string' ? el.alt : el.alt?.content)?.trim();
+    const rawAlt = typeof el.alt === 'string' ? el.alt : el.alt?.content;
+    const alt = typeof rawAlt === 'string' ? stripTrailingGroupContextCardPurposeMarker(rawAlt).trim() : undefined;
     if (k) parts.push(alt ? withImgAlt(imgLabel(k), alt) : imgLabel(k));
   }
 
