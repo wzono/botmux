@@ -316,7 +316,8 @@ vi.mock('../src/setup/owner-identity.js', () => ({
 
 vi.mock('../src/im/lark/client.js', () => ({
   // ou_ passes through literally (the reason the owner-identity probe exists);
-  // on_xxx → ou_xxx (except on_ghost). Used by the real setBotAllowedUsers behind /botconfig.
+  // on_xxx → ou_xxx (except on_ghost); emails/mobiles stay unresolved here
+  // (modeling a definitive miss). Used by the real setBotAllowedUsers behind /botconfig.
   resolveAllowedUsersWithMap: vi.fn(async (_appId: string, raw: string[]) => {
     const map = new Map<string, string>();
     const entryStatus = new Map<string, 'resolved' | 'transient' | 'definitive'>();
@@ -327,7 +328,8 @@ vi.mock('../src/im/lark/client.js', () => ({
       if (id) { resolved.push(id); map.set(v, id); entryStatus.set(v, 'resolved'); }
       else entryStatus.set(v, 'definitive');
     }
-    return { resolved, map, entryStatus };
+    const definitiveMisses = raw.filter(v => entryStatus.get(v) === 'definitive');
+    return { resolved, map, entryStatus, definitiveMisses };
   }),
   updateMessage: vi.fn(async () => {}),
   MessageWithdrawnError: class extends Error {},
@@ -411,6 +413,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   }),
   isSessionTransferring: vi.fn(() => false),
   updateCodexAppEffort: vi.fn(async () => ({ status: 'applied' })),
+  updateCodexCliEffort: vi.fn(async () => ({ status: 'future_only', reason: 'cli_next_turn' })),
   sendWorkerSessionInput: vi.fn(() => true),
   // /close routes the「会话已关闭」card through this: ephemeral (visible-to-you)
   // when the chat supports it, else the visible reply fallback. The stub just
@@ -675,7 +678,7 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, updateCodexAppEffort, sendWorkerSessionInput, withActiveSessionKeyLock, postFreshStreamingCard, reconcileBotStreamingCardPins } from '../src/core/worker-pool.js';
+import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, updateCodexAppEffort, updateCodexCliEffort, sendWorkerSessionInput, withActiveSessionKeyLock, postFreshStreamingCard, reconcileBotStreamingCardPins } from '../src/core/worker-pool.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
@@ -1604,6 +1607,17 @@ describe('/botconfig set allowedUsers surfaces owner-identity verdicts', () => {
     expect(replies).toHaveLength(1);
     expect(replies[0]).toContain(t('cmd.config.allow_ok', { count: 1, total: 2 }, 'zh'));
     expect(replies[0]).toContain(t('cmd.config.allow_warn_union', { items: 'on_ghost' }, 'zh'));
+  });
+
+  it('writes but warns in /botconfig when an email/mobile definitively fails to resolve', async () => {
+    // 邮箱确定性解析失败：照常落盘（可能临时不可见），回复里点名未生效条目，
+    // 且不与 union_id 告警串台。
+    const { replies, stored } = await runAllow('/botconfig set allowedUsers ou_sender, ghost@corp.com 确认', []);
+    expect(stored).toEqual(['ou_sender', 'ghost@corp.com']);
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toContain(t('cmd.config.allow_ok', { count: 1, total: 2 }, 'zh'));
+    expect(replies[0]).toContain(t('cmd.config.allow_warn_contacts', { items: 'ghost@corp.com' }, 'zh'));
+    expect(replies[0]).not.toContain('union_id');
   });
 });
 
@@ -3421,11 +3435,28 @@ describe('handleCommand', () => {
       expect(dismissSessionGroup).not.toHaveBeenCalled();
     });
     it('reports successful deletion privately rather than to the deleted group', async () => {
-      vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'dismissed' });
+      vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'dismissed', workingDirs: ['/home/testuser/project'] });
       const deps = makeDeps();
       await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss --confirm=' + 'a'.repeat(64), { chatId: CHAT_ID }), deps, LARK_APP_ID);
-      expect(sendUserMessage).toHaveBeenCalledWith(LARK_APP_ID, 'ou_sender', expect.stringContaining('已解散'));
+      expect(sendUserMessage).toHaveBeenCalledWith(LARK_APP_ID, 'ou_sender', expect.stringContaining('已解散'), 'interactive');
+      // A main checkout is never offered for deletion.
+      expect(vi.mocked(sendUserMessage).mock.calls[0]![2]).not.toContain('dismiss_cleanup_wt');
+      expect(putWorktreeCleanupJob).not.toHaveBeenCalled();
       expect(deps.sessionReply).not.toHaveBeenCalled();
+    });
+    it('offers one-click cleanup of the linked worktrees the closed sessions used', async () => {
+      vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'dismissed', workingDirs: ['/home/testuser/project-wt-task'] });
+      vi.mocked(isLinkedWorktree).mockResolvedValueOnce(true);
+      await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss --confirm=' + 'a'.repeat(64), { chatId: CHAT_ID }), makeDeps(), LARK_APP_ID);
+      expect(putWorktreeCleanupJob).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+        larkAppId: LARK_APP_ID, worktreeMain: '/home/testuser/project',
+        worktreeDir: '/home/testuser/project-wt-task', safetyFingerprint: 'clean-state',
+      }));
+      const card = JSON.parse(vi.mocked(sendUserMessage).mock.calls[0]![2] as string);
+      const button = card.body.elements.find((e: any) => e.tag === 'button');
+      expect(button.behaviors[0].value).toEqual({ action: 'dismiss_cleanup_wt', job_ids: 'cleanup-123', invoker_open_id: 'ou_sender' });
+      expect(JSON.stringify(card)).toContain('/home/testuser/project-wt-task');
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
     });
     it('rejects unsupported arguments without executing', async () => {
       await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss --yes', { chatId: CHAT_ID }), makeDeps(), LARK_APP_ID);
@@ -4746,6 +4777,8 @@ describe('handleCommand', () => {
       expect(replyContent).toContain('/help');
       expect(replyContent).toContain('/schedule');
       expect(replyContent).toContain('/login');
+      expect(replyContent).toContain('/adopt orca:<terminal>');
+      expect(replyContent).toContain('实验性');
       expect(replyContent).toContain('/workflow <目标>');
       expect(replyContent).toContain('/workflow run <名称>');
       expect(replyContent).toContain('/workflow save last');
@@ -10104,6 +10137,20 @@ describe('/term — operable terminal slash command (operator / canOperate)', ()
 });
 
 describe('Codex App /effort command', () => {
+  it('uses the CLI menu path and explicitly reports next-turn scope', async () => {
+    vi.clearAllMocks();
+    vi.mocked(canOperate).mockReturnValue(true);
+    const ds = makeDaemonSession({ session: makeSession({ cliId: 'codex' }), lastScreenStatus: 'working' });
+    const deps = makeDeps(ds);
+    await handleCommand('/effort', ROOT_ID, makeLarkMessage('/effort max'), deps, LARK_APP_ID);
+    expect(updateCodexCliEffort).toHaveBeenCalledWith(ds, 'max');
+    expect(updateCodexAppEffort).not.toHaveBeenCalled();
+    expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID,
+      t('cmd.effort.cli_next_turn', { effort: 'max', choices: '' }), undefined, LARK_APP_ID, 'msg_001');
+    expect(sendWorkerSessionInput).not.toHaveBeenCalled();
+    expect(requestSessionRestart).not.toHaveBeenCalled();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(canOperate).mockReturnValue(true);

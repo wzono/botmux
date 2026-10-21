@@ -72,7 +72,7 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
 - **[群内真人独立 lane](docs/principal-lanes.md)** — 可复用 Dashboard 的「跨身份打断隔离（XPI）」开关，让同一群里的真人各用独立 CLI 上下文和 git worktree；消息仍公开可见，引用别人的任务仍可走建议/确认协作。
 - **[多话题并行编排](https://deepcoldy.github.io/botmux/multi-topic)** — 给编排者一个大任务，它自动在群里种话题、拉各 bot 起独立会话跑流水线，飞书任务面板一眼看完所有子任务进度。
 - **[可交互 Web 终端](https://deepcoldy.github.io/botmux/web-terminal)** — 不只是看输出，浏览器 / 手机直接操作 CLI，移动端带悬浮快捷键栏（Esc、Ctrl+C、方向键）。
-- **[会话接入 & 接力](https://deepcoldy.github.io/botmux/adopt)** — 本地 tmux 里跑到一半，手机 `/adopt` 接管；`/relay` 把整个会话（原进程、原记忆）搬进团队群继续。
+- **[会话接入 & 接力](https://deepcoldy.github.io/botmux/adopt)** — tmux / Zellij / Herdr / Orca（实验性）里跑到一半，手机 `/adopt` 接入；`/relay` 把整个会话（原进程、原记忆）搬进团队群继续。
 - **[定时任务](https://deepcoldy.github.io/botmux/schedule) & [外部触发](https://deepcoldy.github.io/botmux/webhook)** — 自然语言配周期任务（报警分析 / 群总结）；从外部系统编程式触发用 [Webhook](https://deepcoldy.github.io/botmux/webhook) 或 [API 任务触发](https://deepcoldy.github.io/botmux/api-task-trigger)。
 - **[Oncall 模式](https://deepcoldy.github.io/botmux/oncall) & [语音总结](https://deepcoldy.github.io/botmux/voice)** — 拉进 oncall 群，任何成员 @ 即在项目目录排查；配好 TTS 后每张卡片页脚会多一个 🔊 语音总结按钮，让模型「说人话」。
 
@@ -86,13 +86,15 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
 
 支持范围复用 CLI 的最终回复兜底采集能力：目前包括 Claude Code、Codex、TraeX、CoCo、Hermes、MTR、Pi、Oh My Pi、ebsd、Grok，以及仅在零注入下启用转写采集的 Cursor、Antigravity（这两者常规模式仍通过 `botmux send` 回复，故默认不采集；均限 PTY、tmux 等本地后端，Codex / TraeX 可走 RPC 输入）。暂不支持远端后端和 v3 workflow；Cursor、Antigravity 的转写目录（`~/.cursor`、`~/.gemini`）在 oncall 沙箱（`sandbox: true`/`oncall`、读隔离、`BOTMUX_SANDBOX`）中以目录级 bind 直挂宿主真实路径，零注入可与其同时使用；全根 COW 的 `sandbox: "scratch"` 暂不支持这两者（结构化桥尚未解析 merged 视图，会直接报错而非静默丢回复）。Antigravity 的静默终态需经视口确认，故暂不支持 `zmx` 后端（Cursor 的终态即时采集，不受此限）。CLI 的共享技能目录若存在全局安装的 `botmux-*` 技能，会拒绝启动以免假称零注入；请使用按会话的技能注入方式或独立 home，不会删除其它 bot 共用的文件。
 
-普通协作可直接在群内 @ 执行 bot，最终回答自动回复当前会话，并默认 @ 本轮任务的发起人（真人或 bot）。收件人取自宿主记录的本轮身份，排队和重试不借用后续轮次的发送者；缺少可用身份时不猜测会话 owner，也不注入额外 prompt。已经 @ 发起 bot 的回复本身就是回报，不再额外通过 HTTP 重复追加一轮任务。
+普通协作可直接在群内 @ 执行 bot，最终回答自动回复当前会话，并默认 @ 本轮任务的发起人（真人或 bot）。收件人取自宿主记录的本轮身份，排队和重试不借用后续轮次的发送者；缺少可用身份时不猜测会话 owner，也不注入额外 prompt。已经 @ 发起 bot 的回复本身就是回报，不再额外通过 HTTP 重复追加一轮任务。回答正文用完整显示名点名群内其它 bot（如 `@Reviewer 请合并`）时，与 `botmux send` 一样就地换成真正的 @，被点名的 bot 才会被唤醒；这时不再 @ 真人发起人，点名的 bot 解析不出身份时宁可不 @ 任何人，发起 bot 仍照常被 @。代码里的名字、私聊和失败通知不受影响。
 
 零注入会话也默认回传 Web 终端中的最终回答：`/rewind` 重跑和随后直接输入的多轮对话，都沿用最新飞书发起人的回复位置和 @，以普通回复卡发送，不附加终端来源或复述输入。每个终端回合开始时固定回复对象，新飞书消息只影响之后开始的回合；`/model` 等设置命令、菜单输出和已有历史不回传。该行为复用原生转写监听，不增加开关或 prompt；普通模式和 `/adopt` 保持原行为。
 
 没有通过 @ 发起 bot 回报时，已建立签名回报绑定的 `botmux dispatch --bot-app <稳定 App ID>` 派单仍可自动回报原 lead：sub 的 daemon 根据绑定去掉自动附加的 report/send 指令，每轮最终回答回报一次，不自动判定任务完成。回报使用独立重试和持久化去重回执，失败不影响子会话回复；lead 正常在原会话回复，不进入 HTTP 结果轮询。提交结果不明时拒绝自动重放。`dispatch --into` 向此前没有派单记录的普通消息追加任务不会创建该绑定，仍会保留完成指令，不能据此验证零注入。
 
 ## 支持的 CLI / Agent
+
+可选的 [OpenViking 共享记忆示例](examples/openviking-memory/README.md)让所有具备 shell 的 coding agent 共用用户与项目记忆，自主搜索、读取和保存重要结论。**默认关闭**，通过公共 Skill/CLI 显式绑定本地 Agent 或单用户 Bot；Codex 自动会话采集作为独立可选适配。（该示例仅存在于源码仓库的 `examples/`，npm 包不打包 `examples/`，此链接在 npm 页面不可达。）
 
 `bots.json` 里用 `cliId` 一键切换。**20+ 适配器**，覆盖本地 CLI（进程隔离，`tmux attach` 可直连）和 API / 云 Agent（如 Mira、riff——通过 API / 远端接入，非本地进程；mojo 为 API 驱动、默认在宿主机执行工具，可配 cloud: true 走云沙箱）。代表项：
 

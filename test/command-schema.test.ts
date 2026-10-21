@@ -62,8 +62,8 @@ describe('command schema ↔ 冻结的 legacy 集合', () => {
     for (const n of all) expect(n).toMatch(/^\/[a-z][a-z0-9-]*$/);
     expect(commandSpec('/G')?.name).toBe('/group');
   });
-  it('/effort 仅为 Codex App 注册，不遮蔽其它 CLI 的透传', () => {
-    expect(commandSpec('/effort')).toMatchObject({ cliId: 'codex-app', sessionPolicy: 'existingOnly' });
+  it('/effort 为 Codex CLI 与 App 注册，不遮蔽其它 CLI 的透传', () => {
+    expect(commandSpec('/effort')).toMatchObject({ cliId: ['codex-app', 'codex'], sessionPolicy: 'existingOnly' });
     expect(DAEMON_COMMANDS.has('/effort')).toBe(false);
     expect(EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has('/effort')).toBe(false);
     expect(PASSTHROUGH_COMMANDS.has('/effort')).toBe(true);
@@ -78,6 +78,11 @@ describe('command schema ↔ /help 文案', () => {
         expect(key in en, `en 缺 ${key}（${spec.name}）`).toBe(true);
       }
     }
+  });
+  it('/adopt 帮助同时覆盖通用目标与实验性 Orca 直连', () => {
+    expect(commandSpec('/adopt')?.help).toEqual(['help.adopt', 'help.adopt_pane', 'help.adopt_orca']);
+    expect(zh['help.adopt_orca']).toContain('实验性');
+    expect(en['help.adopt_orca']).toContain('experimental');
   });
   // 源码结构护栏(K4)：/help 的键是在 handleCommand 的 `case '/help'` 块里内联拼的，没有可 import 的键表；只能读源码确认
   // 每个用到的 help.* 键都归属 schema 里的某个命令或登记过的非命令键，防止 schema（唯一事实源，#1434）与 /help 漂移。
