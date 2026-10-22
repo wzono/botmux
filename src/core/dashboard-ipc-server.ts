@@ -8,7 +8,7 @@ import { resolveWorkspace } from './workspace-metadata.js';
 import { canOperate } from '../im/lark/event-dispatcher.js';
 import { parseHandoffCardEvent } from './handoff-card-lifecycle.js';
 import { updateHandoffLiveCard } from './worker-pool.js';
-import { authorizeOwnerlessScheduleCreator } from './schedule-creator-authorization.js';
+import { authorizeOwnerlessScheduleCreator, authorizeScheduleOperator } from './schedule-creator-authorization.js';
 import { readAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { randomBytes } from 'node:crypto';
@@ -682,6 +682,8 @@ function rejectProtectedSessionMutation(
   const bySessionId = new Map<string, {
     sessionId: string;
     cliId?: string;
+    /** Lets the dashboard name the blocking session instead of a bare id. */
+    title?: string;
     reasons: ReturnType<typeof protectedSessionMutationReasons>;
   }>();
   for (const value of values) {
@@ -696,6 +698,7 @@ function rejectProtectedSessionMutation(
     bySessionId.set(session.sessionId, {
       sessionId: session.sessionId,
       ...(session.cliId ? { cliId: session.cliId } : {}),
+      ...(session.title ? { title: session.title } : {}),
       reasons,
     });
   }
@@ -1331,12 +1334,14 @@ async function handleManagedOriginAttestation(
   // authorization for this exact caller/turn, never a client-selected identity.
   let scheduleBot;
   try { scheduleBot = getBot(ds.larkAppId); } catch { /* unavailable => denied */ }
-  const scheduleCreator = authorizeOwnerlessScheduleCreator({
+  const scheduleCaller = {
     callerOpenId: origin.callerOpenId,
     allowedUsers: scheduleBot?.config.allowedUsers,
     resolvedAllowedUsers: scheduleBot?.resolvedAllowedUsers,
     resolutionCache: readAllowedUsersResolveCache(config.session.dataDir, ds.larkAppId),
-  });
+  };
+  const scheduleCreator = authorizeOwnerlessScheduleCreator(scheduleCaller);
+  const scheduleOperator = authorizeScheduleOperator(scheduleCaller);
   let proofPath: string;
   try {
     proofPath = writeManagedOriginAttestationProof({
@@ -1349,6 +1354,7 @@ async function handleManagedOriginAttestation(
         sessionId,
         turnId: liveTurnId,
         scheduleCreator,
+        scheduleOperator,
         ...(origin.callerOpenId ? { callerOpenId: origin.callerOpenId } : {}),
         larkAppId: ds.larkAppId,
         ...(origin.dispatchAttempt !== undefined
@@ -7662,7 +7668,7 @@ ipcRoute('POST', '/api/bot-slash-commands/delete', async (req, res) => {
 // (UI shows "上次启用时间").
 
 ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => {
-  const { defaultOncall, autoboundChats } = oncallStore.getBotDefaultOncall(cachedLarkAppId);
+  const { defaultOncall, autoboundChats, oncallChatCount } = oncallStore.getBotDefaultOncall(cachedLarkAppId);
   const cardPrefs = cardPrefsStore.getBotCardPrefs(cachedLarkAppId);
   const grantPrefs = grantPrefsStore.getBotGrantPrefs(cachedLarkAppId);
   let replyStyle: ReplyStyleConfig | null = null;
@@ -7861,7 +7867,10 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     schedulePreconditionFileRoot: schedulePreconditionTrustedFilesRoot(),
     defaultWorkingDir,
     defaultWorkingDirAutoWorktree,
+    // 「自动绑定机会已用过」的群数（含已解绑 / 切模式释放的），不是当前绑定数；
+    // 当前绑定数是 oncallChatCount。
     autoboundChatCount: autoboundChats.length,
+    oncallChatCount,
     brandLabel: brandStore.getBotBrandLabel(cachedLarkAppId) ?? null,
     replyStyle,
     askOptionLayout,
@@ -7900,6 +7909,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     codexBrowser: cardPrefs.codexBrowser,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
     privateCard: cardPrefs.privateCard,
+    replyCardActions: cardPrefs.replyCardActions,
     cotEnabled: cardPrefs.cotEnabled,
     senderTag: cardPrefs.senderTag,
     senderTagHideEmail: cardPrefs.senderTagHideEmail,
@@ -8047,7 +8057,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     thinkingCardToolResult?: unknown;
     usageDisplay?: unknown;
     replyCardMode?: unknown;
-    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
+    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; replyCardActions?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
     botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown; autoStartExcludedChats?: unknown; autoInviteOwnerOnGroupAdd?: unknown;
     groupJoinCommandEnabled?: unknown; groupJoinCommand?: unknown;
@@ -8064,7 +8074,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     thinkingCardToolResult?: boolean;
     usageDisplay?: UsageDisplayMode;
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
-    disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; cotEnabled?: boolean;
+    disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; replyCardActions?: boolean; cotEnabled?: boolean;
     botToBotSameDir?: boolean;
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean; autoStartExcludedChats?: string[]; autoInviteOwnerOnGroupAdd?: boolean;
     groupJoinCommandEnabled?: boolean; groupJoinCommand?: string;
@@ -8112,6 +8122,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   if (typeof body.thinkingCardToolResult === 'boolean') patch.thinkingCardToolResult = body.thinkingCardToolResult;
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
+  if (typeof body.replyCardActions === 'boolean') patch.replyCardActions = body.replyCardActions;
   if (typeof body.cotEnabled === 'boolean') patch.cotEnabled = body.cotEnabled;
   // [legacy-thinkingCard] 旧名请求仍接受；随 normalizeCotEnabled 一并移除（不早于 v3.33.0）。
   else if (typeof body.thinkingCard === 'boolean') patch.cotEnabled = body.thinkingCard;
@@ -9812,7 +9823,10 @@ ipcRoute('PUT', '/api/bot-read-isolation', requireBoundBot(async (req, res) => {
           backendType,
           session.sessionId,
         );
-        const probe = backendType === 'zmx'
+        // tmux rows may be frozen onto the dedicated socket (`socketName`); a
+        // name-only probe would ask the default server and read a live pane as
+        // gone. Rows without it resolve to the historical default-server target.
+        const probe = backendType === 'zmx' || backendType === 'tmux'
           ? persistentBackend.probePersistentBackendTarget(persistentBackend.resolvePersistentBackendTarget(
             backendType, session.sessionId, session.persistentBackendTarget,
           ))
