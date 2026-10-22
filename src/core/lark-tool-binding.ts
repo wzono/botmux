@@ -155,6 +155,9 @@ export function prepareLarkToolEnv(input: {
   const runner = input.runner ?? (moduleDir.endsWith('/src/core')
     ? { command: process.execPath, args: [...sourceExecArgs, resolve(moduleDir, '../lark-tool-runner.ts')] }
     : resolveEntrySpawn('lark-tool-runner', resolve(moduleDir, '..')));
+  if (moduleDir.endsWith('/src/core')) {
+    input.env.TSX_TSCONFIG_PATH ??= join(process.cwd(), 'tsconfig.json');
+  }
   const quote = (v: string) => `'${v.replaceAll("'", "'\\''")}'`;
   atomicWriteFileSync(join(binDir, 'lark-cli'), [
     '#!/bin/sh', '# botmux managed lark-cli — application and caller are host-bound.',
