@@ -45,7 +45,18 @@ import {
 } from '../services/codex-reasoning-effort.js';
 import { isCodexServiceTier, isCodexServiceTierCliId, type CodexServiceTier } from '../services/codex-service-tier.js';
 import { validateCodexServiceTier } from '../services/codex-service-tier-catalog.js';
-import { botInjectedEnv, buildSessionChildEnv } from './env-policy.js';
+import { botOneShotEnv } from './session-env-resolve.js';
+import {
+  botSessionEnvView,
+  globalSessionEnvView,
+  liveSessionEnvView,
+  removeTmuxServerGlobalEnv,
+  revealLiveSessionEnvValue,
+  revealSessionEnvValue,
+  revealTmuxServerEnvValue,
+  sessionEnvSessions,
+  tmuxServersEnvView,
+} from './session-env-host.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import { resolveAsyncTriggerState, decideAsyncOwnership } from '../services/async-trigger-state.js';
 import { isLoopbackPeer } from '../utils/loopback-peers.js';
@@ -141,7 +152,7 @@ import type {
   OpenPlatformDescriptionReadResult,
   OpenPlatformDescriptionUpdateResult,
 } from '../services/open-platform-rename.js';
-import { findConfigField, applyConfigField, applyPerBotEnvChange, coerceConfigValue, setChatFeedbackPolicy, setBotBlockedUsers, removeBlockedUsers, type SetBlockedUsersResult, type ConfigFieldSpec } from '../services/bot-config-store.js';
+import { findConfigField, applyConfigField, applyPerBotEnvChange, applyBotSessionEnvRequest, coerceConfigValue, setChatFeedbackPolicy, setBotBlockedUsers, removeBlockedUsers, type SetBlockedUsersResult, type ConfigFieldSpec } from '../services/bot-config-store.js';
 import { defaultReplyDeliveryFor, effectiveReplyDelivery, supportsTranscriptReplyDelivery } from './reply-delivery.js';
 import { resolveFeedbackTeamId, traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TURN_DELIVERY_ROUTE } from './relayed-turn-delivery.js';
@@ -290,6 +301,7 @@ import {
 } from '../services/headless-session-store.js';
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
 import { checkCliAvailability } from '../setup/cli-availability.js';
+import { resolveBotCodexRpcInput } from '../services/codex-rpc-input-policy.js';
 import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
 import {
   validateCodexAppManagedSendOrigin,
@@ -500,6 +512,8 @@ import {
   writeNativeSubagentRuntimeResponseProof,
 } from './native-subagent-runtime-ipc-auth.js';
 import { normalizeNativeSubagentRuntimePolicy } from '../services/native-subagent-runtime-policy.js';
+import { normalizeTraexAutoModelConfig, TRAEX_AUTO_MODEL_ID } from '../services/traex-auto-model.js';
+import { detectModelCapabilitiesViaExec } from '../adapters/cli/model-catalog-json.js';
 import { normalizeSessionTitleSource, updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import {
@@ -1093,6 +1107,9 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // verification and then enters the durable action ledger. Keeping this one
   // aperture is what preserves managed meeting actions from inside bwrap.
   if (method === 'POST' && pathname === '/api/vc-meetings/action-request') return true;
+  // Human summary sharing uses the same rotating capability, plus an exact IM
+  // turn and frozen sharing policy. The handler, not host HMAC, proves authority.
+  if (method === 'POST' && pathname === '/api/vc-meetings/share-summary') return true;
   // These two CLI-in-sandbox endpoints verify the same rotating capability in
   // their handlers and bind it to body.sessionId. They cannot be bare loopback
   // exceptions: a receiver that learned another session id could otherwise
@@ -7735,6 +7752,9 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
   let reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | null = null;
   let serviceTier: CodexServiceTier | null = null;
   let nativeSubagentRuntime: BotConfig['nativeSubagentRuntime'] | null = null;
+  let traexAutoModel: BotConfig['traexAutoModel'] | null = null;
+  let codexRpcInput: boolean | null = null;
+  const codexRpcInputDefault = config.codexRpcInputDefault;
   // dsh runner turn timeout (ms). Only meaningful for the dsh adapter; exposed
   // so the dashboard can render the dsh-only field with its current value.
   let turnTimeoutMs: number | null = null;
@@ -7762,6 +7782,8 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
       : null;
     reasoningEffort = cfg.reasoningEffort ?? null;
     serviceTier = cfg.serviceTier ?? null;
+    traexAutoModel = cfg.traexAutoModel ?? null;
+    codexRpcInput = cfg.codexRpcInput ?? null;
     const normalizedNativeSubagentRuntime = normalizeNativeSubagentRuntimePolicy(cfg.nativeSubagentRuntime);
     nativeSubagentRuntime = normalizedNativeSubagentRuntime.ok
       ? normalizedNativeSubagentRuntime.value ?? null
@@ -7855,6 +7877,13 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     reasoningEffort,
     serviceTier,
     nativeSubagentRuntime,
+    traexAutoModel,
+    codexRpcInput,
+    codexRpcInputDefault,
+    codexRpcInputEffective: resolveBotCodexRpcInput({
+      cliId, model: model ?? undefined, traexAutoModel, codexRpcInput, wrapperCli, cliLaunchMode,
+    }, codexRpcInputDefault),
+    traexAutoModelBlockedReason: null,
     turnTimeoutMs,
     dshRuntime,
     agentSelectionKey,
@@ -8554,6 +8583,8 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
     reasoningEffort?: unknown;
     serviceTier?: unknown;
     nativeSubagentRuntime?: unknown;
+    traexAutoModel?: unknown;
+    codexRpcInput?: unknown;
     turnTimeoutMs?: unknown;
     cliRuntime?: unknown;
     dshRuntime?: unknown;
@@ -8574,7 +8605,16 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
     return jsonRes(res, 400, { ok: false, error: 'invalid_replace_cli_selection' });
   }
   const requestedSelection = selected;
+  const rpcFieldPresent = Object.prototype.hasOwnProperty.call(body, 'codexRpcInput');
+  if (rpcFieldPresent && body.codexRpcInput !== null && typeof body.codexRpcInput !== 'boolean') {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_codex_rpc_input' });
+  }
   const model = typeof body.model === 'string' ? body.model.trim() : '';
+  const autoFieldPresent = Object.prototype.hasOwnProperty.call(body, 'traexAutoModel');
+  const requestedAuto = normalizeTraexAutoModelConfig(body.traexAutoModel);
+  if (selected.cliId === 'traex' && requestedAuto.error) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_traex_auto_model', message: requestedAuto.error });
+  }
   const modelBackendVariantFieldPresent = Object.prototype.hasOwnProperty.call(body, 'modelBackendVariant');
   let modelBackendVariant: 'standard' | 'max' | undefined;
   const supportsModelBackendVariant = isBackendVariantCliId(selected.cliId);
@@ -8626,11 +8666,10 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       });
     }
   }
-  // Per-bot dsh runner turn timeout. Only the dsh adapter forwards it
-  // (`--turn-timeout-ms`); the dashboard exposes the field for dsh only. The
+  // Per-bot dsh / MiniMax runner timeout (`--turn-timeout-ms`). The
   // field is optional in the body, so distinguish absent (preserve) from
   // present-but-empty (clear → watchdog disabled) like reasoningEffort does.
-  const supportsTurnTimeout = selected.cliId === 'dsh';
+  const supportsTurnTimeout = selected.cliId === 'dsh' || selected.cliId === 'minimax';
   const turnTimeoutFieldPresent = Object.prototype.hasOwnProperty.call(body, 'turnTimeoutMs');
   let nextTurnTimeoutMs: number | undefined;
   if (turnTimeoutFieldPresent && body.turnTimeoutMs !== null && body.turnTimeoutMs !== '') {
@@ -8721,6 +8760,8 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       nextServiceTier?: CodexServiceTier;
       nextModelBackendVariant?: 'standard' | 'max';
       nextNativeSubagentRuntimeState?: NativeSubagentRuntimeConfigState;
+      nextTraexAutoModel?: BotConfig['traexAutoModel'];
+      nextCodexRpcInput?: boolean;
     }>(larkAppId, async (entry) => {
       const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
       const currentSelectionKey = selectionKeyForBot(entry.cliId, entry.wrapperCli, entry.cliLaunchMode);
@@ -8731,6 +8772,17 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       selected = !selectionChanged && !runtimeFieldPresent
         ? { cliId: requestedSelection.cliId, wrapperCli: entry.wrapperCli, cliLaunchMode: entry.cliLaunchMode }
         : requestedSelection;
+      const nextTraexAutoModel = selected.cliId === 'traex'
+        ? (autoFieldPresent ? requestedAuto.config : normalizeTraexAutoModelConfig(entry.traexAutoModel).config)
+        : undefined;
+      const nextCodexRpcInput = rpcFieldPresent
+        ? typeof body.codexRpcInput === 'boolean' ? body.codexRpcInput : undefined
+        : typeof entry.codexRpcInput === 'boolean' ? entry.codexRpcInput : undefined;
+      if (selected.cliId === 'traex' && model.toLowerCase() === TRAEX_AUTO_MODEL_ID
+        && (!nextTraexAutoModel || selected.wrapperCli || selected.cliLaunchMode)) {
+        return { write: false, result: { error: 'invalid_traex_auto_model',
+          message: 'Auto requires an enabled model pool and a directly managed TraeX terminal.' } };
+      }
       if (runtimeFieldPresent) {
         if (body.cliRuntime !== null) {
           if (selected.cliId !== 'codex') {
@@ -8827,6 +8879,29 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
         const tuiWarning = `配置已保存，但 dsh-tui 未安装（${dshTuiAvailability.reason ?? 'dsh-tui 二进制不在 PATH'}）。请在 daemon 所在机器安装 @deepseek-harness-tui/dsh-tui。`;
         availabilityWarning = availabilityWarning ? `${availabilityWarning} ${tuiWarning}` : tuiWarning;
       }
+      if (model.toLowerCase() === TRAEX_AUTO_MODEL_ID && nextTraexAutoModel?.modelSettings) {
+        const settingsEntries = Object.entries(nextTraexAutoModel.modelSettings)
+          .filter(([, settings]) => settings.reasoningEffort || settings.modelBackendVariant);
+        const catalog = settingsEntries.length ? await detectModelCapabilitiesViaExec(
+          availability.resolvedPath ?? effectivePath ?? 'traex',
+          botOneShotEnv(process.env, entry),
+        ) : null;
+        for (const [modelId, settings] of settingsEntries) {
+          const capability = catalog?.find(item => item.slug.toLowerCase() === modelId.toLowerCase());
+          const variant = capability?.contextVariants?.find(item => item.id === settings.modelBackendVariant);
+          if (settings.modelBackendVariant && capability && !variant) {
+            return { write: false, result: { error: 'invalid_traex_auto_model',
+              message: `${modelId} 不支持所选上下文档位 ${settings.modelBackendVariant}` } };
+          }
+          const efforts = variant?.reasoningEfforts ?? capability?.reasoningEfforts;
+          if (settings.reasoningEffort && (efforts
+            ? !efforts.includes(settings.reasoningEffort)
+            : !cliModelSupportsReasoningEffort('traex', modelId, settings.reasoningEffort))) {
+            return { write: false, result: { error: 'invalid_traex_auto_model',
+              message: `${modelId} 不支持所选思考强度 ${settings.reasoningEffort}` } };
+          }
+        }
+      }
       const effectiveServiceTier = supportsServiceTier
         ? (serviceTierFieldPresent ? serviceTier ?? undefined : entry.serviceTier)
         : undefined;
@@ -8837,10 +8912,7 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
         const codexAvailability = checkCliAvailability({ cliId: 'codex', cliPathOverride: effectivePath });
         const tierCheck = await validateCodexServiceTier({
           cliBin: codexAvailability.resolvedPath ?? codexAvailability.command ?? 'codex',
-          env: {
-            ...buildSessionChildEnv(process.env, entry.envPolicy),
-            ...botInjectedEnv(entry.env, entry.envPolicy),
-          },
+          env: botOneShotEnv(process.env, entry),
           model,
           serviceTier: effectiveServiceTier,
         });
@@ -8863,7 +8935,21 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       const nextReasoningEffort = supportsReasoningEffort
         ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : entry.reasoningEffort)
         : undefined;
-      if (nextReasoningEffort && !cliModelSupportsReasoningEffort(selected.cliId, model || undefined, nextReasoningEffort)) {
+      let fixedTraexEfforts: string[] | undefined;
+      if (selected.cliId === 'traex' && model.toLowerCase() !== TRAEX_AUTO_MODEL_ID && nextReasoningEffort
+        && (nextModelBackendVariant || !cliModelSupportsReasoningEffort('traex', model, nextReasoningEffort))) {
+        const capabilities = await detectModelCapabilitiesViaExec(
+          availability.resolvedPath ?? effectivePath ?? 'traex', botOneShotEnv(process.env, entry));
+        const capability = capabilities?.find(item => item.slug.toLowerCase() === model.toLowerCase());
+        fixedTraexEfforts = capability?.contextVariants?.find(item => item.id === nextModelBackendVariant)?.reasoningEfforts
+          ?? capability?.reasoningEfforts;
+      }
+      const effortModels = selected.cliId === 'traex' && model.toLowerCase() === TRAEX_AUTO_MODEL_ID
+        ? nextTraexAutoModel!.models : [model || undefined];
+      if (nextReasoningEffort && effortModels.some(candidate =>
+        !(model.toLowerCase() === TRAEX_AUTO_MODEL_ID && candidate && nextTraexAutoModel?.modelSettings && Object.prototype.hasOwnProperty.call(nextTraexAutoModel.modelSettings, candidate)) &&
+        !(fixedTraexEfforts ? fixedTraexEfforts.includes(nextReasoningEffort)
+          : cliModelSupportsReasoningEffort(selected.cliId, candidate, nextReasoningEffort)))) {
         return { write: false, result: { error: 'reasoning_effort_not_supported_by_model' } };
       }
       const nextServiceTier = supportsServiceTier
@@ -8892,6 +8978,12 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       }
       if (model) entry.model = model;
       else delete entry.model;
+      if (nextTraexAutoModel) entry.traexAutoModel = nextTraexAutoModel;
+      else delete entry.traexAutoModel;
+      if (rpcFieldPresent) {
+        if (nextCodexRpcInput === undefined) delete entry.codexRpcInput;
+        else entry.codexRpcInput = nextCodexRpcInput;
+      }
       if (!supportsModelBackendVariant) delete entry.modelBackendVariant;
       else if (modelBackendVariantFieldPresent) {
         if (modelBackendVariant) entry.modelBackendVariant = modelBackendVariant;
@@ -8927,8 +9019,8 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
             ? { status: 'valid', policy: normalized.value }
             : { status: 'absent' };
       }
-      // dsh-only turn timeout: non-dsh always drops it; on dsh, an explicit
-      // field value writes/clears it, absence preserves the current value.
+      // Runner timeout: unsupported CLIs always drop it; dsh / MiniMax write
+      // or clear an explicit field, while absence preserves the current value.
       if (!supportsTurnTimeout) delete entry.turnTimeoutMs;
       else if (turnTimeoutFieldPresent) {
         if (nextTurnTimeoutMs !== undefined) entry.turnTimeoutMs = nextTurnTimeoutMs;
@@ -8963,7 +9055,7 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
         // turn）。手动的 pty/tmux/herdr/zellij override 不受影响（它们不是远端后端）。
         delete entry.backendType;
       }
-      return { write: true, result: { nextReasoningEffort, nextServiceTier, nextModelBackendVariant, nextNativeSubagentRuntimeState } };
+      return { write: true, result: { nextReasoningEffort, nextServiceTier, nextModelBackendVariant, nextNativeSubagentRuntimeState, nextTraexAutoModel, nextCodexRpcInput } };
     });
     if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
     if (r.result.error) {
@@ -8991,6 +9083,8 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
     else bot.config.wrapperCli = undefined;
     bot.config.cliLaunchMode = selected.cliLaunchMode;
     bot.config.model = model || undefined;
+    bot.config.traexAutoModel = r.result.nextTraexAutoModel;
+    bot.config.codexRpcInput = r.result.nextCodexRpcInput;
     bot.config.modelBackendVariant = supportsModelBackendVariant
       ? r.result.nextModelBackendVariant
       : undefined;
@@ -9002,8 +9096,8 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       larkAppId,
       r.result.nextNativeSubagentRuntimeState ?? { status: 'absent' },
     );
-    // Mirror the entry write: non-dsh clears it, dsh with an explicit field
-    // takes the parsed value, dsh without the field preserves the existing one.
+    // Mirror the entry write: unsupported CLIs clear it; supported runners
+    // take an explicit field or preserve the existing value when absent.
     if (!supportsTurnTimeout) bot.config.turnTimeoutMs = undefined;
     else if (turnTimeoutFieldPresent) bot.config.turnTimeoutMs = nextTurnTimeoutMs;
     // dsh-only runtime variant: same mirror semantics as turnTimeoutMs.
@@ -9039,6 +9133,10 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       reasoningEffort: supportsReasoningEffort ? bot.config.reasoningEffort ?? null : null,
       serviceTier: supportsServiceTier ? bot.config.serviceTier ?? null : null,
       nativeSubagentRuntime: bot.config.nativeSubagentRuntime ?? null,
+      traexAutoModel: bot.config.traexAutoModel ?? null,
+      codexRpcInput: bot.config.codexRpcInput ?? null,
+      codexRpcInputDefault: config.codexRpcInputDefault,
+      codexRpcInputEffective: resolveBotCodexRpcInput(bot.config, config.codexRpcInputDefault),
       turnTimeoutMs: supportsTurnTimeout ? bot.config.turnTimeoutMs ?? null : null,
       dshRuntime: supportsDshRuntime ? bot.config.dshRuntime ?? null : null,
       dshProfile: supportsDshProfile ? bot.config.dshProfile ?? null : null,
@@ -9314,6 +9412,23 @@ botConfigPutRoute<{ oncallGroup?: unknown }>('/api/bot-oncall-group', 'oncallGro
   respond: value => ({ ok: true, oncallGroup: value }),
 });
 
+// Security-sensitive Bot caller → human Owner bindings. There is deliberately
+// no free-form merge mode: each PUT replaces the complete target-Bot policy
+// after the shared strict parser validates exact keys, both source ids, Owner
+// union/email and duplicate identities. null clears the policy.
+botConfigPutRoute<{ botActorOwnerBindings?: unknown }>(
+  '/api/bot-actor-owner-bindings',
+  'botActorOwnerBindings',
+  {
+    normalize: (body, spec) => {
+      if (body.botActorOwnerBindings === null) return fieldOk(null);
+      const parsed = coerceConfigValue(spec, JSON.stringify(body.botActorOwnerBindings ?? []));
+      return parsed.ok ? fieldOk(parsed.value) : fieldInvalid(parsed.reason);
+    },
+    respond: value => ({ ok: true, botActorOwnerBindings: value ?? null }),
+  },
+);
+
 // Per-bot Codex App 无进展提醒 noProgressNotify（#1162）。Body
 // `{ noProgressNotify?: { enabled?: boolean; timeoutMs?: number } | null }`:
 //   • null/缺省 → 清回默认（开启 + 90s）
@@ -9401,6 +9516,88 @@ ipcRoute('PUT', '/api/bot-env', async (req, res) => {
 });
 
 // Codex credential policy: shared global login or an independent per-bot CODEX_HOME.
+// ─── 会话环境变量（Dashboard「会话环境变量」，core/session-env*.ts）──────────
+// 视图里的值一律打码；`maskAll=1` 由 Dashboard 给没有查看原文权限的访客加上，
+// 连非凭据值也遮住。`/reveal` 只回单个变量的原文，Dashboard 只对本机 owner 转发。
+function sessionEnvQuery(req: IncomingMessage): URLSearchParams {
+  return new URL(req.url ?? '/', 'http://localhost').searchParams;
+}
+const sessionEnvViewOpts = (req: IncomingMessage) => ({ maskAll: sessionEnvQuery(req).get('maskAll') === '1' });
+/** `?socket=` → tmux server: absent/`default` = default server. */
+function sessionEnvSocketParam(raw: unknown): string | null {
+  return typeof raw === 'string' && raw && raw !== 'default' ? raw : null;
+}
+
+ipcRoute('GET', '/api/bot-session-env', requireBoundBot(async (req, res) => {
+  jsonRes(res, 200, { ok: true, ...botSessionEnvView(getBot(cachedLarkAppId).config, sessionEnvViewOpts(req)) });
+}, NOT_BOUND_BODY.okFalse));
+
+// Body `{ ops: [{op:'set',key,value} | {op:'unset',key} | {op:'reset',key}] }`：
+// 在 bots.json 文件锁内改本 bot 的 env（= set）/ envUnset（= unset），内存热更，
+// 下一个新会话生效。保留变量、身份包装接管的变量与 PATH/HOME 的去掉一律 400。
+ipcRoute('PUT', '/api/bot-session-env', requireBoundBot(async (req, res) => {
+  const body = await readJsonBodyOrBadJson<{ ops?: unknown }>(req, res);
+  if (body === BAD_JSON) return;
+  const r = await applyBotSessionEnvRequest(cachedLarkAppId, body?.ops);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason, ...(r.key ? { key: r.key } : {}) });
+  jsonRes(res, 200, { ok: true, ...botSessionEnvView(getBot(cachedLarkAppId).config, sessionEnvViewOpts(req)) });
+}, NOT_BOUND_BODY.okFalse));
+
+ipcRoute('GET', '/api/bot-session-env/reveal', requireBoundBot(async (req, res) => {
+  const value = revealSessionEnvValue(sessionEnvQuery(req).get('key') ?? '', getBot(cachedLarkAppId).config);
+  if (value === undefined) return jsonRes(res, 404, { ok: false, error: 'not_found' });
+  jsonRes(res, 200, { ok: true, value });
+}, NOT_BOUND_BODY.okFalse));
+
+// 运行中会话实际拿到的环境（/proc/<CLI pid>/environ），只读、打码。
+ipcRoute('GET', '/api/bot-session-env/live', requireBoundBot(async (req, res) => {
+  const ds = findActiveBySessionId(sessionEnvQuery(req).get('sessionId') ?? '');
+  if (!ds || ds.larkAppId !== cachedLarkAppId) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  const view = liveSessionEnvView(ds, sessionEnvViewOpts(req));
+  jsonRes(res, view.ok ? 200 : 409, view);
+}, NOT_BOUND_BODY.okFalse));
+
+ipcRoute('GET', '/api/bot-session-env/live/reveal', requireBoundBot(async (req, res) => {
+  const q = sessionEnvQuery(req);
+  const ds = findActiveBySessionId(q.get('sessionId') ?? '');
+  if (!ds || ds.larkAppId !== cachedLarkAppId) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  const value = revealLiveSessionEnvValue(ds, q.get('key') ?? '');
+  if (value === undefined) return jsonRes(res, 404, { ok: false, error: 'not_found' });
+  jsonRes(res, 200, { ok: true, value });
+}, NOT_BOUND_BODY.okFalse));
+
+// 全局层视图：基线取本 daemon（fleet 共用 supervisor 环境），全局层读 config.json；
+// 写全局层在 Dashboard 进程里做（它负责 config.json 的写入）。
+ipcRoute('GET', '/api/session-env-global', async (req, res) => {
+  const opts = sessionEnvViewOpts(req);
+  jsonRes(res, 200, { ok: true, ...globalSessionEnvView(opts), tmuxServers: tmuxServersEnvView(opts) });
+});
+
+ipcRoute('GET', '/api/session-env-global/reveal', async (req, res) => {
+  const q = sessionEnvQuery(req);
+  const key = q.get('key') ?? '';
+  const value = q.get('source') === 'tmux'
+    ? revealTmuxServerEnvValue(sessionEnvSocketParam(q.get('socket')), key)
+    : revealSessionEnvValue(key);
+  if (value === undefined) return jsonRes(res, 404, { ok: false, error: 'not_found' });
+  jsonRes(res, 200, { ok: true, value });
+});
+
+/** 本 daemon 正在运行的会话及其环境是否过期（Dashboard 汇总全 fleet）。 */
+ipcRoute('GET', '/api/session-env-sessions', async (_req, res) => {
+  jsonRes(res, 200, { ok: true, sessions: sessionEnvSessions() });
+});
+
+// Body `{ socket: string|null, key }`：从该 tmux server 的全局环境移除一个变量
+// （set-environment -g -u）。只影响之后新建的 pane；只允许默认 server 和托管
+// 会话所用的 socket。
+ipcRoute('POST', '/api/session-env-tmux/remove', async (req, res) => {
+  const body = await readJsonBodyOrBadJson<{ socket?: unknown; key?: unknown }>(req, res);
+  if (body === BAD_JSON) return;
+  const r = removeTmuxServerGlobalEnv(sessionEnvSocketParam(body?.socket), typeof body?.key === 'string' ? body.key : '');
+  jsonRes(res, r.ok ? 200 : r.error === 'server_not_running' ? 409 : 400, r);
+});
+
 ipcRoute('PUT', '/api/bot-env-policy', requireBoundBot(async (req, res) => {
   let body: { envPolicy?: unknown };
   try { body = await readJsonBody<{ envPolicy?: unknown }>(req); }

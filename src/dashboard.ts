@@ -1,6 +1,7 @@
 // src/dashboard.ts
 import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
+import { applyVcMeetingInviterPolicyPatch } from './services/vc-meeting-inviter-policy.js';
 import type { Duplex } from 'node:stream';
 import {
   readFileSync, existsSync, mkdirSync, readdirSync, writeFileSync, statSync, createReadStream, realpathSync,
@@ -104,6 +105,7 @@ import {
 } from './workflows/v3/daemon-ipc-auth.js';
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
 import { BOT_PROXY_ROUTES, handleDaemonProxyRoute, type DaemonProxyDeps } from './dashboard/daemon-proxy-routes.js';
+import { handleSessionEnvRoute } from './dashboard/session-env-api.js';
 import { handleNativeSlashCommandsProxy } from './dashboard/native-slash-commands-proxy.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
 import { handleAgentProfilesApi } from './dashboard/agent-profiles-api.js';
@@ -132,6 +134,7 @@ import {
   resolveDashboardH5AuthConfig,
 } from './dashboard/h5-auth.js';
 import { PluginResultArtifactStore } from './core/plugins/mcp/result-artifact-store.js';
+import { listLatestDiagnosticFiles } from './core/plugins/mcp/diagnostics-files.js';
 import {
   handlePluginResultAccess,
   resolvePluginResultViewerIdentity,
@@ -178,7 +181,7 @@ import {
 import { modelCatalogProbeContext } from './dashboard/model-catalog-request.js';
 import { checkCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { globalConfigPath, invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
+import { applyGlobalSessionEnvOps, globalConfigPath, invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import {
   buildDashboardUrls,
@@ -1118,6 +1121,9 @@ interface ResolvedDashboardSettings {
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
+  /** Experimental, default OFF: reap tmux servers orphaned by a previous
+   *  daemon generation at daemon startup (automatic process kill). */
+  reapOrphanTmuxServers: boolean;
   /** Whether botmux auto-bypasses Codex's interactive hook-trust gate for
    *  Codex-family plain-TUI launches. Default ON (only an explicit false disables). */
   bypassCodexHookTrust: boolean;
@@ -1409,6 +1415,7 @@ function vcMeetingConsumerProfilesApiDeps(): VcMeetingConsumerProfilesApiDeps {
           : {};
         // 「接收会议事件」开关。VC 对每个连着飞书的 bot 默认可用，`enabled: false`
         // 才是显式退出——所以打开时删掉这个 key 回到默认，而不是写 `enabled: true`。
+        applyVcMeetingInviterPolicyPatch(vc, patch.inviterManagementEnabled);
         if (patch.vcEnabled) delete vc.enabled;
         else vc.enabled = false;
         const consumer = (vc.meetingConsumer && typeof vc.meetingConsumer === 'object' && !Array.isArray(vc.meetingConsumer))
@@ -1749,6 +1756,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     },
     codexRpcInput: dashboard.codexRpcInput === true, // default OFF until live-verified
     autoUpgradeCodexSessions: dashboard.autoUpgradeCodexSessions === true, // default OFF until live-verified
+    reapOrphanTmuxServers: dashboard.reapOrphanTmuxServers === true, // default OFF: automatic process kill, explicit opt-in
     // default ON — only an explicit stored false disables (matches config.ts getter)
     bypassCodexHookTrust: dashboard.bypassCodexHookTrust !== false,
     hideCodexRateLimitModelNudge: dashboard.hideCodexRateLimitModelNudge !== false,
@@ -2696,13 +2704,7 @@ function latestGatewayDiagnostics(): Map<string, unknown[]> {
   const root = join(config.session.dataDir, 'mcp-gateway');
   const byPlugin = new Map<string, unknown[]>();
   if (!existsSync(root)) return byPlugin;
-  let files: string[] = [];
-  try {
-    files = readdirSync(root)
-      .filter(file => file.endsWith('.json'))
-      .sort((a, b) => statSync(join(root, b)).mtimeMs - statSync(join(root, a)).mtimeMs)
-      .slice(0, 50);
-  } catch { return byPlugin; }
+  const files = listLatestDiagnosticFiles(root, 50);
   const seen = new Set<string>();
   for (const file of files) {
     try {
@@ -3062,7 +3064,13 @@ function configuredBrands(): Map<string, string | undefined> {
   return brandMapByAppId(loadBotConfigs);
 }
 
-function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string; cliConfigDir?: string }> {
+type ConfiguredBotAgentFields = Partial<Pick<BotConfig,
+  'cliRuntime' | 'cliPathOverride' | 'wrapperCli' | 'cliLaunchMode' | 'model'
+  | 'modelBackendVariant' | 'reasoningEffort' | 'serviceTier' | 'nativeSubagentRuntime'
+  | 'traexAutoModel' | 'turnTimeoutMs' | 'dshRuntime' | 'dshProfile' | 'cliConfigDir'
+>> & { cliId?: string };
+
+function configuredBotAgentFields(): Map<string, ConfiguredBotAgentFields> {
   try {
     return new Map(loadBotConfigs().map(b => [b.larkAppId, {
       cliId: b.cliId,
@@ -3074,6 +3082,7 @@ function configuredBotAgentFields(): Map<string, { cliId?: string; cliRuntime?: 
       wrapperCli: b.wrapperCli,
       cliLaunchMode: b.cliLaunchMode,
       model: b.model,
+      traexAutoModel: b.traexAutoModel,
       modelBackendVariant: b.modelBackendVariant,
       reasoningEffort: b.reasoningEffort,
       serviceTier: b.serviceTier,
@@ -3124,6 +3133,8 @@ async function configuredBotDefaultsRecoveryRows(
           wrapperCli: bot.wrapperCli,
           cliLaunchMode: bot.cliLaunchMode,
           model: bot.model,
+          traexAutoModel: bot.traexAutoModel,
+          codexRpcInput: bot.codexRpcInput,
           modelBackendVariant: bot.modelBackendVariant,
           reasoningEffort: bot.reasoningEffort,
           serviceTier: bot.serviceTier,
@@ -3153,12 +3164,12 @@ async function configuredBotDefaultsRecoveryRows(
   }
 }
 
-function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string; cliConfigDir?: string }>(
+function withConfiguredCliId<T extends { larkAppId: string } & ConfiguredBotAgentFields>(
   bot: T,
-  ids: Map<string, string> | Map<string, { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier'] }>,
-): T & { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string; cliConfigDir?: string } {
+  ids: Map<string, string> | Map<string, ConfiguredBotAgentFields>,
+): T & ConfiguredBotAgentFields {
   const raw = ids.get(bot.larkAppId);
-  const fallback: { cliId?: string; cliRuntime?: BotConfig['cliRuntime']; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: BotConfig['cliLaunchMode']; model?: string; modelBackendVariant?: BotConfig['modelBackendVariant']; reasoningEffort?: BotConfig['reasoningEffort']; serviceTier?: BotConfig['serviceTier']; nativeSubagentRuntime?: BotConfig['nativeSubagentRuntime']; turnTimeoutMs?: number; dshRuntime?: BotConfig['dshRuntime']; dshProfile?: string; cliConfigDir?: string } | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
+  const fallback: ConfiguredBotAgentFields | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
   return {
     ...bot,
     cliId: bot.cliId || fallback?.cliId,
@@ -3167,6 +3178,7 @@ function withConfiguredCliId<T extends { larkAppId: string; cliId?: string; cliR
     wrapperCli: bot.wrapperCli || fallback?.wrapperCli,
     cliLaunchMode: bot.cliLaunchMode || fallback?.cliLaunchMode,
     model: bot.model || fallback?.model,
+    traexAutoModel: bot.traexAutoModel ?? fallback?.traexAutoModel,
     modelBackendVariant: bot.modelBackendVariant ?? fallback?.modelBackendVariant,
     reasoningEffort: bot.reasoningEffort || fallback?.reasoningEffort,
     serviceTier: bot.serviceTier || fallback?.serviceTier,
@@ -6882,6 +6894,7 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, out.status, out.body);
       }
       if (req.method === 'PUT') {
+        if (!authed) return jsonRes(res, 403, { ok: false, error: 'host_management_required' });
         let parsed: unknown;
         try {
           parsed = await readJsonBody(req);
@@ -7296,6 +7309,9 @@ const server = createServer(async (req, res) => {
               ? j.cliLaunchMode ?? undefined
               : d.cliLaunchMode,
             model: j.model || d.model,
+            traexAutoModel: Object.prototype.hasOwnProperty.call(j, 'traexAutoModel')
+              ? j.traexAutoModel ?? undefined
+              : d.traexAutoModel,
             modelBackendVariant: Object.prototype.hasOwnProperty.call(j, 'modelBackendVariant')
               ? j.modelBackendVariant ?? undefined
               : d.modelBackendVariant,
@@ -7402,6 +7418,17 @@ const server = createServer(async (req, res) => {
     // /api/fs/list、/api/dsh/profiles、/api/feed-groups/*（以及 blocked-users / grants 三块之后的
     // vc-meeting、role-profiles、groups/*、GET /api/bots），它们的 path 与表内每一条都互斥，
     // 所以在此一次性匹配整张表与原先的穿插排布先后等价。新增穿插路由时别让它的 path 与表内条目重叠。
+    // 会话环境变量（全局层 / Bot 层 / 运行中会话实际环境 / tmux server 全局环境）。
+    // 原文查看与 tmux server 改动只给本机 owner（legacyAuthed），见 dashboard/session-env-api.ts。
+    if (await handleSessionEnvRoute(req, res, url, {
+      canReveal: legacyAuthed,
+      daemons: () => registry.list(),
+      proxyToDaemon,
+      readJsonBody: body => readJsonBody(body),
+      applyGlobalOps: ops => applyGlobalSessionEnvOps(ops),
+      jsonRes,
+    })) return;
+
     if (await handleDaemonProxyRoute(BOT_PROXY_ROUTES, req, res, url, daemonProxyDeps)) return;
 
     // GET  /api/bots/:appId/slash-commands — native Lark slash-command catalog.

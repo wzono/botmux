@@ -1,3 +1,4 @@
+import { normalizeVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 /**
  * Global botmux configuration stored at `~/.botmux/config.json`.
  *
@@ -24,6 +25,7 @@ import { normalizePluginIdList } from './core/plugins/ids.js';
 import { assertDurableConfigMutationAllowed } from './services/durable-config-mutation.js';
 import { normalizeLinkRefConfig } from './services/link-ref-config.js';
 import type { LinkRefConfig } from './services/link-ref-types.js';
+import { applyEnvOps, envLayerWithinBudget, globalEnvLayer, isEmptyEnvLayer, type EnvLayer, type EnvOp } from './core/session-env.js';
 
 export type RepoPickerMode = 'all' | 'repos';
 export type LocalCliOpenMode = 'attach' | 'resume';
@@ -110,6 +112,8 @@ export interface VcMeetingSharedConsumerCatalog {
 }
 
 export interface VcMeetingAgentGlobalConfig {
+  /** Defaults for future meetings; each meeting freezes its effective policy. */
+  listenerPolicy?: Partial<VcMeetingListenerPolicy>;
   /** Machine-wide VC meeting listener kill-switch. Missing means enabled for
    *  backwards compatibility; per-bot vcMeetingAgent.enabled still controls
    *  whether a given bot responds to meetings. */
@@ -274,6 +278,10 @@ export interface GlobalConfig {
   scheduleTimeZone?: string;
   /** Machine-wide cross-bot schedule delegation policy. */
   scheduleDelegation?: ScheduleDelegationGlobalConfig;
+  /** Session environment overlay for every bot's sessions, applied after the
+   *  inherited baseline and before each bot's own layer (core/session-env.ts).
+   *  Managed from Dashboard「设置 → 会话环境变量」. Values may be credentials. */
+  sessionEnv?: EnvLayer;
 }
 
 export interface GlobalSkillConfig {
@@ -362,13 +370,22 @@ export interface DashboardGlobalConfig {
    *  instead of a tmux paste, bypassing codex's terminal paste-drop. Default OFF
    *  (absent ⇒ off); flip on to enable fleet-wide. Read live by the daemon —
    *  see config.ts `codexRpcInputDefault`. A per-bot `codexRpcInput: true` still
-   *  force-enables regardless of this global default. */
+   *  force-enables regardless of this global default; false explicitly keeps
+   *  that bot on terminal input. */
   codexRpcInput?: boolean;
   /** Automatically replace outdated Codex session processes when safely idle
    *  and resume the same thread without sending a new prompt. Experimental,
    *  default OFF; read live so an explicit true starts scheduling upgrades and
    *  removing it stops them, both without restarting the daemon. */
   autoUpgradeCodexSessions?: boolean;
+  /** Experimental: at daemon startup, SIGTERM tmux SERVERS orphaned by a
+   *  previous daemon generation (a displaced server whose socket was rebound
+   *  still hosts the old managed CLIs holding per-session file locks). This is
+   *  an automatic process kill, so it is default OFF and must be enabled
+   *  explicitly from the Dashboard experimental settings; read live by the
+   *  daemon gate (config.ts `reapOrphanTmuxServers`). BOTMUX_DISABLE_ORPHAN_TMUX_REAP=1
+   *  remains an independent emergency kill-switch. */
+  reapOrphanTmuxServers?: boolean;
   /** Whether botmux auto-bypasses Codex's interactive hook-trust gate ("Press t
    *  to trust") for Codex-family plain-TUI launches (codex / traex). Codex 0.14x
    *  gates the botmux-installed ~/.codex/hooks.json behind a manual trust prompt,
@@ -551,6 +568,7 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   if (herdrTraexPlugin) out.herdrTraexPlugin = herdrTraexPlugin;
   if (typeof d.codexRpcInput === 'boolean') out.codexRpcInput = d.codexRpcInput;
   if (typeof d.autoUpgradeCodexSessions === 'boolean') out.autoUpgradeCodexSessions = d.autoUpgradeCodexSessions;
+  if (typeof d.reapOrphanTmuxServers === 'boolean') out.reapOrphanTmuxServers = d.reapOrphanTmuxServers;
   // Round-trip an explicit boolean either way. Absent stays absent — the live
   // getter (config.ts `bypassCodexHookTrust`) treats absent as ON, so we must
   // preserve a stored `false` to let an operator disable it.
@@ -762,6 +780,15 @@ function readVcMeetingAgent(raw: unknown): VcMeetingAgentGlobalConfig | undefine
   if (!raw || typeof raw !== 'object') return undefined;
   const v = raw as Record<string, unknown>;
   const out: VcMeetingAgentGlobalConfig = {};
+  try {
+    const listenerPolicy = normalizeVcMeetingListenerPolicy(v.listenerPolicy);
+    if (listenerPolicy) out.listenerPolicy = listenerPolicy;
+  } catch {
+    // A typo in this optional feature must not break unrelated global config
+    // reads or silently fall back to publishing raw meeting text.
+    console.warn('[botmux] Invalid vcMeetingAgent.listenerPolicy; disabling its publication/sharing flags.');
+    out.listenerPolicy = { rawMessages: false, finalSummary: false, allowSummarySharing: false };
+  }
   if (typeof v.enabled === 'boolean') out.enabled = v.enabled;
   if (typeof v.listenerBotAppId === 'string' && v.listenerBotAppId.trim()) {
     out.listenerBotAppId = v.listenerBotAppId.trim();
@@ -886,6 +913,8 @@ export function readGlobalConfig(): GlobalConfig {
   }
   const scheduleDelegation = readScheduleDelegation(raw.scheduleDelegation);
   if (scheduleDelegation) out.scheduleDelegation = scheduleDelegation;
+  const sessionEnv = globalEnvLayer(raw.sessionEnv);
+  if (!isEmptyEnvLayer(sessionEnv)) out.sessionEnv = sessionEnv;
   readCache = { path, value: out, at: Date.now() };
   return out;
 }
@@ -929,6 +958,7 @@ export function globalVcMeetingAgentConfigLive(): VcMeetingAgentGlobalConfig {
     enabled: parsed?.enabled !== false,
     ...(parsed?.listenerBotAppId ? { listenerBotAppId: parsed.listenerBotAppId } : {}),
     ...(parsed?.consumerCatalog ? { consumerCatalog: parsed.consumerCatalog } : {}),
+    ...(parsed?.listenerPolicy ? { listenerPolicy: parsed.listenerPolicy } : {}),
   };
   vcMeetingAgentLiveCache = { path, mtimeMs, config };
   return config;
@@ -1084,6 +1114,21 @@ export function mergeGlobalConfig(patch: Partial<Record<keyof GlobalConfig, Glob
   // (e.g. dashboard PUT /api/settings responds with the resolved config).
   readCache = null;
   vcMeetingAgentLiveCache = null;
+}
+
+/** The stored `sessionEnv` exactly as written (for hand-edit diagnostics). */
+export function readRawGlobalSessionEnv(): unknown {
+  return readRawConfig().sessionEnv;
+}
+
+/** Apply validated ops to the global session-env layer; an empty result
+ *  removes the key so an untouched install keeps no trace of the feature. */
+export function applyGlobalSessionEnvOps(ops: readonly EnvOp[]): { ok: true; layer: EnvLayer } | { ok: false; error: 'layer_too_large' } {
+  const prev = globalEnvLayer(readRawConfig().sessionEnv);
+  const next = applyEnvOps(prev, ops);
+  if (!envLayerWithinBudget(prev, next)) return { ok: false, error: 'layer_too_large' };
+  mergeGlobalConfig({ sessionEnv: isEmptyEnvLayer(next) ? null : next });
+  return { ok: true, layer: next };
 }
 
 /** Merge only the dashboard sub-config, preserving unknown keys inside that

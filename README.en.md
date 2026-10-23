@@ -81,6 +81,8 @@ More: [Roles & teams](https://deepcoldy.github.io/botmux/en/roles) · [File sand
 
 ## Supported CLIs & Agents
 
+Kimi-compatible TUI distributions can retain `cliId: "kimi"` and declare their own `cliRuntime` identity. For example, a CodeM wrapper can use `{ "id": "codem", "displayName": "CodeM", "executable": "codem-wrapper", "update": { "provider": "none" } }`. Cards and session views use that distribution name while the Kimi adapter owns input handling. Existing sessions retain their frozen runtime identity; verify configuration changes in a new topic.
+
 The optional [OpenViking shared-memory example](examples/openviking-memory/README.md) lets every shell-capable coding agent share per-user and per-project memory, searching, reading and saving key conclusions on demand. **Off by default**; opt in by binding a local agent or a single-user Bot through the shared Skill/CLI, with Codex automatic session capture as a separate optional adapter. (The example ships only in the source repository's `examples/`; the npm package does not include `examples/`, so this link does not resolve on the npm page.)
 
 Switch with `cliId` in `bots.json`. **20+ adapters**, spanning local CLIs (process-isolated, reachable via `tmux attach`) and API / cloud agents (e.g. Mira, riff — reached over API / remote, not a local process; mojo is API-driven but executes tools on the bot host by default, set cloud: true for the remote sandbox). Representative ones:

@@ -1721,6 +1721,8 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     expect(resolvePassthroughCommands(LARK_APP_ID, 'mira').size).toBe(0);
     expect(resolvePassthroughCommands(LARK_APP_ID, 'mir').size).toBe(0);
     expect(resolvePassthroughCommands(LARK_APP_ID, 'dsh').size).toBe(0);
+    expect(cliHasNoRawPassthroughSurface('minimax')).toBe(true);
+    expect(resolvePassthroughCommands(LARK_APP_ID, 'minimax').size).toBe(0);
     // ebsd is interactive, but every external message must pass through the
     // service-user envelope and structured terminal-marker ledger.
     expect(cliHasNoRawPassthroughSurface('ebsd')).toBe(true);
@@ -5279,6 +5281,73 @@ describe('handleCommand', () => {
       );
       expect(selected, 'no 已选择 confirmation was sent').toBeDefined();
       expect(selected![4]).toBe('msg_prime');
+    });
+
+    // A first message whose start was refused because the directory it fell
+    // back to is missing: it stays staged for repo selection on a session that
+    // is no longer pendingRepo. When no recovery card could be sent, the reply
+    // points at `/repo <路径>` — which must pick the directory for that message.
+    function makeRefusedOpeningDs(sessionOverrides: Record<string, unknown> = {}): DaemonSession {
+      return makeDaemonSession({
+        pendingRepo: false,
+        worker: null,
+        hasHistory: false,
+        initialStartPending: true,
+        pendingPrompt: 'first prompt',
+        session: makeSession({
+          queued: true,
+          queuedPrompt: 'first prompt',
+          pendingRepoSetup: { mode: 'picker', linkRefMode: 'disabled', prompt: 'first prompt' },
+          ...sessionOverrides,
+        } as any),
+      });
+    }
+
+    it('starts a first message refused for its missing directory in the /repo-chosen one', async () => {
+      const ds = makeRefusedOpeningDs();
+      ds.workingDirRecovery = { path: '/gone/default-dir' };
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, [
+        { name: 'project-a', path: '/home/testuser/project-a', branch: 'main' },
+      ]);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo 1'), deps, LARK_APP_ID);
+
+      const said = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(said).not.toContain('未结算');
+      expect(forkWorker).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(forkWorker).mock.calls[0]![0]).toBe(ds);
+      expect(sessionStore.createSession).not.toHaveBeenCalled();
+      expect(ds.workingDir).toBe('/home/testuser/project-a');
+      expect(ds.pendingRepo).toBe(false);
+      expect(ds.workingDirRecovery).toBeUndefined();
+    });
+
+    it('guides bare /repo to pass a path instead of blaming an unsettled Codex App turn when only the refused opening holds the session', async () => {
+      const ds = makeRefusedOpeningDs();
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo'), deps, LARK_APP_ID);
+
+      const said = vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join();
+      expect(said).toContain('/repo <');
+      expect(said).not.toContain('Codex App');
+      expect(said).not.toContain('未结算');
+      expect(forkWorker).not.toHaveBeenCalled();
+    });
+
+    it('still refuses /repo while an activation is actually in flight', async () => {
+      const ds = makeRefusedOpeningDs({ queuedActivationPending: true });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, [
+        { name: 'project-a', path: '/home/testuser/project-a', branch: 'main' },
+      ]);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo 1'), deps, LARK_APP_ID);
+
+      expect(vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join()).toContain('未结算');
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.pendingRepo).toBe(false);
     });
 
     it('should prompt to run /repo first when index given but no cached scan', async () => {

@@ -166,6 +166,8 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
 
 严格兼容 Codex 参数、交互与会话存储的独立发行版无需新增适配器：保留 `cliId: "codex"`，通过 `cliRuntime` 声明自己的 executable、展示名和更新源。BotMux 会按发行版隔离版本与会话身份，未知更新源不会回落到官方 Codex。详见 [Codex 兼容发行版](https://deepcoldy.github.io/botmux/adapters#codex-兼容发行版)。
 
+兼容 Kimi TUI 交互的发行版也可保留 `cliId: "kimi"`，配置 `cliRuntime` 的 `id`、`displayName` 和 `executable`。例如 CodeM wrapper 可使用 `id: "codem"`、`displayName: "CodeM"`、`executable: "codem-wrapper"`、`update: { "provider": "none" }`；卡片、会话与终端提示显示发行版名称，交互仍由 Kimi 适配器处理。已有会话保留启动时的发行版快照，修改配置后在新话题验证。
+
 ## 设计理念：直接桥接 CLI，不做 SDK wrapper
 
 botmux 不重新实现记忆、上下文管理、工具调用、权限体系——**多数 CLI 原生能力无需 botmux 重造，CLI 升级通常直接受益**（接口 / 参数 / 输出格式 / resume 语义有变时，adapter 仍可能要跟进）。用户照常发人话，daemon 在后台把上下文封装成结构化 prompt 再喂给 CLI。基于 Agent SDK 的方案则相反：能力取决于 SDK 暴露的接口面与你自己的集成实现。

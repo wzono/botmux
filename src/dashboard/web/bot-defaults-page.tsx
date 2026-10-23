@@ -51,9 +51,8 @@ import {
 import { isRemoteCliId } from '../../core/remote-cli-ids.js';
 import { resolvePairedBackendId } from '../../core/remote-cli-ids.js';
 import type { HerdrBackendConfig } from '../../adapters/backend/types.js';
-import { isReservedPerBotEnvKey, parsePerBotEnvText, sanitizePerBotEnv } from '../../core/per-bot-env.js';
+import { SessionEnvEditor } from './session-env-editor.js';
 import { supportsZeroPromptInjection } from '../../core/zero-prompt-support.js';
-import { confirm } from './confirm-modal.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import { DropdownField, ModelPickerField, type DropdownFieldOption } from './field-controls.js';
@@ -97,6 +96,12 @@ import { CODEX_REASONING_EFFORTS, isBackendVariantCliId, isCodexReasoningEffort,
 import { lookupCliSelection } from '../../setup/cli-selection.js';
 import { cliSupportsConfigDir } from '../../core/cli-config-dir.js';
 import { fetchAgents } from './agents-api.js';
+import { normalizeTraexAutoModelConfig, resolveTraexAutoModelSettings } from '../../services/traex-auto-model.js';
+import { TraexAutoModelEditor } from './traex-auto-model-editor.js';
+import {
+  autoModelDraftFromConfig, readAutoModelDraft, writeAutoModelDraft, clearAutoModelDraft,
+  strongestTraexModelSettings, type TraexAutoModelDraft,
+} from './traex-auto-model-preferences.js';
 import { AGENT_SECTIONS } from '../agent-profiles-model.js';
 import { clearHashQueryParam, hashQueryParam } from './dashboard-routes.js';
 import {
@@ -1186,7 +1191,7 @@ function BotDefaultsCard(props: {
                 所以不按 cliId 收窄——不像上面的 hook 注入只验证过 claude-code。 */}
             <section className="bd-tile" id={botDefaultsSectionDomId('sender-tag')}><SenderTagSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('quota-fallback')}><QuotaFallbackSection bot={bot} bots={props.bots} patchBot={patchBot} /></section>
-            <section className="bd-tile" id={botDefaultsSectionDomId('runtime-env')}><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile bd-tile-wide" id={botDefaultsSectionDomId('runtime-env')}><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('owner-reminder')}><SessionOwnerReminderSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </div>
@@ -1523,8 +1528,16 @@ function RuntimeEnvironmentSection(props: { bot: BotDefaultsRow; patchBot: Patch
     <section className="bd-section bd-runtime-env">
       <h3 className="bd-section-title">{tr('botDefaults.sectionRuntimeEnv')}</h3>
       <LaunchShellSection bot={props.bot} patchBot={props.patchBot} />
-      <EnvPolicySection bot={props.bot} patchBot={props.patchBot} />
-      <EnvSection bot={props.bot} patchBot={props.patchBot} />
+      <div className="bd-subsection bd-session-env">
+        <h4 className="bd-subsection-title"><FieldTitle help={tr('sessionEnv.introBot')}>{tr('sessionEnv.sectionTitle')}</FieldTitle></h4>
+        <SessionEnvEditor
+          scope={{
+            kind: 'bot',
+            larkAppId: props.bot.larkAppId,
+            onPolicySaved: envPolicy => props.patchBot(props.bot.larkAppId, { envPolicy }),
+          }}
+        />
+      </div>
     </section>
   );
 }
@@ -2338,9 +2351,46 @@ export function BotAgentSection(props: {
   const { bot, cliState, patchBot } = props;
   const initialKey = agentSelectionKey(bot, props.sessionFallback);
   const runtimeConfigKey = JSON.stringify([bot.cliRuntime ?? null, bot.cliPathOverride ?? null]);
+  const autoConfigKey = JSON.stringify(bot.traexAutoModel ?? null);
+  const initialAutoDraft = useRef(selectedAgentCliId(initialKey) === 'traex'
+    ? readAutoModelDraft(bot.larkAppId) : undefined);
+  const autoDraftRef = useRef<TraexAutoModelDraft>(autoModelDraftFromConfig(bot.traexAutoModel, {
+      reasoningEffort: bot.reasoningEffort, modelBackendVariant: bot.modelBackendVariant ?? undefined,
+    }, initialAutoDraft.current, selectedAgentCliId(initialKey) === 'traex' && bot.model?.toLowerCase() === 'auto'));
   const [cliKey, setCliKey] = useState(initialKey);
   const [cliSelectionTouched, setCliSelectionTouched] = useState(false);
-  const [model, setModel] = useState(typeof bot.model === 'string' ? bot.model : '');
+  const [model, setModel] = useState(autoDraftRef.current.enabled ? 'auto'
+    : typeof bot.model === 'string' ? bot.model : '');
+  const [autoModelEnabled, setAutoModelEnabled] = useState(autoDraftRef.current.enabled);
+  const [autoReselectPerTurn, setAutoReselectPerTurn] = useState(autoDraftRef.current.reselectPerTurn);
+  const [autoModelTouched, setAutoModelTouched] = useState(!!initialAutoDraft.current);
+  const [autoModels, setAutoModels] = useState(autoDraftRef.current.models);
+  const [autoModelSettings, setAutoModelSettings] = useState(autoDraftRef.current.modelSettings);
+  const [autoTimeoutSeconds, setAutoTimeoutSeconds] = useState(autoDraftRef.current.timeoutSeconds);
+  const [autoCooldownSeconds, setAutoCooldownSeconds] = useState(autoDraftRef.current.cooldownSeconds);
+  const [autoDraftStorageFailed, setAutoDraftStorageFailed] = useState(false);
+  const pendingAutoDefaults = useRef(new Set<string>());
+  const savedAutoPreferences = useRef<string | undefined>(undefined);
+  const editorSaveEpoch = useRef(0);
+  useEffect(() => {
+    editorSaveEpoch.current += 1;
+    return () => { editorSaveEpoch.current += 1; };
+  }, [bot.larkAppId]);
+  function applyAutoDraft(draft: TraexAutoModelDraft) {
+    autoDraftRef.current = draft;
+    setAutoModelEnabled(draft.enabled);
+    setAutoReselectPerTurn(draft.reselectPerTurn);
+    setAutoModels(draft.models);
+    setAutoModelSettings(draft.modelSettings);
+    setAutoTimeoutSeconds(draft.timeoutSeconds);
+    setAutoCooldownSeconds(draft.cooldownSeconds);
+  }
+  function editAutoDraft(patch: Partial<TraexAutoModelDraft>) {
+    const next = { ...autoDraftRef.current, ...patch };
+    applyAutoDraft(next);
+    setAutoModelTouched(true);
+    setAutoDraftStorageFailed(!writeAutoModelDraft(bot.larkAppId, next));
+  }
   const [modelBackendVariant, setModelBackendVariant] = useState<'' | 'standard' | 'max'>(bot.modelBackendVariant ?? '');
   const [modelBackendVariantTouched, setModelBackendVariantTouched] = useState(false);
   const [reasoningEffort, setReasoningEffort] = useState<'' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'>(bot.reasoningEffort ?? '');
@@ -2352,7 +2402,7 @@ export function BotAgentSection(props: {
   const [nativeEffort, setNativeEffort] = useState<'' | NativeEffort>(bot.nativeSubagentRuntime?.reasoningEffort?.mode === 'custom' ? bot.nativeSubagentRuntime.reasoningEffort.value : '');
   const [nativePolicyTouched, setNativePolicyTouched] = useState(false);
   const [nativePolicyErrors, setNativePolicyErrors] = useState<NativePolicyErrors>({ model: null, effort: null });
-  // dsh-only turn timeout, edited in minutes (bots.json stores ms). Empty means
+  // dsh timeout / MiniMax turn budget, edited in minutes (bots.json stores ms). Empty means
   // no runner watchdog. `touched` gates whether a save sends the field
   // at all: an untouched field is omitted so the daemon preserves the exact
   // stored ms (including legal non-whole-minute values) instead of clearing it.
@@ -2382,7 +2432,16 @@ export function BotAgentSection(props: {
   useEffect(() => {
     setCliKey(agentSelectionKey(bot, props.sessionFallback));
     setCliSelectionTouched(false);
-    setModel(typeof bot.model === 'string' ? bot.model : '');
+    const stored = selectedAgentCliId(agentSelectionKey(bot, props.sessionFallback)) === 'traex'
+      ? readAutoModelDraft(bot.larkAppId) : undefined;
+    const draft = autoModelDraftFromConfig(bot.traexAutoModel, {
+      reasoningEffort: bot.reasoningEffort, modelBackendVariant: bot.modelBackendVariant ?? undefined,
+    }, stored, selectedAgentCliId(agentSelectionKey(bot, props.sessionFallback)) === 'traex' && bot.model?.toLowerCase() === 'auto');
+    applyAutoDraft(draft);
+    setModel(draft.enabled ? 'auto' : typeof bot.model === 'string' ? bot.model : '');
+    setAutoModelTouched(!!stored && JSON.stringify(stored) !== savedAutoPreferences.current);
+    setAutoDraftStorageFailed(false);
+    pendingAutoDefaults.current.clear();
     setModelBackendVariant(bot.modelBackendVariant ?? '');
     setModelBackendVariantTouched(false);
     setReasoningEffort(bot.reasoningEffort ?? '');
@@ -2411,6 +2470,9 @@ export function BotAgentSection(props: {
     bot.cliId,
     bot.larkAppId,
     bot.model,
+    autoConfigKey,
+    bot.codexRpcInput,
+    bot.codexRpcInputDefault,
     bot.modelBackendVariant,
     bot.reasoningEffort,
     bot.serviceTier,
@@ -2431,6 +2493,17 @@ export function BotAgentSection(props: {
   // live 探测当前 CLI 的可用模型（ttadk 网关项保持现状，只用静态建议列表）。
   const [detectedModels, setDetectedModels] = useState<Awaited<ReturnType<typeof fetchDetectedModels>>>(null);
   const [detectingModels, setDetectingModels] = useState(false);
+  useEffect(() => {
+    const current = autoDraftRef.current;
+    let settings = current.modelSettings;
+    for (const model of pendingAutoDefaults.current) {
+      const capability = detectedModels?.modelCapabilities?.find(entry => entry.slug.toLowerCase() === model.toLowerCase());
+      if (!capability) continue;
+      settings = { ...settings, [model]: strongestTraexModelSettings(model, capability) };
+      pendingAutoDefaults.current.delete(model);
+    }
+    if (settings !== current.modelSettings) editAutoDraft({ modelSettings: settings });
+  }, [detectedModels]);
   useEffect(() => {
     if (option?.gateway === 'ttadk') {
       setDetectedModels(null);
@@ -2496,6 +2569,10 @@ export function BotAgentSection(props: {
       setModelBackendVariant('');
       setModelBackendVariantTouched(true);
     }
+    if (autoModelEnabled && (selectedAgentCliId(nextKey) !== 'traex' || nextOption?.cliLaunchMode)) {
+      editAutoDraft({ enabled: false });
+      if (model === 'auto') setModel('');
+    }
   }
 
   function updateRuntimeMode(mode: RuntimeMode): void {
@@ -2544,12 +2621,12 @@ export function BotAgentSection(props: {
           : { provider: runtimeDraft.updateProvider },
       };
     }
-    // dsh-only turn timeout: validate the (touched) minutes input before saving
+    // Runner turn budget: validate the (touched) minutes input before saving
     // so an illegal value surfaces an inline error instead of silently clearing
     // the config. Untouched → omitted below so the daemon preserves the stored
     // ms exactly (including legal non-whole-minute values).
     let turnTimeoutField: number | '' | undefined;
-    if (cliKey === 'dsh' && turnTimeoutTouched) {
+    if (supportsTurnTimeout && turnTimeoutTouched) {
       const parsed = parseTurnTimeoutMinInput(turnTimeoutMin);
       if (parsed === 'invalid') {
         const text = tr('botDefaults.agentTurnTimeoutInvalid');
@@ -2562,6 +2639,19 @@ export function BotAgentSection(props: {
     }
     const trimmedNativeModel = nativeModel.trim();
     const saveCliId = selectedAgentCliId(cliKey);
+    const autoConfig = normalizeTraexAutoModelConfig(autoModelEnabled ? {
+      enabled: true, models: autoModels, queueTimeoutMs: Number(autoTimeoutSeconds) * 1_000,
+      reselectPerTurn: autoReselectPerTurn,
+      switchCooldownMs: Number(autoCooldownSeconds) * 1_000,
+      modelSettings: Object.fromEntries(autoModels.filter(Boolean).map(model => [model,
+        resolveTraexAutoModelSettings({ enabled: true, models: autoModels, queueTimeoutMs: 30_000, modelSettings: autoModelSettings },
+          model, { reasoningEffort: reasoningEffort || undefined, modelBackendVariant: modelBackendVariant || undefined }),
+      ])),
+    } : null);
+    if (saveCliId === 'traex' && autoConfig.error) {
+      setAgentStatus({ text: `✗ ${tr('botDefaults.autoModelInvalid')}` });
+      return;
+    }
     if (saveCliId === 'traex') {
       const nextNativePolicyErrors: NativePolicyErrors = {
         model: nativeModelMode === 'custom' && !trimmedNativeModel ? tr('botDefaults.nativeSubagentModelRequired') : null,
@@ -2573,6 +2663,9 @@ export function BotAgentSection(props: {
         return;
       }
     }
+    const saveEpoch = editorSaveEpoch.current;
+    const draftAtSave = autoDraftRef.current;
+    const storedAtSave = JSON.stringify(readAutoModelDraft(bot.larkAppId));
     setAgentBusy(true);
     try {
       const nativeSubagentRuntime = nativeModelMode === 'passthrough' && nativeEffortMode === 'passthrough'
@@ -2589,15 +2682,16 @@ export function BotAgentSection(props: {
         cliId: cliKey,
         ...(cliSelectionTouched ? { replaceCliSelection: true } : {}),
         model,
+        ...(saveCliId === 'traex' && (autoModelTouched || autoModelEnabled)
+          ? { traexAutoModel: autoConfig.config ?? null } : {}),
         ...(isBackendVariantCliId(saveCliId) && modelBackendVariantTouched ? { modelBackendVariant } : {}),
         reasoningEffort: cliSupportsReasoningEffort(cliKey) ? reasoningEffort : '',
         ...(serviceTierTouched && (saveCliId === 'codex' || saveCliId === 'codex-app')
           ? { serviceTier }
           : {}),
-        // dsh-only: only send when the user actually edited the field. Omitting
-        // it makes the daemon preserve the current value; non-dsh selections
-        // never send it (the daemon drops any stored value for non-dsh CLIs).
-        ...(cliKey === 'dsh' && turnTimeoutField !== undefined ? { turnTimeoutMs: turnTimeoutField } : {}),
+        // Only send a supported budget when edited. For supported runners, the
+        // server preserves omitted values; for unsupported CLIs, it deletes them.
+        ...(supportsTurnTimeout && turnTimeoutField !== undefined ? { turnTimeoutMs: turnTimeoutField } : {}),
         // dsh-only runtime variant: only send when touched, same semantics as
         // turnTimeoutMs. 'official' clears a stored 'tui' selection.
         ...(cliKey === 'dsh' && dshRuntimeTouched ? { dshRuntime } : {}),
@@ -2608,7 +2702,60 @@ export function BotAgentSection(props: {
         ...(saveCliId === 'traex' && nativePolicyTouched ? { nativeSubagentRuntime } : {}),
       };
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, body);
+      const syncSavedBot = () => patchBot(bot.larkAppId, {
+          cliId: res.body.cliId,
+          cliRuntime: res.body.cliRuntime === undefined
+            ? runtimeTouched ? cliRuntime ?? null : bot.cliRuntime ?? null
+            : res.body.cliRuntime,
+          cliPathOverride: res.body.cliPathOverride === undefined
+            ? runtimeTouched ? null : bot.cliPathOverride ?? null
+            : res.body.cliPathOverride,
+          wrapperCli: res.body.wrapperCli ?? null,
+          cliLaunchMode: res.body.cliLaunchMode ?? null,
+          model: res.body.model ?? '',
+          traexAutoModel: res.body.traexAutoModel ?? undefined,
+          codexRpcInput: res.body.codexRpcInput === undefined ? bot.codexRpcInput : res.body.codexRpcInput,
+          codexRpcInputDefault: res.body.codexRpcInputDefault ?? bot.codexRpcInputDefault,
+          codexRpcInputEffective: res.body.codexRpcInputEffective,
+          traexAutoModelBlockedReason: null,
+          modelBackendVariant: res.body.modelBackendVariant ?? undefined,
+          reasoningEffort: res.body.reasoningEffort ?? undefined,
+          serviceTier: res.body.serviceTier ?? undefined,
+          nativeSubagentRuntime: res.body.nativeSubagentRuntime ?? undefined,
+          turnTimeoutMs: typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
+          dshRuntime: typeof res.body.dshRuntime === 'string' ? res.body.dshRuntime : bot.dshRuntime ?? null,
+          dshProfile: typeof res.body.dshProfile === 'string' ? res.body.dshProfile : bot.dshProfile ?? null,
+          cliConfigDir: typeof res.body.cliConfigDir === 'string' ? res.body.cliConfigDir : null,
+          agentSelectionKey: res.body.selectionKey ?? cliKey,
+          readIsolation: res.body.readIsolation === true,
+          readIsolationSupported: res.body.readIsolationSupported === true,
+        });
+      if (editorSaveEpoch.current !== saveEpoch) {
+        if (res.ok && res.body.ok) syncSavedBot();
+        return;
+      }
       if (res.ok && res.body.ok) {
+        const savedAutoConfig = res.body.traexAutoModel ?? undefined;
+        const latestStored = readAutoModelDraft(bot.larkAppId);
+        const newerStored = JSON.stringify(latestStored) !== storedAtSave;
+        const newerDraft = autoDraftRef.current !== draftAtSave || newerStored;
+        const retainedPreferences = newerStored ? latestStored
+          : (newerDraft || !savedAutoConfig?.enabled) && autoDraftRef.current.models.length > 0
+            ? autoDraftRef.current : undefined;
+        // Disabling the feature saves the switch without discarding its pool.
+        // Saving an enabled pool replaces the draft with authoritative config.
+        if (retainedPreferences) {
+          setAutoDraftStorageFailed(!writeAutoModelDraft(bot.larkAppId, retainedPreferences));
+        } else {
+          clearAutoModelDraft(bot.larkAppId);
+          setAutoDraftStorageFailed(false);
+        }
+        savedAutoPreferences.current = newerDraft ? undefined : JSON.stringify(readAutoModelDraft(bot.larkAppId));
+        setAutoModelTouched(newerDraft);
+        applyAutoDraft(autoModelDraftFromConfig(savedAutoConfig, {
+          reasoningEffort: res.body.reasoningEffort ?? undefined,
+          modelBackendVariant: res.body.modelBackendVariant ?? undefined,
+        }, retainedPreferences, res.body.model?.toLowerCase() === 'auto' && savedAutoConfig?.enabled === true));
         const summary = parseAgentSwitchSummary(res.body);
         const closedCount = summary.closed;
         const residualCount = summary.residual;
@@ -2637,29 +2784,7 @@ export function BotAgentSection(props: {
             // session survived: that is what made this invisible.
             ? { text: `⚠️ ${closedText}` }
             : { text: `✓ ${closedText || tr('botDefaults.agentSaved')}`, ok: true });
-        patchBot(bot.larkAppId, {
-          cliId: res.body.cliId,
-          cliRuntime: res.body.cliRuntime === undefined
-            ? runtimeTouched ? cliRuntime ?? null : bot.cliRuntime ?? null
-            : res.body.cliRuntime,
-          cliPathOverride: res.body.cliPathOverride === undefined
-            ? runtimeTouched ? null : bot.cliPathOverride ?? null
-            : res.body.cliPathOverride,
-          wrapperCli: res.body.wrapperCli ?? null,
-          cliLaunchMode: res.body.cliLaunchMode ?? null,
-          model: res.body.model ?? '',
-          modelBackendVariant: res.body.modelBackendVariant ?? undefined,
-          reasoningEffort: res.body.reasoningEffort ?? undefined,
-          serviceTier: res.body.serviceTier ?? undefined,
-          nativeSubagentRuntime: res.body.nativeSubagentRuntime ?? undefined,
-          turnTimeoutMs: typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
-          dshRuntime: typeof res.body.dshRuntime === 'string' ? res.body.dshRuntime : bot.dshRuntime ?? null,
-          dshProfile: typeof res.body.dshProfile === 'string' ? res.body.dshProfile : bot.dshProfile ?? null,
-          cliConfigDir: typeof res.body.cliConfigDir === 'string' ? res.body.cliConfigDir : null,
-          agentSelectionKey: res.body.selectionKey ?? cliKey,
-          readIsolation: res.body.readIsolation === true,
-          readIsolationSupported: res.body.readIsolationSupported === true,
-        });
+        syncSavedBot();
         // Re-sync the minutes input from the authoritative saved ms and clear
         // the dirty flag so a subsequent unrelated save won't touch the field.
         setTurnTimeoutMin(turnTimeoutMinFromMs(
@@ -2812,15 +2937,18 @@ export function BotAgentSection(props: {
   const isTraex = isBackendVariantCliId(selectedCliId);
   const isCodexSelection = selectedCliId === 'codex' || selectedCliId === 'codex-app';
   const isReasoningSelection = cliSupportsReasoningEffort(cliKey);
-  // The dsh adapter is the only one that forwards a runner turn timeout.
   const isDsh = selectedCliId === 'dsh';
+  const supportsTurnTimeout = isDsh || selectedCliId === 'minimax';
   const reasoningEffortOptions = useMemo(
     () => {
-      const live = isCodexSelection ? detectedModels?.reasoningEffortsByModel?.[model] : undefined;
+      const capability = isTraex ? detectedModels?.modelCapabilities?.find(entry => entry.slug.toLowerCase() === model.toLowerCase()) : undefined;
+      const live = isTraex
+        ? capability?.contextVariants?.find(entry => entry.id === modelBackendVariant)?.reasoningEfforts ?? capability?.reasoningEfforts
+        : isCodexSelection ? detectedModels?.reasoningEffortsByModel?.[model] : undefined;
       return live?.filter(isCodexReasoningEffort)
         ?? reasoningEffortsForCliModel(reasoningCatalogKey(cliKey), model);
     },
-    [cliKey, detectedModels, isCodexSelection, model],
+    [cliKey, detectedModels, isCodexSelection, isTraex, model, modelBackendVariant],
   );
   const nativeReasoningEffortOptions = useMemo(
     () => nativeModelMode === 'custom'
@@ -2830,8 +2958,11 @@ export function BotAgentSection(props: {
   );
 
   useEffect(() => {
+    // Await positive per-model metadata before clearing a saved TraeX value.
+    // A pending or missing live catalog is not evidence that a level is invalid.
+    if (isTraex && !detectedModels?.modelCapabilities?.some(entry => entry.slug.toLowerCase() === model.toLowerCase())) return;
     if (reasoningEffort && !reasoningEffortOptions.includes(reasoningEffort)) setReasoningEffort('');
-  }, [reasoningEffort, reasoningEffortOptions]);
+  }, [reasoningEffort, reasoningEffortOptions, isTraex, detectedModels, model]);
   useEffect(() => {
     if (nativeModelMode !== 'custom') {
       if (nativePolicyErrors.model) setNativePolicyErrors(current => ({ ...current, model: null }));
@@ -3044,8 +3175,8 @@ export function BotAgentSection(props: {
               key={cliKey}
               value={model}
               onChange={setModel}
-              options={modelCandidates}
-              disabled={agentBusy || modelDisabledByCli}
+              options={autoModelEnabled && selectedCliId === 'traex' ? ['auto', ...modelCandidates] : modelCandidates}
+              disabled={agentBusy || modelDisabledByCli || (selectedCliId === 'traex' && autoModelEnabled)}
               busy={detectingModels}
               dataInput="agentModel"
               ariaLabel={tr('botDefaults.agentModel')}
@@ -3060,6 +3191,54 @@ export function BotAgentSection(props: {
           </label>
         </div>
       )}
+      {selectedCliId === 'traex' && !bot.wrapperCli && !option?.cliLaunchMode ? (
+        <TraexAutoModelEditor enabled={autoModelEnabled} models={autoModels}
+          reselectPerTurn={autoReselectPerTurn}
+          onReselectPerTurn={enabled => editAutoDraft({ reselectPerTurn: enabled })}
+          modelSettings={autoModelSettings} capabilities={detectedModels?.modelCapabilities}
+          timeoutSeconds={autoTimeoutSeconds} cooldownSeconds={autoCooldownSeconds}
+          candidates={modelCandidates.filter(candidate => candidate.toLowerCase() !== 'auto')}
+          busy={agentBusy} onModels={models => {
+            const current = autoDraftRef.current;
+            const settings = Object.fromEntries(models.filter(Boolean).map(model => {
+              if (Object.prototype.hasOwnProperty.call(current.modelSettings, model)) return [model, current.modelSettings[model]];
+              const capability = detectedModels?.modelCapabilities?.find(entry => entry.slug.toLowerCase() === model.toLowerCase());
+              if (!capability) pendingAutoDefaults.current.add(model);
+              return [model, strongestTraexModelSettings(model, capability)];
+            }));
+            editAutoDraft({ models, modelSettings: settings });
+          }}
+          onSettings={(model, settings) => {
+            pendingAutoDefaults.current.delete(model);
+            editAutoDraft({ modelSettings: { ...autoDraftRef.current.modelSettings, [model]: settings } });
+          }}
+          onTimeout={seconds => editAutoDraft({ timeoutSeconds: seconds })}
+          onCooldown={seconds => editAutoDraft({ cooldownSeconds: seconds })}
+          dirty={autoModelTouched} storageFailed={autoDraftStorageFailed} saveStatus={agentStatus?.text}
+          onSave={() => void saveAgent()}
+          onEnabled={enabled => {
+            const current = autoDraftRef.current;
+            let nextModels = current.models;
+            let nextSettings = current.modelSettings;
+            if (enabled) {
+              if (autoModels.length === 0) {
+                const preferred = model && model !== 'auto' ? model : modelCandidates[0] ?? '';
+                nextModels = [preferred];
+                const capability = detectedModels?.modelCapabilities?.find(entry => entry.slug.toLowerCase() === preferred.toLowerCase());
+                if (preferred && !capability) pendingAutoDefaults.current.add(preferred);
+                nextSettings = preferred ? { [preferred]: strongestTraexModelSettings(preferred, capability) } : {};
+              }
+              setModel('auto');
+              setReasoningEffort('');
+            } else if (model === 'auto') {
+              setModel(autoModels[0] ?? '');
+              setReasoningEffort(autoModelSettings[autoModels[0] ?? '']?.reasoningEffort ?? '');
+              setModelBackendVariant(autoModelSettings[autoModels[0] ?? '']?.modelBackendVariant ?? '');
+              setModelBackendVariantTouched(true);
+            }
+            editAutoDraft({ enabled, models: nextModels, modelSettings: nextSettings });
+          }} />
+      ) : null}
       {cliSupportsConfigDir(selectedAgentCliId(cliKey)) && (
         <div className="bd-row">
           <label>
@@ -3078,7 +3257,7 @@ export function BotAgentSection(props: {
           </label>
         </div>
       )}
-      {isTraex && (
+      {isTraex && !autoModelEnabled && (
         <div className="bd-row">
           <div className="bd-field">
             <FieldTitle help={tr('botDefaults.agentModelBackendVariantHelp')}>{tr('botDefaults.agentModelBackendVariant')}</FieldTitle>
@@ -3181,10 +3360,14 @@ export function BotAgentSection(props: {
           </label>
         </div>
       )}
-      {isDsh && (
+      {supportsTurnTimeout && (
         <div className="bd-row">
           <label>
-            <FieldTitle help={tr('botDefaults.agentTurnTimeoutHelp')}>{tr('botDefaults.agentTurnTimeout')}</FieldTitle>
+            {isDsh ? (
+              <FieldTitle help={tr('botDefaults.agentTurnTimeoutHelp')}>{tr('botDefaults.agentTurnTimeout')}</FieldTitle>
+            ) : (
+              <FieldTitle help={tr('botDefaults.minimaxTurnBudgetHelp')}>{tr('botDefaults.minimaxTurnBudget')}</FieldTitle>
+            )}
             <input
               type="number"
               min={0}
@@ -3206,7 +3389,7 @@ export function BotAgentSection(props: {
           </label>
         </div>
       )}
-      {isReasoningSelection && (
+      {isReasoningSelection && !(selectedCliId === 'traex' && autoModelEnabled) && (
         <div className="bd-row">
           <div className="bd-field">
             <FieldTitle help={tr('botDefaults.agentReasoningEffortHelp')}>{tr('botDefaults.agentReasoningEffort')}</FieldTitle>
@@ -7839,228 +8022,7 @@ function LaunchShellSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) 
   );
 }
 
-export function EnvPolicySection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
-  const tr = useT();
-  const [mode, setMode] = useState<'inherit' | 'strict'>(props.bot.envPolicy?.mode ?? 'inherit');
-  const [names, setNames] = useState((props.bot.envPolicy?.inherit ?? []).join(', '));
-  const [status, setStatus] = useState<StatusMessage>(null);
-  const [busy, setBusy] = useState(false);
-  useEffect(() => {
-    setMode(props.bot.envPolicy?.mode ?? 'inherit');
-    setNames((props.bot.envPolicy?.inherit ?? []).join(', '));
-  }, [props.bot.larkAppId, props.bot.envPolicy]);
-  async function save(): Promise<void> {
-    setBusy(true);
-    setStatus(null);
-    try {
-      const envPolicy = { mode, ...(mode === 'strict' ? { inherit: names.split(/[\s,]+/).filter(Boolean) } : {}) };
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/env-policy`, { envPolicy });
-      if (res.ok && res.body.ok) {
-        props.patchBot(props.bot.larkAppId, { envPolicy });
-        setStatus({ text: tr('botDefaults.envPolicySaved'), ok: true });
-      } else setStatus({ text: tr('botDefaults.envPolicyInvalid') });
-    } catch { setStatus({ text: tr('botDefaults.envPolicyInvalid') }); }
-    finally { setBusy(false); }
-  }
-  return <div className="bd-subsection">
-    <h4 className="bd-subsection-title"><FieldTitle help={tr('botDefaults.envPolicyHelp')}>{tr('botDefaults.envPolicyLabel')}</FieldTitle></h4>
-    <select data-input="envPolicyMode" value={mode} disabled={busy} onChange={e => setMode(e.currentTarget.value as 'inherit' | 'strict')}>
-      <option value="inherit">{tr('botDefaults.envPolicyInherit')}</option>
-      <option value="strict">{tr('botDefaults.envPolicyStrict')}</option>
-    </select>
-    {mode === 'strict' && <input data-input="envPolicyNames" value={names} disabled={busy} placeholder="HTTPS_PROXY, NODE_EXTRA_CA_CERTS" onChange={e => setNames(e.currentTarget.value)} />}
-    <div className="actions"><button className="primary" type="button" data-action="save-env-policy" disabled={busy} onClick={() => void save()}>{tr('botDefaults.envPolicySave')}</button><StatusSpan status={status} /></div>
-  </div>;
-}
 
-type EnvEntryTag = 'new' | 'overwrite' | 'reserved' | 'skipped';
-
-/** Live analysis of the env textarea against the stored names. Names only —
- *  parsed values never leave this function. */
-function analyzeEnvDraft(text: string, storedKeys: readonly string[], mode: 'merge' | 'replace') {
-  if (!text.trim()) return null;
-  const parsed = parsePerBotEnvText(text);
-  if (!parsed.ok) return { ok: false as const, reason: parsed.reason, line: parsed.line };
-  const sanitized = sanitizePerBotEnv(parsed.env);
-  const stored = new Set(storedKeys);
-  const entries = Object.keys(parsed.env).map((key): { key: string; tag: EnvEntryTag } => ({
-    key,
-    tag: isReservedPerBotEnvKey(key) ? 'reserved'
-      : !(key in sanitized) ? 'skipped'
-      : stored.has(key) ? 'overwrite' : 'new',
-  }));
-  const reserved = entries.filter(e => e.tag === 'reserved').map(e => e.key);
-  const dropped = mode === 'replace' ? storedKeys.filter(k => !(k in sanitized)) : [];
-  return {
-    ok: true as const,
-    format: parsed.format,
-    entries,
-    reserved,
-    dropped,
-    ignoredLines: parsed.ignoredLines,
-    savable: reserved.length === 0 && Object.keys(sanitized).length > 0,
-  };
-}
-
-export function EnvSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
-  const tr = useT();
-  const [value, setValue] = useState('');
-  const [mode, setMode] = useState<'merge' | 'replace'>('merge');
-  const [status, setStatus] = useState<StatusMessage>(null);
-  const [busy, setBusy] = useState(false);
-  const storedKeys = props.bot.envKeys ?? [];
-
-  useEffect(() => { setValue(''); setMode('merge'); setStatus(null); }, [props.bot.larkAppId]);
-
-  const draft = useMemo(() => analyzeEnvDraft(value, storedKeys, mode), [value, storedKeys, mode]);
-
-  async function put(body: { env: string; mode?: 'merge' | 'replace'; remove?: string[] }): Promise<boolean> {
-    return saveBotField({
-      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/env`, body),
-      setStatus,
-      setBusy,
-      saved: tr('botDefaults.cardPrefSaved'),
-      onSaved: resBody =>
-        // Never echo stored values, including older daemon responses.
-        props.patchBot(props.bot.larkAppId, { env: '', envKeys: Array.isArray(resBody.envKeys) ? resBody.envKeys : [] }),
-    });
-  }
-
-  async function save(): Promise<void> {
-    if (!draft?.ok || !draft.savable) return;
-    if (await put({ env: value, mode })) setValue('');
-  }
-
-  async function removeKey(key: string): Promise<void> {
-    const ok = await confirm({
-      title: tr('botDefaults.envRemoveConfirmTitle'),
-      message: tr('botDefaults.envRemoveConfirm', { key }),
-      danger: true,
-    });
-    if (ok) await put({ env: '', mode: 'merge', remove: [key] });
-  }
-
-  async function clearAll(): Promise<void> {
-    const ok = await confirm({
-      title: tr('botDefaults.envClearConfirmTitle'),
-      message: tr('botDefaults.envClearConfirm', { count: storedKeys.length }),
-      danger: true,
-    });
-    if (ok) await put({ env: '', mode: 'replace' });
-  }
-
-  const parseError = draft && !draft.ok
-    ? draft.reason === 'invalid_json'
-      ? tr('botDefaults.envParseInvalidJson')
-      : draft.line ? tr('botDefaults.envParseInvalidLine', { line: draft.line }) : tr('botDefaults.envParseNoAssignment')
-    : null;
-  const tagLabel: Record<EnvEntryTag, string> = {
-    new: tr('botDefaults.envPreviewNew'),
-    overwrite: tr('botDefaults.envPreviewOverwrite'),
-    reserved: tr('botDefaults.envPreviewReserved'),
-    skipped: tr('botDefaults.envPreviewSkipped'),
-  };
-
-  return (
-    <div className="bd-subsection bd-env">
-      <h4 className="bd-subsection-title"><FieldTitle help={tr('botDefaults.envHelp')}>{tr('botDefaults.sectionEnv')}</FieldTitle></h4>
-      <div className="bd-env-stored" data-env-stored="">
-        <div className="bd-env-stored-head">
-          <span className="muted">
-            {storedKeys.length ? tr('botDefaults.envStoredLabel', { count: storedKeys.length }) : tr('botDefaults.envStoredEmpty')}
-          </span>
-          {storedKeys.length > 0 && (
-            <button type="button" className="bd-env-clear" data-action="clear-env" disabled={busy} onClick={() => void clearAll()}>
-              {tr('botDefaults.envClearAll')}
-            </button>
-          )}
-        </div>
-        {storedKeys.length > 0 && (
-          <ul className="bd-env-chips">
-            {storedKeys.map(key => (
-              <li key={key} className="bd-env-chip" data-env-key={key}>
-                <code>{key}</code>
-                <button
-                  type="button"
-                  className="bd-env-chip-remove"
-                  data-action="remove-env-key"
-                  aria-label={tr('botDefaults.envRemoveKey', { key })}
-                  title={tr('botDefaults.envRemoveKey', { key })}
-                  disabled={busy}
-                  onClick={() => void removeKey(key)}
-                >×</button>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
-      <textarea
-        data-input="env"
-        rows={6}
-        spellCheck={false}
-        autoComplete="off"
-        placeholder={tr('botDefaults.envPlaceholder')}
-        value={value}
-        disabled={busy}
-        aria-invalid={parseError || (draft?.ok && draft.reserved.length) ? true : undefined}
-        onChange={event => setValue(event.currentTarget.value)}
-      />
-      {parseError && <p className="bd-env-preview is-error" data-env-preview="">{parseError}</p>}
-      {draft?.ok && (
-        <div className="bd-env-preview" data-env-preview="">
-          <div className="bd-env-preview-head">
-            {tr('botDefaults.envPreview', {
-              format: tr(draft.format === 'json' ? 'botDefaults.envFormatJson' : 'botDefaults.envFormatDotenv'),
-              count: draft.entries.length,
-            })}
-          </div>
-          <ul className="bd-env-chips">
-            {draft.entries.map(e => (
-              <li key={e.key} className={`bd-env-chip is-${e.tag}`}>
-                <code>{e.key}</code>
-                <span className="bd-env-chip-tag">{tagLabel[e.tag]}</span>
-              </li>
-            ))}
-          </ul>
-          {draft.reserved.length > 0 && (
-            <p className="is-error">{tr('botDefaults.envReservedBlocked', { keys: draft.reserved.join(', ') })}</p>
-          )}
-          {draft.dropped.length > 0 && (
-            <p className="is-warning">{tr('botDefaults.envPreviewDropped', { count: draft.dropped.length, names: draft.dropped.join(', ') })}</p>
-          )}
-          {draft.ignoredLines.length > 0 && (
-            <p className="muted">{tr('botDefaults.envPreviewIgnored', { lines: draft.ignoredLines.join(', ') })}</p>
-          )}
-        </div>
-      )}
-      <div className="bd-env-mode" role="radiogroup">
-        {(['merge', 'replace'] as const).map(m => (
-          <label key={m}>
-            <input
-              type="radio"
-              name={`bd-env-mode-${props.bot.larkAppId}`}
-              data-input={`envMode-${m}`}
-              checked={mode === m}
-              disabled={busy}
-              onChange={() => setMode(m)}
-            />
-            {tr(m === 'merge' ? 'botDefaults.envModeMerge' : 'botDefaults.envModeReplace')}
-          </label>
-        ))}
-      </div>
-      <div className="actions">
-        <button
-          type="button"
-          className="primary"
-          data-action="save-env"
-          disabled={busy || !draft?.ok || !draft.savable}
-          onClick={() => void save()}
-        >{tr('botDefaults.envSave')}</button>
-        <StatusSpan status={status} attr={{ 'data-env-status': '' }} />
-      </div>
-    </div>
-  );
-}
 
 /** riff UI 建议主动选择的模型（服务端另有隐藏降级备胎，不在此列）。 */
 const RIFF_MODEL_SUGGESTIONS = ['gpt-5.5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.4', 'gpt-5.4-pro'];

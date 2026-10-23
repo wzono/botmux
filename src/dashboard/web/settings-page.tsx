@@ -14,6 +14,7 @@ import {
   binaryProgressText,
 } from './update-action.js';
 import { ui } from './ui.js';
+import { SessionEnvEditor, type SessionEnvScope } from './session-env-editor.js';
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
 import {
@@ -21,6 +22,8 @@ import {
   idleCleanupHoursLabel,
   type IdleCleanupHours,
 } from '../session-cleanup.js';
+
+const GLOBAL_SESSION_ENV_SCOPE: SessionEnvScope = { kind: 'global' };
 
 interface MaintenanceTaskCfg { enabled?: boolean; time?: string }
 interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: MaintenanceTaskCfg }
@@ -41,6 +44,7 @@ interface DashboardSettings {
   };
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
+  reapOrphanTmuxServers: boolean;
   bypassCodexHookTrust: boolean;
   hideCodexRateLimitModelNudge: boolean;
   cardBrandLabel: boolean;
@@ -202,6 +206,7 @@ function parseSettings(s: any): DashboardSettings {
     },
     codexRpcInput: s?.codexRpcInput === true,
     autoUpgradeCodexSessions: s?.autoUpgradeCodexSessions === true,
+    reapOrphanTmuxServers: s?.reapOrphanTmuxServers === true,
     // default ON — only an explicit persisted false disables (matches server snapshot)
     bypassCodexHookTrust: s?.bypassCodexHookTrust !== false,
     hideCodexRateLimitModelNudge: s?.hideCodexRateLimitModelNudge !== false,
@@ -829,7 +834,7 @@ function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'reapOrphanTmuxServers' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
@@ -987,6 +992,13 @@ function SettingsBody(props: {
             onChange={value => saveBoolean('autoUpgradeCodexSessions', value)}
           />
           <ToggleRow
+            title={tr('settings.reapOrphanTmuxServers')}
+            help={tr('settings.reapOrphanTmuxServersHelp')}
+            checked={settings.reapOrphanTmuxServers}
+            disabled={dis || savingKey === 'reapOrphanTmuxServers'}
+            onChange={value => saveBoolean('reapOrphanTmuxServers', value)}
+          />
+          <ToggleRow
             title={tr('settings.bypassCodexHookTrust')}
             help={tr('settings.bypassCodexHookTrustHelp')}
             checked={settings.bypassCodexHookTrust}
@@ -1103,6 +1115,12 @@ function SettingsBody(props: {
               );
             }}
           />
+        </SettingsBlock>
+      </SettingsGroup>
+      {/* 表格型区块：不进上面的瀑布流窄栏，单独一组占满宽度。 */}
+      <SettingsGroup className="settings-group-session-env">
+        <SettingsBlock id="settings-session-env" title={tr('sessionEnv.sectionTitle')}>
+          <SessionEnvEditor scope={GLOBAL_SESSION_ENV_SCOPE} />
         </SettingsBlock>
       </SettingsGroup>
       </SettingsModule>
@@ -1258,6 +1276,7 @@ function SettingsNav(props: { tr: ReturnType<typeof useT> }): React.JSX.Element 
       label: tr('settings.moduleGeneral'),
       items: [
         { id: 'settings-access', label: tr('settings.sectionAccess') },
+        { id: 'settings-session-env', label: tr('sessionEnv.sectionTitle') },
         { id: 'settings-cards', label: tr('settings.sectionCards') },
         { id: 'settings-group-creation', label: tr('settings.sectionGroupCreation') },
         { id: 'settings-experimental', label: tr('settings.sectionExperimental') },
