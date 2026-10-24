@@ -56,6 +56,7 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   // 插位会让老脚本静默选错 CLI。
   '31': 'mimocode',
   '32': 'remote-runner',
+  '33': 'codem',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));

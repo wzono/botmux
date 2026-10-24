@@ -23,7 +23,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { shellQuote } from '../../core/cli-launch-mode.js';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
-import { sessionReadyHookCommand, statuslineHookCommand, userPromptHookCommand } from '../hook-command.js';
+import { claudeStopFailureHookCommand, sessionReadyHookCommand, statuslineHookCommand, userPromptHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 import { CLAUDE_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
@@ -1205,7 +1205,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, larkToolAppId, settingsEnv, settingsFilePath, replyDelivery, solo, promptInjection }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, larkToolAppId, settingsEnv, settingsFilePath, replyDelivery, solo, promptInjection, promptCacheTtl }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -1281,6 +1281,12 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // 跟上 5h/7d 窗口滚动；快照 10 min 陈旧自动失效（STATUSLINE_STALE_MS）。
       if (variant.id === 'claude-code') {
         inlineSettings.statusLine = { type: 'command', command: statuslineHookCommand(), refreshInterval: 60 };
+      }
+      // Prompt-cache lifetime (bots.json / config.json `promptCache.ttl`). Through a
+      // gateway Claude Code treats itself as an API-key client and asks for 5m;
+      // `promptCacheTtl` makes it request the lifetime the operator chose.
+      if (variant.id === 'claude-code' && promptCacheTtl) {
+        inlineSettings.promptCacheTtl = promptCacheTtl;
       }
       // claude-code 恒传 --settings（statusLine 总在）；其它 variant 仅在有内容（bypass
       // 键 / env）时才传，disableCliBypass 且无 env 下没东西可传就不传。
@@ -1694,6 +1700,10 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // variant 不装（supportsInvisiblePromptHook 也只对 claude-code 为 true，
       // 装了也是每轮空跑一个子进程）。
       userPromptSubmitCommand: variant.id === 'claude-code' ? userPromptHookCommand() : undefined,
+      // StopFailure 兜底（API 错误结束的回合不跑 Stop hook，transcript 跟丢时没人收口）：
+      // 同样写全局 settings.json。只给 claude-code：该事件在 Claude Code 2.1.x 实测存在，
+      // seed/relay 等共享 adapter 的 variant 未验证。
+      stopFailureCommand: variant.id === 'claude-code' ? claudeStopFailureHookCommand() : undefined,
     },
     // Claude Code 把 UserPromptSubmit 的 additionalContext 注入为不可见的
     // system-reminder（TUI transcript 不可见，仅落 JSONL）。codex 会渲染成可见的

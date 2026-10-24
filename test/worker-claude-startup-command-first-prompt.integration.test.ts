@@ -48,6 +48,7 @@ import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import { killProcessTree } from './helpers/process-tree.js';
+import { readJsonLines } from './helpers/read-json-lines.js';
 
 const tmuxAvailable = probeTmuxFunctional().ok;
 
@@ -183,8 +184,7 @@ interface ScenarioRun {
 }
 
 function readEvents(file: string): FakeEvent[] {
-  if (!existsSync(file)) return [];
-  return readFileSync(file, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line) as FakeEvent);
+  return readJsonLines<FakeEvent>(file);
 }
 
 async function runScenario(scenario: Scenario): Promise<ScenarioRun> {
