@@ -106,6 +106,9 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex') {
     // admitted; the traex viewport veto (covered by the startup integration
     // suite) is inert here.
     awaitingFirstPrompt: false,
+    // ...and no startup dialog can be up (covered by
+    // worker-claude-startup-dialog.integration.test.ts).
+    probeStartupBlocker: () => null,
   };
   const run = new Function('scope', `with (scope) { ${readyCode}; return markPromptReady; }`)(scope);
   try { run(); } catch (err) { if (err !== released) throw err; }

@@ -871,7 +871,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
 
     expect(res).toMatchObject({
       ok: false,
-      errorCode: 'trigger_failed',
+      errorCode: 'session_not_runnable',
       error: expect.stringContaining('durable_owner'),
     });
     expect(mockForkWorker).not.toHaveBeenCalled();

@@ -19,7 +19,7 @@
 
 import { stripAnsiScreenText } from '../utils/idle-detector.js';
 
-export type CliStartupBlockerKind = 'folder_trust' | 'login' | 'update' | 'terms';
+export type CliStartupBlockerKind = 'folder_trust' | 'login' | 'update' | 'terms' | 'api_key' | 'permission_mode';
 
 export interface CliStartupBlocker {
   kind: CliStartupBlockerKind;
@@ -160,6 +160,32 @@ const RULES: readonly StartupBlockerRule[] = [
     rule: 'mtr-update-dialog',
     kind: 'update',
     all: [dialogLine(String.raw`A new release v\S+ is available\.`), /Would you like to update now\?/],
+  },
+  {
+    // Claude Code 2.1.310 (captured): the first start that finds an
+    // ANTHROPIC_API_KEY it has neither approved nor rejected asks about it, and
+    // runs no SessionStart hook until someone answers. Which key Claude then
+    // authenticates with is the user's call, so Botmux never answers it.
+    rule: 'claude-custom-api-key',
+    kind: 'api_key',
+    all: [
+      /Detected a custom API key in your environment/,
+      /Do you want to use this API key\?/,
+      dialogLine(String.raw`No \(recommended\)`),
+    ],
+  },
+  {
+    // Claude Code 2.1.310 (captured): offered once per config dir to a session
+    // started with bypass permissions — every Botmux spawn. Its default option
+    // rewrites the user's default permission mode, so it must never be answered
+    // by a queued message's Enter.
+    rule: 'claude-auto-mode-default-offer',
+    kind: 'permission_mode',
+    all: [
+      /Make auto mode your default permission mode\?/,
+      dialogLine('Yes, set auto mode as my default permission mode'),
+      dialogLine('No, keep '),
+    ],
   },
   {
     // Claude Code bypass-permissions acceptance (2.1.310 binary strings); the

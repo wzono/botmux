@@ -1,3 +1,4 @@
+import { CodexProfilePicker } from './codex-profile-picker.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter } from '../../services/reply-footer.js';
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ComponentProps, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
@@ -1194,9 +1195,8 @@ function BotDefaultsCard(props: {
             {herdrConfigVisible(bot) ? (
               <section className="bd-tile" id={botDefaultsSectionDomId('herdr')}><HerdrConfigSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
-            {/* Codex App 历史显示只对 codex-app agent 有意义（其它 CLI 无此渲染通道），
-                选了别的 agent 就隐藏，避免无效开关。 */}
-            {bot.cliId === 'codex-app' ? (
+            {/* Codex App 历史显示只对 codex-app agent 有意义；CLI 停顿提醒区块对 codex 同样展示。 */}
+            {bot.cliId === 'codex-app' || bot.cliId === 'codex' ? (
               <section className="bd-tile" id={botDefaultsSectionDomId('codex-app-display')}><CodexAppDisplaySection bot={bot} putCardPref={putCardPref} patchBot={patchBot} /></section>
             ) : null}
             {/* #794 hook 注入目前只验证了 claude-code，其它 CLI 隐藏避免误开。 */}
@@ -2419,6 +2419,15 @@ export function BotAgentSection(props: {
   const [reasoningEffort, setReasoningEffort] = useState<'' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'>(bot.reasoningEffort ?? '');
   const [serviceTier, setServiceTier] = useState<'' | 'default' | 'priority' | 'ultrafast'>(bot.serviceTier ?? '');
   const [serviceTierTouched, setServiceTierTouched] = useState(false);
+  const currentAgentAppId = useRef(bot.larkAppId);
+  currentAgentAppId.current = bot.larkAppId;
+  const [codexProfile, setCodexProfile] = useState(bot.codexProfile ?? '');
+  const [codexProfileTouched, setCodexProfileTouched] = useState(false);
+  // Set when an incompatible CLI switch auto-clears a selected profile, so the
+  // save sends an explicit null (the server rejects cliId!=codex with a kept
+  // profile) and the UI explains why the value is gone. Switching back to
+  // Codex before saving restores the saved value and withdraws the clear.
+  const [codexProfileAutoCleared, setCodexProfileAutoCleared] = useState(false);
   const [nativeModelMode, setNativeModelMode] = useState<NativePolicyMode>(nativePolicyModeFrom(bot.nativeSubagentRuntime?.model));
   const [nativeModel, setNativeModel] = useState(bot.nativeSubagentRuntime?.model?.mode === 'custom' ? bot.nativeSubagentRuntime.model.value : '');
   const [nativeEffortMode, setNativeEffortMode] = useState<NativePolicyMode>(nativePolicyModeFrom(bot.nativeSubagentRuntime?.reasoningEffort));
@@ -2468,6 +2477,9 @@ export function BotAgentSection(props: {
     setModelBackendVariant(bot.modelBackendVariant ?? '');
     setModelBackendVariantTouched(false);
     setReasoningEffort(bot.reasoningEffort ?? '');
+    setCodexProfile(bot.codexProfile ?? '');
+    setCodexProfileTouched(false);
+    setCodexProfileAutoCleared(false);
     setServiceTier(bot.serviceTier ?? '');
     setServiceTierTouched(false);
     setNativeModelMode(nativePolicyModeFrom(bot.nativeSubagentRuntime?.model));
@@ -2498,6 +2510,7 @@ export function BotAgentSection(props: {
     bot.codexRpcInputDefault,
     bot.modelBackendVariant,
     bot.reasoningEffort,
+    bot.codexProfile,
     bot.serviceTier,
     bot.nativeSubagentRuntime,
     bot.turnTimeoutMs,
@@ -2572,6 +2585,18 @@ export function BotAgentSection(props: {
     const previousKey = cliKey;
     setCliKey(nextKey);
     setCliSelectionTouched(true);
+    // A saved profile applies only to native Codex. Leaving Codex with a
+    // profile still selected must explicitly clear it on save (the daemon
+    // rejects the combination); coming back before saving restores it.
+    if (codexProfile && selectedAgentCliId(nextKey) !== 'codex') {
+      setCodexProfile('');
+      setCodexProfileTouched(true);
+      setCodexProfileAutoCleared(true);
+    } else if (codexProfileAutoCleared && selectedAgentCliId(nextKey) === 'codex') {
+      setCodexProfile(bot.codexProfile ?? '');
+      setCodexProfileTouched(false);
+      setCodexProfileAutoCleared(false);
+    }
     if (nextKey !== previousKey && (nextKey !== 'codex' || previousKey !== 'codex')) {
       setRuntimeDraft(runtimeDraftFromBot({ cliRuntime: null, cliPathOverride: null }));
       // If the user leaves Codex and comes back before saving, the visible
@@ -2704,6 +2729,7 @@ export function BotAgentSection(props: {
           };
       const body = {
         cliId: cliKey,
+        ...(codexProfileTouched ? { codexProfile: codexProfile || null } : {}),
         ...(cliSelectionTouched ? { replaceCliSelection: true } : {}),
         model,
         ...(saveCliId === 'traex' && (autoModelTouched || autoModelEnabled)
@@ -2726,6 +2752,7 @@ export function BotAgentSection(props: {
         ...(saveCliId === 'traex' && nativePolicyTouched ? { nativeSubagentRuntime } : {}),
       };
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/agent`, body);
+      if (currentAgentAppId.current !== bot.larkAppId) return;
       const syncSavedBot = () => patchBot(bot.larkAppId, {
           cliId: res.body.cliId,
           cliRuntime: res.body.cliRuntime === undefined
@@ -2744,6 +2771,7 @@ export function BotAgentSection(props: {
           traexAutoModelBlockedReason: null,
           modelBackendVariant: res.body.modelBackendVariant ?? undefined,
           reasoningEffort: res.body.reasoningEffort ?? undefined,
+          codexProfile: res.body.codexProfile ?? null,
           serviceTier: res.body.serviceTier ?? undefined,
           nativeSubagentRuntime: res.body.nativeSubagentRuntime ?? undefined,
           turnTimeoutMs: typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
@@ -2814,6 +2842,9 @@ export function BotAgentSection(props: {
         setTurnTimeoutMin(turnTimeoutMinFromMs(
           typeof res.body.turnTimeoutMs === 'number' ? res.body.turnTimeoutMs : undefined,
         ));
+        setCodexProfile(res.body.codexProfile ?? '');
+        setCodexProfileTouched(false);
+        setCodexProfileAutoCleared(false);
         setTurnTimeoutTouched(false);
         setModelBackendVariant(res.body.modelBackendVariant ?? '');
         setModelBackendVariantTouched(false);
@@ -3331,6 +3362,17 @@ export function BotAgentSection(props: {
               {tr(dshRuntime === 'tui' ? 'botDefaults.dshRuntimeTuiNote' : 'botDefaults.dshRuntimeOfficialNote')}
             </p>
           </div>
+        </div>
+      )}
+      {(selectedCliId === 'codex' || codexProfile) && <CodexProfilePicker
+        appId={bot.larkAppId} contextKey={bot}
+        value={codexProfile} disabled={!!props.lock || agentBusy}
+        launchChanged={cliSelectionTouched || runtimeTouched}
+        onChange={value => { setCodexProfile(value); setCodexProfileTouched(true); setCodexProfileAutoCleared(false); }} />}
+      {codexProfileAutoCleared && selectedCliId !== 'codex' && (
+        <div className="bd-row" data-section="codex-profile-cleared">
+          <span />
+          <p className="bd-aux-note bd-aux-err" role="status">{tr('botDefaults.codexProfileClearedOnCliSwitch')}</p>
         </div>
       )}
       {isDsh && (
@@ -5332,11 +5374,13 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
   const tr = useT();
   const [cleanInput, setCleanInput] = useState(props.bot.codexAppCleanInput === true);
   const [browserEnabled, setBrowserEnabled] = useState(props.bot.codexBrowser === true);
+  const [cliNudge, setCliNudge] = useState(props.bot.noProgressNotify?.cliEnabled === true);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState<'clean-input' | 'browser' | 'no-progress' | null>(null);
   // 无进展提醒（#1162）：null 配置 = 默认（开启，90s）。UI 状态与 bot 配置同步，
   // 两个控件独立保存但总是提交完整对象，避免 toggle 顺手丢掉已配置的阈值。
   const noProgress = props.bot.noProgressNotify ?? null;
+  const isCodexApp = props.bot.cliId === 'codex-app';
   const nudgeOn = noProgress?.enabled !== false;
   const nudgeTimeoutSec = noProgress?.timeoutMs != null ? Math.round(noProgress.timeoutMs / 1000) : null;
   const nudgeLabel = useId();
@@ -5349,6 +5393,7 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
 
   useEffect(() => setCleanInput(props.bot.codexAppCleanInput === true), [props.bot.codexAppCleanInput]);
   useEffect(() => setBrowserEnabled(props.bot.codexBrowser === true), [props.bot.codexBrowser]);
+  useEffect(() => setCliNudge(props.bot.noProgressNotify?.cliEnabled === true), [props.bot.noProgressNotify]);
 
   async function saveCleanInput(checked: boolean): Promise<void> {
     const previous = cleanInput;
@@ -5376,12 +5421,16 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
     });
   }
 
-  async function saveNoProgress(next: { enabled: boolean; timeoutMs?: number } | null): Promise<void> {
+  async function saveNoProgress(
+    next: { enabled: boolean; cliEnabled?: boolean; timeoutMs?: number } | null,
+    rollback?: () => void,
+  ): Promise<void> {
     await saveBotField({
-      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/no-progress-notify`, { noProgressNotify: next }),
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/no-progress-notify`, { noProgressNotify: next === null ? null : { ...props.bot.noProgressNotify, ...next } }),
       setStatus,
       setBusy: on => setBusy(on ? 'no-progress' : null),
       saved: tr('botDefaults.cardPrefSaved'),
+      rollback,
       onSaved: body => {
         const saved = body.noProgressNotify ?? null;
         props.patchBot(props.bot.larkAppId, { noProgressNotify: saved });
@@ -5402,34 +5451,54 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
 
   return (
     <section className="bd-section" data-codex-app-display>
-      <h3 className="bd-section-title">{tr('botDefaults.sectionCodexAppDisplay')}</h3>
-      <ToggleRow
-        checked={cleanInput}
-        disabled={busy !== null}
-        dataAction="toggle-codex-app-clean-input"
-        title={tr('botDefaults.codexAppCleanInput')}
-        help={tr('botDefaults.codexAppCleanInputHelp')}
-        onChange={checked => void saveCleanInput(checked)}
-      />
-      <small className="bd-section-note">{tr('botDefaults.codexAppCleanInputCompat')}</small>
-      <ToggleRow
-        checked={browserEnabled}
-        disabled={busy !== null}
-        dataAction="toggle-codex-browser"
-        title={tr('botDefaults.codexBrowser')}
-        description={tr('botDefaults.codexBrowserDescription')}
-        help={tr('botDefaults.codexBrowserHelp')}
-        onChange={checked => void saveBrowser(checked)}
-      />
-      <small className="bd-section-note">{tr('botDefaults.codexBrowserRestartNote')}</small>
-      <ToggleRow
-        checked={nudgeOn}
-        disabled={busy !== null}
-        dataAction="toggle-codex-app-no-progress"
-        title={tr('botDefaults.noProgressNotify')}
-        help={tr('botDefaults.noProgressNotifyHelp')}
-        onChange={checked => void saveNoProgress({ enabled: checked, ...(nudgeTimeoutSec != null ? { timeoutMs: nudgeTimeoutSec * 1000 } : {}) })}
-      />
+      {isCodexApp
+        ? <h3 className="bd-section-title">{tr('botDefaults.sectionCodexAppDisplay')}</h3>
+        : <h3 className="bd-section-title">{tr('botDefaults.sectionCodexRuntime')}</h3>}
+      {isCodexApp ? <>
+        <ToggleRow
+          checked={cleanInput}
+          disabled={busy !== null}
+          dataAction="toggle-codex-app-clean-input"
+          title={tr('botDefaults.codexAppCleanInput')}
+          help={tr('botDefaults.codexAppCleanInputHelp')}
+          onChange={checked => void saveCleanInput(checked)}
+        />
+        <small className="bd-section-note">{tr('botDefaults.codexAppCleanInputCompat')}</small>
+        <ToggleRow
+          checked={browserEnabled}
+          disabled={busy !== null}
+          dataAction="toggle-codex-browser"
+          title={tr('botDefaults.codexBrowser')}
+          description={tr('botDefaults.codexBrowserDescription')}
+          help={tr('botDefaults.codexBrowserHelp')}
+          onChange={checked => void saveBrowser(checked)}
+        />
+        <small className="bd-section-note">{tr('botDefaults.codexBrowserRestartNote')}</small>
+        <ToggleRow
+          checked={nudgeOn}
+          disabled={busy !== null}
+          dataAction="toggle-codex-app-no-progress"
+          title={tr('botDefaults.noProgressNotify')}
+          help={tr('botDefaults.noProgressNotifyHelp')}
+          onChange={checked => void saveNoProgress({ enabled: checked, ...(nudgeTimeoutSec != null ? { timeoutMs: nudgeTimeoutSec * 1000 } : {}) })}
+        />
+      </> : <>
+        <ToggleRow
+          checked={cliNudge}
+          disabled={busy !== null}
+          dataAction="toggle-cli-no-progress"
+          title={tr('botDefaults.cliProgressNotify')}
+          help={tr('botDefaults.cliProgressNotifyHelp')}
+          onChange={checked => {
+            const previous = cliNudge;
+            setCliNudge(checked);
+            void saveNoProgress(
+              { enabled: nudgeOn, cliEnabled: checked, ...(nudgeTimeoutSec != null ? { timeoutMs: nudgeTimeoutSec * 1000 } : {}) },
+              () => setCliNudge(previous),
+            );
+          }}
+        />
+      </>}
       <div className="bd-row">
         <label htmlFor={nudgeLabel}>{tr('botDefaults.noProgressNotifyTimeoutLabel')}</label>
         <input
@@ -5439,19 +5508,19 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
           max={3600}
           step={1}
           data-input="no-progress-timeout-sec"
-          placeholder="90"
+          placeholder={isCodexApp ? '90' : '300'}
           value={nudgeInput}
-          disabled={busy !== null || !nudgeOn}
+          disabled={busy !== null || (isCodexApp ? !nudgeOn : !cliNudge)}
           onChange={event => setNudgeInput(event.currentTarget.value)}
         />
-        <button type="button" className="primary" data-action="save-no-progress-timeout" disabled={busy !== null || !nudgeOn} onClick={saveNudgeTimeout}>
+        <button type="button" className="primary" data-action="save-no-progress-timeout" disabled={busy !== null || (isCodexApp ? !nudgeOn : !cliNudge)} onClick={saveNudgeTimeout}>
           {tr('botDefaults.noProgressNotifyTimeoutSave')}
         </button>
         <button type="button" data-action="reset-no-progress" disabled={busy !== null || noProgress === null} onClick={() => void saveNoProgress(null)}>
           {tr('botDefaults.noProgressNotifyReset')}
         </button>
       </div>
-      <small className="bd-section-note">{tr('botDefaults.noProgressNotifyTimeoutHelp')}</small>
+      <small className="bd-section-note">{tr(isCodexApp ? 'botDefaults.noProgressNotifyTimeoutHelp' : 'botDefaults.cliProgressNotifyTimeoutHelp')}</small>
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-codex-app-clean-input-status': '' }} />
       </div>
@@ -6143,6 +6212,8 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
   const savedForm = useMemo(() => stewardFormFrom(props.bot.steward), [props.bot.steward]);
   const [enabled, setEnabled] = useState(savedForm.enabled);
   const [chatId, setChatId] = useState(savedForm.chatId);
+  const [autoJoin, setAutoJoin] = useState(savedForm.autoJoinNewGroups);
+  const [autoJoinSolo, setAutoJoinSolo] = useState(savedForm.autoJoinSoloGroups);
   const [guideMode, setGuideMode] = useState<StewardGuideMode>(savedForm.guideMode);
   const [guideText, setGuideText] = useState(savedForm.guideText);
   const [busy, setBusy] = useState(false);
@@ -6159,6 +6230,8 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
   // 各自只在自己那部分的已保存值变化时同步：保存开关后不能把没保存的提示词冲掉。
   useEffect(() => { setEnabled(savedForm.enabled); }, [appId, savedForm.enabled]);
   useEffect(() => { setChatId(savedForm.chatId); }, [appId, savedForm.chatId]);
+  useEffect(() => { setAutoJoin(savedForm.autoJoinNewGroups); }, [appId, savedForm.autoJoinNewGroups]);
+  useEffect(() => { setAutoJoinSolo(savedForm.autoJoinSoloGroups); }, [appId, savedForm.autoJoinSoloGroups]);
   useEffect(() => {
     setGuideMode(savedForm.guideMode);
     setGuideText(savedForm.guideText);
@@ -6216,6 +6289,18 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
     void save({ ...savedForm, enabled: on }, setStatus, () => setEnabled(previous));
   }
 
+  function toggleAutoJoin(on: boolean): void {
+    const previous = autoJoin;
+    setAutoJoin(on);
+    void save({ ...savedForm, autoJoinNewGroups: on }, setStatus, () => setAutoJoin(previous));
+  }
+
+  function toggleAutoJoinSolo(on: boolean): void {
+    const previous = autoJoinSolo;
+    setAutoJoinSolo(on);
+    void save({ ...savedForm, autoJoinSoloGroups: on }, setStatus, () => setAutoJoinSolo(previous));
+  }
+
   function changeChat(next: string): void {
     const previous = chatId;
     setChatId(next);
@@ -6271,6 +6356,23 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
               {selectedChat?.chatMode === 'topic' ? <p className="bd-section-note">{tr('botDefaults.stewardChatTopic')}</p> : null}
             </div>
           </div>
+          <ToggleRow
+            checked={autoJoin}
+            disabled={busy}
+            dataAction="toggle-steward-auto-join"
+            title={tr('botDefaults.stewardAutoJoin')}
+            help={tr('botDefaults.stewardAutoJoinHelp')}
+            onChange={toggleAutoJoin}
+          />
+          {/* 受上一项约束：拉新群不带管家时，单人群自然也不带，置灰。 */}
+          <ToggleRow
+            checked={autoJoinSolo}
+            disabled={busy || !autoJoin}
+            dataAction="toggle-steward-auto-join-solo"
+            title={tr('botDefaults.stewardAutoJoinSolo')}
+            help={tr('botDefaults.stewardAutoJoinSoloHelp')}
+            onChange={toggleAutoJoinSolo}
+          />
           <div className="bd-row bd-steward-guide">
             <div className="bd-field">
               <FieldTitle help={tr('botDefaults.stewardGuideHelp')}>{tr('botDefaults.stewardGuide')}</FieldTitle>
@@ -8763,6 +8865,8 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
   const [restrict, setRestrict] = useState(props.bot.restrictGrantCommands === true);
   const [p2pOpen, setP2pOpen] = useState(props.bot.p2pOpen === true);
   const [trustSameOwner, setTrustSameOwner] = useState(props.bot.trustSameOwnerBots !== false);
+  const [delegateBots, setDelegateBots] = useState<string[]>(props.bot.grantDelegateBots ?? []);
+  const [delegateBotsInput, setDelegateBotsInput] = useState((props.bot.grantDelegateBots ?? []).join(', '));
   const [duration, setDuration] = useState(typeof props.bot.grantDefaultDurationMs === 'number' ? props.bot.grantDefaultDurationMs : null);
   const [durationInput, setDurationInput] = useState(String(props.bot.grantDefaultDurationMs ?? DEFAULT_GRANT_DURATION_MS));
   const [quota, setQuota] = useState(typeof props.bot.messageQuotaDefaultLimit === 'number' ? props.bot.messageQuotaDefaultLimit : null);
@@ -8794,6 +8898,12 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
   }, [props.bot.trustSameOwnerBots]);
 
   useEffect(() => {
+    const next = props.bot.grantDelegateBots ?? [];
+    setDelegateBots(next);
+    setDelegateBotsInput(next.join(', '));
+  }, [props.bot.grantDelegateBots]);
+
+  useEffect(() => {
     const nextDuration = typeof props.bot.grantDefaultDurationMs === 'number' ? props.bot.grantDefaultDurationMs : null;
     setDuration(nextDuration);
     setDurationInput(String(nextDuration ?? DEFAULT_GRANT_DURATION_MS));
@@ -8812,6 +8922,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
       restrictGrantCommands?: boolean;
       p2pOpen?: boolean;
       trustSameOwnerBots?: boolean;
+      grantDelegateBots?: string[];
       grantDefaultDurationMs?: number | null;
       messageQuotaDefaultLimit?: number | null;
     },
@@ -8829,23 +8940,29 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
       onSaved: body => {
         const nextDuration = typeof body.grantDefaultDurationMs === 'number' ? body.grantDefaultDurationMs : null;
         const nextQuota = typeof body.messageQuotaDefaultLimit === 'number' ? body.messageQuotaDefaultLimit : null;
+        const nextDelegateBots: string[] = Array.isArray(body.grantDelegateBots)
+          ? body.grantDelegateBots.filter((x: unknown): x is string => typeof x === 'string')
+          : [];
         setAutoCard(body.autoGrantRequestCards !== false);
         setOwnerDm(body.grantRequestToOwnerDm === true);
         setRestrict(body.restrictGrantCommands === true);
         setP2pOpen(body.p2pOpen === true);
         setTrustSameOwner(body.trustSameOwnerBots !== false);
+        setDelegateBots(nextDelegateBots);
         setDuration(nextDuration);
         setQuota(nextQuota);
         if ('grantDefaultDurationMs' in patch) setDurationInput(String(nextDuration ?? DEFAULT_GRANT_DURATION_MS));
         if ('messageQuotaDefaultLimit' in patch) {
           setQuotaInput(nextQuota === null ? '' : String(nextQuota));
         }
+        if ('grantDelegateBots' in patch) setDelegateBotsInput(nextDelegateBots.join(', '));
         props.patchBot(props.bot.larkAppId, {
           autoGrantRequestCards: body.autoGrantRequestCards !== false,
           grantRequestToOwnerDm: body.grantRequestToOwnerDm === true,
           restrictGrantCommands: body.restrictGrantCommands === true,
           p2pOpen: body.p2pOpen === true,
           trustSameOwnerBots: body.trustSameOwnerBots !== false,
+          grantDelegateBots: nextDelegateBots,
           grantDefaultDurationMs: nextDuration,
           messageQuotaDefaultLimit: nextQuota,
         });
@@ -8887,6 +9004,22 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
     }
     setQuotaError(null);
     void savePatch({ messageQuotaDefaultLimit: parsed }, 'quota');
+  }
+
+  /** 输入框文本 → 名单：逗号/空白分隔，trim、去空白项、去重（与 daemon 侧归一化同口径）。 */
+  function parseDelegateBotsInput(text: string): string[] {
+    return [...new Set(text.split(/[\s,]+/).map(s => s.trim()).filter(Boolean))];
+  }
+
+  function saveDelegateBots(): void {
+    const parsed = parseDelegateBotsInput(delegateBotsInput);
+    setStatus(null);
+    if (parsed.length === delegateBots.length && parsed.every((v, i) => v === delegateBots[i])) {
+      setDelegateBotsInput(parsed.join(', '));
+      return;
+    }
+    const previousInput = delegateBots.join(', ');
+    void savePatch({ grantDelegateBots: parsed }, 'delegateBots', () => setDelegateBotsInput(previousInput));
   }
 
   const durationOptions: DropdownFieldOption<string>[] = [
@@ -9002,6 +9135,29 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
           saveQuota();
         }}
       >
+        <div className="bd-row bd-grant-delegate-bots">
+          <label>
+            <FieldTitle help={tr('botDefaults.grantDelegateBotsHelp')}>{tr('botDefaults.grantDelegateBots')}</FieldTitle>
+            <input
+              type="text"
+              data-input="grantDelegateBots"
+              placeholder={tr('botDefaults.grantDelegateBotsPlaceholder')}
+              value={delegateBotsInput}
+              disabled={busy !== null}
+              aria-label={tr('botDefaults.grantDelegateBots')}
+              onChange={event => {
+                setDelegateBotsInput(event.currentTarget.value);
+                setStatus(null);
+              }}
+              onBlur={saveDelegateBots}
+              onKeyDown={event => {
+                if (event.key !== 'Enter') return;
+                event.preventDefault();
+                event.currentTarget.blur();
+              }}
+            />
+          </label>
+        </div>
         <div className="bd-row bd-grant-duration">
           <div className="bd-field">
             <FieldTitle help={tr('botDefaults.grantDurationHelp')}>{tr('botDefaults.grantDurationDefault')}</FieldTitle>

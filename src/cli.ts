@@ -290,7 +290,7 @@ import {
   readWorkflowSessionRelayContext,
 } from './workflows/v3/session-relay-client.js';
 import { fetchDaemonIpc, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
-import { REPORT_SESSION_RELAY_ROUTE } from './core/report-session-relay.js';
+import { describeReportRelayFallback, REPORT_SESSION_RELAY_ROUTE } from './core/report-session-relay.js';
 import { DISPATCH_USER_DELIVERY_ROUTE, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from './core/dispatch-user-delegation.js';
 import { DISPATCH_REPORT_REGISTER_ROUTE } from './core/dispatch-report-binding.js';
 import { isRetryableAskHttpStatus } from './core/ask-types.js';
@@ -353,6 +353,11 @@ import { type Brand, chatAppLink, larkHosts, normalizeBrand } from './im/lark/la
 import { clearWorkerConfig, mergeDashboardConfig, mergeGlobalConfig, mergeWorkerConfig, readGlobalConfig, setGlobalLocale, globalConfigPath, type WorkerConfig } from './global-config.js';
 import { evaluateWorkerAdmission, formatMemoryBytes, readHostMemoryPressure } from './core/worker-budget.js';
 import { sessionScopeCapabilities } from './core/session-scope.js';
+import {
+  inspectRecordedSessionWorker,
+  recordedSessionWorkerAlive,
+  signalRecordedSessionWorker,
+} from './core/session-worker-identity.js';
 import { DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
 import {
   createWhiteboard,
@@ -3972,6 +3977,7 @@ interface SessionData {
   lastMessageAt?: string;
   closedAt?: string;
   pid?: number;
+  pidProcStart?: string;
   workingDir?: string;
   webPort?: number;
   larkAppId?: string;
@@ -4185,12 +4191,19 @@ async function abandonSessionOffline(session: SessionData): Promise<OfflineAband
         }),
       };
     }
-    if (isProcessAlive(ownedWorkerPid)) {
-      const signalled = killProcess(ownedWorkerPid);
-      if ((!signalled && isProcessAlive(ownedWorkerPid))
-        || !(await waitForProcessExit(ownedWorkerPid))) {
+    // Only the exact worker this row recorded is ever signalled: a dormant
+    // row's pid may long since belong to an unrelated process (pid reuse, see
+    // core/session-worker-identity.ts). Anything not provably that worker is
+    // left alone; the row is still marked worker-less below.
+    const inspection = inspectRecordedSessionWorker({ ...current, pid: ownedWorkerPid });
+    if (inspection.status === 'exact') {
+      const signalled = signalRecordedSessionWorker(inspection, 'SIGTERM', { processGroup: false });
+      if ((!signalled && recordedSessionWorkerAlive(inspection))
+        || !(await waitForRecordedWorkerExit(inspection))) {
         return { ok: false, error: `worker_pid_kill_failed:${ownedWorkerPid}` };
       }
+    } else if (inspection.status !== 'gone' && inspection.status !== 'reused') {
+      console.error(`未向 pid ${ownedWorkerPid} 发信号：无法证明它是这个会话记录的 worker（${inspection.status}）`);
     }
 
     // Persist worker-less state without touching FIFO authority. If a new
@@ -4516,22 +4529,16 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-function killProcess(pid: number): boolean {
-  try {
-    process.kill(pid, 'SIGTERM');
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function waitForProcessExit(pid: number, timeoutMs = 2_000): Promise<boolean> {
+async function waitForRecordedWorkerExit(
+  target: { pid: number; processStart: string },
+  timeoutMs = 2_000,
+): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (!isProcessAlive(pid)) return true;
+    if (!recordedSessionWorkerAlive(target)) return true;
     await new Promise(resolve => setTimeout(resolve, 50));
   }
-  return !isProcessAlive(pid);
+  return !recordedSessionWorkerAlive(target);
 }
 
 function formatDuration(ms: number): string {
@@ -6066,6 +6073,7 @@ export async function resolveLinkRefsThroughSessionHost(
   input: import('./services/link-ref-resolver.js').OutboundLinkRefPayload,
   options: {
     mode?: 'observe' | 'enabled';
+    responseKind?: TurnSendKind;
     sessionId?: string;
     appId?: string;
     ipcPort?: number;
@@ -6078,7 +6086,7 @@ export async function resolveLinkRefsThroughSessionHost(
     expandOutboundLinkRefs,
     findOutboundExecutableLinkRefs,
   } = await import('./services/link-ref-resolver.js');
-  if (findOutboundExecutableLinkRefs(input).length === 0) {
+  if (findOutboundExecutableLinkRefs(input).length === 0 && options.responseKind !== 'final') {
     return expandOutboundLinkRefs(input, new Map());
   }
   const sessionId = options.sessionId ?? context?.sessionId;
@@ -6096,7 +6104,10 @@ export async function resolveLinkRefsThroughSessionHost(
     ipcPort,
     sessionId,
     'link-refs/resolve',
-    { payload: input },
+    {
+      payload: input,
+      ...(options.responseKind === undefined ? {} : { responseKind: options.responseKind }),
+    },
   );
   const body = await response.json().catch(() => ({})) as {
     ok?: boolean;
@@ -11341,6 +11352,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       expectedLinks,
     }, {
       mode: linkRefMode,
+      responseKind: effectiveResponseKind,
       sessionId: originSessionId ?? sid,
       appId: originSession?.larkAppId ?? s.larkAppId,
     });
@@ -13932,14 +13944,6 @@ async function cmdAuth(rest: string[]): Promise<void> {
     // tuple. Absence of both env markers is the host case, never a missing turn.
     const isolatedPane = !!process.env.BOTMUX_SEND_RELAY
       || !!process.env.BOTMUX_ORIGIN_CHANNEL_ID?.trim();
-    let claim: ManagedOriginCapabilityClaim | undefined;
-    if (isolatedPane && !toolBinding) {
-      const read = readManagedOriginCapability(
-        resolveDataDir(), sid, process.env.BOTMUX_SEND_RELAY, process.env.BOTMUX_ORIGIN_CHANNEL_ID,
-      );
-      if (!read?.turnId) throw new Error('当前会话的本轮身份凭据不可用');
-      claim = read;
-    }
     const deadline = Date.now() + 300_000;
     while (true) {
       const remaining = deadline - Date.now();
@@ -13947,6 +13951,14 @@ async function cmdAuth(rest: string[]): Promise<void> {
         console.log(JSON.stringify({ ok: false, status: 'pending', error: 'auth_request_timeout' }));
         process.exitCode = 1;
         return;
+      }
+      let claim: ManagedOriginCapabilityClaim | undefined;
+      if (isolatedPane && !toolBinding) {
+        const read = readManagedOriginCapability(
+          resolveDataDir(), sid, process.env.BOTMUX_SEND_RELAY, process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+        );
+        if (!read?.turnId) throw new Error('当前会话的本轮身份凭据不可用');
+        claim = read;
       }
       const authBody = parsed.command === 'request'
         ? { scopes: parsed.scopes, ...(parsed.allowUnknown ? { allowUnknown: true } : {}) }
@@ -14984,8 +14996,9 @@ async function cmdReport(rest: string[]): Promise<void> {
   --top-level            显式发到当前群顶层（覆盖默认落点）
   --dispatch-root <id>   dispatch 注入的精确 seed；优先且不命中时 fail closed
   --recipient-root <id>  仅指定历史收件人来源根消息；校验失败不降级，不代替 --dispatch-root
-  --delivery <mode>      relay（默认，仅回传来源会话）|publish（仅发布到当前派单话题）|
-                         publish-and-relay（发布并回传来源会话）
+  --delivery <mode>      relay（默认，仅回传来源会话；主编排不在线、会话已关闭或还没启动好、
+                         派单目标已不在时，改为在当前派单话题可见发布并注明未送达原因）|
+                         publish（仅发布到当前派单话题）|publish-and-relay（发布并回传来源会话）
   --publish-to <target>  thread（默认，当前派单话题）|chat（当前群顶层）
   --status <状态>        同步子任务状态：pending|in_progress|blocked|completed|failed
   --progress <0-100>     同步子任务完成百分比
@@ -15297,6 +15310,13 @@ async function cmdReport(rest: string[]): Promise<void> {
           ...(projectMilestone ? { milestone: projectMilestone } : {}),
           ...(reportDelivery !== 'relay' ? { delivery: reportDelivery } : {}),
           ...(publishTo ? { publishTo } : {}),
+          // #2262: if the orchestrator provably never gets the relay, publish it
+          // in this dispatch thread instead of losing it. Only a named root makes
+          // a registry miss a failure; an implicit miss is an ordinary report.
+          ...(reportDelivery === 'relay' ? {
+            relayFallback: 'publish',
+            ...(explicitDispatchRoot ? { explicitDispatchRoot: true } : {}),
+          } : {}),
         },
       });
     } catch (err: any) {
@@ -15304,10 +15324,61 @@ async function cmdReport(rest: string[]): Promise<void> {
       process.exit(1);
     }
     const triggerBody: any = await response.json().catch(() => ({}));
+    const relayFallback = reportDelivery === 'relay'
+      && triggerBody?.relayFallback && typeof triggerBody.relayFallback === 'object'
+      ? triggerBody.relayFallback : undefined;
     if (response.status === 404
       && triggerBody?.error === 'dispatch_target_unavailable'
       && !explicitDispatchRoot) {
       // Ordinary topic/chat turn, not a registered dispatch.
+    } else if (relayFallback) {
+      const relayFailure = {
+        reason: relayFallback.reason,
+        status: relayFallback.relayStatus,
+        ...(relayFallback.relayError ? { error: relayFallback.relayError } : {}),
+      };
+      const publicationTarget = triggerBody.publicationTarget;
+      if (!response.ok || triggerBody.ok !== true || relayFallback.published !== true
+        || typeof triggerBody.publishedMessageId !== 'string') {
+        // Never echo a publication claim the receipt cannot back up.
+        const notice = describeReportRelayFallback(relayFallback.published === true
+          ? { ...relayFallback, published: false, publicationError: 'report_publication_unknown' }
+          : relayFallback);
+        console.error(JSON.stringify({ success: false, error: triggerBody.error ?? `HTTP ${response.status}`,
+          notice, relayFailure,
+          ...(relayFallback.publicationError ? { publicationError: relayFallback.publicationError } : {}),
+          ...(relayFallback.blockedBy ? { publicationBlockedBy: relayFallback.blockedBy } : {}),
+          ...(relayFallback.publishedMessageId ? { publishedMessageId: relayFallback.publishedMessageId } : {}),
+          ...(relayFallback.deliveryKey ? { deliveryKey: relayFallback.deliveryKey } : {}),
+        }));
+        process.exit(1);
+      }
+      const notice = describeReportRelayFallback(relayFallback);
+      recordSuccessfulReportMarker({
+        messageId: triggerBody.publishedMessageId,
+        targetChatId: s.chatId,
+        ...(typeof publicationTarget?.rootMessageId === 'string'
+          ? { targetRootMessageId: publicationTarget.rootMessageId }
+          : {}),
+        dispatchRootId: dispatchRootCandidate,
+      });
+      console.log(JSON.stringify({
+        success: true,
+        delivery: 'lark-message',
+        reportedTo: triggerBody.publishedMessageId,
+        viaRegistry: relayFallback.reason !== 'dispatch_target_gone',
+        recipient: { kind: 'chat', chatId: s.chatId },
+        placementSource: 'relay-fallback',
+        messageTarget: publicationTarget,
+        notice,
+        relayDelivered: false,
+        relayFailure,
+        projectSynced: triggerBody.projectSynced === true,
+        deliveryMode: reportDelivery,
+        publishedMessageId: triggerBody.publishedMessageId,
+        publicationTarget,
+      }));
+      return;
     } else if (!response.ok || triggerBody?.ok !== true) {
       console.error(JSON.stringify({ success: false, error: triggerBody?.error ?? `HTTP ${response.status}`,
         ...(triggerBody?.publishedMessageId ? { publishedMessageId: triggerBody.publishedMessageId } : {}),
@@ -15566,7 +15637,7 @@ botmux create-group — 用一组机器人新建飞书群
                  该 bot 必须已在 --bot 列表中（即已是群成员）。
   --kickoff-prompt "文本"  可选；与 --kickoff-bot 配合使用，@ bot 后发送的 prompt 文本。
   --json-status    可选；在 chatId 后追加一行结构化完成状态。默认 stdout 无论完整成功或
-                   部分失败都保持历史兼容，只输出单行 chatId；部分失败仍以非零退出表示。
+                   部分失败都保持历史兼容，只输出单行 chatId；显式 kickoff 未发出时以非零退出表示。
 
 团队模式（跨机建聚焦新群，走中心化平台）:
   botmux create-group --team <teamId> --agent <appId> [--agent ...] [--name "群名"]
@@ -15591,7 +15662,8 @@ botmux create-group — 用一组机器人新建飞书群
 输出协议（skill 友好）:
   - chat.create 成功拿到 chatId 后立即向 stdout 写单行 chatId，不等待后续 bot 邀请、grant、
     群主转让或通知。默认任何已创建结果都只有这一行；--json-status 才追加 JSON。
-    collaboration 或显式 kickoff 未完成时 exit 非零。
+    显式 kickoff 未发出时 exit 非零。bot 邀请被拒、Bot 之间的本群对话授权没写全（如某个
+    bot 的 daemon 不在线）只在 stderr 告警，群主转让、@通知、kickoff 照常进行。
   - 只有缺 --bot / 解析失败 / chat.create 未成功时 stdout 才为空。只要 stdout 已有 chatId，
     即使超时或 exit 非零也必须先检查并复用该群，不得重建。
 `);
@@ -15757,10 +15829,10 @@ botmux create-group — 用一组机器人新建飞书群
       bindWorkingDir,
       kickoffBotLarkAppId: kickoff.targetLarkAppId,
       kickoffPrompt: kickoff.prompt,
-      ensureBotCollaboration: async (chatId, joinedBotAppIds, rejectedBotAppIds) => {
-        if (rejectedBotAppIds.length > 0) {
-          throw new Error(`bot_invites_incomplete:${rejectedBotAppIds.join(',')}`);
-        }
+      // Best-effort: rejected invitees are already reported as invalidBotIds,
+      // and a failed grant is reported as collaborationError — neither skips
+      // owner transfer, notify or kickoff.
+      ensureBotCollaboration: async (chatId, joinedBotAppIds) => {
         if (joinedBotAppIds.length >= 2) {
           await ensureLocalBotCollaboration(chatId, joinedBotAppIds);
         }
@@ -15794,16 +15866,15 @@ botmux create-group — 用一组机器人新建飞书群
 
   const invalidBots = new Set(result.invalidBotIds);
   const joinedBotAppIds = [...new Set(resolved.larkAppIds)].filter(appId => !invalidBots.has(appId));
-  // createGroupWithBots runs the exact grant preflight after invitations and
-  // before any role/kickoff message. Returning here therefore proves the cold
-  // group's collaboration boundary completed (or there was only one bot).
-  const collaborationReady = true;
+  const collaborationReady = !result.collaborationError;
   const kickoffRequested = !!kickoff.targetLarkAppId && !!kickoff.prompt;
 
   // Human-readable summary + warnings → stderr.
   const link = chatAppLink(result.chatId, botBrand(creatorCfg));
   console.error(`✅ 群已创建：${link}`);
-  if (collaborationReady) {
+  if (result.collaborationError) {
+    console.error(`⚠️  Bot 之间的本群对话授权没写全（不影响建群和后续步骤）: ${result.collaborationError}`);
+  } else if (joinedBotAppIds.length >= 2) {
     console.error(`✅ Bot 对话授权已就绪（talk-only，${joinedBotAppIds.length} 个 Bot）`);
   }
   if (result.invalidBotIds.length > 0) {
@@ -15826,6 +15897,11 @@ botmux create-group — 用一组机器人新建飞书群
     console.error(`⚠️  kickoff 消息发送失败: ${result.kickoffError}`);
   } else if (result.kickoffMessageId) {
     console.error(`✅ kickoff 消息已发送 (msg ${result.kickoffMessageId})`);
+  }
+  for (const steward of result.stewardJoins ?? []) {
+    const label = botInfoEntries.find(b => b.larkAppId === steward.larkAppId)?.botName ?? steward.larkAppId;
+    if (steward.ok) console.error(`✅ 已带上管家 ${label}`);
+    else console.error(`⚠️  管家 ${label} 没加进群（不影响建群）: ${steward.error ?? 'unknown'}`);
   }
   if (bindWorkingDir) {
     const ok = result.oncallBindings.filter(b => b.ok).length;
@@ -17929,6 +18005,10 @@ if (__entrySubcommand) {
   else if (__entrySubcommand === 'mir-runner') await import('./mir-runner.js');
   else if (__entrySubcommand === 'lark-tool-runner') {
     await import('./lark-tool-runner.js');
+    process.exit(process.exitCode ?? 0);
+  }
+  else if (__entrySubcommand === 'cli-identity-runner') {
+    await import('./cli-identity-runner.js');
     process.exit(process.exitCode ?? 0);
   }
   // The entry module now drives the process (top-level main() keeps the event

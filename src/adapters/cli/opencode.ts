@@ -128,7 +128,7 @@ function detectNewSubmit(
   expectedText: string,
   kind: OpenCodeDbKind,
   dbPath: string,
-): { found: boolean; cliSessionId?: string } {
+): { found: boolean; cliSessionId?: string; unreadable?: true } {
   const q = kind === 'v2'
     ? "SELECT session_id AS sid, json_extract(data, '$.text') AS text " +
       "FROM session_message WHERE type = 'user' " +
@@ -149,7 +149,7 @@ function detectNewSubmit(
       }
     }
     return { found: false };
-  }, dbPath) ?? { found: false };
+  }, dbPath) ?? { found: false, unreadable: true };
 }
 
 /** 提交验证轮询（writeInput 共用实现，opencode2 复用）：基线已由调用方采样，
@@ -537,6 +537,7 @@ export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runt
     findInitialPromptArgSubmission(baseline, content) {
       if (baseline === null) return { submitted: false };
       const result = detectNewSubmit(baseline, content, 'v1', runtime.dbPath());
+      if (result.unreadable) return { submitted: false, unreadable: true };
       return result.cliSessionId
         ? { submitted: result.found, cliSessionId: result.cliSessionId }
         : { submitted: result.found };

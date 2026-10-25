@@ -259,6 +259,7 @@ export interface CliAdapter {
      *  only — Claude Code rejects it with a warning, so its adapter filters. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
     /** Codex-only thread service tier. Missing inherits the executor's config. */
+    codexProfile?: string;
     serviceTier?: CodexServiceTier;
     /** Optional TraeX process-scoped backend variant. Missing means inherit
      * the user's TraeX global configuration; all non-TraeX adapters ignore it. */
@@ -380,6 +381,9 @@ export interface CliAdapter {
   findInitialPromptArgSubmission?(baseline: number, content: string): {
     submitted: boolean;
     cliSessionId?: string;
+    /** The store could not be read this time (gone, unopenable, query
+     *  failed): `submitted: false` is then no evidence the prompt is absent. */
+    unreadable?: true;
   };
   isInitialPromptComplete?(baseline: number, cliSessionId: string): boolean;
 

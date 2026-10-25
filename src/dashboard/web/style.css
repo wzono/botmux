@@ -28137,8 +28137,14 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   width: min(560px, calc(100vw - 32px));
   max-height: 90dvh;
   overflow-y: auto;
-  padding: 24px;
+  padding: 0;
   color: var(--text);
+}
+
+.schedule-form-dialog-content {
+  width: 100%;
+  min-width: 0;
+  padding: 24px;
 }
 
 .schedule-form-dialog::backdrop {
@@ -28154,12 +28160,14 @@ button.ui-refresh-button.is-loading .ui-action-icon {
 .schedule-form {
   display: flex;
   flex-direction: column;
+  min-width: 0;
   gap: 14px;
 }
 
 .schedule-form-field {
   display: flex;
   flex-direction: column;
+  min-width: 0;
   gap: 4px;
 }
 
@@ -29468,7 +29476,10 @@ button.schedule-run-log-row:focus-visible {
   align-items: center;
   gap: 8px;
   width: 100%;
+  max-width: 100%;
+  min-width: 0;
   min-height: 44px;
+  overflow: hidden;
   padding: 8px 10px;
   border: 1px solid var(--border-soft);
   border-radius: var(--radius-sm);
@@ -35982,6 +35993,13 @@ html.terminal-immersive-lock body {
     max-height: min(560px, calc(var(--vv-height, 100dvh) - 56px));
   }
 }
+
+/* Named Codex configuration selection: retain unavailable values visibly. */
+.bd-codex-profile-controls { display: flex; gap: 8px; align-items: center; }
+.bd-codex-profile-controls .bd-field-menu { flex: 1; min-width: 0; }
+.bd-codex-profile .bd-aux-note { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.bd-codex-profile .bd-aux-err { color: var(--danger); }
+.bd-codex-profile .codex-profile-unavailable summary { color: var(--danger); border-color: var(--danger); }
 
 /* ═══ ⌘K 全局搜索 ════════════════════════════════════════════════════════════
    顶栏中列放一个搜索框外观的入口（窄屏收成圆形图标），面板是顶部锚定的原生

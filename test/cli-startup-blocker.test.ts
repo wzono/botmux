@@ -58,6 +58,25 @@ describe('detectCliStartupBlocker', () => {
     });
   });
 
+  it('recognizes the two one-time Claude Code questions that run before its SessionStart hooks', () => {
+    // Claude Code 2.1.310 under an isolated HOME whose ANTHROPIC_API_KEY was
+    // never answered, started with bypass permissions like every Botmux spawn.
+    for (const suffix of ['txt', 'tmux-e.ansi']) {
+      expect(detectCliStartupBlocker(fixture(`claude-2.1.310-custom-api-key.${suffix}`))).toEqual({
+        kind: 'api_key',
+        rule: 'claude-custom-api-key',
+      });
+      expect(detectCliStartupBlocker(fixture(`claude-2.1.310-auto-mode-offer.${suffix}`))).toEqual({
+        kind: 'permission_mode',
+        rule: 'claude-auto-mode-default-offer',
+      });
+    }
+  });
+
+  it('does not fire on the Claude Code composer those questions lead to', () => {
+    expect(detectCliStartupBlocker(fixture('claude-2.1.310-composer.txt'))).toBeNull();
+  });
+
   it('does not fire on a ready Grok composer', () => {
     expect(detectCliStartupBlocker(fixture('grok-1.0.70-composer.txt'))).toBeNull();
   });
@@ -87,7 +106,9 @@ describe('detectCliStartupBlocker', () => {
       '    Sign in with a Personal Access Token、Press any key to log in...、How would you like to authenticate for this',
       '    project? 下面 Use Gemini API Key；升级框有 Kimi Code Update Available / Install update now / Continue with',
       '    current version、Update available! / Skip until next version、MTR 的 A new release v0.4.12 is available.',
-      '    Would you like to update now?；还有 Bypass Permissions mode 下的 Yes, I accept。',
+      '    Would you like to update now?；还有 Bypass Permissions mode 下的 Yes, I accept；',
+      '    Claude 首启会问 Detected a custom API key in your environment，接着 Do you want to use this API key? 默认 No (recommended)；',
+      '    再问 Make auto mode your default permission mode? 选项 Yes, set auto mode as my default permission mode 和 No, keep bypass permissions。',
       '  ╭──────────────────────────────────────────╮',
       '  │ ❯                                        │',
       '  ╰──────────────────────────────────────────╯',
