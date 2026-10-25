@@ -34,6 +34,8 @@ import {
   classifyClaudeTerminalEvent,
   isSyntheticNoModelReplyEvent,
   apiErrorMessageText,
+  transcriptShowsTurnDurationMarker,
+  transcriptHoldsConversation,
   type TranscriptEvent,
 } from '../src/services/claude-transcript.js';
 
@@ -111,6 +113,26 @@ describe('drainTranscript', () => {
     appendLine({ type: 'assistant', uuid: 'u2', message: { role: 'assistant', content: [{ type: 'text', text: 'short' }] } });
     const r2 = drainTranscript(path, r1.newOffset);
     expect(r2.events.find(e => e.uuid === 'u2')).toBeDefined();
+  });
+});
+
+describe('transcriptShowsTurnDurationMarker', () => {
+  it('finds a main-thread turn_duration in the history behind the baseline', () => {
+    appendLine({ type: 'user', uuid: 'u1', message: { role: 'user', content: 'hi' } });
+    appendLine({ type: 'assistant', uuid: 'a1', message: { role: 'assistant', content: [{ type: 'text', text: 'hello' }], stop_reason: 'end_turn' } });
+    appendLine({ type: 'system', subtype: 'turn_duration', uuid: 'd1', durationMs: 1200 });
+    appendLine({ type: 'last-prompt', leafUuid: 'a1' });
+    expect(transcriptShowsTurnDurationMarker(path)).toBe(true);
+  });
+
+  it('is false for a transcript that never wrote one, a sidechain one, or only a half-written one', () => {
+    appendLine({ type: 'assistant', uuid: 'a1', message: { role: 'assistant', content: [{ type: 'text', text: 'turn_duration is just a word here' }], stop_reason: 'end_turn' } });
+    appendLine({ type: 'system', subtype: 'turn_duration', uuid: 'side-d', isSidechain: true });
+    expect(transcriptShowsTurnDurationMarker(path)).toBe(false);
+    // A record still being written sits past the baseline cursor.
+    appendFileSync(path, '{"type":"system","subtype":"turn_duration","uuid":"d-partial"', 'utf8');
+    expect(transcriptShowsTurnDurationMarker(path)).toBe(false);
+    expect(transcriptShowsTurnDurationMarker(join(dir, 'missing.jsonl'))).toBe(false);
   });
 });
 
@@ -1840,5 +1862,38 @@ describe('trailingAssistantText across memory writes', () => {
     expect(isClaudeMemoryToolUse({ name: 'Bash', input: { command: `cat ${mem}-backup/a.md` } }, homePath)).toBe(false);
     expect(isClaudeMemoryToolUse({ name: 'Read', input: { file_path: `${mem}/a.md` } }, homePath)).toBe(false);
     expect(isClaudeMemoryToolUse({ name: 'Write', input: { file_path: `${mem}/a.md` } }, undefined)).toBe(false);
+  });
+});
+
+describe('transcriptHoldsConversation', () => {
+  // The records a Claude 2.1.308 transcript opens with before any conversation.
+  const preamble = [
+    { type: 'mode', mode: 'normal', sessionId: 's' },
+    { type: 'permission-mode', permissionMode: 'bypassPermissions', sessionId: 's' },
+    { type: 'file-history-snapshot', messageId: 'm', snapshot: { messageId: 'm', trackedFileBackups: {}, timestamp: '2026-10-22T00:00:00.000Z' }, isSnapshotUpdate: false },
+  ];
+
+  it('is false while the file holds only the metadata a fork child starts with', () => {
+    for (const record of preamble) appendLine(record);
+    expect(transcriptHoldsConversation(path)).toBe(false);
+  });
+
+  it('is true from the first user record — the /clear command Claude writes counts', () => {
+    for (const record of preamble) appendLine(record);
+    appendLine({ type: 'user', isMeta: true, message: { role: 'user', content: '<local-command-caveat>…</local-command-caveat>' } });
+    expect(transcriptHoldsConversation(path)).toBe(true);
+  });
+
+  it('is true for an assistant record, and false for a missing file or a half-written first line', () => {
+    appendLine({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'hi' }] } });
+    expect(transcriptHoldsConversation(path)).toBe(true);
+    expect(transcriptHoldsConversation(join(dir, 'missing.jsonl'))).toBe(false);
+    writeFileSync(path, JSON.stringify({ type: 'user', message: { role: 'user', content: 'still being written' } }));
+    expect(transcriptHoldsConversation(path)).toBe(false);
+  });
+
+  it('does not take a nested "type":"user" for a conversation record', () => {
+    appendLine({ type: 'file-history-snapshot', snapshot: { note: { type: 'user' } } });
+    expect(transcriptHoldsConversation(path)).toBe(false);
   });
 });

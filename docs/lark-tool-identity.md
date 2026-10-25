@@ -43,6 +43,7 @@ Botmux 提供的短期 bot token。
   - `local`，或 `triggerUserAuth` 未覆盖 lark-cli：与以前一致，只用对 bot 应用的授权。
   - `--as bot` 始终是本 bot 应用，不受影响；只有 daemon 明确标注为平台签发的用户票，lark-cli 包装器才接受与绑定应用不同的 app id。
   - 这种情况下 `botmux auth request` 不再发 bot 应用的设备码链接，而是返回 `platform_authorization_required` 与平台凭据页地址；平台应用缺某个权限时，需要先在平台应用后台开通，再让用户在平台重新授权。
+  - 平台应用拿不到某些敏感权限（例如以用户身份读群聊/私聊消息，全员可见的应用通常批不下来）时，数据若在本 bot 能访问的群或文档里，提示会先引导模型对这次**读取**改用 `--as bot`，再考虑补权限；写操作不改用 bot 身份。执行者由模型在命令里显式选择，包装器不会自动换身份重试。
 
 ## 使用
 
@@ -68,11 +69,11 @@ bot 读取失败后，agent 可根据任务与错误尝试 user。包装器不�
 - 默认开启（未配置或显式开启）。已接入的会话恢复或重启时重新评估配置。
 - 当关闭该配置并重启（`/restart`）或恢复时，自动清理会话目录下的 `lark-tool-binding.json`、`lark-config/` 及托管包装脚本 `binDir/lark-cli`，且不会误伤 `triggerUserAuth` 包装脚本（如 `bytedcli` 或 trigger-user `lark-cli`）或其它文件。
 - 远端后端、adopt、外部 app-server、workflow 和无飞书通道的会话不使用应用绑定。
-- Linux 与 macOS 使用相同的应用/用户解析路径，标准 PTY/Tmux 与托管 RPC（如 Codex）后端行为保持一致。
+- Linux 本机受管会话的 user 调用须通过当前执行的进程证明，覆盖标准 PTY/Tmux 与托管 RPC（如 Codex）。macOS 保留应用绑定和当前用户解析，不提供旧后台进程跨轮隔离保证。
 
 ## 实现
 
-新会话启动时生成自己的工具入口和配置，记录当前 App ID、品牌与真实 lark-cli 路径。botmux 用已有会话上下文确定当前请求者，并查询该用户在同一应用下的授权。会话入口的访问密钥只用于绑定应用，不引入调用进程扫描、回合证明或后台进程追踪。
+新会话启动时生成自己的工具入口和配置，记录当前 App ID、品牌与真实 lark-cli 路径。botmux 用已有执行权威确定当前请求者，并查询该用户在同一应用下的授权。会话入口的访问密钥绑定应用；Linux user 调用同时复用 `execution current` 的 socket 进程血缘检查，并在异步取得 token 后复核 turn、attempt 和 worker generation 等执行状态。旧轮后台进程及其新建子进程无法取得新轮用户凭证。机器触发的执行可在没有真人 actor 时使用该轮明确许可的工具委托身份。
 
 工具启动前清除继承的旧应用/用户凭证变量，再注入本次 App ID、品牌及 bot 或 user 凭证。用户 token 不得跨应用使用，未知用户不会借用 owner 或机器默认账户。CLI 原有 stdout、stderr、退出码和工作目录保持。
 

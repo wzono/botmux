@@ -73,6 +73,7 @@ import {
   copySpawnCommand,
   repoBasename,
   restartConfirmMessage,
+  restartErrorMessage,
   resumeErrorMessage,
   sessionLocationText,
   preferChatFilterLabel,
@@ -126,6 +127,7 @@ import {
 } from './sessions-kanban.js';
 import { toast } from './toast.js';
 import { confirm } from './confirm-modal.js';
+import { SessionEnvLiveModal } from './session-env-editor.js';
 import { controlCsrfHeaders } from './control-csrf.js';
 
 type SessionRow = Record<string, any> & { sessionId: string; status: string };
@@ -2150,7 +2152,10 @@ function Drawer(props: {
   const terminal = row ? terminalHref(row) : null;
   const closed = !!row && row.status === 'closed';
   const canTakeover = !!row && !closed && !!terminal;
+  const [envOpen, setEnvOpen] = useState(false);
+  useEffect(() => { setEnvOpen(false); }, [row?.sessionId]);
   return (
+    <>
     <ModalDialog
       id="drawer"
       open={!!props.row}
@@ -2276,12 +2281,33 @@ function Drawer(props: {
                     {t('sessions.create.start')}
                   </button>
                 ) : null}
+                {!closed && row.larkAppId ? (
+                  <button
+                    id="session-env-btn"
+                    type="button"
+                    role="menuitem"
+                    data-action="open-session-env"
+                    onClick={() => setEnvOpen(true)}
+                  >
+                    {t('sessionEnv.viewLive')}
+                  </button>
+                ) : null}
               </div>
             </details>
           </footer>
         </article>
       ) : null}
     </ModalDialog>
+    {row ? (
+      <SessionEnvLiveModal
+        open={envOpen}
+        larkAppId={String(row.larkAppId ?? '')}
+        sessionId={String(row.sessionId)}
+        title={stripMentionPrefix(row.title) || undefined}
+        onClose={() => setEnvOpen(false)}
+      />
+    ) : null}
+    </>
   );
 }
 
@@ -3304,7 +3330,7 @@ function SessionsPage(): React.JSX.Element {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/restart`, { method: 'POST' });
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body?.ok === false) {
-        if (r.status !== 401) toast(`${t('sessions.restartFailed')}: ${body?.message ?? body?.error ?? r.status}`, { kind: 'error' });
+        if (r.status !== 401) toast(restartErrorMessage(body, r.status), { kind: 'error' });
         return false;
       }
       restartCooldownIds.current.add(row.sessionId);
