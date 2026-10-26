@@ -79,6 +79,14 @@ function makePending(overrides: Partial<PendingAsk> = {}): PendingAsk {
 }
 
 describe('buildAskCard', () => {
+  it('renders a permanent active ask as waiting without a deadline', () => {
+    const card = buildAskCard(makePending({ deadlineAt: null }));
+    expect(card).toContain('等待你回答');
+    expect(card).not.toContain('截止');
+    expect(card).not.toContain('超时未答');
+    expect(card).not.toContain('1970');
+  });
+
   it.each([false, true])('preserves labelled web links before and after settlement (%s)', (settled) => {
     const ask = makePending();
     ask.questions[0]!.prompt = 'Review [design](https://example.com/design?id=4&rev=2) and [preview](http://localhost:3000/path_(v2)) before _confirming_.';
