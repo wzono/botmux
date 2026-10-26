@@ -333,6 +333,7 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
       sessionId: input.sessionId,
       chatType: input.chatType,
       answererOpenId: input.answererOpenId,
+      mentionedOpenId: input.mentionedOpenId,
       deliveryTarget: input.deliveryTarget ? { ...input.deliveryTarget } : undefined,
       questions: input.questions,
       replyCardTarget: input.replyCardTarget,
@@ -413,9 +414,10 @@ function sameIdentity(ask: InternalPending, input: CreateAskInput): boolean {
 }
 
 /** Stable shape string for question-set equality (prompt + multiSelect + each
- *  option's key AND label, order-sensitive). Two question sets that would render
- *  a DIFFERENT card to the user — including a relabelled option whose key is
- *  unchanged — must not re-attach/replay (codex P1-2). */
+ *  option's key, label AND description, order-sensitive). Two question sets that
+ *  would render a DIFFERENT card to the user — including a relabelled option or
+ *  one whose description changed while its key is unchanged — must not
+ *  re-attach/replay (codex P1-2). */
 function questionsShape(qs: PendingAsk['questions']): string {
   return JSON.stringify(
     qs.map((q) => ({
@@ -423,7 +425,7 @@ function questionsShape(qs: PendingAsk['questions']): string {
       m: !!q.multiSelect,
       d: q.defaultSelectedKeys,
       input: q.inputMode,
-      o: q.options.map((o) => [o.key, o.label]),
+      o: q.options.map((o) => [o.key, o.label, o.description ?? null]),
     })),
   );
 }
@@ -589,6 +591,7 @@ function persistFromInternal(ask: InternalPending): void {
     sessionId: ask.sessionId,
     chatType: ask.chatType,
     answererOpenId: ask.answererOpenId,
+    mentionedOpenId: ask.mentionedOpenId,
     deliveryTarget: ask.deliveryTarget,
     questions: ask.questions,
     createdAt: ask.createdAt,
@@ -969,6 +972,7 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       sessionId: p.sessionId,
       chatType: p.chatType,
       answererOpenId: p.answererOpenId,
+      mentionedOpenId: p.mentionedOpenId,
       deliveryTarget: p.deliveryTarget,
       questions: p.questions,
       createdAt: p.createdAt,
