@@ -222,7 +222,7 @@ sample_source: natural | probe | validation
 probe_run_id: nullable string
 ~~~
 
-旧记录迁移为 natural。探针请求使用专用本机请求标记；Proxy 只在 loopback 且已通过现有 API 鉴权时把该标记写入 request metadata，并在转发上游前剥离。Usage reporter 把 metadata 归一为 Record.Source，usage sink 只转发枚举后的 sampleSource，绝不转发 API key、原始 header 或 prompt。
+旧记录迁移为 natural。探针请求使用专用本机请求标记；Proxy 只在 loopback 且已通过现有 API 鉴权时把该标记写入 request metadata，并在转发上游前剥离。Usage record 新增独立的 SampleSource 和 ProbeRunID 字段；现有 Record.Source 继续保持 credential source 语义，绝不复用。usage sink 只转发枚举后的 sampleSource 和受限格式的 probeRunId，绝不转发 API key、原始 header 或 prompt。
 
 不能从时间、模型名或调用者进程猜测样本来源。
 
