@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
-import { dirname, join, relative, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { EventEmitter } from 'node:events';
 import type { ChildProcess } from 'node:child_process';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -30,12 +30,12 @@ afterEach(() => {
 });
 
 describe('session temp', () => {
-  it('creates stable per-session scratch in the user cache tree', () => {
+  it('creates stable per-session scratch in a short user-owned cache tree', () => {
     const data = dataDir();
     const path = ensureSessionTempDir(data, 'session-123');
     roots.push(dirname(path));
-    expect(path.startsWith(join(homedir(), '.cache', 'botmux', 'session-tmp'))).toBe(true);
-    expect(path).toMatch(/\/session-tmp\/[0-9a-f]{8}\/[0-9a-f]{16}$/);
+    expect(dirname(dirname(path))).toBe(join(homedir(), '.cache', 'bm'));
+    expect(path).toMatch(/\/[0-9a-f]{8}\/[0-9a-f]{16}$/);
     expect(existsSync(path)).toBe(true);
 
     const env: NodeJS.ProcessEnv = {};
@@ -46,26 +46,50 @@ describe('session temp', () => {
   it('hashes unsafe session ids instead of permitting traversal', () => {
     const data = dataDir();
     const path = sessionTempDir(data, '../../escape');
-    expect(path).toMatch(/\/session-tmp\/[0-9a-f]{8}\/[0-9a-f]{16}$/);
+    expect(path).toMatch(/\/[0-9a-f]{8}\/[0-9a-f]{16}$/);
   });
 
-  it('leaves room under the 104-byte AF_UNIX limit for sockets created in TMPDIR', () => {
-    // The scratch dir becomes the CLI's TMPDIR. A raw UUID segment used to put
-    // e.g. Python multiprocessing's listener socket past macOS's sun_path cap.
-    const path = sessionTempDir(dataDir(), '6c255026-e993-495d-80ec-85d2c3c440dc');
-    expect(relative(homedir(), path).length).toBeLessThanOrEqual(51);
+  it('leaves room under AF_UNIX limits for Chromium singleton sockets', () => {
+    const previousHome = process.env.HOME;
+    process.env.HOME = '/home/botmux-user';
+    try {
+      const path = sessionTempDir(dataDir(), '6c255026-e993-495d-80ec-85d2c3c440dc');
+      const chromiumSuffix = '/org.chromium.Chromium.NtgTAI/SingletonSocket';
+      expect(`${path}${chromiumSuffix}`.length).toBeLessThanOrEqual(103);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
   });
 
-  it('also retires scratch left in the pre-shortening layout', async () => {
+  it('stays visible through scratch sandbox fresh tmpfs mounts', () => {
+    const path = sessionTempDir(dataDir(), 'scratch-compatible');
+    expect(path.startsWith(`${homedir()}/`)).toBe(true);
+    for (const masked of ['/tmp/', '/var/tmp/', '/run/', '/dev/shm/']) {
+      expect(path.startsWith(masked)).toBe(false);
+    }
+  });
+
+  it('also retires scratch left in prior cache, flat short, and var-tmp layouts', async () => {
     const data = dataDir();
     const sessionId = '6c255026-e993-495d-80ec-85d2c3c440dc';
-    const profile = createHash('sha256').update(resolve(data)).digest('hex').slice(0, 16);
-    const legacy = join(homedir(), '.cache', 'botmux', 'session-tmp', profile, sessionId);
-    roots.push(dirname(legacy));
-    mkdirSync(legacy, { recursive: true });
-    writeFileSync(join(legacy, 'artifact'), 'x');
+    const digest = createHash('sha256').update(resolve(data)).digest('hex');
+    const sessionKey = createHash('sha256').update(sessionId).digest('hex').slice(0, 16);
+    const flatShortKey = createHash('sha256').update(resolve(data)).update('\0').update(sessionId).digest('hex').slice(0, 20);
+    const legacyRoot = join(homedir(), '.cache', 'botmux', 'session-tmp');
+    const legacyPaths = [
+      join(legacyRoot, digest.slice(0, 8), sessionKey),
+      join(legacyRoot, digest.slice(0, 16), sessionId),
+      join(homedir(), '.cache', 'bm', flatShortKey),
+      ...(process.getuid ? [join('/var/tmp', `botmux-${process.getuid()}`, digest.slice(0, 8), sessionKey)] : []),
+    ];
+    roots.push(dirname(legacyPaths[0]), dirname(legacyPaths[1]), legacyPaths[2]);
+    for (const path of legacyPaths) {
+      mkdirSync(path, { recursive: true });
+      writeFileSync(join(path, 'artifact'), 'x');
+    }
     await cleanupSessionTempDir(data, sessionId);
-    expect(existsSync(legacy)).toBe(false);
+    for (const path of legacyPaths) expect(existsSync(path)).toBe(false);
   });
 
   it('separates sibling data directories with the same session id', () => {
