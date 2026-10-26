@@ -259,7 +259,11 @@ export function serviceUrls(record: InstalledPluginRecord, definition: PluginSer
   return {
     ...(serviceHost ? { host: serviceHost } : {}),
     ...(Number.isFinite(port) ? { port } : {}),
-    ...(urls.openUrl ? { openUrl: rewriteLoopbackServiceUrl(urls.openUrl) } : Number.isFinite(port) ? { openUrl: `http://${publicHost}:${port}/` } : {}),
+    ...(urls.openUrl
+      ? { openUrl: rewriteLoopbackServiceUrl(urls.openUrl) }
+      : !definition.urls && Number.isFinite(port)
+        ? { openUrl: `http://${publicHost}:${port}/` }
+        : {}),
     ...(urls.healthUrl ? { healthUrl: rewriteLoopbackServiceUrl(urls.healthUrl) } : {}),
   };
 }
