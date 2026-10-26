@@ -89,6 +89,14 @@ export type AskResult =
  *  v0.1.8 新增 `answers: string[][] | null`（多问多选完整答案），
  *  保留 `selected: string | null` 做向后兼容（等价于 `toLegacySelected`）。
  *  `comment` 携带用户的自定义回复原文（话题直接打字作答），无则 null。 */
+export interface AskPendingResult {
+  kind: 'pending';
+  requestId: string;
+  askId: string;
+  messageId: string;
+  pending: true;
+}
+
 export interface AskJsonOutput {
   /** 向后兼容：单问单选时等于 `answers[0][0]`，否则为 null。 */
   selected: string | null;
@@ -141,7 +149,7 @@ export interface CreateAskInput {
   questions: ReadonlyArray<AskQuestion>;
   /** Absolute deadline; computed by caller from `--timeout`. Broker won't
    *  re-compute. */
-  timeoutMs: number;
+  timeoutMs: number | null;
   /** 发起 ask 的会话类型。仅用于点击鉴权时把 chatType 喂给 canTalk（p2pOpen 腿）；
    *  缺省时该腿 fail-closed，鉴权退回原语义。 */
   chatType?: 'group' | 'p2p';
@@ -186,7 +194,7 @@ export interface PendingAsk {
   /** 当前已勾选答案快照。仅 daemon/card 内部使用；CLI IPC 边界不暴露。 */
   selections?: ReadonlyArray<ReadonlyArray<string>>;
   createdAt: number;
-  deadlineAt: number;
+  deadlineAt: number | null;
   /** Set after the card dispatch succeeds. Until then, the ask is "registered
    *  but not visible" — clicks can't physically arrive yet. */
   cardMessageId?: string;
