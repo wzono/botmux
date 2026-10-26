@@ -30,6 +30,25 @@ afterEach(() => {
 });
 
 describe('session temp', () => {
+  it('sweeps orphaned scratch in the old cache root while protecting active sessions', async () => {
+    const data = dataDir();
+    const oldRoot = join(homedir(), '.cache', 'botmux', 'session-tmp');
+    const orphan = ensureSessionTempDir(data, 'legacy-orphan', oldRoot);
+    const active = ensureSessionTempDir(data, 'legacy-active', oldRoot);
+    roots.push(dirname(orphan));
+    writeFileSync(join(orphan, 'artifact'), 'old');
+    writeFileSync(join(active, 'artifact'), 'active');
+    const old = new Date(Date.now() - 120_000);
+    utimesSync(orphan, old, old);
+    utimesSync(active, old, old);
+    const removed = await sweepOrphanSessionTempDirs(data, new Set(['legacy-active']), {
+      liveReferences: async paths => new Set(paths.filter(path => path !== orphan)),
+    });
+    expect(removed).toContain(orphan);
+    expect(existsSync(orphan)).toBe(false);
+    expect(readFileSync(join(active, 'artifact'), 'utf8')).toBe('active');
+  });
+
   it('creates stable per-session scratch in a short user-owned cache tree', () => {
     const data = dataDir();
     const path = ensureSessionTempDir(data, 'session-123');
