@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { logger } from '../../utils/logger.js';
 import type { InstalledPluginRecord, PluginServiceState } from './types.js';
 
 const DEFAULT_TIMEOUT_MS = 3_000;
@@ -36,8 +37,10 @@ function fail(code: PluginDashboardServiceErrorCode): never {
   throw new PluginDashboardServiceError(code);
 }
 
-function isLoopbackHost(host: unknown): boolean {
-  return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]';
+function loopbackUrlHost(host: unknown): string | undefined {
+  if (host === '127.0.0.1' || host === 'localhost') return '127.0.0.1';
+  if (host === '::1' || host === '[::1]') return '[::1]';
+  return undefined;
 }
 
 async function readBoundedJson(response: Response, maxBytes: number): Promise<unknown> {
@@ -86,7 +89,8 @@ export async function proxyPluginDashboardServiceRequest(
     .some(route => route.method === input.method && route.path === input.path);
   if (!allowed) fail('route_not_allowed');
   if (deps.state?.pluginId !== deps.record.id || deps.state.status !== 'online') fail('service_offline');
-  if (!isLoopbackHost(deps.state.host)) fail('service_host_invalid');
+  const targetHost = loopbackUrlHost(deps.state.host);
+  if (!targetHost) fail('service_host_invalid');
   if (!Number.isInteger(deps.state.port) || deps.state.port! < 1 || deps.state.port! > 65_535) {
     fail('service_port_invalid');
   }
@@ -103,9 +107,8 @@ export async function proxyPluginDashboardServiceRequest(
   const maxBytes = deps.maxBytes ?? DEFAULT_MAX_BYTES;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  let response: Response;
   try {
-    response = await (deps.fetchImpl ?? fetch)(`http://127.0.0.1:${deps.state.port}${input.path}`, {
+    const response = await (deps.fetchImpl ?? fetch)(`http://${targetHost}:${deps.state.port}${input.path}`, {
       method: input.method,
       redirect: 'error',
       signal: controller.signal,
@@ -115,7 +118,11 @@ export async function proxyPluginDashboardServiceRequest(
       },
       ...(body !== undefined ? { body } : {}),
     });
+    if (response.status >= 300 && response.status < 400) fail('upstream_redirect');
+    if (!response.ok) fail('upstream_http_status');
+    return await readBoundedJson(response, maxBytes);
   } catch (error) {
+    if (error instanceof PluginDashboardServiceError) throw error;
     if (controller.signal.aborted) fail('upstream_timeout');
     const detail = [error, (error as { cause?: unknown })?.cause]
       .map(item => item instanceof Error ? item.message : String(item ?? ''))
@@ -126,9 +133,6 @@ export async function proxyPluginDashboardServiceRequest(
   } finally {
     clearTimeout(timeout);
   }
-  if (response.status >= 300 && response.status < 400) fail('upstream_redirect');
-  if (!response.ok) fail('upstream_http_status');
-  return readBoundedJson(response, maxBytes);
 }
 
 function writeJson(res: ServerResponse, status: number, body: unknown): true {
@@ -170,33 +174,47 @@ export async function handlePluginDashboardServiceHttpRequest(
     readState(id: string): PluginServiceState | undefined;
     readBody(req: IncomingMessage): Promise<unknown>;
     proxy?: typeof proxyPluginDashboardServiceRequest;
+    log?: (event: { pluginId: string; path: string; status: string; durationMs: number }) => void;
+    now?: () => number;
   },
 ): Promise<true> {
-  if (req.method !== 'POST') return writeJson(res, 405, { error: 'method_not_allowed' });
+  const now = deps.now ?? Date.now;
+  const startedAt = now();
+  const log = deps.log ?? (event => logger.info('[plugin-dashboard-service]', event));
+  let auditPath = '<invalid>';
+  const respond = (httpStatus: number, body: unknown, status: string): true => {
+    log({ pluginId, path: auditPath, status, durationMs: Math.max(0, now() - startedAt) });
+    return writeJson(res, httpStatus, body);
+  };
+  if (req.method !== 'POST') return respond(405, { error: 'method_not_allowed' }, 'method_not_allowed');
   const record = deps.resolveRecord(pluginId);
-  if (!record) return writeJson(res, 404, { error: 'plugin_not_found' });
+  if (!record) return respond(404, { error: 'plugin_not_found' }, 'plugin_not_found');
   const state = deps.readState(pluginId);
   if (state?.pluginId !== pluginId || state.status !== 'online') {
-    return writeJson(res, 409, { error: 'service_offline' });
+    return respond(409, { error: 'service_offline' }, 'service_offline');
   }
   let raw: unknown;
   try {
     raw = await deps.readBody(req);
   } catch {
-    return writeJson(res, 400, { error: 'bad_json' });
+    return respond(400, { error: 'bad_json' }, 'bad_json');
   }
   const parsed = requestShape(raw);
-  if (!parsed) return writeJson(res, 400, { error: 'invalid_request' });
+  if (!parsed) return respond(400, { error: 'invalid_request' }, 'invalid_request');
+  auditPath = record.contributions?.serviceHttp?.routes
+    .some(route => route.method === parsed.method && route.path === parsed.path)
+    ? parsed.path
+    : '<rejected>';
   try {
     const result = await (deps.proxy ?? proxyPluginDashboardServiceRequest)(
       { pluginId, ...parsed },
       { record, state },
     );
-    return writeJson(res, 200, result);
+    return respond(200, result, 'ok');
   } catch (error) {
     if (error instanceof PluginDashboardServiceError) {
-      return writeJson(res, errorStatus(error), { error: error.code });
+      return respond(errorStatus(error), { error: error.code }, error.code);
     }
-    return writeJson(res, 502, { error: 'upstream_unavailable' });
+    return respond(502, { error: 'upstream_unavailable' }, 'upstream_unavailable');
   }
 }

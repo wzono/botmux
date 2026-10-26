@@ -16,7 +16,7 @@ afterEach(async () => {
   })));
 });
 
-async function fixture() {
+async function fixture(host = '127.0.0.1') {
   const requests: Array<{ path: string; method: string; headers: Record<string, string | string[] | undefined>; body: string }> = [];
   const server = createServer(async (req, res) => {
     let body = '';
@@ -45,11 +45,22 @@ async function fixture() {
       }, 100);
       return;
     }
+    if (req.url === '/stream') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.write('{"ok":');
+      return;
+    }
     res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({ ok: true, method: req.method, body: body ? JSON.parse(body) : null }));
   });
   servers.push(server);
-  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, host, () => {
+      server.off('error', reject);
+      resolve();
+    });
+  });
   return { port: (server.address() as { port: number }).port, requests };
 }
 
@@ -60,6 +71,7 @@ const routes = [
   { method: 'GET' as const, path: '/plain' },
   { method: 'GET' as const, path: '/large' },
   { method: 'GET' as const, path: '/slow' },
+  { method: 'GET' as const, path: '/stream' },
 ];
 
 function record(): InstalledPluginRecord {
@@ -153,6 +165,28 @@ describe('Dashboard plugin service bridge', () => {
     await expect(call('/plain')).rejects.toThrow('upstream_non_json');
     await expect(call('/large', { maxBytes: 128 })).rejects.toThrow('upstream_too_large');
     await expect(call('/slow', { timeoutMs: 10 })).rejects.toThrow('upstream_timeout');
+    const streamed = call('/stream', { timeoutMs: 50 }).then(
+      () => 'resolved',
+      error => error instanceof PluginDashboardServiceError ? error.code : String(error),
+    );
+    await expect(Promise.race([
+      streamed,
+      new Promise(resolve => setTimeout(() => resolve('still_pending'), 250)),
+    ])).resolves.toBe('upstream_timeout');
+  });
+
+  it('connects to the validated IPv4 or IPv6 loopback host from service state', async () => {
+    const ipv4 = await fixture('127.0.0.1');
+    await expect(proxyPluginDashboardServiceRequest(
+      { pluginId: 'sample', method: 'GET', path: '/api/snapshot' },
+      { record: record(), state: state(ipv4.port, { host: 'localhost' }) },
+    )).resolves.toMatchObject({ ok: true });
+
+    const ipv6 = await fixture('::1');
+    await expect(proxyPluginDashboardServiceRequest(
+      { pluginId: 'sample', method: 'GET', path: '/api/snapshot' },
+      { record: record(), state: state(ipv6.port, { host: '[::1]' }) },
+    )).resolves.toMatchObject({ ok: true });
   });
 });
 
@@ -160,6 +194,8 @@ async function bridgeHttpFixture(options: {
   installed?: boolean;
   serviceState?: PluginServiceState;
   proxy?: () => Promise<unknown>;
+  log?: (event: unknown) => void;
+  now?: () => number;
 }) {
   if (typeof handlePluginDashboardServiceHttpRequest !== 'function') {
     throw new Error('plugin_dashboard_service_http_handler_missing');
@@ -174,7 +210,9 @@ async function bridgeHttpFixture(options: {
         for await (const chunk of request) raw += chunk;
         return JSON.parse(raw);
       },
-    });
+      log: options.log,
+      now: options.now,
+    } as any);
   });
   servers.push(server);
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -208,6 +246,23 @@ describe('Dashboard plugin service bridge HTTP contract', () => {
       const call = await bridgeHttpFixture({ proxy: async () => { throw new PluginDashboardServiceError(code); } });
       expect(await call()).toEqual({ status, body: { error: code } });
     }
+  });
+
+  it('audits plugin, allowlisted path, result, and duration without request bodies', async () => {
+    const events: unknown[] = [];
+    let clock = 100;
+    const call = await bridgeHttpFixture({
+      proxy: async () => ({ ok: true }),
+      log: event => events.push(event),
+      now: () => (clock += 7),
+    });
+
+    await expect(call('{"method":"POST","path":"/api/refresh","body":{"secret":"not logged"}}'))
+      .resolves.toEqual({ status: 200, body: { ok: true } });
+    expect(events).toEqual([{
+      pluginId: 'sample', path: '/api/refresh', status: 'ok', durationMs: 7,
+    }]);
+    expect(JSON.stringify(events)).not.toContain('not logged');
   });
 });
 
