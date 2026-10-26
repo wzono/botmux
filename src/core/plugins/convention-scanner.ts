@@ -211,15 +211,16 @@ const scanServiceHttp = (
   if (!Array.isArray(record.routes) || record.routes.length === 0 || record.routes.length > 16) {
     throw new Error('invalid_plugin_service_http_routes');
   }
-  const routes = record.routes.map((rawRoute) => {
+  const routes: PluginServiceHttpContribution['routes'] = record.routes.map((rawRoute) => {
     const route = optionalRecord(rawRoute, 'plugin_service_http_route');
     if (Object.keys(route).some(key => key !== 'method' && key !== 'path')) {
       throw new Error('invalid_plugin_service_http_route_fields');
     }
-    if (route.method !== 'GET' && route.method !== 'POST') {
+    const method = route.method;
+    if (method !== 'GET' && method !== 'POST') {
       throw new Error('invalid_plugin_service_http_method');
     }
-    return { method: route.method, path: readServiceHttpPath(route.path) };
+    return { method, path: readServiceHttpPath(route.path) };
   });
   const keys = routes.map(route => `${route.method} ${route.path}`);
   if (new Set(keys).size !== keys.length) throw new Error('duplicate_plugin_service_http_route');
