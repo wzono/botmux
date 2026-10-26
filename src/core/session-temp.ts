@@ -14,8 +14,12 @@ function sessionTempSegment(sessionId: string): string {
   return `sha256-${createHash('sha256').update(sessionId).digest('hex')}`;
 }
 
-function sessionTempRoot(): string {
+function legacySessionTempRoot(): string {
   return join(homedir(), '.cache', 'botmux', 'session-tmp');
+}
+
+function sessionTempRoot(): string {
+  return join(homedir(), '.cache', 'bm');
 }
 
 function sessionTempProfile(dataDir: string, length: number): string {
@@ -32,15 +36,11 @@ function sessionTempKey(sessionId: string): string {
 const PROFILE_DATA_DIR_MARKER = '.data-dir';
 
 /**
- * Stable scratch path owned by one logical session. It lives in the user's
- * cache tree, keyed by SESSION_DATA_DIR, rather than in the host's /tmp:
- * production Linux hosts commonly mount /tmp as tmpfs, while agent turns clone
- * repositories and build dependency trees that can be many GiB.
- *
- * The path becomes the CLI's TMPDIR, and tools create Unix sockets under it
- * (Python multiprocessing, ad-hoc servers, …). AF_UNIX paths are capped at
- * 104 bytes on macOS (108 on Linux), so both segments are short hashes: a raw
- * UUID session id here left too little room for any socket name.
+ * Stable scratch path owned by one logical session and keyed by
+ * SESSION_DATA_DIR. It stays under the user's cache tree so another local user
+ * cannot pre-create the root, while the deliberately short `bm/<hash>` suffix
+ * leaves room for tools that append Unix socket names to TMPDIR. Chromium's
+ * singleton socket needs 45 bytes; macOS allows only 104 bytes total.
  */
 export function sessionTempDir(dataDir: string, sessionId: string, root: string = sessionTempRoot()): string {
   // Keep scratch outside BOTMUX_HOME. Core-only sandboxes deliberately freeze
@@ -50,8 +50,23 @@ export function sessionTempDir(dataDir: string, sessionId: string, root: string 
 }
 
 /** Pre-shortening layout, still owned by sessions created before the change. */
-function legacySessionTempDir(dataDir: string, sessionId: string): string {
-  return join(sessionTempRoot(), sessionTempProfile(dataDir, 16), sessionTempSegment(sessionId));
+function legacySessionTempDirs(dataDir: string, sessionId: string): string[] {
+  const cacheRoot = legacySessionTempRoot();
+  const legacyVarRoot = process.getuid ? join('/var/tmp', `botmux-${process.getuid()}`) : undefined;
+  const profile = sessionTempProfile(dataDir, 8);
+  const key = createHash('sha256').update(sessionId).digest('hex').slice(0, 16);
+  const flatShortKey = createHash('sha256')
+    .update(resolve(dataDir))
+    .update('\0')
+    .update(sessionId)
+    .digest('hex')
+    .slice(0, 20);
+  return [
+    join(cacheRoot, profile, key),
+    join(cacheRoot, sessionTempProfile(dataDir, 16), sessionTempSegment(sessionId)),
+    join(sessionTempRoot(), flatShortKey),
+    ...(legacyVarRoot ? [join(legacyVarRoot, profile, key)] : []),
+  ];
 }
 
 /** Create and validate the session scratch directory before exposing it. */
@@ -97,7 +112,7 @@ function writeProfileDataDirMarker(profileDir: string, dataDir: string): void {
 /** Best-effort caller decides when the logical session is durably closed. */
 export async function cleanupSessionTempDir(dataDir: string, sessionId: string): Promise<void> {
   await retireSessionTempPath(sessionTempDir(dataDir, sessionId));
-  await retireSessionTempPath(legacySessionTempDir(dataDir, sessionId));
+  for (const path of legacySessionTempDirs(dataDir, sessionId)) await retireSessionTempPath(path);
 }
 
 async function retireSessionTempPath(path: string): Promise<void> {
@@ -138,7 +153,7 @@ export function cleanupSessionTempDirAfterExit(
 }
 
 export interface SessionTempSweepOptions {
-  /** Defaults to ~/.cache/botmux/session-tmp. */
+  /** Defaults to ~/.cache/bm. */
   root?: string;
   now?: number;
   /** Directories touched more recently than this are never removed. */
@@ -261,7 +276,7 @@ export function applySessionTempEnv(env: NodeJS.ProcessEnv, path: string): void 
 const SESSION_TEMP_ENV_KEYS = ['TMPDIR', 'TMP', 'TEMP'] as const;
 
 /**
- * Drop TMPDIR/TMP/TEMP values that point into the session scratch tree.
+ * Drop TMPDIR/TMP/TEMP values that point into current or legacy session scratch trees.
  *
  * A `botmux restart` run from a session shell inherits that session's scratch
  * as TMPDIR. Carried into the fleet, every worker would pin it as its Gateway
@@ -269,11 +284,15 @@ const SESSION_TEMP_ENV_KEYS = ['TMPDIR', 'TMP', 'TEMP'] as const;
  * paths are removed: an operator's own short TMPDIR is kept.
  */
 export function scrubSessionTempEnv(env: NodeJS.ProcessEnv): void {
-  const root = sessionTempRoot();
+  const roots = [
+    sessionTempRoot(),
+    legacySessionTempRoot(),
+    ...(process.getuid ? [join('/var/tmp', `botmux-${process.getuid()}`)] : []),
+  ];
   for (const key of SESSION_TEMP_ENV_KEYS) {
     const value = env[key]?.trim();
     if (!value) continue;
     const path = resolve(value);
-    if (path === root || path.startsWith(`${root}${sep}`)) delete env[key];
+    if (roots.some(root => path === root || path.startsWith(`${root}${sep}`))) delete env[key];
   }
 }
