@@ -13,6 +13,7 @@ import { describe, expect, it } from 'vitest';
 const root = new URL('..', import.meta.url).pathname;
 const src = (f: string) => readFileSync(new URL(`../src/${f}`, import.meta.url), 'utf8');
 
+// 源码结构护栏(K4)：purge_images_continue 需要跨 IPC 类型、worker 重启、卡片按钮和处理器逐段接通。
 describe('purge-images-continue end-to-end wiring', () => {
   it('carries the purge flag on the message IPC type', () => {
     const types = src('types.ts');
