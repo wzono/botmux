@@ -229,13 +229,15 @@ describe('Dashboard plugin service bridge', () => {
     ]);
   });
 
-  it('connects to real IPv4 and IPv6-only loopback listeners when available', async context => {
+  it('connects to a real IPv4 loopback listener', async () => {
     const ipv4 = await fixture('127.0.0.1');
     await expect(proxyPluginDashboardServiceRequest(
       { pluginId: 'sample', method: 'GET', path: '/api/snapshot' },
       { record: record(), state: state(ipv4.port, { host: '127.0.0.1' }) },
     )).resolves.toMatchObject({ ok: true });
+  });
 
+  it('connects to a real IPv6-only loopback listener when available', async context => {
     let ipv6;
     try {
       ipv6 = await fixture('::1');
