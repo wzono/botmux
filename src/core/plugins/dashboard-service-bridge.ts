@@ -38,14 +38,21 @@ function fail(code: PluginDashboardServiceErrorCode): never {
 }
 
 function loopbackUrlHost(host: unknown): string | undefined {
-  if (host === '127.0.0.1' || host === 'localhost') return '127.0.0.1';
+  if (host === '127.0.0.1' || host === 'localhost') return host;
   if (host === '::1' || host === '[::1]') return '[::1]';
   return undefined;
 }
 
+async function cancelResponseBody(response: Response): Promise<void> {
+  await response.body?.cancel().catch(() => {});
+}
+
 async function readBoundedJson(response: Response, maxBytes: number): Promise<unknown> {
   const contentType = response.headers.get('content-type')?.toLowerCase() ?? '';
-  if (!contentType.startsWith('application/json')) fail('upstream_non_json');
+  if (!contentType.startsWith('application/json')) {
+    await cancelResponseBody(response);
+    fail('upstream_non_json');
+  }
   if (!response.body) fail('upstream_invalid_json');
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -118,8 +125,14 @@ export async function proxyPluginDashboardServiceRequest(
       },
       ...(body !== undefined ? { body } : {}),
     });
-    if (response.status >= 300 && response.status < 400) fail('upstream_redirect');
-    if (!response.ok) fail('upstream_http_status');
+    if (response.status >= 300 && response.status < 400) {
+      await cancelResponseBody(response);
+      fail('upstream_redirect');
+    }
+    if (!response.ok) {
+      await cancelResponseBody(response);
+      fail('upstream_http_status');
+    }
     return await readBoundedJson(response, maxBytes);
   } catch (error) {
     if (error instanceof PluginDashboardServiceError) throw error;

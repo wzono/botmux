@@ -18,6 +18,7 @@ afterEach(async () => {
 
 async function fixture(host = '127.0.0.1') {
   const requests: Array<{ path: string; method: string; headers: Record<string, string | string[] | undefined>; body: string }> = [];
+  const streamClosed = new Map<string, Promise<void>>();
   const server = createServer(async (req, res) => {
     let body = '';
     for await (const chunk of req) body += chunk;
@@ -30,6 +31,14 @@ async function fixture(host = '127.0.0.1') {
     if (req.url === '/plain') {
       res.writeHead(200, { 'content-type': 'text/plain' });
       res.end('not json');
+      return;
+    }
+    if (req.url === '/plain-stream' || req.url === '/error-stream') {
+      streamClosed.set(req.url, new Promise(resolve => res.once('close', resolve)));
+      res.writeHead(req.url === '/error-stream' ? 503 : 200, {
+        'content-type': req.url === '/error-stream' ? 'application/json' : 'text/plain',
+      });
+      res.write(req.url === '/error-stream' ? '{"error":' : 'not json');
       return;
     }
     if (req.url === '/large') {
@@ -61,7 +70,18 @@ async function fixture(host = '127.0.0.1') {
       resolve();
     });
   });
-  return { port: (server.address() as { port: number }).port, requests };
+  return {
+    port: (server.address() as { port: number }).port,
+    requests,
+    async didStreamClose(path: string, timeoutMs = 250) {
+      const closed = streamClosed.get(path);
+      if (!closed) return false;
+      return Promise.race([
+        closed.then(() => true),
+        new Promise<false>(resolve => setTimeout(() => resolve(false), timeoutMs)),
+      ]);
+    },
+  };
 }
 
 const routes = [
@@ -69,6 +89,8 @@ const routes = [
   { method: 'POST' as const, path: '/api/refresh' },
   { method: 'GET' as const, path: '/redirect' },
   { method: 'GET' as const, path: '/plain' },
+  { method: 'GET' as const, path: '/plain-stream' },
+  { method: 'GET' as const, path: '/error-stream' },
   { method: 'GET' as const, path: '/large' },
   { method: 'GET' as const, path: '/slow' },
   { method: 'GET' as const, path: '/stream' },
@@ -175,14 +197,56 @@ describe('Dashboard plugin service bridge', () => {
     ])).resolves.toBe('upstream_timeout');
   });
 
-  it('connects to the validated IPv4 or IPv6 loopback host from service state', async () => {
+  it('cancels unread bodies for non-JSON and non-success streaming responses', async () => {
+    const local = await fixture();
+    const call = (path: string) => proxyPluginDashboardServiceRequest(
+      { pluginId: 'sample', method: 'GET', path },
+      { record: record(), state: state(local.port) },
+    );
+    await expect(call('/plain-stream')).rejects.toThrow('upstream_non_json');
+    await expect(local.didStreamClose('/plain-stream')).resolves.toBe(true);
+    await expect(call('/error-stream')).rejects.toThrow('upstream_http_status');
+    await expect(local.didStreamClose('/error-stream')).resolves.toBe(true);
+  });
+
+  it('preserves localhost while normalizing explicit IPv4 and IPv6 literals', async () => {
+    const targets: string[] = [];
+    const fetchImpl = async (input: string | URL | Request) => {
+      targets.push(String(input));
+      return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+    for (const host of ['localhost', '127.0.0.1', '::1', '[::1]']) {
+      await proxyPluginDashboardServiceRequest(
+        { pluginId: 'sample', method: 'GET', path: '/api/snapshot' },
+        { record: record(), state: state(43210, { host }), fetchImpl: fetchImpl as typeof fetch },
+      );
+    }
+    expect(targets).toEqual([
+      'http://localhost:43210/api/snapshot',
+      'http://127.0.0.1:43210/api/snapshot',
+      'http://[::1]:43210/api/snapshot',
+      'http://[::1]:43210/api/snapshot',
+    ]);
+  });
+
+  it('connects to real IPv4 and IPv6-only loopback listeners when available', async context => {
     const ipv4 = await fixture('127.0.0.1');
     await expect(proxyPluginDashboardServiceRequest(
       { pluginId: 'sample', method: 'GET', path: '/api/snapshot' },
-      { record: record(), state: state(ipv4.port, { host: 'localhost' }) },
+      { record: record(), state: state(ipv4.port, { host: '127.0.0.1' }) },
     )).resolves.toMatchObject({ ok: true });
 
-    const ipv6 = await fixture('::1');
+    let ipv6;
+    try {
+      ipv6 = await fixture('::1');
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'EAFNOSUPPORT' || code === 'EADDRNOTAVAIL') {
+        context.skip();
+        return;
+      }
+      throw error;
+    }
     await expect(proxyPluginDashboardServiceRequest(
       { pluginId: 'sample', method: 'GET', path: '/api/snapshot' },
       { record: record(), state: state(ipv6.port, { host: '[::1]' }) },
