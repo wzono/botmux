@@ -30,6 +30,19 @@ afterEach(() => {
 });
 
 describe('session temp', () => {
+  it('preserves an empty live scratch from the flat legacy layout', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'legacy-flat-'));
+    roots.push(root);
+    const path = join(root, '0123456789abcdef0123');
+    mkdirSync(path);
+    const old = new Date(Date.now() - 120_000);
+    utimesSync(path, old, old);
+    await sweepOrphanSessionTempDirs(dataDir(), new Set(['active']), {
+      root, liveReferences: async () => new Set([path]),
+    });
+    expect(existsSync(path)).toBe(true);
+  });
+
   it('sweeps orphaned scratch in the old cache root while protecting active sessions', async () => {
     const data = dataDir();
     const oldRoot = join(homedir(), '.cache', 'botmux', 'session-tmp');
