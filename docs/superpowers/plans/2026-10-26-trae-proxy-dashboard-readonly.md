@@ -42,7 +42,7 @@ Expected: 21 tests pass and 9 runtime files validate. Save the hash list under `
 
 Run `bytedcli codebase namespace list` or `repo list --query trae-model-status` first. If the repository is absent, dry-run `bytedcli codebase repo create --namespace zhongweijie.x --name trae-model-status --description "Botmux Trae Proxy model status plugin"`, inspect the target, then execute the same command with `--execute --confirm zhongweijie.x/trae-model-status`. Do not create a second repository if one already exists.
 
-Expected: repository URL `https://code.byted.org/zhongweijie.x/trae-model-status` exists and is private/internal.
+Expected: repository path `zhongweijie.x/trae-model-status` exists and is private/internal; obtain the deployment-specific URL from Codebase at runtime.
 
 - [ ] **Step 3: Copy only source-controlled plugin files**
 

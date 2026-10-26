@@ -214,8 +214,8 @@ bun test
 node scripts/build.mjs
 node scripts/validate.mjs
 npm exec --yes --package=tsx -- tsx /data00/home/zhongweijie.x/.codex/skills/create-lark-card/scripts/validate_card.ts card.json
-env npm_config_registry=https://bnpm.byted.org npx -y @lark/card-preview@0.0.5-0 --user-dsl-path card.json --device pc --output card-preview.png
-env npm_config_registry=https://bnpm.byted.org npx -y @lark/card-preview@0.0.5-0 --user-dsl-path card.json --device mobile --output card-preview-mobile.png
+env npm_config_registry="$INTERNAL_NPM_REGISTRY" npx -y @lark/card-preview@0.0.5-0 --user-dsl-path card.json --device pc --output card-preview.png
+env npm_config_registry="$INTERNAL_NPM_REGISTRY" npx -y @lark/card-preview@0.0.5-0 --user-dsl-path card.json --device mobile --output card-preview-mobile.png
 ~~~
 
 Visually inspect both previews. No clipped table, collapsed button, fake image, or unreadable dark-mode token is acceptable.
