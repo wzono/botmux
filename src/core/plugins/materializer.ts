@@ -71,6 +71,7 @@ export function materializePlugin(pluginId: string): PluginMaterializedFile {
       ? { dashboard: record.contributions.dashboard.map(entry => ({ id: entry.id, entry: entry.entry })) }
       : {}),
     ...(record.contributions?.service ? { service: [{ name: record.id }] } : {}),
+    ...(record.contributions?.serviceHttp ? { serviceHttp: record.contributions.serviceHttp } : {}),
   };
   if (record.contributions?.cardActions) {
     materialized.cardActions = record.contributions.cardActions;

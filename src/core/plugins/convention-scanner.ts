@@ -8,6 +8,7 @@ import type {
   PluginCliCommandIndexEntry,
   PluginCardActionsContribution,
   PluginMcpServer,
+  PluginServiceHttpContribution,
   PluginServiceMode,
   ScannedPluginContributions,
 } from './types.js';
@@ -170,6 +171,61 @@ function scanService(runtimeDir: string, mode: PluginServiceMode | undefined): S
   return { entry, mode: mode! };
 }
 
+const readServiceHttpPath = (raw: unknown): string => {
+  if (
+    typeof raw !== 'string'
+    || raw !== raw.trim()
+    || !raw.startsWith('/')
+    || raw.startsWith('//')
+    || raw.includes('\\')
+    || raw.includes('?')
+    || raw.includes('#')
+    || /[\u0000-\u001f\u007f]/.test(raw)
+  ) {
+    throw new Error('invalid_plugin_service_http_path');
+  }
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    throw new Error('invalid_plugin_service_http_path');
+  }
+  if (decoded.startsWith('//') || decoded.includes('\\') || decoded.split('/').some(part => part === '..')) {
+    throw new Error('plugin_service_http_path_escapes_root');
+  }
+  return raw;
+};
+
+const scanServiceHttp = (
+  runtimeDir: string,
+  service: ScannedPluginContributions['service'],
+): PluginServiceHttpContribution | undefined => {
+  const rel = 'service-http/index.json';
+  if (!isFile(join(runtimeDir, rel))) return undefined;
+  if (!service) throw new Error('plugin_service_http_service_required');
+  const record = optionalRecord(JSON.parse(readFileSync(join(runtimeDir, rel), 'utf-8')), 'plugin_service_http');
+  if (record.schemaVersion !== 1) throw new Error('invalid_plugin_service_http_schema');
+  if (Object.keys(record).some(key => key !== 'schemaVersion' && key !== 'routes')) {
+    throw new Error('invalid_plugin_service_http_fields');
+  }
+  if (!Array.isArray(record.routes) || record.routes.length === 0 || record.routes.length > 16) {
+    throw new Error('invalid_plugin_service_http_routes');
+  }
+  const routes = record.routes.map((rawRoute) => {
+    const route = optionalRecord(rawRoute, 'plugin_service_http_route');
+    if (Object.keys(route).some(key => key !== 'method' && key !== 'path')) {
+      throw new Error('invalid_plugin_service_http_route_fields');
+    }
+    if (route.method !== 'GET' && route.method !== 'POST') {
+      throw new Error('invalid_plugin_service_http_method');
+    }
+    return { method: route.method, path: readServiceHttpPath(route.path) };
+  });
+  const keys = routes.map(route => `${route.method} ${route.path}`);
+  if (new Set(keys).size !== keys.length) throw new Error('duplicate_plugin_service_http_route');
+  return { schemaVersion: 1, routes };
+};
+
 const isCardActionSelector = (value: unknown): value is string => {
   return typeof value === 'string'
     && value === value.trim()
@@ -254,6 +310,7 @@ export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPlug
   const dashboard = scanDashboard(runtimeDir, manifest.id);
   const cli = scanCli(runtimeDir);
   const service = scanService(runtimeDir, manifest.service?.mode);
+  const serviceHttp = scanServiceHttp(runtimeDir, service);
   const cardActions = scanCardActions(runtimeDir, service);
   const contributions: ScannedPluginContributions = {
     ...(skills ? { skills } : {}),
@@ -261,6 +318,7 @@ export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPlug
     ...(dashboard ? { dashboard } : {}),
     ...(cli ? { cli } : {}),
     ...(service ? { service } : {}),
+    ...(serviceHttp ? { serviceHttp } : {}),
   };
   if (cardActions) contributions.cardActions = cardActions;
   return Object.keys(contributions).length > 0 ? contributions : undefined;

@@ -649,6 +649,103 @@ describe('plugin manifest and registry basics', () => {
     }
   });
 
+  it('scans and materializes a fixed plugin service HTTP allowlist', () => {
+    const source = join(home, 'service-http-source');
+    const runtime = join(source, 'dist');
+    mkdirSync(join(runtime, 'service'), { recursive: true });
+    mkdirSync(join(runtime, 'service-http'), { recursive: true });
+    writeFileSync(join(source, 'package.json'), JSON.stringify({
+      name: '@botmux-ai/plugin-service-http-demo',
+      version: '0.1.0',
+      type: 'module',
+      keywords: ['botmux-plugin'],
+      botmux: {
+        schemaVersion: 1,
+        id: 'service-http-demo',
+        service: { mode: 'auto' },
+      },
+    }));
+    writeFileSync(join(runtime, 'package.json'), JSON.stringify({ type: 'module' }));
+    writeFileSync(join(runtime, 'service', 'index.js'), 'export default { port: 43210, pm2: { script: "./service/server.js" } };\n');
+    writeFileSync(join(runtime, 'service', 'server.js'), 'process.stdin.resume();\n');
+    writeFileSync(join(runtime, 'service-http', 'index.json'), JSON.stringify({
+      schemaVersion: 1,
+      routes: [
+        { method: 'GET', path: '/api/snapshot' },
+        { method: 'POST', path: '/api/refresh' },
+      ],
+    }));
+
+    const installed = installLocalPlugin(source);
+    const materialized = materializePlugin('service-http-demo');
+    const expected = {
+      schemaVersion: 1,
+      routes: [
+        { method: 'GET', path: '/api/snapshot' },
+        { method: 'POST', path: '/api/refresh' },
+      ],
+    };
+    expect(installed.record.contributions?.serviceHttp).toEqual(expected);
+    expect(readPluginRegistry().plugins['service-http-demo'].contributions?.serviceHttp).toEqual(expected);
+    expect(materialized.serviceHttp).toEqual(expected);
+  });
+
+  it('rejects unsafe or incomplete plugin service HTTP allowlists', () => {
+    const makeSource = (
+      id: string,
+      declaration: unknown,
+      options: { serviceFile?: boolean; serviceManifest?: boolean } = {},
+    ) => {
+      const source = join(home, id);
+      const runtime = join(source, 'dist');
+      mkdirSync(join(runtime, 'service-http'), { recursive: true });
+      if (options.serviceFile !== false) {
+        mkdirSync(join(runtime, 'service'), { recursive: true });
+        writeFileSync(join(runtime, 'service', 'index.js'), 'export default { port: 43210, pm2: { script: "./service/server.js" } };\n');
+        writeFileSync(join(runtime, 'service', 'server.js'), 'process.stdin.resume();\n');
+      }
+      writeFileSync(join(source, 'package.json'), JSON.stringify({
+        name: `@botmux-ai/plugin-${id}`,
+        version: '0.1.0',
+        type: 'module',
+        keywords: ['botmux-plugin'],
+        botmux: {
+          schemaVersion: 1,
+          id,
+          ...(options.serviceManifest === false ? {} : { service: { mode: 'auto' } }),
+        },
+      }));
+      writeFileSync(join(runtime, 'package.json'), JSON.stringify({ type: 'module' }));
+      writeFileSync(join(runtime, 'service-http', 'index.json'), JSON.stringify(declaration));
+      return source;
+    };
+
+    const validRoute = { method: 'GET', path: '/api/snapshot' };
+    const invalidCases: Array<[string, unknown, { serviceFile?: boolean; serviceManifest?: boolean }?]> = [
+      ['service-http-url-field', { schemaVersion: 1, routes: [{ ...validRoute, url: 'http://127.0.0.1:43210' }] }],
+      ['service-http-parent', { schemaVersion: 1, routes: [{ method: 'GET', path: '/api/../secret' }] }],
+      ['service-http-encoded-parent', { schemaVersion: 1, routes: [{ method: 'GET', path: '/api/%2e%2e/secret' }] }],
+      ['service-http-query', { schemaVersion: 1, routes: [{ method: 'GET', path: '/api/snapshot?full=1' }] }],
+      ['service-http-fragment', { schemaVersion: 1, routes: [{ method: 'GET', path: '/api/snapshot#x' }] }],
+      ['service-http-backslash', { schemaVersion: 1, routes: [{ method: 'GET', path: '/api\\snapshot' }] }],
+      ['service-http-origin', { schemaVersion: 1, routes: [{ method: 'GET', path: 'http://127.0.0.1:43210/api' }] }],
+      ['service-http-protocol-relative', { schemaVersion: 1, routes: [{ method: 'GET', path: '//127.0.0.1/api' }] }],
+      ['service-http-method', { schemaVersion: 1, routes: [{ method: 'DELETE', path: '/api/snapshot' }] }],
+      ['service-http-duplicate', { schemaVersion: 1, routes: [validRoute, validRoute] }],
+      ['service-http-too-many', { schemaVersion: 1, routes: Array.from({ length: 17 }, (_, index) => ({ method: 'GET', path: `/api/${index}` })) }],
+      ['service-http-empty', { schemaVersion: 1, routes: [] }],
+      ['service-http-future', { schemaVersion: 2, routes: [validRoute] }],
+      ['service-http-missing-file', { schemaVersion: 1, routes: [validRoute] }, { serviceFile: false }],
+      ['service-http-missing-manifest', { schemaVersion: 1, routes: [validRoute] }, { serviceManifest: false }],
+    ];
+
+    for (const [id, declaration, options] of invalidCases) {
+      expect(() => installLocalPlugin(makeSource(id, declaration, options)), id)
+        .toThrow(/plugin_(?:service|service_http)|invalid_plugin_service_http/);
+      expect(readPluginRegistry().plugins[id], id).toBeUndefined();
+    }
+  });
+
   it('拒绝不安全或不完整的卡片动作声明', () => {
     const makeSource = (id: string, declaration: unknown, options: { serviceFile?: boolean; serviceManifest?: boolean } = {}) => {
       const source = join(home, id);
