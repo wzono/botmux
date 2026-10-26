@@ -231,6 +231,9 @@ export async function sweepOrphanSessionTempDirs(
   const candidates: { path: string; detached: boolean }[] = [];
   const profileDirs: string[] = [];
   for (const profile of profiles) {
+    // Flat 20-hex legacy session leaves are not profiles. Their ownership
+    // cannot be recovered from the name; normal close cleans exact paths.
+    if (!/^(?:[0-9a-f]{8}|[0-9a-f]{16})$/.test(profile)) continue;
     const profileDir = join(root, profile);
     if (!isRealDir(profileDir)) continue;
     profileDirs.push(profileDir);
