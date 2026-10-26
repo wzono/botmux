@@ -209,6 +209,13 @@ export async function sweepOrphanSessionTempDirs(
   protectedSessionIds: ReadonlySet<string>,
   opts: SessionTempSweepOptions,
 ): Promise<string[]> {
+  if (opts.root === undefined) {
+    const removed: string[] = [];
+    for (const root of [sessionTempRoot(), legacySessionTempRoot()]) {
+      removed.push(...await sweepOrphanSessionTempDirs(dataDir, protectedSessionIds, { ...opts, root }));
+    }
+    return removed;
+  }
   const root = opts.root ?? sessionTempRoot();
   const now = opts.now ?? Date.now();
   const graceMs = opts.graceMs ?? SESSION_TEMP_SWEEP_GRACE_MS;
