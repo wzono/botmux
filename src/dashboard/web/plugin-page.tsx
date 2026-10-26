@@ -912,7 +912,7 @@ function PluginManagementPage(): React.JSX.Element {
   );
 }
 
-function pluginDashboardApi(pluginId: string) {
+export function pluginDashboardApi(pluginId: string) {
   async function settings(method: string, value?: unknown) {
     const response = await fetch(`/api/plugins/${encodeURIComponent(pluginId)}/settings`, {
       method, headers: { 'content-type': 'application/json' },
@@ -924,6 +924,21 @@ function pluginDashboardApi(pluginId: string) {
   }
   return {
     react: React,
+    async requestService(input: { method: 'GET' | 'POST'; path: string; body?: unknown }) {
+      const request = {
+        method: input.method,
+        path: input.path,
+        ...(input.body !== undefined ? { body: input.body } : {}),
+      };
+      const response = await fetch(`/api/plugins/${encodeURIComponent(pluginId)}/service-request`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(request),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+      return result;
+    },
     getSettings: () => settings('GET'),
     saveSettings: (value: unknown) => settings('PUT', value),
     async listBots() { return (await fetchPluginManagement()).bots; },

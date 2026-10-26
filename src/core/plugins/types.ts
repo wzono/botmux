@@ -149,6 +149,7 @@ export interface PluginServiceState {
   updatedAt: string;
   status?: string;
   pid?: number;
+  host?: string;
   port?: number;
   openUrl?: string;
   healthUrl?: string;

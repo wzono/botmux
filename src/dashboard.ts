@@ -383,7 +383,8 @@ import { buildResourceMonitorDaemonSeeds, createResourceMonitorService, handleRe
 import { readPluginRegistry } from './services/plugin-registry-store.js';
 import { pluginRuntimeDir, resolvePluginPath } from './core/plugins/paths.js';
 import { isValidPluginId, normalizePluginIdList } from './core/plugins/ids.js';
-import { listPluginServiceStatus, startPluginServices, stopPluginServices } from './core/plugins/service-manager.js';
+import { listPluginServiceStatus, readPluginServiceState, startPluginServices, stopPluginServices } from './core/plugins/service-manager.js';
+import { handlePluginDashboardServiceHttpRequest } from './core/plugins/dashboard-service-bridge.js';
 import { materializePlugin } from './core/plugins/materializer.js';
 import { resolveEffectivePluginIds, updateBotPluginOverride } from './core/plugins/effective.js';
 import { assertPluginBindingTransition, describePluginDependencyError } from './core/plugins/dependencies.js';
@@ -2845,6 +2846,16 @@ async function handlePluginManagementApi(
 ): Promise<boolean> {
   if (req.method === 'GET' && url.pathname === '/api/plugins') {
     return pluginJson(res, 200, await listDashboardPluginsPayload());
+  }
+
+  const serviceRequestMatch = url.pathname.match(/^\/api\/plugins\/([^/]+)\/service-request$/);
+  if (serviceRequestMatch) {
+    const pluginId = decodeURIComponent(serviceRequestMatch[1]);
+    return handlePluginDashboardServiceHttpRequest(req, res, pluginId, {
+      resolveRecord: id => requireInstalledPlugin(id) ?? undefined,
+      readState: readPluginServiceState,
+      readBody: readJsonBody,
+    });
   }
 
   const settingsMatch = url.pathname.match(/^\/api\/plugins\/([^/]+)\/settings$/);

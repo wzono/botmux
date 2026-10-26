@@ -250,14 +250,16 @@ export function rewriteLoopbackServiceUrl(rawUrl: string | undefined): string | 
   }
 }
 
-export function serviceUrls(record: InstalledPluginRecord, definition: PluginServiceDefinition): Pick<PluginServiceState, 'port' | 'openUrl' | 'healthUrl'> {
+export function serviceUrls(record: InstalledPluginRecord, definition: PluginServiceDefinition): Pick<PluginServiceState, 'host' | 'port' | 'openUrl' | 'healthUrl'> {
   const env = publicDefinitionEnv(record, definition);
   const port = definition.port ?? (env.PORT ? Number(env.PORT) : undefined);
-  const host = formatUrlHost(config.dashboard.externalHost);
-  const urls = definition.urls?.({ host, env, ...(Number.isFinite(port) ? { port } : {}) }) ?? {};
+  const serviceHost = typeof env.HOST === 'string' && env.HOST.trim() ? env.HOST.trim() : undefined;
+  const publicHost = formatUrlHost(config.dashboard.externalHost);
+  const urls = definition.urls?.({ host: publicHost, env, ...(Number.isFinite(port) ? { port } : {}) }) ?? {};
   return {
+    ...(serviceHost ? { host: serviceHost } : {}),
     ...(Number.isFinite(port) ? { port } : {}),
-    ...(urls.openUrl ? { openUrl: rewriteLoopbackServiceUrl(urls.openUrl) } : Number.isFinite(port) ? { openUrl: `http://${host}:${port}/` } : {}),
+    ...(urls.openUrl ? { openUrl: rewriteLoopbackServiceUrl(urls.openUrl) } : Number.isFinite(port) ? { openUrl: `http://${publicHost}:${port}/` } : {}),
     ...(urls.healthUrl ? { healthUrl: rewriteLoopbackServiceUrl(urls.healthUrl) } : {}),
   };
 }
