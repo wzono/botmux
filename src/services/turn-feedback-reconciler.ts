@@ -192,8 +192,16 @@ function aliasOwnerTurnIds(session: LiveRoutingSnapshot, rootMessageId: string):
   const turnIds = new Set([
     ...Object.keys(session.replyTargets ?? {}),
     ...Object.keys(session.turnReplyContexts ?? {}),
+    ...(session.currentReplyTarget ? [session.currentReplyTarget.turnId] : []),
   ]);
   return [...turnIds].filter(turnId => turnRootIds(session, turnId).has(rootMessageId));
+}
+
+function turnUpdatedAt(session: LiveRoutingSnapshot, turnId: string): string | undefined {
+  return session.replyTargets?.[turnId]?.updatedAt
+    ?? (session.currentReplyTarget?.turnId === turnId
+      ? session.currentReplyTarget.updatedAt
+      : undefined);
 }
 
 function obsoleteForeignAlias(
@@ -205,8 +213,8 @@ function obsoleteForeignAlias(
   const owners = aliasOwnerTurnIds(live, rootMessageId)
     .filter(turnId => turnId !== admittedTurnId);
   return owners.length > 0 && owners.every(turnId => {
-    const liveAt = live.replyTargets?.[turnId]?.updatedAt;
-    const durableAt = fresh.replyTargets?.[turnId]?.updatedAt;
+    const liveAt = turnUpdatedAt(live, turnId);
+    const durableAt = turnUpdatedAt(fresh, turnId);
     if (!liveAt || !durableAt || durableAt <= liveAt) return false;
     return !turnRootIds(fresh, turnId).has(rootMessageId);
   });

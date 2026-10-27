@@ -780,6 +780,64 @@ describe('two-phase turn reactions', () => {
     expect(ds.replyThreadAliases).toEqual(durable?.replyThreadAliases);
   });
 
+  it('ignores an obsolete current-only foreign alias after its durable owner moved roots', async () => {
+    registerWith(false);
+    const ds = makeDs();
+    const foreignTurnId = 'om_legacy_foreign_b';
+    ds.session.currentReplyTarget = {
+      rootMessageId: 'om_b_current_new', turnId: foreignTurnId, updatedAt: '2026-10-27T10:00:00.000Z',
+    };
+    ds.session.replyThreadAliases = {
+      om_b_current_new: {
+        createdAt: '2026-10-27T10:00:00.000Z', lastUsedAt: '2026-10-27T10:00:00.000Z',
+      },
+    };
+    sessionStore.updateSession(ds.session);
+
+    ds.session.currentReplyTarget = {
+      rootMessageId: 'om_b_current_old', turnId: foreignTurnId, updatedAt: '2026-10-27T09:00:00.000Z',
+    };
+    ds.session.replyThreadAliases = {
+      om_b_current_old: {
+        createdAt: '2026-10-27T09:00:00.000Z', lastUsedAt: '2026-10-27T09:00:00.000Z',
+      },
+    };
+    const admittedTurnId = 'om_current_owner_a';
+    ds.session.quoteTargetId = admittedTurnId;
+    ds.session.quoteTargetSenderOpenId = 'ou_a';
+    ds.session.quoteTargetSenderIsBot = false;
+    beginReplyTargetTurn(ds, 'om_a_current_owner_root', admittedTurnId, '2026-10-27T11:00:00.000Z', {
+      senderOpenId: 'ou_a', participants: [{ openId: 'ou_a', isBot: false }], inThread: true,
+    });
+    const liveForeignCurrent = {
+      rootMessageId: 'om_b_current_old', turnId: foreignTurnId, updatedAt: '2026-10-27T09:00:00.000Z',
+    };
+    ds.session.currentReplyTarget = liveForeignCurrent;
+    ds.currentReplyTarget = liveForeignCurrent;
+    const aliases = {
+      ...(ds.session.replyThreadAliases ?? {}),
+      om_b_current_old: {
+        createdAt: '2026-10-27T09:00:00.000Z', lastUsedAt: '2026-10-27T09:00:00.000Z',
+      },
+    };
+    ds.session.replyThreadAliases = aliases;
+    ds.replyThreadAliases = aliases;
+
+    await noteTurnReceived(ds, admittedTurnId);
+
+    const durable = sessionStore.getSessionFresh(ds.session.sessionId);
+    expect(durable?.turnFeedback?.[admittedTurnId]).toMatchObject({
+      requesterOpenId: 'ou_a', requesterIsBot: false,
+    });
+    expect(durable?.currentReplyTarget).toEqual({
+      rootMessageId: 'om_b_current_new', turnId: foreignTurnId, updatedAt: '2026-10-27T10:00:00.000Z',
+    });
+    expect(durable?.replyThreadAliases?.om_b_current_new).toBeDefined();
+    expect(durable?.replyThreadAliases?.om_b_current_old).toBeUndefined();
+    expect(ds.currentReplyTarget).toEqual(durable?.currentReplyTarget);
+    expect(ds.replyThreadAliases).toEqual(durable?.replyThreadAliases);
+  });
+
   it('rejects an uncommitted foreign alias without a strictly newer durable owner route', async () => {
     registerWith(false);
     const ds = makeDs();
