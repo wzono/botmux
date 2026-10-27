@@ -164,9 +164,9 @@
 
 ### 7.2 owner 传播
 
-旧实现用 Proxy 静态 `CapacitySidebandAppID`，只能服务一个机器人。全量方案不接受调用者自由填写 owner header，而由 Proxy 根据已认证的 per-bot access-key ID 映射 `owner_app_id`：
+旧实现用 Proxy 静态 `CapacitySidebandAppID`，只能服务一个机器人。全量方案不接受调用者自由填写 owner header，而由 Proxy 根据已认证的 per-bot access key 的不可逆 caller-scope 映射 `owner_app_id`：
 
-- Botmux fleet 为使用受管 loopback Trae Proxy 的机器人配置独立 access key；Proxy 侧保存 `key_id -> owner_app_id` 映射。
+- Botmux fleet 为使用受管 loopback Trae Proxy 的机器人配置独立 access key；Proxy 侧只保存 `caller_scope -> owner_app_id` 映射，不在 owner 表重复保存明文 key。
 - Proxy 根据已验证 access key 查 owner，并对照由 Botmux fleet 配置生成、带哈希回读的 allowlist；调用方传入 owner header 时直接拒绝，不能覆盖映射。
 - 外部 provider 和未登记 access key 不产生 sideband。
 - access key 负责请求归属，Ed25519 signer 负责事件完整性，两者用途不混用；Botmux 仍须把签名 owner 与 exact native binding 再次匹配。
