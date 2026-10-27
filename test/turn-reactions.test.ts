@@ -45,6 +45,7 @@ vi.mock('../src/im/lark/client.js', async () => {
 import { getBot, registerBot } from '../src/bot-registry.js';
 import { noteTurnReceived } from '../src/daemon.js';
 import * as sessionStore from '../src/services/session-store.js';
+import { beginReplyTargetTurn } from '../src/core/reply-target.js';
 import {
   initWorkerPool,
   __testOnly_finishTurnReactions as finishTurnReactions,
@@ -330,6 +331,144 @@ describe('two-phase turn reactions', () => {
     }
     expect(ds.session.replyTargets?.turn_live).toEqual(liveReplyTarget);
     expect(durable?.replyTargets?.turn_live).toEqual(liveReplyTarget);
+  });
+
+  it('atomically retains the queued-message exact routing snapshot created before admission', async () => {
+    registerWith(false);
+    const ds = makeDs();
+    const turnId = 'om_queued_turn';
+    const updatedAt = '2026-10-27T09:00:00.000Z';
+    ds.session.quoteTargetId = 'om_previous_trigger';
+    ds.session.quoteTargetSenderOpenId = 'ou_previous';
+    ds.session.quoteTargetSenderIsBot = true;
+    beginReplyTargetTurn(ds, 'om_previous_topic', 'turn-previous', '2026-10-27T08:59:00.000Z', {
+      senderOpenId: 'ou_previous',
+      participants: [{ openId: 'ou_previous', isBot: true }],
+      inThread: true,
+    });
+    sessionStore.updateSession(ds.session);
+    ds.session.quoteTargetId = turnId;
+    ds.session.quoteTargetSenderOpenId = 'ou_queued_human';
+    ds.session.quoteTargetSenderIsBot = false;
+    beginReplyTargetTurn(ds, 'om_queued_topic', turnId, updatedAt, {
+      senderOpenId: 'ou_queued_human',
+      participants: [{ openId: 'ou_queued_human', isBot: false }],
+      inThread: true,
+    });
+    const expected = {
+      replyTarget: structuredClone(ds.session.replyTargets?.[turnId]),
+      replyContext: structuredClone(ds.session.turnReplyContexts?.[turnId]),
+      current: structuredClone(ds.session.currentReplyTarget),
+      alias: structuredClone(ds.session.replyThreadAliases?.om_queued_topic),
+    };
+
+    await noteTurnReceived(ds, turnId, undefined, undefined, turnId);
+
+    const durable = sessionStore.getSessionFresh(ds.session.sessionId);
+    for (const session of [ds.session, durable]) {
+      expect(session?.replyTargets?.[turnId]).toEqual(expected.replyTarget);
+      expect(session?.turnReplyContexts?.[turnId]).toEqual(expected.replyContext);
+      expect(session?.currentReplyTarget).toEqual(expected.current);
+      expect(session?.replyThreadAliases?.om_queued_topic).toEqual(expected.alias);
+      expect(session).toMatchObject({
+        quoteTargetId: turnId,
+        quoteTargetSenderOpenId: 'ou_queued_human',
+        quoteTargetSenderIsBot: false,
+      });
+    }
+    expect(durable?.turnFeedback?.[turnId]).toMatchObject({
+      turnId, requesterOpenId: 'ou_queued_human', requesterIsBot: false,
+    });
+  });
+
+  it('atomically retains an Ask document turn routing and comment association', async () => {
+    registerWith(false);
+    const ds = makeDs();
+    const turnId = 'codex-async-answer-fixture';
+    const updatedAt = '2026-10-27T09:05:00.000Z';
+    ds.session.quoteTargetId = 'om_async_origin';
+    ds.session.quoteTargetSenderOpenId = 'ou_answerer';
+    ds.session.quoteTargetSenderIsBot = false;
+    beginReplyTargetTurn(ds, 'om_ask_topic', turnId, updatedAt, {
+      senderOpenId: 'ou_answerer',
+      participants: [{ openId: 'ou_answerer', isBot: false }],
+      inThread: true,
+    });
+    (ds.session.docCommentTargets ??= {})[turnId] = {
+      fileToken: 'doccn_fixture',
+      fileType: 'docx',
+      commentId: 'comment_fixture',
+      replyToOpenId: 'ou_answerer',
+      replyToName: 'Answerer',
+      turnId,
+    };
+    const expected = {
+      replyTarget: structuredClone(ds.session.replyTargets?.[turnId]),
+      replyContext: structuredClone(ds.session.turnReplyContexts?.[turnId]),
+      current: structuredClone(ds.session.currentReplyTarget),
+      alias: structuredClone(ds.session.replyThreadAliases?.om_ask_topic),
+      document: structuredClone(ds.session.docCommentTargets[turnId]),
+    };
+
+    await noteTurnReceived(ds, turnId, undefined, undefined, turnId);
+
+    const durable = sessionStore.getSessionFresh(ds.session.sessionId);
+    for (const session of [ds.session, durable]) {
+      expect(session?.replyTargets?.[turnId]).toEqual(expected.replyTarget);
+      expect(session?.turnReplyContexts?.[turnId]).toEqual(expected.replyContext);
+      expect(session?.currentReplyTarget).toEqual(expected.current);
+      expect(session?.replyThreadAliases?.om_ask_topic).toEqual(expected.alias);
+      expect(session?.docCommentTargets?.[turnId]).toEqual(expected.document);
+      expect(session).toMatchObject({
+        quoteTargetId: 'om_async_origin',
+        quoteTargetSenderOpenId: 'ou_answerer',
+        quoteTargetSenderIsBot: false,
+      });
+    }
+    expect(durable?.turnFeedback?.[turnId]).toMatchObject({
+      turnId, requesterOpenId: 'ou_answerer', requesterIsBot: false,
+    });
+  });
+
+  it('merges exact turn maps without overwriting newer durable routing slots', async () => {
+    registerWith(false);
+    const ds = makeDs();
+    ds.session.quoteTargetId = 'om_newer_trigger';
+    ds.session.quoteTargetSenderOpenId = 'ou_newer';
+    ds.session.quoteTargetSenderIsBot = true;
+    beginReplyTargetTurn(ds, 'om_newer_topic', 'turn-newer', '2026-10-27T09:10:00.000Z', {
+      senderOpenId: 'ou_newer',
+      participants: [{ openId: 'ou_newer', isBot: true }],
+      inThread: true,
+    });
+    sessionStore.updateSession(ds.session);
+
+    const turnId = 'turn-live-old-slot';
+    ds.session.quoteTargetId = 'om_live_origin';
+    ds.session.quoteTargetSenderOpenId = 'ou_live';
+    ds.session.quoteTargetSenderIsBot = false;
+    beginReplyTargetTurn(ds, 'om_live_topic', turnId, '2026-10-27T09:09:00.000Z', {
+      senderOpenId: 'ou_live',
+      participants: [{ openId: 'ou_live', isBot: false }],
+      inThread: true,
+    });
+    (ds.session.docCommentTargets ??= {})[turnId] = {
+      fileToken: 'doccn_live', fileType: 'docx', commentId: 'comment_live', turnId,
+    };
+
+    await noteTurnReceived(ds, turnId, undefined, undefined, turnId);
+
+    const durable = sessionStore.getSessionFresh(ds.session.sessionId);
+    expect(durable?.replyTargets?.[turnId]).toBeDefined();
+    expect(durable?.turnReplyContexts?.[turnId]).toBeDefined();
+    expect(durable?.replyThreadAliases?.om_live_topic).toBeDefined();
+    expect(durable?.docCommentTargets?.[turnId]).toBeDefined();
+    expect(durable?.currentReplyTarget?.turnId).toBe('turn-newer');
+    expect(durable).toMatchObject({
+      quoteTargetId: 'om_newer_trigger',
+      quoteTargetSenderOpenId: 'ou_newer',
+      quoteTargetSenderIsBot: true,
+    });
   });
 
   it('persists a stamped meeting-origin turn before the reaction early return', async () => {
