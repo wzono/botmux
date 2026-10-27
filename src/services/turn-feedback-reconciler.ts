@@ -1,4 +1,4 @@
-import type { Session } from '../types.js';
+import type { ReplyTargetEntry, Session } from '../types.js';
 
 export interface TurnFeedbackTarget {
   session: Session;
@@ -19,11 +19,10 @@ export interface TurnFeedbackAdmission {
   background?: boolean;
 }
 
-function requesterSnapshot(session: Session, turnId: string): {
+function requesterSnapshot(replyTarget: ReplyTargetEntry | undefined): {
   requesterOpenId?: string;
   requesterIsBot?: boolean;
 } {
-  const replyTarget = session.replyTargets?.[turnId];
   const requesterOpenId = replyTarget?.senderOpenId;
   const requester = requesterOpenId
     ? replyTarget?.participants?.find(participant => participant.openId === requesterOpenId)
@@ -38,10 +37,17 @@ function requesterSnapshot(session: Session, turnId: string): {
 
 export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
   function admit(target: TurnFeedbackTarget, input: TurnFeedbackAdmission): void {
+    const liveReplyTarget = target.session.replyTargets?.[input.turnId];
+    const frozenReplyTarget = liveReplyTarget === undefined
+      ? undefined
+      : structuredClone(liveReplyTarget);
+    const requester = requesterSnapshot(frozenReplyTarget);
     deps.commit(target, fresh => {
+      if (frozenReplyTarget !== undefined) {
+        (fresh.replyTargets ??= {})[input.turnId] = frozenReplyTarget;
+      }
       const records = fresh.turnFeedback ??= {};
       const existing = records[input.turnId];
-      const requester = requesterSnapshot(fresh, input.turnId);
       if (!existing) {
         records[input.turnId] = {
           version: 1,

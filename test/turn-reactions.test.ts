@@ -299,6 +299,39 @@ describe('two-phase turn reactions', () => {
     expect(mocks.addReaction).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['human', false],
+    ['unknown', undefined],
+  ] as const)('captures a live-only %s requester without dropping its reply target', async (_label, requesterIsBot) => {
+    registerWith(false);
+    const ds = makeDs();
+    const liveReplyTarget = {
+      updatedAt: new Date().toISOString(),
+      senderOpenId: 'ou_live_requester',
+      participants: [{
+        openId: 'ou_live_requester',
+        ...(requesterIsBot === undefined ? {} : { isBot: requesterIsBot }),
+      }],
+    };
+    ds.session.replyTargets = { turn_live: liveReplyTarget };
+
+    await noteTurnReceived(ds, 'om_live_trigger', undefined, undefined, 'turn_live');
+
+    const durable = sessionStore.getSessionFresh(ds.session.sessionId);
+    expect(durable?.turnFeedback?.turn_live).toMatchObject({
+      turnId: 'turn_live',
+      messageId: 'om_live_trigger',
+      requesterOpenId: 'ou_live_requester',
+    });
+    if (requesterIsBot === undefined) {
+      expect(durable?.turnFeedback?.turn_live).not.toHaveProperty('requesterIsBot');
+    } else {
+      expect(durable?.turnFeedback?.turn_live?.requesterIsBot).toBe(requesterIsBot);
+    }
+    expect(ds.session.replyTargets?.turn_live).toEqual(liveReplyTarget);
+    expect(durable?.replyTargets?.turn_live).toEqual(liveReplyTarget);
+  });
+
   it('persists a stamped meeting-origin turn before the reaction early return', async () => {
     registerWith(true);
     const ds = makeDs();

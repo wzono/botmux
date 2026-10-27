@@ -511,13 +511,6 @@ export interface PersistedTurnFeedback {
     dispatchAttempt: number;
     workerGeneration: number;
     openedAtMs: number;
-    source?: 'worker' | 'ask';
-  };
-  attentionClearPending?: {
-    nonce: string;
-    dispatchAttempt: number;
-    workerGeneration: number;
-    source: 'worker' | 'ask';
   };
   reaction?: { id: string; type: string };
   reactionReconcilePending?: true;
@@ -540,8 +533,6 @@ export interface PersistedTurnFeedback {
     adopted?: { id: string; type: string };
     duplicateIds?: string[];
   };
-  /** Correlation timestamp retained after clear; never contains user content. */
-  capacityAuditEpisodeStartedAt?: string;
   reminder?: {
     messageId?: string;
     sentAt?: string;
