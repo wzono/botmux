@@ -422,6 +422,12 @@ function capPrompt(prompt: string, cap: number, locale?: Locale): string {
   return `${head}…\n\n${t('card.ask.prompt_truncated', undefined, locale)}`;
 }
 
+/** 选项说明的展示层长度兜底，与 prompt 的 30KB 字节预算相互独立。 */
+function truncate(s: string, maxChars: number, locale?: Locale): string {
+  if (s.length <= maxChars) return s || t('common.empty_paren', undefined, locale);
+  return `${s.slice(0, maxChars)}\n\n${t('common.truncated_short', undefined, locale)}`;
+}
+
 /** 完整问题正文（附件内容）。 */
 export function askPromptAttachmentText(ask: PendingAsk): string {
   const locale = localeForBot(ask.larkAppId);
@@ -459,17 +465,24 @@ function renderAskCardWithCap(
 ): string {
   const locale = localeForBot(ask.larkAppId);
   const optionLayout = askOptionLayoutForBot(ask.larkAppId);
-  const deadline = new Date(ask.deadlineAt).toLocaleString('zh-CN');
+  // timeoutMs=null + deadlineAt=null = 永久等待的 ask：卡片不展示截止字段，
+  // 未 settle 时显示「等待你回答」。
+  const permanent = ask.deadlineAt === null;
+  const deadline = permanent ? null : new Date(ask.deadlineAt!).toLocaleString('zh-CN');
   const status = result ? settleStatus(result, ask, locale) : undefined;
   const confirmEmptyArmed = !!opts?.confirmEmptyArmed && !status;
 
-  // 截止时间 + 可答复人 字段行（settled 与 unsettled 均展示）
+  // 截止时间 + 可答复人 字段行（settled 与 unsettled 均展示；永久等待无截止字段）
+  const metaFields: Array<Record<string, unknown>> = [];
+  if (!permanent) {
+    metaFields.push({ is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.deadline', undefined, locale)}**\n${escapeMd(deadline ?? '')}` } });
+  } else if (status) {
+    metaFields.push({ is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.deadline', undefined, locale)}**\n${t('card.ask.permanent', undefined, locale)}` } });
+  }
+  metaFields.push({ is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.answerable', undefined, locale)}**\n${escapeMd(approverSummary(ask, locale))}` } });
   const metaDiv = {
     tag: 'div',
-    fields: [
-      { is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.deadline', undefined, locale)}**\n${escapeMd(deadline)}` } },
-      { is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.answerable', undefined, locale)}**\n${approverSummary(ask, locale)}` } },
-    ],
+    fields: metaFields,
   };
 
   const elements: Array<Record<string, unknown>> = [metaDiv];
@@ -511,6 +524,12 @@ function renderAskCardWithCap(
       const q = ask.questions[i]!;
       const prompt = capPrompt(questionPrompt(ask, i), promptCap, locale);
 
+      // 显式 `botmux ask --mention <open_id>` 的点名：卡片不像回复消息天然带 @，
+      // daemon 已保证这里的 open_id 是人类（bot 会触发 100290 被剔除），故可安全
+      // 注入真实 `<at>`。只在第一问前注入一次即可触达通知。
+      const mentionPrefix = i === 0 && ask.mentionedOpenId
+        ? `<at id=${ask.mentionedOpenId}></at>\n`
+        : '';
       // 问题标题。问题正文完整渲染：审批按钮的效力取决于完整信息，展示层截断
       // 会让批准人在信息不全的情况下做决定。空 prompt 已在 ask-api 归一化时以
       // bad_question_shape 拒绝。整卡超飞书 30KB 请求体上限时由 renderAskCard 的
@@ -519,7 +538,7 @@ function renderAskCardWithCap(
         tag: 'div',
         text: {
           tag: 'lark_md',
-          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(prompt)}`,
+          content: `${mentionPrefix}**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(prompt)}`,
         },
       });
 
@@ -548,6 +567,22 @@ function renderAskCardWithCap(
             },
       }));
       appendActionRows(elements, optionButtons, optionLayout);
+
+      // 选项的详细说明（Claude Code AskUserQuestion 的 options[].description）。
+      // 不进按钮（飞书按钮无副标题），在按钮行下方以小字列出 label → description，
+      // 缺省时整块不渲染，老调用方渲染结果不变。
+      const described = q.options.filter((opt) => opt.description?.trim());
+      if (described.length > 0) {
+        elements.push({
+          tag: 'div',
+          text: {
+            tag: 'lark_md',
+            content: described
+              .map((opt) => `**${escapeMd(truncate(opt.label, 120, locale))}**：${escapeMd(truncate(opt.description!.trim(), 400, locale))}`)
+              .join('\n'),
+          },
+        });
+      }
     }
 
     if (requiresSubmit && !textReplyRequired) {
@@ -590,13 +625,14 @@ function renderAskCardWithCap(
 
     // 自定义回复提示：选项都不满意时，直接在话题里回复一句文字即可当答案。
     elements.push({ tag: 'hr' });
+    const noteLines: string[] = [];
+    if (permanent) noteLines.push(t('card.ask.permanent', undefined, locale));
+    noteLines.push(t(ask.deliveryTarget ? 'card.ask.document_reply_hint'
+      : ask.originKind === 'native-user-input-async' ? 'card.ask.async_reply_hint'
+        : textReplyRequired ? 'card.ask.text_reply_hint' : 'card.ask.custom_reply_hint', undefined, locale));
     elements.push({
       tag: 'note',
-      elements: [
-        { tag: 'plain_text', content: t(ask.deliveryTarget ? 'card.ask.document_reply_hint'
-          : ask.originKind === 'native-user-input-async' ? 'card.ask.async_reply_hint'
-            : textReplyRequired ? 'card.ask.text_reply_hint' : 'card.ask.custom_reply_hint', undefined, locale) },
-      ],
+      elements: noteLines.map(content => ({ tag: 'plain_text', content })),
     });
   }
 

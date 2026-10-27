@@ -69,14 +69,16 @@ export interface PersistedAsk {
   chatType?: 'group' | 'p2p';
   /** Optional app-scoped responder lock for host-owned approval asks. */
   answererOpenId?: string;
+  /** 显式 ask 要 @ 的人类 open_id，跨重启保留以保证重发卡片仍带通知。 */
+  mentionedOpenId?: string;
   deliveryTarget?: CreateAskInput['deliveryTarget'];
   questions: ReadonlyArray<AskQuestion>;
   createdAt: number;
-  deadlineAt: number;
+  deadlineAt: number | null;
   /** Original relative timeout. Host-owned asks defer this clock until the
    *  interaction card is confirmed delivered; ordinary CLI asks start it at
    *  registration as before. Optional for backward-compatible v2 records. */
-  timeoutMs?: number;
+  timeoutMs?: number | null;
   /** True only for daemon-hosted asks whose responder cannot act before the
    *  card exists. An undelivered record must not expire during restore. */
   timeoutStartsAfterDelivery?: boolean;

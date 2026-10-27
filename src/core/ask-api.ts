@@ -17,10 +17,12 @@ export interface AskApiBody {
   chatId: string;
   larkAppId: string;
   rootMessageId: string | null;
+  /** Explicit `--into` target; daemon validates it against the authenticated chat. */
+  requestedRootMessageId?: string;
   /** v0.1.8：替换旧的 options/prompt，支持多问多选。 */
   questions: AskQuestion[];
   /** Already in milliseconds. CLI side converts from `--timeout` seconds. */
-  timeoutMs: number;
+  timeoutMs: number | null;
   /** Per-invocation identity (hook generates once, reuses across reconnect
    *  retries) so a re-POST after a daemon restart re-attaches to the same ask.
    *  Optional — legacy callers omit it and the broker synthesizes one. */
@@ -28,6 +30,9 @@ export interface AskApiBody {
   /** Caller kind ('hook' | 'explicit' | …) namespacing the identity so an
    *  explicit `botmux ask` can't re-claim a hook ask's card. Optional. */
   originKind?: string;
+  /** 显式 `botmux ask --mention <open_id>` 要 @ 的人类成员。daemon 会在发卡前
+   *  剔除 bot open_id（卡片 at bot 触发 100290）。 */
+  mentionedOpenId?: string;
   acknowledge?: boolean;
   asyncUserInput?: CodexAsyncUserInput;
   asyncFailure?: 'limit' | 'invalid_questions';
@@ -40,12 +45,14 @@ export type AskApiBodyError =
   | 'bad_chatId'
   | 'bad_larkAppId'
   | 'bad_rootMessageId'
+  | 'bad_requestedRootMessageId'
   | 'bad_prompt'
   | 'bad_timeoutMs'
   | 'bad_options'
   | 'bad_option_shape'
   | 'bad_option_key'
   | 'bad_option_label'
+  | 'bad_option_description'
   | 'duplicate_option_key'
   | 'bad_questions'
   | 'bad_question_shape'
@@ -54,6 +61,7 @@ export type AskApiBodyError =
   | 'bad_defaultSelectedKeys'
   | 'bad_requestId'
   | 'bad_originKind'
+  | 'bad_mentionedOpenId'
   | 'bad_acknowledge'
   | 'bad_asyncUserInput';
 
@@ -74,10 +82,20 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
   if (r.rootMessageId !== null && typeof r.rootMessageId !== 'string') {
     return { error: 'bad_rootMessageId' };
   }
+  let requestedRootMessageId: string | undefined;
+  if (r.requestedRootMessageId !== undefined) {
+    if (typeof r.requestedRootMessageId !== 'string'
+      || !/^om_[A-Za-z0-9_-]{1,128}$/.test(r.requestedRootMessageId)) {
+      return { error: 'bad_requestedRootMessageId' };
+    }
+    requestedRootMessageId = r.requestedRootMessageId;
+  }
   if (
-    typeof r.timeoutMs !== 'number' ||
-    !Number.isFinite(r.timeoutMs) ||
-    r.timeoutMs < 1000
+    r.timeoutMs !== null && (
+      typeof r.timeoutMs !== 'number' ||
+      !Number.isFinite(r.timeoutMs) ||
+      r.timeoutMs < 1000
+    )
   ) {
     return { error: 'bad_timeoutMs' };
   }
@@ -104,6 +122,18 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
       return { error: 'bad_originKind' };
     }
     originKind = r.originKind;
+  }
+  let mentionedOpenId: string | undefined;
+  if (r.mentionedOpenId !== undefined && r.mentionedOpenId !== null) {
+    // 卡片 `<at id=…>` 只接受 open_id（`ou_` 前缀）。union_id/user_id 等其它
+    // ID 形态进了卡片会整条被飞书拒掉，这里 fail loud。
+    if (
+      typeof r.mentionedOpenId !== 'string'
+      || !/^ou_[A-Za-z0-9]{6,64}$/.test(r.mentionedOpenId)
+    ) {
+      return { error: 'bad_mentionedOpenId' };
+    }
+    mentionedOpenId = r.mentionedOpenId;
   }
 
   if (r.acknowledge !== undefined && typeof r.acknowledge !== 'boolean') return { error: 'bad_acknowledge' };
@@ -148,10 +178,12 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     chatId: r.chatId,
     larkAppId: r.larkAppId,
     rootMessageId: r.rootMessageId as string | null,
+    ...(requestedRootMessageId !== undefined ? { requestedRootMessageId } : {}),
     questions,
     timeoutMs: r.timeoutMs,
     ...(requestId !== undefined ? { requestId } : {}),
     ...(originKind !== undefined ? { originKind } : {}),
+    ...(mentionedOpenId !== undefined ? { mentionedOpenId } : {}),
     ...(r.acknowledge !== undefined ? { acknowledge: r.acknowledge as boolean } : {}),
     ...(asyncUserInput ? { asyncUserInput } : {}),
     ...(r.asyncFailure ? { asyncFailure: r.asyncFailure as 'limit' | 'invalid_questions' } : {}),
@@ -160,7 +192,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
   // a different kind of Ask. Identity claims remain on the raw body for the
   // route's authorization checks; options/prompt are normalized above.
   const routeFields = new Set(['prompt', 'options', 'originCapability', 'originTurnId', 'originDispatchAttempt']);
-  if (Object.keys(r).some(key => r[key] !== undefined && !Object.hasOwn(parsed, key) && !routeFields.has(key))) {
+  if (Object.keys(r).some(key => r[key] !== undefined && r[key] !== null && !Object.hasOwn(parsed, key) && !routeFields.has(key))) {
     return { error: 'unsupported_fields' };
   }
   return parsed;

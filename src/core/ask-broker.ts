@@ -62,10 +62,11 @@ interface InternalPending extends Omit<PendingAsk, 'selections'> {
    *  waiter here so all callers get the one result — no second ask/card
    *  (codex P1-1 active-replay). */
   waiters: Array<(result: AskResult) => void>;
+  deliveryWaiters: Array<(delivery: { askId: string; messageId: string }) => void>;
   timeoutHandle?: NodeJS.Timeout;
   /** Relative timeout retained so host-owned asks can start the human action
    *  window only after the card is confirmed delivered. */
-  timeoutMs: number;
+  timeoutMs: number | null;
   timeoutStartsAfterDelivery: boolean;
   timeoutStartedAt?: number;
   /** epoch ms when settle ran; undefined while still pending. */
@@ -240,6 +241,15 @@ export function registerHostAsk(input: CreateAskInput): Promise<AskResult> {
   return registerAskInternal(input, true);
 }
 
+/** Resolve once the daemon-owned Ask card is durably registered and delivered. */
+export async function waitForAskDelivery(input: CreateAskInput): Promise<{ askId: string; messageId: string }> {
+  const askKey = askKeyFor(input.larkAppId, input.sessionId, input.originKind ?? 'hook', input.requestId!);
+  const ask = findByKey(askKey);
+  if (!ask) throw new Error('ask delivery registration missing');
+  if (ask.cardMessageId) return { askId: ask.askId, messageId: ask.cardMessageId };
+  return new Promise(resolve => ask.deliveryWaiters.push(resolve));
+}
+
 function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal?: AbortSignal): Promise<AskResult> {
   if (signal?.aborted) return Promise.resolve(disconnectedResult());
   if (!dispatcher) {
@@ -314,7 +324,7 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
   const askId = randomUUID();
   const nonce = randomUUID().slice(0, 8);
   const createdAt = Date.now();
-  const deadlineAt = createdAt + input.timeoutMs;
+  const deadlineAt = input.timeoutMs === null ? null : createdAt + input.timeoutMs;
 
   return new Promise<AskResult>((resolve) => {
     const selections = new Map<number, Set<string>>();
@@ -333,6 +343,7 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
       sessionId: input.sessionId,
       chatType: input.chatType,
       answererOpenId: input.answererOpenId,
+      mentionedOpenId: input.mentionedOpenId,
       deliveryTarget: input.deliveryTarget ? { ...input.deliveryTarget } : undefined,
       questions: input.questions,
       replyCardTarget: input.replyCardTarget,
@@ -340,11 +351,12 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
       deadlineAt,
       settled: false,
       waiters: [],
+      deliveryWaiters: [],
       timeoutMs: input.timeoutMs,
       timeoutStartsAfterDelivery: hostManaged,
       selections,
     };
-    if (!hostManaged) armAskTimeout(ask, input.timeoutMs, createdAt);
+    if (!hostManaged && input.timeoutMs !== null) armAskTimeout(ask, input.timeoutMs, createdAt);
     pending.set(askId, ask);
     attachWaiter(ask, resolve, signal);
     // Persist ONLY resumable origins (codex P1-4). A restart before the card
@@ -413,9 +425,10 @@ function sameIdentity(ask: InternalPending, input: CreateAskInput): boolean {
 }
 
 /** Stable shape string for question-set equality (prompt + multiSelect + each
- *  option's key AND label, order-sensitive). Two question sets that would render
- *  a DIFFERENT card to the user — including a relabelled option whose key is
- *  unchanged — must not re-attach/replay (codex P1-2). */
+ *  option's key, label AND description, order-sensitive). Two question sets that
+ *  would render a DIFFERENT card to the user — including a relabelled option or
+ *  one whose description changed while its key is unchanged — must not
+ *  re-attach/replay (codex P1-2). */
 function questionsShape(qs: PendingAsk['questions']): string {
   return JSON.stringify(
     qs.map((q) => ({
@@ -423,7 +436,7 @@ function questionsShape(qs: PendingAsk['questions']): string {
       m: !!q.multiSelect,
       d: q.defaultSelectedKeys,
       input: q.inputMode,
-      o: q.options.map((o) => [o.key, o.label]),
+      o: q.options.map((o) => [o.key, o.label, o.description ?? null]),
     })),
   );
 }
@@ -459,13 +472,14 @@ function sendCardForAsk(ask: InternalPending): void {
         // The displayed deadline is a best estimate made immediately before
         // dispatch. Correctness does not depend on it: the broker clock below
         // starts only after the Lark API confirms delivery.
-        if (live.timeoutStartsAfterDelivery && live.timeoutStartedAt === undefined) {
+        if (live.timeoutStartsAfterDelivery && live.timeoutMs !== null && live.timeoutStartedAt === undefined) {
           live.deadlineAt = Date.now() + live.timeoutMs;
         }
         const { messageId } = await dispatcher!.send(snapshot(ask));
         const cur = pending.get(ask.askId);
         if (cur) {
           cur.cardMessageId = messageId;
+          for (const resolve of cur.deliveryWaiters.splice(0)) resolve({ askId: cur.askId, messageId });
           // The caller can disconnect while send is in flight. The earlier
           // standalone-card notification had no messageId to patch; update it
           // now. Reply-card settlement does not need that id and is idempotent.
@@ -473,7 +487,7 @@ function sendCardForAsk(ask: InternalPending): void {
             notifyOnSettle(cur, cur.terminalResult);
             return;
           }
-          if (cur.timeoutStartsAfterDelivery && cur.timeoutStartedAt === undefined) {
+          if (cur.timeoutStartsAfterDelivery && cur.timeoutMs !== null && cur.timeoutStartedAt === undefined) {
             armAskTimeout(cur, cur.timeoutMs, Date.now());
           }
           if (cur.resumable) persistFromInternal(cur);
@@ -558,12 +572,13 @@ function reattachByRequest(ask: InternalPending, signal?: AbortSignal): Promise<
     ask.dormant = false;
     attachWaiter(ask, resolve, signal);
     clearTimeout(ask.timeoutHandle);
-    const awaitsDelivery = ask.timeoutStartsAfterDelivery && !ask.cardMessageId;
-    const remaining = awaitsDelivery ? ask.timeoutMs : Math.max(0, ask.deadlineAt - Date.now());
-    if (!awaitsDelivery) armAskTimeout(ask, remaining, Date.now());
+    const permanent = ask.timeoutMs === null && ask.deadlineAt === null;
+    const awaitsDelivery = !permanent && ask.timeoutStartsAfterDelivery && !ask.cardMessageId;
+    const remaining = permanent ? null : awaitsDelivery ? ask.timeoutMs : Math.max(0, (ask.deadlineAt ?? Date.now()) - Date.now());
+    if (!awaitsDelivery && remaining !== null) armAskTimeout(ask, remaining, Date.now());
     logger.info?.(
       `ask-broker: re-attached hook to restored ask ${ask.askId} (key=${ask.askKey}, ` +
-      `${Math.round(remaining / 1000)}s left, card=${ask.cardMessageId ? 'live' : 'MISSING→resend'})`,
+      `${remaining === null ? 'no deadline' : `${Math.round(remaining / 1000)}s left`}, card=${ask.cardMessageId ? 'live' : 'MISSING→resend'})`,
     );
     if (!ask.cardMessageId) sendCardForAsk(ask);
   });
@@ -589,6 +604,7 @@ function persistFromInternal(ask: InternalPending): void {
     sessionId: ask.sessionId,
     chatType: ask.chatType,
     answererOpenId: ask.answererOpenId,
+    mentionedOpenId: ask.mentionedOpenId,
     deliveryTarget: ask.deliveryTarget,
     questions: ask.questions,
     createdAt: ask.createdAt,
@@ -943,11 +959,14 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
     // hook's claim — it must NOT arm a deadline timer (there's nothing left to
     // time out). A still-awaiting-click restore arms the ORIGINAL absolute
     // deadline so it can't linger forever if the CLI never returns.
-    const awaitsDelivery = p.timeoutStartsAfterDelivery === true && !p.cardMessageId;
-    const remaining = awaitsDelivery
-      ? (p.timeoutMs ?? Math.max(1, p.deadlineAt - p.createdAt))
-      : Math.max(0, p.deadlineAt - now);
-    const timeoutHandle = hasStashedAnswer || awaitsDelivery
+    const permanent = p.timeoutMs === null && p.deadlineAt === null;
+    const awaitsDelivery = !permanent && p.timeoutStartsAfterDelivery === true && !p.cardMessageId;
+    const remaining = permanent
+      ? null
+      : awaitsDelivery
+        ? (p.timeoutMs ?? Math.max(1, (p.deadlineAt ?? p.createdAt + 1) - p.createdAt))
+        : Math.max(0, (p.deadlineAt ?? now) - now);
+    const timeoutHandle = hasStashedAnswer || awaitsDelivery || remaining === null
       ? undefined
       : setTimeout(() => {
           settle(p.askId, {
@@ -969,11 +988,12 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       sessionId: p.sessionId,
       chatType: p.chatType,
       answererOpenId: p.answererOpenId,
+      mentionedOpenId: p.mentionedOpenId,
       deliveryTarget: p.deliveryTarget,
       questions: p.questions,
       createdAt: p.createdAt,
       deadlineAt: p.deadlineAt,
-      timeoutMs: p.timeoutMs ?? Math.max(1, p.deadlineAt - p.createdAt),
+      timeoutMs: permanent ? null : (p.timeoutMs ?? Math.max(1, (p.deadlineAt ?? p.createdAt + 1) - p.createdAt)),
       timeoutStartsAfterDelivery: p.timeoutStartsAfterDelivery === true,
       timeoutStartedAt: p.timeoutStartedAt,
       cardMessageId: p.cardMessageId,
@@ -985,6 +1005,7 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       settledAt: hasStashedAnswer ? (p.answeredAt ?? now) : undefined,
       dormant: true,
       waiters: [], // attached when the reconnecting hook re-registers
+      deliveryWaiters: [],
       // Carry a stashed answer forward (user answered before restart): the
       // reconnecting hook claims it via reattachByRequest.
       ...(p.answeredResult ? { answeredResult: p.answeredResult, terminalResult: p.answeredResult } : {}),
@@ -1003,7 +1024,7 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
     restored++;
     logger.info?.(
       `ask-broker: restored pending ask ${p.askId} (key=${p.askKey}, session=${p.sessionId}, ` +
-      `dormant${p.answeredResult ? '+answered' : ''}, ${Math.round((p.deadlineAt - now) / 1000)}s left) — awaiting hook re-attach`,
+      `dormant${p.answeredResult ? '+answered' : ''}, ${p.deadlineAt === null ? 'no deadline' : `${Math.round((p.deadlineAt - now) / 1000)}s left`}) — awaiting hook re-attach`,
     );
   }
   // Always log the boot sweep outcome (even 0) so a live restart test can

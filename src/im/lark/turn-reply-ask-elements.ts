@@ -26,9 +26,17 @@ export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 
   });
   const optionLayout = askOptionLayoutForBot(ask.larkAppId);
   ask.questions.forEach((q, i) => {
-    elements.push({ tag: 'markdown', content: safe(textReplyRequired && q.options.length
-      ? `${q.prompt}\n\n${q.options.map(o => o.label).join(' / ')}` : q.prompt) });
+    // 显式 `botmux ask --mention` 的点名（daemon 已剔除 bot open_id）：嵌入
+    // turn-reply 卡时同样要保留真实 <at>，不能走 safe()——safe 会把 at 抹成
+    // [mention]，通知触达丢失。仅第一问前注入一次。
+    const mentionPrefix = i === 0 && ask.mentionedOpenId
+      ? `<at id=${ask.mentionedOpenId}></at>\n`
+      : '';
+    const prompt = textReplyRequired && q.options.length
+      ? `${q.prompt}\n\n${q.options.map(o => o.label).join(' / ')}` : q.prompt;
+    elements.push({ tag: 'markdown', content: `${mentionPrefix}${safe(prompt)}` });
     if (textReplyRequired) return; // Keep the batch intact; answer it with one text reply.
+
     const selected = new Set(ask.selections?.[i] ?? []);
     const buttons = q.options.map(option => ({
       ...button(option.label,
@@ -42,6 +50,16 @@ export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 
     } else {
       for (let start = 0; start < buttons.length; start += 3) elements.push(row(buttons.slice(start, start + 3)));
     }
+    // 选项详细说明（Claude Code AskUserQuestion options[].description）：按钮无副标题，
+    // 在按钮行下用小字列出。safe() 已做转义，这里仅按 label 加粗。缺省不渲染。
+    const described = q.options.filter(option => option.description?.trim());
+    if (described.length) {
+      elements.push({
+        tag: 'markdown',
+        text_size: 'notation',
+        content: described.map(option => `**${safe(option.label)}**：${safe(option.description!.trim())}`).join('\n'),
+      });
+    }
   });
   if (submit && !textReplyRequired) {
     if (entry.confirmEmptyArmed) elements.push({ tag: 'markdown', content: t('card.ask.empty_warning', undefined, locale) });
@@ -51,7 +69,9 @@ export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 
   }
   elements.push({ tag: 'markdown', text_size: 'notation', content: [
     t(textReplyRequired ? 'card.ask.text_reply_hint' : 'card.ask.custom_reply_hint', undefined, locale),
-    `${t('card.ask.field.deadline', undefined, locale)}: ${new Date(ask.deadlineAt).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN')}`,
+    ask.deadlineAt === null
+      ? `${t('card.ask.field.deadline', undefined, locale)}: ${t('card.grant.duration_permanent', undefined, locale)}`
+      : `${t('card.ask.field.deadline', undefined, locale)}: ${new Date(ask.deadlineAt).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN')}`,
     t('card.ask.answerable_talk_members', undefined, locale),
   ].join('\n') });
   return elements;

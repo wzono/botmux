@@ -16,13 +16,14 @@ import { stripDispatchCompletionProtocol } from './core/dispatch.js';
 import { withConfiguredBotOwner } from './core/bot-owner-attribution.js';
 import { readCanonicalBotActorOwnerBindings } from './core/bot-actor-owner-binding.js';
 import { releaseExplicitAskHandoff, hasExplicitAskHandoff } from './core/ask-broker.js';
-import { createExplicitAskContinuation, explicitAskRecoveryRequest } from './core/explicit-ask-continuation.js';
+import { canResumeExplicitAskInSession, createExplicitAskContinuation, explicitAskRecoveryRequest } from './core/explicit-ask-continuation.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync, mkdirSync, unlinkSync, realpathSync } from 'node:fs';
 import { installDaemonRejectionGuard } from './utils/daemon-rejection-guard.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readPeerCrossRef } from './services/peer-cross-ref-store.js';
+import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from './utils/bot-routing.js';
 import { parseBotSteerDirective } from './core/bot-steer-directive.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { join, dirname, basename, isAbsolute, relative } from 'node:path';
@@ -914,6 +915,7 @@ import {
   setAskPersistStore as setAskPersistStoreBroker,
   registerAsk as registerAskBroker,
   registerHostAsk,
+  waitForAskDelivery,
   restorePersistedAsks as restorePersistedAsksBroker,
   startHookAskReclaim,
   findPendingAskByAnchor,
@@ -929,6 +931,7 @@ import {
 import { runCompletionProposalContinuation } from './core/completion-proposal-continuation.js';
 import { renderCompletionProposalCard } from './im/lark/completion-proposal-card.js';
 import { parseAskBody, registerAskForResponse } from './core/ask-api.js';
+import { resolveAskRootTarget } from './core/ask-into-target.js';
 import { CODEX_ASYNC_ASK_ORIGIN, deliverCodexAsyncAnswer } from './services/codex-async-user-input.js';
 import { resolveDocumentAskDelivery } from './core/doc-comment-ask.js';
 import { isHumanOpenId } from './im/lark/client.js';
@@ -8857,6 +8860,25 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
 // the request's lifetime is bounded by `body.timeoutMs` which the broker
 // enforces. Default fetch on the CLI side has no read timeout.
 
+/** 已知 peer bot open_id 集合（peer cross-ref + bots-info.json），与
+ *  worker-pool 的 loadKnownBotOpenIdsForApp 同源。ask 卡片用它剔除 bot
+ *  mention：飞书卡片里的 `<at id=botOpenId>` 会以 100290 整卡拒收。 */
+function knownBotOpenIdsForAsk(larkAppId: string): Set<string> {
+  const dataDir = config.session.dataDir;
+  const crossRef = readPeerCrossRef(dataDir, larkAppId);
+  let botEntries: BotMentionEntry[] = [];
+  const botInfoPath = join(dataDir, 'bots-info.json');
+  try {
+    if (existsSync(botInfoPath)) {
+      const parsed = JSON.parse(readFileSync(botInfoPath, 'utf-8'));
+      if (Array.isArray(parsed)) botEntries = parsed as BotMentionEntry[];
+    }
+  } catch {
+    // 损坏的 bots-info.json 不阻塞 ask：降级为只信 cross-ref。
+  }
+  return knownBotOpenIdsFromCrossRef(crossRef, botEntries, larkAppId);
+}
+
 export function __testOnly_setScheduleAuthorityStore(store: ScheduleAuthorityStore | null): ScheduleAuthorityStore | null {
   const previous = scheduleAuthorityStore; scheduleAuthorityStore = store; return previous;
 }
@@ -8869,10 +8891,13 @@ const explicitAskContinuation = createExplicitAskContinuation({
   hasHandoff: hasExplicitAskHandoff,
   canResume: receipt => {
     const ds = findActiveBySessionId(receipt.input.sessionId);
-    return sessionsRestored && !!ds && ds.larkAppId === receipt.input.larkAppId
-      && ds.chatId === receipt.input.chatId
-      && (ds.session.scope === 'chat' ? null : ds.session.rootMessageId) === receipt.input.rootMessageId
-      && (!receipt.result || !ds.worker || ds.lastScreenStatus === 'idle');
+    return sessionsRestored && !!ds && canResumeExplicitAskInSession(receipt, {
+      larkAppId: ds.larkAppId,
+      chatId: ds.chatId,
+      sessionId: ds.session.sessionId,
+      workerPresent: !!ds.worker,
+      lastScreenStatus: ds.lastScreenStatus,
+    });
   },
   dispatch: async (receipt, key) => {
     const ds = findActiveBySessionId(receipt.input.sessionId);
@@ -8991,6 +9016,26 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
         : askSession.session.rootMessageId,
     });
   }
+  if (boundAsk.requestedRootMessageId && !askSession) {
+    return jsonRes(res, 403, { ok: false, error: 'ask_origin_unproven' });
+  }
+  if (askSession && boundAsk.requestedRootMessageId) {
+    const target = await resolveAskRootTarget({
+      requestedRootMessageId: boundAsk.requestedRootMessageId,
+      ambientRootMessageId: boundAsk.rootMessageId,
+      authenticatedChatId: askSession.chatId,
+      larkAppId: askSession.larkAppId,
+      getMessageDetail,
+    });
+    if (!target.ok) {
+      return jsonRes(res, target.status, {
+        ok: false,
+        error: target.error,
+        ...('detail' in target ? { detail: target.detail } : {}),
+      });
+    }
+    boundAsk = { ...boundAsk, rootMessageId: target.rootMessageId };
+  }
   if (askSession?.session.vcMeetingReceiver) {
     // A meeting receiver ask would post a Lark card outside the managed action
     // ledger/provider-idempotency boundary. Durable replay could therefore
@@ -9080,6 +9125,16 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // p2pOpen 的 bot 在私聊里会出现「对方点不动按钮」，留痕便于排查。
     logger.warn(`[ask:${boundAsk.larkAppId}] no active session for ${boundAsk.sessionId.substring(0, 8)}; chatType unknown (p2pOpen answer gate falls back to allowlist)`);
   }
+  let askMentionedOpenId: string | undefined;
+  if (boundAsk.mentionedOpenId) {
+    if (knownBotOpenIdsForAsk(boundAsk.larkAppId).has(boundAsk.mentionedOpenId)) {
+      logger.warn(
+        `[ask:${boundAsk.larkAppId}] --mention target ${boundAsk.mentionedOpenId} is a known bot; dropping card <at> (Feishu 100290)`,
+      );
+    } else {
+      askMentionedOpenId = boundAsk.mentionedOpenId;
+    }
+  }
   const askInput = {
     larkAppId: boundAsk.larkAppId,
     chatId: boundAsk.chatId,
@@ -9091,6 +9146,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     deliveryTarget: documentDelivery,
     timeoutMs: boundAsk.timeoutMs,
     chatType: askChatType,
+    ...(askMentionedOpenId ? { mentionedOpenId: askMentionedOpenId } : {}),
     // Invocation identity (from the hook; enables cross-restart re-attach).
     requestId: boundAsk.requestId,
     originKind: boundAsk.originKind,
@@ -9109,6 +9165,20 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     if (!managedExplicit) return jsonRes(res, 400, { error: 'invalid_acknowledgement' });
     const result = explicitAskContinuation.acknowledge(explicitInput);
     return result ? jsonRes(res, 200, result) : jsonRes(res, 409, { error: 'ask_result_not_ready' });
+  }
+  if (managedExplicit && explicitInput.timeoutMs === null) {
+    void explicitAskContinuation.wait(explicitInput).catch(error => {
+      logger.warn(`[ask-continuation] ${error instanceof Error ? error.message : String(error)}`);
+    });
+    try {
+      const delivery = await waitForAskDelivery(explicitInput);
+      return jsonRes(res, 200, {
+        kind: 'pending', requestId: explicitInput.requestId,
+        askId: delivery.askId, messageId: delivery.messageId, pending: true,
+      });
+    } catch (error) {
+      return jsonRes(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    }
   }
   const result = managedExplicit
     ? await explicitAskContinuation.wait(explicitInput)

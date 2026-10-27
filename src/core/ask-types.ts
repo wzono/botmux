@@ -11,10 +11,16 @@ import type { GroupContextDeliveryBinding } from '../services/group-context-deli
 /** A single selectable option on an ask card. `key` is the stable identifier
  *  returned via stdout; `label` is the human-facing button text. When the user
  *  writes `--options "yes,no"`, `key === label`. With `--options "yes=继续"`,
- *  `key="yes"` and `label="继续"`. */
+ *  `key="yes"` and `label="继续"`.
+ *
+ *  `description` is the optional longer explanation the upstream CLI attaches
+ *  to an option (Claude Code `AskUserQuestion.options[].description`,
+ *  OpenCode `question.options[].description`). It is shown beneath the option
+ *  label; older callers that omit it render exactly as before. */
 export interface AskOption {
   key: string;
   label: string;
+  description?: string;
 }
 
 /** 多问多选模型中一个问题的描述。`key` 是问题的稳定标识符（可选，默认用序号），
@@ -83,6 +89,14 @@ export type AskResult =
  *  v0.1.8 新增 `answers: string[][] | null`（多问多选完整答案），
  *  保留 `selected: string | null` 做向后兼容（等价于 `toLegacySelected`）。
  *  `comment` 携带用户的自定义回复原文（话题直接打字作答），无则 null。 */
+export interface AskPendingResult {
+  kind: 'pending';
+  requestId: string;
+  askId: string;
+  messageId: string;
+  pending: true;
+}
+
 export interface AskJsonOutput {
   /** 向后兼容：单问单选时等于 `answers[0][0]`，否则为 null。 */
   selected: string | null;
@@ -135,13 +149,18 @@ export interface CreateAskInput {
   questions: ReadonlyArray<AskQuestion>;
   /** Absolute deadline; computed by caller from `--timeout`. Broker won't
    *  re-compute. */
-  timeoutMs: number;
+  timeoutMs: number | null;
   /** 发起 ask 的会话类型。仅用于点击鉴权时把 chatType 喂给 canTalk（p2pOpen 腿）；
    *  缺省时该腿 fail-closed，鉴权退回原语义。 */
   chatType?: 'group' | 'p2p';
   /** Optional exact responder lock for host-owned approval asks. Ordinary
    * agent asks omit it and retain the existing canTalk-any-member policy. */
   answererOpenId?: string;
+  /** 显式 `botmux ask --mention <open_id>` 要 @ 的人（仅人类 open_id；bot 的
+   *  open_id 在卡片里会触发 100290，daemon 侧会识别并剔除）。daemon 在卡片
+   *  问题正文前注入真实 `<at>`，确保接收者能收到通知——卡片不像回复消息那样
+   *  天然带 @。 */
+  mentionedOpenId?: string;
 }
 
 /** Daemon-internal state for a pending ask. Not exported on the IPC boundary —
@@ -168,12 +187,14 @@ export interface PendingAsk {
   chatType?: 'group' | 'p2p';
   /** When present, only this app-scoped open_id may settle the ask. */
   answererOpenId?: string;
+  /** 显式 ask 要 @ 的人类 open_id（见 CreateAskInput.mentionedOpenId）。 */
+  mentionedOpenId?: string;
   /** 问题列表，替代旧的 `options` + `prompt`。 */
   questions: ReadonlyArray<AskQuestion>;
   /** 当前已勾选答案快照。仅 daemon/card 内部使用；CLI IPC 边界不暴露。 */
   selections?: ReadonlyArray<ReadonlyArray<string>>;
   createdAt: number;
-  deadlineAt: number;
+  deadlineAt: number | null;
   /** Set after the card dispatch succeeds. Until then, the ask is "registered
    *  but not visible" — clicks can't physically arrive yet. */
   cardMessageId?: string;
