@@ -363,6 +363,55 @@ describe('empty-started session — first real business turn must use the new-to
     expect(opening).toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
   });
 
+  it('live resumed worker receives current Feishu emphasis guidance on its next turn', async () => {
+    const anchor = 'om_live_resumed_emphasis_root';
+    seedEmptyStarted(anchor, { hasHistory: true, pending: false, cliId: 'codex' });
+
+    await handleThreadReply(
+      makeEventData('om_live_resumed_emphasis', '继续', anchor),
+      makeCtx(anchor, 'om_live_resumed_emphasis'),
+    );
+
+    const followUp = liveInputs()[0]!.content;
+    expect(followUp).toContain('<botmux_reminder>');
+    expect(followUp).toContain('短进度优先纯文本');
+    expect(followUp).toContain('强调仅包短词或无中文标点的短语');
+    expect(followUp).toContain('标点和后文放在 `**` 外');
+  });
+
+  it('live resumed Claude hook receives current Feishu emphasis guidance in its sidecar', async () => {
+    const anchor = 'om_live_resumed_hook_emphasis_root';
+    const ds = seedEmptyStarted(anchor, { hasHistory: true, pending: false, cliId: 'claude-code' });
+    ds.session.backendType = 'pty';
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+      envelopeInjection: 'auto' as const,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    preflightMock.mockReturnValue(true);
+
+    await handleThreadReply(
+      makeEventData('om_live_resumed_hook_emphasis', '继续', anchor),
+      makeCtx(anchor, 'om_live_resumed_hook_emphasis'),
+    );
+
+    const followUp = liveInputs()[0]!.content;
+    expect(followUp).toBe('继续');
+    const envelope = claimPromptContext(
+      ds.session.sessionId,
+      'om_live_resumed_hook_emphasis',
+      fingerprintPromptText(followUp),
+      prefixOf(followUp),
+    );
+    expect(envelope).toContain('短进度优先纯文本');
+    expect(envelope).toContain('强调仅包短词或无中文标点的短语');
+    expect(envelope).toContain('标点和后文放在 `**` 外');
+  });
+
   it('live worker: opening carries sender, mentions, available bots and attachments', async () => {
     const anchor = 'om_live_meta_root';
     seedEmptyStarted(anchor);

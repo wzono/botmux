@@ -1873,7 +1873,10 @@ function buildFollowUpBlocks(
         : resolveConditionalLine('ai.followup.reminder_no_resend', config.noVisibleOutputHint)
           ? 'ai.followup.reminder_no_resend'
           : 'ai.followup.reminder';
-    const reminder = t(reminderKey, undefined, opts?.locale);
+    const baseReminder = t(reminderKey, undefined, opts?.locale);
+    const reminder = noTransport
+      ? baseReminder
+      : `${baseReminder} ${t('ai.followup.feishu_safe_emphasis', undefined, opts?.locale)}`;
     blocks.push({ key: 'reminder', text: `<botmux_reminder>${reminder}</botmux_reminder>` });
   }
   if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
