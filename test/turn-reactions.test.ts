@@ -12,7 +12,7 @@
  * Run:  pnpm vitest run test/turn-reactions.test.ts
  */
 import { EventEmitter } from 'node:events';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -59,8 +59,20 @@ function makeDs(over: Partial<DaemonSession> = {}): DaemonSession {
   // guard (added with the ZMX lifecycle-ownership work). Without it every
   // screen_update breaks before lastScreenStatus updates, so the behavioral
   // working→idle / working→limited flip tests below never see a real edge.
-  const session: any = { sessionId: 'sess-' + Math.random().toString(36).slice(2), chatId: 'oc_x', rootMessageId: 'om_root', status: 'active' };
-  return { session, larkAppId: APP, chatId: 'oc_x', scope: 'chat', ...over } as unknown as DaemonSession;
+  const session = sessionStore.createSession(
+    'oc_x',
+    'om_root-' + Math.random().toString(36).slice(2),
+    'reaction fixture',
+    'group',
+    'chat',
+  );
+  const { session: sessionPatch, ...runtimePatch } = over;
+  if (sessionPatch) {
+    const { sessionId: _ignoredSessionId, ...persistedPatch } = sessionPatch;
+    Object.assign(session, persistedPatch);
+    sessionStore.updateSession(session);
+  }
+  return { session, larkAppId: APP, chatId: 'oc_x', scope: 'chat', ...runtimePatch } as unknown as DaemonSession;
 }
 
 // Reactions are auto-on for card-off sessions, so the gate is driven by
@@ -88,11 +100,18 @@ describe('two-phase turn reactions', () => {
     mocks.removeReaction.mockResolvedValue(undefined);
   });
 
+  afterEach(() => {
+    sessionStore.__testOnly_setBeforeRowPersist(undefined);
+  });
+
   it('streaming card on (default): no reaction on receipt', async () => {
     registerWith(false);
     const ds = makeDs();
     await noteTurnReceived(ds, 'om_a');
     expect(mocks.addReaction).not.toHaveBeenCalled();
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a).toMatchObject({
+      version: 1, turnId: 'om_a', messageId: 'om_a', phase: 'processing',
+    });
     expect(ds.pendingAckReactions ?? []).toEqual([]);
     expect(ds.turnReceivedAtMs).toBeUndefined();
     getBot(APP).config.showReplyTiming = true;
@@ -135,13 +154,22 @@ describe('two-phase turn reactions', () => {
   it('reacts 冲! (GoGoGo) on each accepted message and dedups by message id', async () => {
     registerWith(true);
     const ds = makeDs();
+    mocks.addReaction.mockImplementationOnce(async (_app: string, msgId: string) => {
+      expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a).toMatchObject({
+        turnId: 'om_a', messageId: 'om_a', phase: 'processing',
+      });
+      return `rid_${msgId}`;
+    });
     await noteTurnReceived(ds, 'om_a');
+    const firstAdmission = structuredClone(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a);
     await noteTurnReceived(ds, 'om_a'); // same message — must not double-react
     await noteTurnReceived(ds, 'om_b');
     expect(mocks.addReaction).toHaveBeenCalledTimes(2);
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'GoGoGo');
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_b', 'GoGoGo');
     expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_a', 'om_b']);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a).toEqual(firstAdmission);
+    expect(Object.keys(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback ?? {})).toEqual(['om_a', 'om_b']);
   });
 
   it('can use Get as the received reaction for substitute turns', async () => {
@@ -152,6 +180,7 @@ describe('two-phase turn reactions', () => {
 
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_sub', 'Get');
     expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_sub']);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_sub?.receivedReactionEmoji).toBe('Get');
   });
 
   it('substitute turn is card-off even when streaming card is globally enabled', async () => {
@@ -228,6 +257,7 @@ describe('two-phase turn reactions', () => {
 
     expect(mocks.addReaction).not.toHaveBeenCalled();
     expect(ds.pendingAckReactions ?? []).toEqual([]);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a).toMatchObject({ turnId: 'om_a' });
   });
 
   it('silentTurnReactions is a no-op when the streaming card is on (gate order)', async () => {
@@ -247,6 +277,54 @@ describe('two-phase turn reactions', () => {
     const ds = makeDs();
     await noteTurnReceived(ds, 'comment_123');
     await noteTurnReceived(ds, 'oc_chat');
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+    expect(ds.pendingAckReactions ?? []).toEqual([]);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback).toMatchObject({
+      comment_123: { turnId: 'comment_123', messageId: 'comment_123' },
+      oc_chat: { turnId: 'oc_chat', messageId: 'oc_chat' },
+    });
+  });
+
+  it('keys feedback by explicit turn id when one trigger message routes two turns', async () => {
+    registerWith(false);
+    const ds = makeDs();
+
+    await noteTurnReceived(ds, 'om_shared', undefined, undefined, 'turn-a');
+    await noteTurnReceived(ds, 'om_shared', undefined, undefined, 'turn-b');
+
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback).toMatchObject({
+      'turn-a': { turnId: 'turn-a', messageId: 'om_shared' },
+      'turn-b': { turnId: 'turn-b', messageId: 'om_shared' },
+    });
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+  });
+
+  it('persists a stamped meeting-origin turn before the reaction early return', async () => {
+    registerWith(true);
+    const ds = makeDs();
+    ds.session.vcMeetingReceiver = { listenerAppId: 'listener-app', meetingId: 'meeting-1', memberId: 'member-1', memberEpoch: 1 };
+    ds.session.vcMeetingImTurnOrigins = {
+      om_meeting: {
+        listenerAppId: 'listener-app', meetingId: 'meeting-1', memberId: 'member-1', memberEpoch: 1,
+        agentAppId: APP, ownerBootId: 'boot-1', ownerEpoch: 1, membershipGeneration: 1,
+        sinkOwnerGeneration: 1, receiverSessionId: ds.session.sessionId, larkMessageId: 'om_meeting',
+      },
+    };
+    sessionStore.updateSession(ds.session);
+
+    await noteTurnReceived(ds, 'om_meeting');
+
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_meeting).toMatchObject({ turnId: 'om_meeting' });
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+  });
+
+  it('fails closed before reaction when admission persistence fails', async () => {
+    registerWith(true);
+    const ds = makeDs();
+    sessionStore.__testOnly_setBeforeRowPersist(() => { throw new Error('simulated feedback admission failure'); });
+
+    await expect(noteTurnReceived(ds, 'om_fail')).rejects.toThrow('simulated feedback admission failure');
+
     expect(mocks.addReaction).not.toHaveBeenCalled();
     expect(ds.pendingAckReactions ?? []).toEqual([]);
   });

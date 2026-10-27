@@ -127,6 +127,7 @@ import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
+import { createTurnFeedbackReconciler } from './services/turn-feedback-reconciler.js';
 import { initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
 import { closeLinkRefRuntime, initializeLinkRefRuntime } from './services/link-ref-runtime.js';
 import { startDurableInboxShadowConsumer } from './services/durable-inbox-shadow-consumer.js';
@@ -4099,6 +4100,17 @@ function receivedReactionEmojiFor(ds: DaemonSession): string {
   } catch { return RECEIVED_REACTION_EMOJI_TYPE; }
 }
 
+const turnFeedbackReconciler = createTurnFeedbackReconciler({
+  now: () => Date.now(),
+  commit(target, mutate) {
+    const { rows } = sessionStore.mutateOwnedSessionsAtomically(
+      [target.session.sessionId],
+      fresh => mutate(fresh.get(target.session.sessionId)!),
+    );
+    target.session.turnFeedback = rows.get(target.session.sessionId)!.turnFeedback;
+  },
+});
+
 export async function noteTurnReceived(
   ds: DaemonSession,
   triggerMessageId: string,
@@ -4107,8 +4119,8 @@ export async function noteTurnReceived(
   _turnId?: string,
   receivedReactionEmoji?: string,
 ): Promise<void> {
+  const turnId = _turnId ?? triggerMessageId;
   if (getBot(ds.larkAppId).config.showReplyTiming === true) {
-    const turnId = _turnId ?? triggerMessageId;
     const received = ds.turnReceivedAtMs ??= new Map();
     if (!received.has(turnId)) received.set(turnId, Date.now());
     // Keep recent timestamps for delivery retries; unknown/evicted turns omit waiting time.
@@ -4127,7 +4139,16 @@ export async function noteTurnReceived(
   // on. A feature that is off must not perturb timing at all, so the await only
   // happens once a bot has actually opted in.
   if (triggerUserAuthEnabledFor(ds)) {
-    await refreshTurnCliIdentity(ds, _turnId ?? triggerMessageId);
+    await refreshTurnCliIdentity(ds, turnId);
+  }
+  // The identity unit test still executes this function body in isolation via
+  // the repository's transitional function harness. The real daemon module
+  // always has this binding; only that source-extraction harness does not.
+  if (typeof turnFeedbackReconciler !== 'undefined') {
+    turnFeedbackReconciler.admit(
+      { session: ds.session, larkAppId: ds.larkAppId },
+      { turnId, messageId: triggerMessageId, receivedReactionEmoji },
+    );
   }
   // Replaces the old 「处理中」 placeholder card. That card existed only to be
   // PATCHed with the final answer, and `im.v1.message.patch` is silent (no Feishu

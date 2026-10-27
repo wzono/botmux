@@ -21,6 +21,8 @@ import type { TurnTerminalCarrierKind } from './core/types.js';
 import type { LinkRefTurnEnvelope } from './services/link-ref-types.js';
 import type { TurnSendKind } from './services/turn-send-ledger.js';
 import type { IdentityStorageModel } from './core/lark-tool-binding.js';
+import type { CapacityWaitPhase } from './services/capacity-wait-evidence.js';
+import type { TurnFeedbackPhase } from './services/turn-feedback-state.js';
 
 /** Managed meeting sinks supported by the first multi-consumer slice. */
 export type VcMeetingConsumerManagedSink = 'meeting_text' | 'meeting_voice';
@@ -488,8 +490,92 @@ export interface MessageProvenance {
   updatedAt: string;
 }
 
+/** Durable ownership and projection state for one exact admitted turn. */
+export interface PersistedTurnFeedback {
+  version: 1;
+  turnId: string;
+  /** Exact inbound trigger. It may be a Lark message, document comment, or another anchor. */
+  messageId?: string;
+  /** Admission-time requester snapshot retained after replyTargets pruning. */
+  requesterOpenId?: string;
+  requesterIsBot?: boolean;
+  phase: TurnFeedbackPhase;
+  updatedAt: string;
+  /** Per-turn receipt override, for example the substitute-mode Get reaction. */
+  receivedReactionEmoji?: string;
+  capacity?: CapacityWaitPhase;
+  capacityClearedAt?: string;
+  attention?: {
+    state: 'needs_user' | 'resumed';
+    promptNonce: string;
+    dispatchAttempt: number;
+    workerGeneration: number;
+    openedAtMs: number;
+    source?: 'worker' | 'ask';
+  };
+  attentionClearPending?: {
+    nonce: string;
+    dispatchAttempt: number;
+    workerGeneration: number;
+    source: 'worker' | 'ask';
+  };
+  reaction?: { id: string; type: string };
+  reactionReconcilePending?: true;
+  reactionMessageGone?: true;
+  reactionOperation?: {
+    opId: string;
+    messageId: string;
+    desiredType?: string;
+    createdAt: string;
+    phase: 'remove_pending' | 'add_pending' | 'cleanup_pending' | 'failed' | 'blocked';
+    failureReason?:
+      | 'invalid-emoji'
+      | 'permission-denied'
+      | 'invalid-request'
+      | 'unsupported-message'
+      | 'chat-unavailable'
+      | 'operator-unavailable';
+    retryExhausted?: true;
+    old?: { id: string; type: string };
+    adopted?: { id: string; type: string };
+    duplicateIds?: string[];
+  };
+  /** Correlation timestamp retained after clear; never contains user content. */
+  capacityAuditEpisodeStartedAt?: string;
+  reminder?: {
+    messageId?: string;
+    sentAt?: string;
+    uuid?: string;
+    episodeKey?: string;
+    status?: 'pending' | 'sent' | 'ambiguous';
+    attemptedAt?: string;
+    closed?: true;
+  };
+  /** Last daemon-committed signed v3 event for replay protection. */
+  capacitySidebandCursor?: {
+    adapter: 'codex' | 'claude-code';
+    signerKeyId: string;
+    signerEpoch: number;
+    requestId: string;
+    sequence: number;
+    observedAtMs: number;
+  };
+  /** Restart-recoverable native ownership for exact sideband attribution. */
+  capacityBinding?: {
+    adapter: 'codex' | 'claude-code';
+    nativeSessionId?: string;
+    nativeTurnId: string;
+    dispatchAttempt: number;
+    workerGeneration: number;
+  };
+  silent?: boolean;
+  background?: boolean;
+}
+
 export interface Session {
   sessionId: string;
+  /** Whole-row optional v1 state; legacy rows require no SQL migration. */
+  turnFeedback?: Record<string, PersistedTurnFeedback>;
   /** Frozen opt-in at birth; ordinary sessions never inherit listener cleanup. */
   messageListenerAutoClose?: boolean;
   /** Internal target-side owner for an idempotent dispatch-launch session. */
