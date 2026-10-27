@@ -575,6 +575,83 @@ export async function addReaction(larkAppId: string, messageId: string, emojiTyp
   });
 }
 
+export type ReactionCreationResult =
+  | { status: 'created'; id: string }
+  | { status: 'ambiguous' | 'gone' }
+  | { status: 'failed'; reason: 'invalid-emoji' | 'invalid-request' | 'unsupported-message' }
+  | { status: 'blocked'; reason: 'permission-denied' | 'chat-unavailable' | 'operator-unavailable' }
+  | { status: 'retryable'; reason: 'rate-limited' | 'request-processing' };
+
+export type ReactionRemovalResult = 'deleted' | 'gone' | 'failed';
+
+export interface OwnReaction {
+  id: string;
+  type: string;
+}
+
+export type OwnReactionListResult =
+  | { status: 'ok'; items: OwnReaction[] }
+  | { status: 'gone' | 'failed' | 'ambiguous' };
+
+function reactionMessageGone(
+  code: unknown,
+  endpoint: 'list' | 'create' | 'delete',
+): boolean {
+  return code === 230110
+    || code === 231005
+    || code === 232009
+    || (endpoint !== 'delete' && code === 231003);
+}
+
+function classifyReactionCreation(
+  code: unknown,
+): Exclude<ReactionCreationResult, { status: 'created' }> {
+  if (reactionMessageGone(code, 'create')) return { status: 'gone' };
+  if (code === 99991400 || code === 230020) {
+    return { status: 'retryable', reason: 'rate-limited' };
+  }
+  if (code === 231015) return { status: 'retryable', reason: 'request-processing' };
+  if (code === 231001) return { status: 'failed', reason: 'invalid-emoji' };
+  if ([231012, 231013, 231014].includes(code as number)) {
+    return { status: 'failed', reason: 'invalid-request' };
+  }
+  if (code === 231017) return { status: 'failed', reason: 'unsupported-message' };
+  if ([231002, 231007, 231008, 231018, 231019, 231020, 231021, 231022]
+    .includes(code as number)) {
+    return { status: 'blocked', reason: 'permission-denied' };
+  }
+  if (code === 231004) return { status: 'blocked', reason: 'chat-unavailable' };
+  if (code === 231006) return { status: 'blocked', reason: 'operator-unavailable' };
+  return { status: 'ambiguous' };
+}
+
+/** One provider CREATE attempt. Provider and transport ACK ambiguity is returned
+ * as data so the generic outer gate cannot replay the POST. */
+export async function addReactionOnce(
+  larkAppId: string,
+  messageId: string,
+  emojiType: string,
+): Promise<ReactionCreationResult> {
+  assertLarkTransport(larkAppId, 'addReactionOnce');
+  return executeWithLarkGate(larkAppId, 'addReactionOnce', async () => {
+    await assertMessageWriteAllowed(larkAppId, messageId);
+    const c = getBotClient(larkAppId);
+    try {
+      const res = await (c as any).im.v1.messageReaction.create({
+        path: { message_id: messageId },
+        data: { reaction_type: { emoji_type: emojiType } },
+      });
+      if (res?.code !== 0) return classifyReactionCreation(res?.code);
+      const id = res?.data?.reaction_id;
+      return typeof id === 'string' && id.length > 0
+        ? { status: 'created', id }
+        : { status: 'ambiguous' };
+    } catch (error) {
+      return classifyReactionCreation(structuredLarkCode(error));
+    }
+  });
+}
+
 export async function removeReaction(larkAppId: string, messageId: string, reactionId: string): Promise<void> {
   assertLarkTransport(larkAppId, 'removeReaction');
   return executeWithLarkGate(larkAppId, 'removeReaction', async () => {
@@ -587,6 +664,106 @@ export async function removeReaction(larkAppId: string, messageId: string, react
     }
     logger.info(`Removed reaction ${reactionId} from message ${messageId}`);
   });
+}
+
+export async function removeReactionDetailed(
+  larkAppId: string,
+  messageId: string,
+  reactionId: string,
+): Promise<ReactionRemovalResult> {
+  assertLarkTransport(larkAppId, 'removeReactionDetailed');
+  try {
+    await removeReaction(larkAppId, messageId, reactionId);
+    return 'deleted';
+  } catch (error) {
+    return reactionMessageGone(structuredLarkCode(error), 'delete') ? 'gone' : 'failed';
+  }
+}
+
+/** Return a complete, validated snapshot of reactions owned by this app. */
+export async function listOwnReactions(
+  larkAppId: string,
+  messageId: string,
+  emojiType?: string,
+): Promise<OwnReaction[]> {
+  assertLarkTransport(larkAppId, 'listOwnReactions');
+  return executeWithLarkGate(larkAppId, 'listOwnReactions', async () => {
+    const c = getBotClient(larkAppId);
+    const own = new Map<string, OwnReaction>();
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+    for (let page = 0; page < 100; page += 1) {
+      const res = await (c as any).im.v1.messageReaction.list({
+        path: { message_id: messageId },
+        params: {
+          ...(emojiType ? { reaction_type: emojiType } : {}),
+          page_size: 50,
+          user_id_type: 'open_id',
+          ...(cursor ? { page_token: cursor } : {}),
+        },
+      });
+      if (res?.code !== 0) throw larkApiError('list own reactions', res);
+      const data = res?.data;
+      if (!data || !Array.isArray(data.items) || data.items.length > 50
+        || typeof data.has_more !== 'boolean') {
+        throw new Error('Ambiguous reaction list page');
+      }
+      for (const item of data.items) {
+        if (!item || typeof item !== 'object' || Array.isArray(item)
+          || !item.operator || typeof item.operator !== 'object' || Array.isArray(item.operator)) {
+          throw new Error('Ambiguous reaction list operator');
+        }
+        const operatorType = item.operator.operator_type;
+        if (operatorType === 'user') continue;
+        const operatorId = item.operator.operator_id;
+        if (operatorType !== 'app' || typeof operatorId !== 'string'
+          || operatorId.length === 0 || operatorId.length > 256) {
+          throw new Error('Ambiguous reaction list operator');
+        }
+        if (operatorId !== larkAppId) continue;
+        const id = item.reaction_id;
+        const type = item.reaction_type?.emoji_type;
+        if (typeof id !== 'string' || id.length === 0 || id.length > 4096
+          || typeof type !== 'string' || type.length === 0 || type.length > 128) {
+          throw new Error('Ambiguous reaction list item');
+        }
+        if (emojiType && type !== emojiType) continue;
+        const existing = own.get(id);
+        if (existing && existing.type !== type) {
+          throw new Error('Conflicting reaction list identity');
+        }
+        own.set(id, { id, type });
+      }
+      if (!data.has_more) return [...own.values()];
+      const next = data.page_token;
+      if (typeof next !== 'string' || next.length === 0 || next.length > 4096
+        || seenCursors.has(next)) {
+        throw new Error('Ambiguous reaction list pagination');
+      }
+      seenCursors.add(next);
+      cursor = next;
+    }
+    throw new Error('Reaction list pagination limit exceeded');
+  });
+}
+
+export async function listOwnReactionsDetailed(
+  larkAppId: string,
+  messageId: string,
+  emojiType?: string,
+): Promise<OwnReactionListResult> {
+  assertLarkTransport(larkAppId, 'listOwnReactionsDetailed');
+  try {
+    return { status: 'ok', items: await listOwnReactions(larkAppId, messageId, emojiType) };
+  } catch (error) {
+    const code = structuredLarkCode(error);
+    if (reactionMessageGone(code, 'list')) return { status: 'gone' };
+    if ([
+      231001, 231002, 231004, 231006, 231007, 231008, 231011, 231012,
+      231013, 231014, 231015, 231017, 231018, 231019, 231020, 231021, 231022,
+    ].includes(code as number)) return { status: 'failed' };
+    return { status: 'ambiguous' };
+  }
 }
 
 /**

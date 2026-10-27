@@ -13,13 +13,17 @@
  */
 import { EventEmitter } from 'node:events';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync } from 'fs';
+import { mkdtempSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
 const mocks = vi.hoisted(() => ({
   addReaction: vi.fn(),
+  addReactionOnce: vi.fn(),
   removeReaction: vi.fn(),
+  removeReactionDetailed: vi.fn(),
+  listOwnReactionsDetailed: vi.fn(),
+  updateMessage: vi.fn(),
   publishTurnCliIdentity: vi.fn(),
 }));
 
@@ -40,7 +44,15 @@ vi.mock('node-pty', () => ({
 
 vi.mock('../src/im/lark/client.js', async () => {
   const actual = await vi.importActual<any>('../src/im/lark/client.js');
-  return { ...actual, addReaction: mocks.addReaction, removeReaction: mocks.removeReaction };
+  return {
+    ...actual,
+    addReaction: mocks.addReaction,
+    addReactionOnce: mocks.addReactionOnce,
+    removeReaction: mocks.removeReaction,
+    removeReactionDetailed: mocks.removeReactionDetailed,
+    listOwnReactionsDetailed: mocks.listOwnReactionsDetailed,
+    updateMessage: mocks.updateMessage,
+  };
 });
 
 vi.mock('../src/core/turn-cli-identity.js', async () => {
@@ -49,17 +61,71 @@ vi.mock('../src/core/turn-cli-identity.js', async () => {
 });
 
 import { getBot, registerBot } from '../src/bot-registry.js';
-import { noteTurnReceived } from '../src/daemon.js';
+import {
+  noteTurnReceived,
+  __testOnly_activeSessions as activeSessions,
+  __testOnly_restoreSessionsAndScheduleStartupRecovery as startupRecovery,
+} from '../src/daemon.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { beginReplyTargetTurn } from '../src/core/reply-target.js';
 import {
   initWorkerPool,
   __testOnly_finishTurnReactions as finishTurnReactions,
   __testOnly_setupWorkerHandlers,
+  __testOnly_setSuspendBackingVerifier,
+  __testOnly_setSuspendPreparationVerifier,
+  suspendWorker,
 } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { activeSessionKey } from '../src/core/types.js';
+import { turnFeedbackReconciler } from '../src/services/turn-feedback-reconciler.js';
+import {
+  readTurnFeedbackTerminalOutbox,
+  writeTurnFeedbackTerminalOutbox,
+  type TurnFeedbackTerminalRecord,
+} from '../src/services/turn-feedback-terminal-outbox.js';
 
 const APP = 'reaction_app';
+const providerOwn = new Map<string, Array<{ id: string; type: string }>>();
+
+function terminalOutboxRecord(
+  ds: DaemonSession,
+  patch: Partial<TurnFeedbackTerminalRecord> = {},
+): TurnFeedbackTerminalRecord {
+  return {
+    version: 1, terminalRequestId: '33333333-3333-4333-8333-333333333333',
+    ownerAppId: APP, sessionId: ds.session.sessionId, turnId: 'turn-replay',
+    workerGeneration: ds.session.workerGeneration ?? 7, status: 'completed',
+    savedAtMs: Date.now(), ...patch,
+  };
+}
+
+function writeLiveTerminalOutbox(
+  ds: DaemonSession,
+  terminal: { terminalRequestId: string; turnId: string; status: TurnFeedbackTerminalRecord['status']; dispatchAttempt?: number; completedAtMs?: number; durationMs?: number },
+): TurnFeedbackTerminalRecord {
+  const value = terminalOutboxRecord(ds, {
+    terminalRequestId: terminal.terminalRequestId, turnId: terminal.turnId,
+    status: terminal.status, workerGeneration: ds.workerGeneration!,
+    ...(terminal.dispatchAttempt !== undefined ? { dispatchAttempt: terminal.dispatchAttempt } : {}),
+    ...(terminal.completedAtMs !== undefined ? { completedAtMs: terminal.completedAtMs } : {}),
+    ...(terminal.durationMs !== undefined ? { durationMs: terminal.durationMs } : {}),
+  });
+  writeTurnFeedbackTerminalOutbox(process.env.SESSION_DATA_DIR!, value);
+  return value;
+}
+
+function makeWorker() {
+  const worker = new EventEmitter() as any;
+  worker.killed = false;
+  worker.connected = true;
+  worker.send = vi.fn();
+  worker.kill = vi.fn();
+  worker.pid = 4242;
+  worker.stdout = new EventEmitter();
+  worker.stderr = new EventEmitter();
+  return worker;
+}
 
 function makeDs(over: Partial<DaemonSession> = {}): DaemonSession {
   // status:'active' is required by the screen_update handler's ownsLifecycleMutation
@@ -108,7 +174,22 @@ describe('two-phase turn reactions', () => {
     sessionStore.init(APP);
     mocks.addReaction.mockImplementation(async (_app: string, msgId: string) => `rid_${msgId}`);
     mocks.removeReaction.mockResolvedValue(undefined);
+    providerOwn.clear();
+    mocks.listOwnReactionsDetailed.mockImplementation(async (_app: string, msgId: string) => ({
+      status: 'ok', items: structuredClone(providerOwn.get(msgId) ?? []),
+    }));
+    mocks.addReactionOnce.mockImplementation(async (_app: string, msgId: string, type: string) => {
+      const item = { id: `rid_${msgId}_${type}`, type };
+      providerOwn.set(msgId, [...(providerOwn.get(msgId) ?? []), item]);
+      return { status: 'created', id: item.id };
+    });
+    mocks.removeReactionDetailed.mockImplementation(async (_app: string, msgId: string, id: string) => {
+      providerOwn.set(msgId, (providerOwn.get(msgId) ?? []).filter(item => item.id !== id));
+      return 'deleted';
+    });
     mocks.publishTurnCliIdentity.mockResolvedValue([]);
+    mocks.updateMessage.mockResolvedValue(undefined);
+    activeSessions.clear();
   });
 
   afterEach(() => {
@@ -135,7 +216,11 @@ describe('two-phase turn reactions', () => {
     registerWith(statusOff, { replyCardMode: 'unified' });
     const ds = makeDs();
     await noteTurnReceived(ds, 'om_status_toggle');
-    expect(mocks.addReaction).toHaveBeenCalledTimes(statusOff ? 1 : 0);
+    expect(mocks.addReactionOnce).toHaveBeenCalledTimes(statusOff ? 1 : 0);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_status_toggle)
+      .toMatchObject(statusOff
+        ? { reaction: { type: 'GoGoGo' } }
+        : { silent: true, phase: 'processing' });
   });
 
   it('Plan B: a meeting-agent session reacts to plain user turns like any card-off session', async () => {
@@ -165,22 +250,828 @@ describe('two-phase turn reactions', () => {
   it('reacts 冲! (GoGoGo) on each accepted message and dedups by message id', async () => {
     registerWith(true);
     const ds = makeDs();
-    mocks.addReaction.mockImplementationOnce(async (_app: string, msgId: string) => {
+    mocks.addReactionOnce.mockImplementationOnce(async (_app: string, msgId: string, type: string) => {
       expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a).toMatchObject({
         turnId: 'om_a', messageId: 'om_a', phase: 'processing',
+        reactionOperation: { phase: 'add_pending', desiredType: 'GoGoGo' },
       });
-      return `rid_${msgId}`;
+      providerOwn.set(msgId, [{ id: `rid_${msgId}_${type}`, type }]);
+      return { status: 'created', id: `rid_${msgId}_${type}` };
     });
     await noteTurnReceived(ds, 'om_a');
     const firstAdmission = structuredClone(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a);
     await noteTurnReceived(ds, 'om_a'); // same message — must not double-react
     await noteTurnReceived(ds, 'om_b');
-    expect(mocks.addReaction).toHaveBeenCalledTimes(2);
-    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'GoGoGo');
-    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_b', 'GoGoGo');
-    expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_a', 'om_b']);
+    expect(mocks.addReactionOnce).toHaveBeenCalledTimes(2);
+    expect(mocks.addReactionOnce).toHaveBeenCalledWith(APP, 'om_a', 'GoGoGo');
+    expect(mocks.addReactionOnce).toHaveBeenCalledWith(APP, 'om_b', 'GoGoGo');
     expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a).toEqual(firstAdmission);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_b)
+      .toMatchObject({ reaction: { type: 'GoGoGo' } });
     expect(Object.keys(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback ?? {})).toEqual(['om_a', 'om_b']);
+  });
+
+  it('commits reaction intent before the provider write and duplicate admission never writes twice', async () => {
+    registerWith(true);
+    const ds = makeDs();
+    mocks.addReactionOnce.mockImplementationOnce(async (_app: string, messageId: string, type: string) => {
+      expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_journal)
+        .toMatchObject({
+          reactionReconcilePending: true,
+          reactionOperation: { messageId, desiredType: type, phase: 'add_pending' },
+        });
+      providerOwn.set(messageId, [{ id: 'rid_journal', type }]);
+      return { status: 'created', id: 'rid_journal' };
+    });
+
+    await noteTurnReceived(ds, 'om_journal');
+    await noteTurnReceived(ds, 'om_journal');
+
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+    expect(mocks.addReactionOnce).toHaveBeenCalledTimes(1);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_journal)
+      .toMatchObject({ reaction: { id: 'rid_journal', type: 'GoGoGo' } });
+  });
+
+  it.each([
+    ['completed', 'DONE'],
+    ['failed', 'ERROR'],
+    ['cancelled', 'ERROR'],
+    ['ambiguous', 'ERROR'],
+  ] as const)('current worker terminal %s converges the exact durable turn to %s', async (status, emoji) => {
+    registerWith(true);
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const worker = makeWorker();
+    const ds = makeDs({ worker });
+    ds.workerGeneration = 3;
+    ds.session.workerGeneration = 3;
+    await noteTurnReceived(ds, 'om_terminal', undefined, undefined, 'turn-terminal');
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'turn-terminal',
+      status,
+      completedAtMs: Date.now(),
+    });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.['turn-terminal'])
+      .toMatchObject({
+        phase: status === 'completed' ? 'completed' : 'failed',
+        reaction: { type: emoji },
+      });
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+  });
+
+  it('stale worker and mismatched session terminal receipts do not terminalize feedback', async () => {
+    registerWith(true);
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const worker = makeWorker();
+    const ds = makeDs({ worker });
+    ds.workerGeneration = 3;
+    ds.session.workerGeneration = 3;
+    await noteTurnReceived(ds, 'om_guarded', undefined, undefined, 'turn-guarded');
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const replacement = makeWorker();
+    ds.worker = replacement;
+    __testOnly_setupWorkerHandlers(ds, replacement);
+
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId,
+      turnId: 'turn-guarded', status: 'completed',
+    });
+    replacement.emit('message', {
+      type: 'turn_terminal', sessionId: 'wrong-session',
+      turnId: 'turn-guarded', status: 'completed',
+    });
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.['turn-guarded'])
+      .toMatchObject({ phase: 'processing', reaction: { type: 'GoGoGo' } });
+  });
+
+  it('ACKs terminal only after durable commit; retry succeeds without duplicate lifecycle effects', async () => {
+    registerWith(true);
+    const onTurnTerminal = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'), getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1, closeSession: vi.fn(), onTurnTerminal,
+    });
+    const worker = makeWorker();
+    const ds = makeDs({ worker });
+    ds.workerGeneration = 3;
+    ds.session.workerGeneration = 3;
+    await noteTurnReceived(ds, 'om_ack', undefined, undefined, 'turn-ack');
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const terminal = {
+      type: 'turn_terminal',
+      terminalRequestId: '11111111-1111-4111-8111-111111111111',
+      sessionId: ds.session.sessionId, turnId: 'turn-ack', status: 'completed',
+    } as const;
+    const durable = writeLiveTerminalOutbox(ds, terminal);
+    let fail = true;
+    sessionStore.__testOnly_setBeforeRowPersist(() => {
+      if (fail) { fail = false; throw new Error('terminal store offline'); }
+    });
+
+    worker.emit('message', terminal);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'turn_terminal_persisted', terminalRequestId: terminal.terminalRequestId, result: 'retry',
+    }));
+    expect(onTurnTerminal).not.toHaveBeenCalled();
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.['turn-ack'].phase)
+      .toBe('processing');
+
+    sessionStore.__testOnly_setBeforeRowPersist(undefined);
+    worker.emit('message', terminal);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'turn_terminal_persisted', terminalRequestId: terminal.terminalRequestId, result: 'committed',
+    }));
+    expect(onTurnTerminal).toHaveBeenCalledTimes(1);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.['turn-ack'].phase)
+      .toBe('completed');
+
+    const providerWrites = mocks.addReactionOnce.mock.calls.length
+      + mocks.removeReactionDetailed.mock.calls.length;
+    worker.emit('message', terminal);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(onTurnTerminal).toHaveBeenCalledTimes(1);
+    expect(mocks.addReactionOnce.mock.calls.length + mocks.removeReactionDetailed.mock.calls.length)
+      .toBe(providerWrites);
+  });
+
+  it('runs lifecycle once even when the first committed ACK transport throws', async () => {
+    registerWith(true);
+    const onTurnTerminal = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'), getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1, closeSession: vi.fn(), onTurnTerminal,
+    });
+    const worker = makeWorker();
+    const ds = makeDs({ worker });
+    ds.workerGeneration = 12;
+    ds.session.workerGeneration = 12;
+    await noteTurnReceived(ds, 'om_ack_throw', undefined, undefined, 'turn-ack-throw');
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const terminal = {
+      type: 'turn_terminal', terminalRequestId: '77777777-7777-4777-8777-777777777777',
+      sessionId: ds.session.sessionId, turnId: 'turn-ack-throw', status: 'completed',
+    } as const;
+    const durable = writeLiveTerminalOutbox(ds, terminal);
+    let ackThrows = true;
+    worker.send.mockImplementation((message: any) => {
+      if (message?.type === 'turn_terminal_persisted' && ackThrows) {
+        ackThrows = false;
+        throw new Error('ACK transport lost');
+      }
+    });
+
+    worker.emit('message', terminal);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(onTurnTerminal).toHaveBeenCalledTimes(1);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.['turn-ack-throw'].phase)
+      .toBe('completed');
+
+    worker.emit('message', terminal);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(onTurnTerminal).toHaveBeenCalledTimes(1);
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'turn_terminal_persisted', result: 'committed',
+    }));
+  });
+
+  it('forged terminal request without an exact outbox stops before lifecycle', async () => {
+    registerWith(true);
+    const onTurnTerminal = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'), getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1, closeSession: vi.fn(), onTurnTerminal,
+    });
+    const worker = makeWorker();
+    const ds = makeDs({ worker });
+    ds.workerGeneration = 13;
+    ds.session.workerGeneration = 13;
+    await noteTurnReceived(ds, 'om_forged', undefined, undefined, 'turn-forged');
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'turn_terminal', terminalRequestId: '88888888-8888-4888-8888-888888888888',
+      sessionId: ds.session.sessionId, turnId: 'turn-forged', status: 'completed',
+    });
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'turn_terminal_persisted', result: 'conflict',
+    }));
+    expect(onTurnTerminal).not.toHaveBeenCalled();
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.['turn-forged'].phase)
+      .toBe('processing');
+  });
+
+  it('durable terminal receipt rejects a new request with a conflicting raw status', async () => {
+    registerWith(true);
+    const onTurnTerminal = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'), getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1, closeSession: vi.fn(), onTurnTerminal,
+    });
+    const worker = makeWorker();
+    const ds = makeDs({ worker });
+    ds.workerGeneration = 14;
+    ds.session.workerGeneration = 14;
+    await noteTurnReceived(ds, 'om_receipt', undefined, undefined, 'turn-receipt');
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const completed = {
+      type: 'turn_terminal', terminalRequestId: '99999999-9999-4999-8999-999999999999',
+      sessionId: ds.session.sessionId, turnId: 'turn-receipt', status: 'completed',
+    } as const;
+    writeLiveTerminalOutbox(ds, completed);
+    worker.emit('message', completed);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const conflicting = {
+      ...completed, terminalRequestId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      status: 'failed' as const,
+    };
+    writeLiveTerminalOutbox(ds, conflicting);
+    worker.emit('message', conflicting);
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      terminalRequestId: conflicting.terminalRequestId, result: 'conflict',
+    }));
+    expect(onTurnTerminal).toHaveBeenCalledTimes(1);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.['turn-receipt'])
+      .toMatchObject({ phase: 'completed', terminalReceipt: { status: 'completed' } });
+  });
+
+  it('refuses idle suspension while this worker owns an uncommitted terminal', async () => {
+    registerWith(true);
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'), getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1, closeSession: vi.fn(),
+    });
+    const worker = makeWorker();
+    const ds = makeDs({ worker, initConfig: { backendType: 'tmux' } as any });
+    ds.workerGeneration = 5;
+    ds.session.workerGeneration = 5;
+    await noteTurnReceived(ds, 'om_suspend', undefined, undefined, 'turn-suspend');
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const terminal = {
+      type: 'turn_terminal', terminalRequestId: '55555555-5555-4555-8555-555555555555',
+      sessionId: ds.session.sessionId, turnId: 'turn-suspend', status: 'completed',
+    } as const;
+    const durable = writeLiveTerminalOutbox(ds, terminal);
+    let fail = true;
+    sessionStore.__testOnly_setBeforeRowPersist(() => {
+      if (fail) { fail = false; throw new Error('terminal unavailable'); }
+    });
+    __testOnly_setSuspendBackingVerifier(() => true);
+    try {
+      worker.emit('message', terminal);
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(suspendWorker(ds, 'idle_timeout')).toBe(false);
+      expect(ds.worker).toBe(worker);
+
+      sessionStore.__testOnly_setBeforeRowPersist(undefined);
+      worker.emit('message', terminal);
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(suspendWorker(ds, 'idle_timeout')).toBe(true);
+      expect(readTurnFeedbackTerminalOutbox(process.env.SESSION_DATA_DIR!, durable)).toBeUndefined();
+    } finally {
+      sessionStore.__testOnly_setBeforeRowPersist(undefined);
+      __testOnly_setSuspendBackingVerifier();
+    }
+  });
+
+  it('same terminal request with a different status ACKs conflict and never mutates', async () => {
+    registerWith(true);
+    const onTurnTerminal = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'), getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1, closeSession: vi.fn(), onTurnTerminal,
+    });
+    const worker = makeWorker();
+    const ds = makeDs({ worker });
+    ds.workerGeneration = 4;
+    ds.session.workerGeneration = 4;
+    await noteTurnReceived(ds, 'om_conflict', undefined, undefined, 'turn-conflict');
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const base = {
+      type: 'turn_terminal', terminalRequestId: '22222222-2222-4222-8222-222222222222',
+      sessionId: ds.session.sessionId, turnId: 'turn-conflict',
+    } as const;
+    writeLiveTerminalOutbox(ds, { ...base, status: 'completed' });
+    worker.emit('message', { ...base, status: 'completed' });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    worker.emit('message', { ...base, status: 'failed' });
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'turn_terminal_persisted', terminalRequestId: base.terminalRequestId, result: 'conflict',
+    }));
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.['turn-conflict'].phase)
+      .toBe('completed');
+    expect(onTurnTerminal).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a terminal from an older dispatch attempt without mutating feedback', async () => {
+    registerWith(true);
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'), getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1, closeSession: vi.fn(),
+    });
+    const worker = makeWorker();
+    const ds = makeDs({ worker });
+    ds.workerGeneration = 6;
+    ds.session.workerGeneration = 6;
+    ds.turnDispatchAttemptHighWater = { turnId: 'turn-attempt', dispatchAttempt: 3 };
+    await noteTurnReceived(ds, 'om_attempt', undefined, undefined, 'turn-attempt');
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    const staleTerminal = {
+      type: 'turn_terminal', terminalRequestId: '66666666-6666-4666-8666-666666666666',
+      sessionId: ds.session.sessionId, turnId: 'turn-attempt', dispatchAttempt: 2,
+      status: 'completed',
+    } as const;
+    writeLiveTerminalOutbox(ds, staleTerminal);
+    worker.emit('message', staleTerminal);
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'turn_terminal_persisted', result: 'conflict', dispatchAttempt: 2,
+    }));
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.['turn-attempt'].phase)
+      .toBe('processing');
+  });
+
+  it('rejects a terminal missing dispatch attempt when live high-water proves one', async () => {
+    registerWith(true);
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'), getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1, closeSession: vi.fn(),
+    });
+    const worker = makeWorker();
+    const ds = makeDs({ worker });
+    ds.workerGeneration = 15; ds.session.workerGeneration = 15;
+    ds.turnDispatchAttemptHighWater = { turnId: 'turn-missing-attempt', dispatchAttempt: 1 };
+    await noteTurnReceived(ds, 'om_missing_attempt', undefined, undefined, 'turn-missing-attempt');
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const terminal = {
+      type: 'turn_terminal', terminalRequestId: 'afafafaf-afaf-4faf-8faf-afafafafafaf',
+      sessionId: ds.session.sessionId, turnId: 'turn-missing-attempt', status: 'completed',
+    } as const;
+    writeLiveTerminalOutbox(ds, terminal);
+    worker.emit('message', terminal);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({ result: 'conflict' }));
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.['turn-missing-attempt'].phase)
+      .toBe('processing');
+  });
+
+  it('legacy idle reaction finalizer ignores feedback-owned turns', async () => {
+    registerWith(true);
+    const ds = makeDs();
+    await noteTurnReceived(ds, 'om_owned');
+    ds.pendingAckReactions = [{ messageId: 'om_owned', reactionId: 'legacy-id' }];
+    mocks.addReaction.mockClear();
+    mocks.removeReaction.mockClear();
+
+    await finishTurnReactions(ds);
+
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+    expect(mocks.removeReaction).not.toHaveBeenCalled();
+    expect(ds.pendingAckReactions).toEqual([]);
+  });
+
+  it.each(['active', 'closed'] as const)('actual startup adopts %s add ACK without duplicate CREATE', async status => {
+    registerWith(true);
+    const ds = makeDs();
+    ds.session.status = status;
+    ds.session.turnFeedback = {
+      'turn-startup': {
+        version: 1, turnId: 'turn-startup', messageId: 'om_startup',
+        phase: status === 'closed' ? 'failed' : 'processing',
+        updatedAt: new Date().toISOString(), reactionReconcilePending: true,
+        reactionOperation: {
+          opId: `op-${status}`, messageId: 'om_startup',
+          desiredType: status === 'closed' ? 'ERROR' : 'GoGoGo',
+          createdAt: new Date().toISOString(), phase: 'add_pending',
+        },
+      },
+    };
+    sessionStore.updateSession(ds.session);
+    providerOwn.set('om_startup', [{
+      id: 'provider-ack', type: status === 'closed' ? 'ERROR' : 'GoGoGo',
+    }]);
+
+    const run = () => startupRecovery({
+      larkAppId: APP,
+      restoreSessions: async () => {
+        if (status === 'active') activeSessions.set(activeSessionKey(ds), ds);
+        return [];
+      },
+      markSessionsRestored: vi.fn(),
+      driveRestoredXpiGroup: vi.fn(),
+      driveRestoredPrincipalLane: vi.fn(),
+    });
+    await run();
+    await run();
+
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.['turn-startup'])
+      .toMatchObject({ reaction: { id: 'provider-ack' } });
+    expect(mocks.addReactionOnce).not.toHaveBeenCalled();
+    expect(mocks.listOwnReactionsDetailed).toHaveBeenCalledTimes(1);
+    if (status === 'closed') {
+      expect(activeSessions.size).toBe(0);
+      expect(mocks.updateMessage).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each(['remove_pending', 'cleanup_pending'] as const)('actual closed startup resumes %s idempotently', async phase => {
+    registerWith(true);
+    const ds = makeDs();
+    ds.session.status = 'closed';
+    ds.session.turnFeedback = {
+      repair: {
+        version: 1, turnId: 'repair', messageId: 'om_repair', phase: 'failed',
+        updatedAt: new Date().toISOString(), reactionReconcilePending: true,
+        reaction: phase === 'remove_pending'
+          ? { id: 'old', type: 'GoGoGo' }
+          : { id: 'a', type: 'ERROR' },
+        reactionOperation: phase === 'remove_pending'
+          ? {
+              opId: 'op-remove', messageId: 'om_repair', desiredType: 'ERROR',
+              createdAt: new Date().toISOString(), phase, old: { id: 'old', type: 'GoGoGo' },
+            }
+          : {
+              opId: 'op-cleanup', messageId: 'om_repair', desiredType: 'ERROR',
+              createdAt: new Date().toISOString(), phase, adopted: { id: 'a', type: 'ERROR' },
+              duplicateIds: ['z'],
+            },
+      },
+    };
+    sessionStore.updateSession(ds.session);
+    providerOwn.set('om_repair', phase === 'remove_pending'
+      ? []
+      : [{ id: 'a', type: 'ERROR' }]);
+    const run = () => startupRecovery({
+      larkAppId: APP, restoreSessions: async () => [], markSessionsRestored: vi.fn(),
+      driveRestoredXpiGroup: vi.fn(), driveRestoredPrincipalLane: vi.fn(),
+    });
+
+    await run();
+    const creates = mocks.addReactionOnce.mock.calls.length;
+    const deletes = mocks.removeReactionDetailed.mock.calls.length;
+    await run();
+
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.repair)
+      .toMatchObject({ phase: 'failed', reaction: { type: 'ERROR' } });
+    expect(mocks.addReactionOnce).toHaveBeenCalledTimes(creates);
+    expect(mocks.removeReactionDetailed).toHaveBeenCalledTimes(deletes);
+    expect(activeSessions.size).toBe(0);
+  });
+
+  it('actual closed startup clears gone journal once and never recreates', async () => {
+    registerWith(true);
+    const ds = makeDs();
+    ds.session.status = 'closed';
+    ds.session.turnFeedback = { gone: {
+      version: 1, turnId: 'gone', messageId: 'om_gone', phase: 'failed',
+      updatedAt: new Date().toISOString(), reactionReconcilePending: true,
+      reactionOperation: {
+        opId: 'op-gone', messageId: 'om_gone', desiredType: 'ERROR',
+        createdAt: new Date().toISOString(), phase: 'add_pending',
+      },
+    } };
+    sessionStore.updateSession(ds.session);
+    mocks.listOwnReactionsDetailed.mockResolvedValue({ status: 'gone' });
+    const run = () => startupRecovery({
+      larkAppId: APP, restoreSessions: async () => [], markSessionsRestored: vi.fn(),
+      driveRestoredXpiGroup: vi.fn(), driveRestoredPrincipalLane: vi.fn(),
+    });
+
+    await run();
+    await run();
+
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.gone)
+      .toMatchObject({ reactionMessageGone: true });
+    expect(mocks.listOwnReactionsDetailed).toHaveBeenCalledTimes(1);
+    expect(mocks.addReactionOnce).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+  });
+
+  it('closed startup terminalizes placeholders but preserves reaction and reminder obligations', async () => {
+    registerWith(true);
+    const ds = makeDs();
+    ds.session.status = 'closed';
+    ds.session.turnFeedback = { repair: {
+      version: 1, turnId: 'repair', messageId: 'om_closed', phase: 'processing',
+      updatedAt: new Date().toISOString(), reaction: { id: 'old', type: 'GoGoGo' },
+      reactionReconcilePending: true, capacityClearedAt: new Date().toISOString(),
+      capacity: { state: 'waiting', source: 'pty', startedAtMs: Date.now(), updatedAtMs: Date.now() },
+      attention: { state: 'needs_user', promptNonce: 'ask', dispatchAttempt: 1, workerGeneration: 2, openedAtMs: Date.now() },
+      reminder: { status: 'pending', uuid: 'reminder-uuid' },
+    } };
+    sessionStore.updateSession(ds.session);
+    providerOwn.set('om_closed', [{ id: 'old', type: 'GoGoGo' }]);
+
+    await startupRecovery({
+      larkAppId: APP, restoreSessions: async () => [], markSessionsRestored: vi.fn(),
+      driveRestoredXpiGroup: vi.fn(), driveRestoredPrincipalLane: vi.fn(),
+    });
+
+    const repaired = sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.repair;
+    expect(repaired).toMatchObject({
+      phase: 'failed', reaction: { type: 'ERROR' },
+      reminder: { status: 'pending', uuid: 'reminder-uuid' },
+    });
+    expect(repaired?.capacity).toBeUndefined();
+    expect(repaired?.capacityClearedAt).toBeUndefined();
+    expect(repaired?.attention).toBeUndefined();
+    expect(repaired?.reactionOperation).toBeUndefined();
+    expect(repaired?.reactionReconcilePending).toBeUndefined();
+    expect(mocks.updateMessage).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+  });
+
+  it('closed startup skips a clean terminal reaction', async () => {
+    registerWith(true);
+    const ds = makeDs();
+    ds.session.status = 'closed';
+    ds.session.turnFeedback = { clean: {
+      version: 1, turnId: 'clean', messageId: 'om_clean', phase: 'failed',
+      updatedAt: new Date().toISOString(), reaction: { id: 'error', type: 'ERROR' },
+    } };
+    sessionStore.updateSession(ds.session);
+
+    await startupRecovery({
+      larkAppId: APP, restoreSessions: async () => [], markSessionsRestored: vi.fn(),
+      driveRestoredXpiGroup: vi.fn(), driveRestoredPrincipalLane: vi.fn(),
+    });
+
+    expect(mocks.listOwnReactionsDetailed).not.toHaveBeenCalled();
+    expect(mocks.addReactionOnce).not.toHaveBeenCalled();
+    expect(mocks.removeReactionDetailed).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+  });
+
+  it.each(['active', 'closed'] as const)('startup replays %s terminal outbox before worker restore without active/card side effects', async status => {
+    registerWith(true);
+    const ds = makeDs();
+    ds.session.status = status;
+    ds.session.workerGeneration = 7;
+    ds.session.turnFeedback = { 'turn-replay': {
+      version: 1, turnId: 'turn-replay', messageId: 'om_replay', phase: 'processing',
+      updatedAt: new Date().toISOString(), reaction: { id: 'old', type: 'GoGoGo' },
+    } };
+    sessionStore.updateSession(ds.session);
+    providerOwn.set('om_replay', [{ id: 'old', type: 'GoGoGo' }]);
+    const record = terminalOutboxRecord(ds);
+    writeTurnFeedbackTerminalOutbox(process.env.SESSION_DATA_DIR!, record);
+    const restoreSessions = vi.fn(async () => []);
+
+    await startupRecovery({
+      larkAppId: APP, restoreSessions, markSessionsRestored: vi.fn(),
+      driveRestoredXpiGroup: vi.fn(), driveRestoredPrincipalLane: vi.fn(),
+    });
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(restoreSessions).toHaveBeenCalledTimes(1);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.['turn-replay'])
+      .toMatchObject({ phase: 'completed', reaction: { type: 'DONE' } });
+    expect(readTurnFeedbackTerminalOutbox(process.env.SESSION_DATA_DIR!, record)).toBeUndefined();
+    expect(activeSessions.size).toBe(0);
+    expect(mocks.updateMessage).not.toHaveBeenCalled();
+  });
+
+  it('startup retains outbox when the Session is missing and fail-closes stale/conflicting generation', async () => {
+    registerWith(true);
+    const missing = terminalOutboxRecord({ session: { sessionId: 'missing' } } as DaemonSession, {
+      sessionId: 'missing', workerGeneration: 2,
+    });
+    writeTurnFeedbackTerminalOutbox(process.env.SESSION_DATA_DIR!, missing);
+    const ds = makeDs();
+    ds.session.workerGeneration = 9;
+    ds.session.turnFeedback = { 'turn-replay': {
+      version: 1, turnId: 'turn-replay', messageId: 'om_replay', phase: 'processing',
+      updatedAt: new Date().toISOString(),
+    } };
+    sessionStore.updateSession(ds.session);
+    const stale = terminalOutboxRecord(ds, { workerGeneration: 8 });
+    writeTurnFeedbackTerminalOutbox(process.env.SESSION_DATA_DIR!, stale);
+
+    await startupRecovery({
+      larkAppId: APP, restoreSessions: async () => [], markSessionsRestored: vi.fn(),
+      driveRestoredXpiGroup: vi.fn(), driveRestoredPrincipalLane: vi.fn(),
+    });
+
+    expect(readTurnFeedbackTerminalOutbox(process.env.SESSION_DATA_DIR!, missing)).toEqual(missing);
+    expect(readTurnFeedbackTerminalOutbox(process.env.SESSION_DATA_DIR!, stale)).toEqual(stale);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.['turn-replay'].phase)
+      .toBe('processing');
+  });
+
+  it('startup replays an attempted terminal only with exact durable attempt evidence', async () => {
+    registerWith(true);
+    const ds = makeDs();
+    ds.session.workerGeneration = 10;
+    ds.session.queuedActivationTurnId = 'turn-replay';
+    ds.session.queuedActivationDispatchAttempt = 4;
+    ds.session.turnFeedback = { 'turn-replay': {
+      version: 1, turnId: 'turn-replay', messageId: 'om_replay', phase: 'processing',
+      updatedAt: new Date().toISOString(), reaction: { id: 'old', type: 'GoGoGo' },
+    } };
+    sessionStore.updateSession(ds.session);
+    providerOwn.set('om_replay', [{ id: 'old', type: 'GoGoGo' }]);
+    const record = terminalOutboxRecord(ds, { workerGeneration: 10, dispatchAttempt: 4 });
+    writeTurnFeedbackTerminalOutbox(process.env.SESSION_DATA_DIR!, record);
+
+    await startupRecovery({
+      larkAppId: APP, restoreSessions: async () => [], markSessionsRestored: vi.fn(),
+      driveRestoredXpiGroup: vi.fn(), driveRestoredPrincipalLane: vi.fn(),
+    });
+
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.['turn-replay'].phase)
+      .toBe('completed');
+    expect(readTurnFeedbackTerminalOutbox(process.env.SESSION_DATA_DIR!, record)).toBeUndefined();
+  });
+
+  it('startup retains a terminal missing dispatch attempt when durable binding requires one', async () => {
+    registerWith(true);
+    const ds = makeDs();
+    ds.session.workerGeneration = 16;
+    ds.session.turnFeedback = { 'turn-replay': {
+      version: 1, turnId: 'turn-replay', messageId: 'om_replay', phase: 'processing',
+      updatedAt: new Date().toISOString(),
+      capacityBinding: {
+        adapter: 'codex', nativeTurnId: 'native', dispatchAttempt: 5, workerGeneration: 16,
+      },
+    } };
+    sessionStore.updateSession(ds.session);
+    const record = terminalOutboxRecord(ds, { workerGeneration: 16, dispatchAttempt: undefined });
+    writeTurnFeedbackTerminalOutbox(process.env.SESSION_DATA_DIR!, record);
+
+    await startupRecovery({
+      larkAppId: APP, restoreSessions: async () => [], markSessionsRestored: vi.fn(),
+      driveRestoredXpiGroup: vi.fn(), driveRestoredPrincipalLane: vi.fn(),
+    });
+
+    expect(readTurnFeedbackTerminalOutbox(process.env.SESSION_DATA_DIR!, record)).toEqual(record);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.['turn-replay'].phase)
+      .toBe('processing');
+  });
+
+  it('startup retains an attempted terminal when no durable source proves its attempt', async () => {
+    registerWith(true);
+    const ds = makeDs();
+    ds.session.workerGeneration = 17;
+    ds.session.turnFeedback = { 'turn-replay': {
+      version: 1, turnId: 'turn-replay', messageId: 'om_replay', phase: 'processing',
+      updatedAt: new Date().toISOString(),
+    } };
+    sessionStore.updateSession(ds.session);
+    const record = terminalOutboxRecord(ds, { workerGeneration: 17, dispatchAttempt: 2 });
+    writeTurnFeedbackTerminalOutbox(process.env.SESSION_DATA_DIR!, record);
+    await startupRecovery({
+      larkAppId: APP, restoreSessions: async () => [], markSessionsRestored: vi.fn(),
+      driveRestoredXpiGroup: vi.fn(), driveRestoredPrincipalLane: vi.fn(),
+    });
+    expect(readTurnFeedbackTerminalOutbox(process.env.SESSION_DATA_DIR!, record)).toEqual(record);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.['turn-replay'].phase)
+      .toBe('processing');
+  });
+
+  it('refuses suspension before IPC handling when current worker outbox is already durable', async () => {
+    registerWith(true);
+    const worker = makeWorker();
+    const ds = makeDs({ worker, initConfig: { backendType: 'tmux' } as any });
+    ds.workerGeneration = 18; ds.session.workerGeneration = 18;
+    const record = terminalOutboxRecord(ds, {
+      terminalRequestId: 'efefefef-efef-4fef-8fef-efefefefefef',
+      workerGeneration: 18, turnId: 'turn-pre-handler',
+    });
+    writeTurnFeedbackTerminalOutbox(process.env.SESSION_DATA_DIR!, record);
+    __testOnly_setSuspendBackingVerifier(() => true);
+    try {
+      expect(suspendWorker(ds, 'idle_timeout')).toBe(false);
+      expect(ds.worker).toBe(worker);
+    } finally {
+      __testOnly_setSuspendBackingVerifier();
+    }
+  });
+
+  it('fences same-generation terminal persistence before backing destruction begins', () => {
+    registerWith(true);
+    const worker = makeWorker();
+    const ds = makeDs({ worker, initConfig: { backendType: 'tmux' } as any });
+    ds.workerGeneration = 21; ds.session.workerGeneration = 21;
+    const late = terminalOutboxRecord(ds, {
+      terminalRequestId: 'f2f2f2f2-f2f2-42f2-82f2-f2f2f2f2f2f2',
+      workerGeneration: 21, turnId: 'turn-after-fence',
+    });
+    const destroy = vi.fn(() => true);
+    __testOnly_setSuspendBackingVerifier(destroy);
+    __testOnly_setSuspendPreparationVerifier(() => {
+      writeTurnFeedbackTerminalOutbox(process.env.SESSION_DATA_DIR!, late);
+      return true;
+    });
+    try {
+      expect(suspendWorker(ds, 'idle_timeout')).toBe(false);
+      expect(ds.worker).toBe(worker);
+      expect(destroy).not.toHaveBeenCalled();
+      expect(readTurnFeedbackTerminalOutbox(process.env.SESSION_DATA_DIR!, late)).toEqual(late);
+    } finally {
+      __testOnly_setSuspendPreparationVerifier();
+      __testOnly_setSuspendBackingVerifier();
+    }
+  });
+
+  it('cleans 513 exact-receipt lost-ACK records without exhausting outbox capacity', () => {
+    registerWith(true);
+    __testOnly_setSuspendBackingVerifier(() => true);
+    try {
+      for (let index = 0; index < 513; index += 1) {
+        const worker = makeWorker();
+        const generation = index + 30;
+        const ds = makeDs({ worker, initConfig: { backendType: 'tmux' } as any });
+        ds.workerGeneration = generation; ds.session.workerGeneration = generation;
+        const suffix = index.toString(16).padStart(12, '0');
+        const turnId = `turn-lost-ack-${index}`;
+        const durable = terminalOutboxRecord(ds, {
+          terminalRequestId: `abababab-abab-4bab-8bab-${suffix}`,
+          workerGeneration: generation, turnId,
+        });
+        writeTurnFeedbackTerminalOutbox(process.env.SESSION_DATA_DIR!, durable);
+        ds.session.turnFeedback = { [turnId]: {
+          version: 1, turnId, messageId: `om_${index}`, phase: 'completed',
+          updatedAt: new Date().toISOString(),
+          terminalReceipt: {
+            version: 1, terminalRequestId: durable.terminalRequestId,
+            workerGeneration: generation, status: durable.status, savedAtMs: durable.savedAtMs,
+          },
+        } };
+        expect(suspendWorker(ds, 'idle_timeout')).toBe(true);
+        expect(readTurnFeedbackTerminalOutbox(process.env.SESSION_DATA_DIR!, durable)).toBeUndefined();
+      }
+    } finally {
+      __testOnly_setSuspendBackingVerifier();
+    }
+  });
+
+  it('allows suspension when a durable terminal belongs to an older worker generation', () => {
+    registerWith(true);
+    const worker = makeWorker();
+    const ds = makeDs({ worker, initConfig: { backendType: 'tmux' } as any });
+    ds.workerGeneration = 19; ds.session.workerGeneration = 19;
+    writeTurnFeedbackTerminalOutbox(process.env.SESSION_DATA_DIR!, terminalOutboxRecord(ds, {
+      terminalRequestId: 'f0f0f0f0-f0f0-40f0-80f0-f0f0f0f0f0f0',
+      workerGeneration: 18, turnId: 'turn-old-generation',
+    }));
+    __testOnly_setSuspendBackingVerifier(() => true);
+    try {
+      expect(suspendWorker(ds, 'idle_timeout')).toBe(true);
+    } finally {
+      __testOnly_setSuspendBackingVerifier();
+    }
+  });
+
+  it('refuses suspension when the current worker outbox cannot be validated', () => {
+    registerWith(true);
+    const worker = makeWorker();
+    const ds = makeDs({ worker, initConfig: { backendType: 'tmux' } as any });
+    ds.workerGeneration = 20; ds.session.workerGeneration = 20;
+    const record = terminalOutboxRecord(ds, {
+      terminalRequestId: 'f1f1f1f1-f1f1-41f1-81f1-f1f1f1f1f1f1',
+      workerGeneration: 20, turnId: 'turn-malformed',
+    });
+    writeTurnFeedbackTerminalOutbox(process.env.SESSION_DATA_DIR!, record);
+    writeFileSync(join(
+      process.env.SESSION_DATA_DIR!, 'turn-feedback-terminal-outbox', APP,
+      ds.session.sessionId, '20', `${record.terminalRequestId}.json`,
+    ), '{malformed');
+    __testOnly_setSuspendBackingVerifier(() => true);
+    try {
+      expect(suspendWorker(ds, 'idle_timeout')).toBe(false);
+      expect(ds.worker).toBe(worker);
+    } finally {
+      __testOnly_setSuspendBackingVerifier();
+    }
   });
 
   it('can use Get as the received reaction for substitute turns', async () => {
@@ -189,9 +1080,9 @@ describe('two-phase turn reactions', () => {
 
     await noteTurnReceived(ds, 'om_sub', undefined, undefined, undefined, 'Get');
 
-    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_sub', 'Get');
-    expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_sub']);
-    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_sub?.receivedReactionEmoji).toBe('Get');
+    expect(mocks.addReactionOnce).toHaveBeenCalledWith(APP, 'om_sub', 'Get');
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_sub)
+      .toMatchObject({ receivedReactionEmoji: 'Get', reaction: { type: 'Get' } });
   });
 
   it('substitute turn is card-off even when streaming card is globally enabled', async () => {
@@ -205,8 +1096,9 @@ describe('two-phase turn reactions', () => {
 
     await noteTurnReceived(ds, 'om_a');
 
-    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'GoGoGo');
-    expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_a']);
+    expect(mocks.addReactionOnce).toHaveBeenCalledWith(APP, 'om_a', 'GoGoGo');
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a)
+      .toMatchObject({ reaction: { type: 'GoGoGo' } });
   });
 
   it('queued substitute turn A stays card-off after normal turn B overwrote the slot (per-turn gate)', async () => {
@@ -226,7 +1118,9 @@ describe('two-phase turn reactions', () => {
 
     await noteTurnReceived(ds, 'om_a');
 
-    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'GoGoGo');
+    expect(mocks.addReactionOnce).toHaveBeenCalledWith(APP, 'om_a', 'GoGoGo');
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a)
+      .toMatchObject({ reaction: { type: 'GoGoGo' } });
   });
 
   it('reverse order: normal turn A keeps its card after substitute turn B overwrote the slot', async () => {
@@ -533,8 +1427,8 @@ describe('two-phase turn reactions', () => {
     });
     expect(ds.currentReplyTarget).toEqual(durable?.currentReplyTarget);
     expect(ds.replyThreadAliases).toEqual(durable?.replyThreadAliases);
-    expect(mocks.addReaction).toHaveBeenCalledTimes(1);
-    expect(ds.pendingAckReactions?.map(item => item.messageId)).toEqual([turnId]);
+    expect(mocks.addReactionOnce).toHaveBeenCalledTimes(1);
+    expect(durable?.turnFeedback?.[turnId]).toMatchObject({ reaction: { type: 'GoGoGo' } });
   });
 
   it('keeps one durable winner on an equal-time conflicting live route', async () => {
@@ -952,17 +1846,17 @@ describe('two-phase turn reactions', () => {
     // each accepted message still gets its own ✋ because we bind to the message.
     await noteTurnReceived(ds, 'om_a');
     await noteTurnReceived(ds, 'om_b');
-    expect(mocks.addReaction).toHaveBeenCalledTimes(2);
+    expect(mocks.addReactionOnce).toHaveBeenCalledTimes(2);
+    await turnFeedbackReconciler.terminal(ds, 'om_a', 'completed');
+    await turnFeedbackReconciler.terminal(ds, 'om_b', 'completed');
 
-    mocks.addReaction.mockClear();
-    await finishTurnReactions(ds);
-
-    // Each ✋ removed and replaced with ✅ DONE — neither message is left behind.
-    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
-    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_b', 'rid_om_b');
-    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'DONE');
-    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_b', 'DONE');
-    expect(ds.pendingAckReactions).toEqual([]);
+    expect(mocks.removeReactionDetailed).toHaveBeenCalledTimes(2);
+    expect(mocks.addReactionOnce).toHaveBeenCalledWith(APP, 'om_a', 'DONE');
+    expect(mocks.addReactionOnce).toHaveBeenCalledWith(APP, 'om_b', 'DONE');
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback).toMatchObject({
+      om_a: { phase: 'completed', reaction: { type: 'DONE' } },
+      om_b: { phase: 'completed', reaction: { type: 'DONE' } },
+    });
   });
 
   it('silentTurnReactions clears pending received reactions without adding DONE', async () => {
@@ -985,30 +1879,33 @@ describe('two-phase turn reactions', () => {
   it('does not register an in-flight ✋ that a concurrent idle could DONE prematurely', async () => {
     registerWith(true);
     const ds = makeDs();
-    // addReaction for B hangs until released — simulating a slow Lark round-trip
+    // addReactionOnce for B hangs until released — simulating a slow Lark round-trip
     // while a previous turn finishes.
-    let releaseB!: (v: string) => void;
-    const bPending = new Promise<string>((r) => { releaseB = r; });
-    mocks.addReaction.mockReturnValueOnce(bPending as any);
+    let releaseB!: (value: { status: 'created'; id: string }) => void;
+    const bPending = new Promise<{ status: 'created'; id: string }>((resolve) => { releaseB = resolve; });
+    mocks.addReactionOnce.mockReturnValueOnce(bPending);
 
     const notePromise = noteTurnReceived(ds, 'om_b'); // in flight, not yet awaited
 
-    // A previous turn's idle fires while addReaction(om_b) is still pending.
+    // A previous turn's legacy idle fires while CREATE(om_b) is still pending.
     await finishTurnReactions(ds);
-    // om_b is NOT registered yet → no premature DONE, list stays empty.
-    expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_b', 'DONE');
-    expect(ds.pendingAckReactions ?? []).toEqual([]);
+    expect(mocks.addReactionOnce).not.toHaveBeenCalledWith(APP, 'om_b', 'DONE');
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_b)
+      .toMatchObject({
+        phase: 'processing',
+        reactionReconcilePending: true,
+        reactionOperation: { phase: 'add_pending', desiredType: 'GoGoGo' },
+      });
 
-    // addReaction resolves → only now does om_b register.
-    releaseB('rid_om_b');
+    releaseB({ status: 'created', id: 'rid_om_b' });
     await notePromise;
-    expect(ds.pendingAckReactions?.map((a) => a.messageId)).toEqual(['om_b']);
+    providerOwn.set('om_b', [{ id: 'rid_om_b', type: 'GoGoGo' }]);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_b)
+      .toMatchObject({ reaction: { id: 'rid_om_b', type: 'GoGoGo' } });
 
-    // om_b's own idle now flips it to ✅ exactly once.
-    await finishTurnReactions(ds);
-    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_b', 'rid_om_b');
-    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_b', 'DONE');
-    expect(ds.pendingAckReactions).toEqual([]);
+    await turnFeedbackReconciler.terminal(ds, 'om_b', 'completed');
+    expect(mocks.removeReactionDetailed).toHaveBeenCalledWith(APP, 'om_b', 'rid_om_b');
+    expect(mocks.addReactionOnce).toHaveBeenCalledWith(APP, 'om_b', 'DONE');
   });
 
   it('finishTurnReactions with no pending acks is a no-op', async () => {
@@ -1023,11 +1920,12 @@ describe('two-phase turn reactions', () => {
     const ds = makeDs();
 
     await noteTurnReceived(ds, 'om_a');
-    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'OK');
+    expect(mocks.addReactionOnce).toHaveBeenCalledWith(APP, 'om_a', 'OK');
 
-    mocks.addReaction.mockClear();
-    await finishTurnReactions(ds);
-    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'Thumbsup');
+    await turnFeedbackReconciler.terminal(ds, 'om_a', 'completed');
+    expect(mocks.addReactionOnce).toHaveBeenCalledWith(APP, 'om_a', 'Thumbsup');
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a)
+      .toMatchObject({ phase: 'completed', reaction: { type: 'Thumbsup' } });
   });
 
   it('received == done emoji: turn-end keeps the marker unchanged (Pi premature-idle guard)', async () => {
@@ -1037,13 +1935,13 @@ describe('two-phase turn reactions', () => {
     const ds = makeDs();
 
     await noteTurnReceived(ds, 'om_a');
-    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'GoGoGo');
+    expect(mocks.addReactionOnce).toHaveBeenCalledWith(APP, 'om_a', 'GoGoGo');
 
-    mocks.addReaction.mockClear();
-    await finishTurnReactions(ds);
-    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
-    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'GoGoGo');
-    expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_a', 'DONE');
+    await turnFeedbackReconciler.terminal(ds, 'om_a', 'completed');
+    expect(mocks.removeReactionDetailed).not.toHaveBeenCalled();
+    expect(mocks.addReactionOnce).toHaveBeenCalledTimes(1);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a)
+      .toMatchObject({ phase: 'completed', reaction: { type: 'GoGoGo' } });
   });
 });
 

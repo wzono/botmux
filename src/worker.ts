@@ -190,6 +190,14 @@ import { TurnTerminalDeduper } from './services/turn-terminal-deduper.js';
 import { drainClaudeStopFailureOutbox, handleClaudeStopFailureReport } from './services/claude-stop-failure.js';
 import { TurnExecutionClock } from './services/turn-execution-clock.js';
 import {
+  createTurnFeedbackTerminalDelivery,
+  createTurnFeedbackSuspendWriteFence,
+  readTurnFeedbackTerminalSuspendReady,
+  removeTurnFeedbackTerminalSuspendReady,
+  type TurnFeedbackTerminalRecord,
+  writeTurnFeedbackTerminalSuspendReady,
+} from './services/turn-feedback-terminal-outbox.js';
+import {
   appendBridgeTurnJournalEntry,
   BridgeRestoreGate,
   clearBridgeTurnJournal,
@@ -2901,6 +2909,16 @@ function ensureZellijAttachConfig(): string {
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
+const terminalDeliveryDataDir = process.env.SESSION_DATA_DIR ?? '/tmp';
+const terminalDelivery = createTurnFeedbackTerminalDelivery({
+  dataDir: terminalDeliveryDataDir,
+  send: message => send(message),
+  ipcLive: () => process.connected === true && process.send !== undefined,
+  now: () => Date.now(),
+  onConflict: record => log(
+    `Terminal persistence conflict preserved request=${record.terminalRequestId} turn=${record.turnId.slice(0, 12)}`,
+  ),
+});
 let traexAutoModelController: TraexAutoModelController | null = null;
 let traexAutoModelSwitching = false;
 let traexAutoModelTurnReplayForbidden = false;
@@ -26110,6 +26128,15 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         ws.close(4003, 'authorization expired');
         return;
       }
+      if (hasWrite && terminalProductionState === 'quiesced'
+        && suspendPrepareRequestId
+        && !suspendReadyMarkerExists(suspendPrepareRequestId)) {
+        reopenTerminalProduction();
+      }
+      if (hasWrite && terminalProductionState === 'quiesced') {
+        ws.close(1013, 'session suspending');
+        return;
+      }
       wsClients.add(ws);
       const allowReadOnlyRemoteScroll = canHandleReadOnlyRemoteScroll();
       if (hasWrite) authedClients.add(ws);
@@ -26250,15 +26277,19 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               // a mouse-aware TUI may bind any of them to approvals/actions.
               // A view capability therefore forwards no input bytes at all.
               if (!authedClients.has(ws)) return;
-              if (codexCliEffortOperation) {
-                const target = backend;
-                const lifetime = cliLifetimeNonce;
-                await cancelCodexCliEffort();
-                if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws)) return;
-              }
-              auditTerminalInput(auditUser, msg.data);
-              if (cp) cp.write(msg.data);
-              else pendingInput.push(msg.data);
+              const disposition = await suspendWebTerminalWrites.submitAsync(async () => {
+                if (codexCliEffortOperation) {
+                  const target = backend;
+                  const lifetime = cliLifetimeNonce;
+                  await cancelCodexCliEffort();
+                  if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws)) return;
+                }
+                auditTerminalInput(auditUser, msg.data);
+                noteWebTerminalWrite();
+                if (cp) cp.write(msg.data);
+                else pendingInput.push(msg.data);
+              });
+              if (disposition === 'rejected') ws.close(1013, 'session suspending');
             }
           } catch { /* ignore non-JSON or bad messages */ }
         });
@@ -26332,15 +26363,19 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               else cp.resize(msg.cols, msg.rows);
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
               if (!authedClients.has(ws)) return;
-              if (codexCliEffortOperation) {
-                const target = backend;
-                const lifetime = cliLifetimeNonce;
-                await cancelCodexCliEffort();
-                if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws)) return;
-              }
-              auditTerminalInput(auditUser, msg.data);
-              if (cp) cp.write(msg.data);
-              else pendingInput.push(msg.data);
+              const disposition = await suspendWebTerminalWrites.submitAsync(async () => {
+                if (codexCliEffortOperation) {
+                  const target = backend;
+                  const lifetime = cliLifetimeNonce;
+                  await cancelCodexCliEffort();
+                  if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws)) return;
+                }
+                auditTerminalInput(auditUser, msg.data);
+                noteWebTerminalWrite();
+                if (cp) cp.write(msg.data);
+                else pendingInput.push(msg.data);
+              });
+              if (disposition === 'rejected') ws.close(1013, 'session suspending');
             }
           } catch { /* ignore non-JSON or bad messages */ }
         });
@@ -26440,27 +26475,33 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               // Mouse protocols can encode approvals/actions as well as wheel input.
               // A read-only view capability must never forward bytes to the backend.
               if (!authedClients.has(ws)) return;
-              if (codexCliEffortOperation) {
-                const target = backend;
-                const lifetime = cliLifetimeNonce;
-                await cancelCodexCliEffort();
-                if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws)) return;
-              }
-              auditTerminalInput(auditUser, msg.data);
-              lastWebTerminalInputAtMs = Date.now();
-              webTerminalInputGeneration++;
-              if (usesHerdrSnapshotWebHistory()) {
-                if (msg.data.includes('\x1b[<64;')) herdrWebScrollDirection = 'up';
-                else if (msg.data.includes('\x1b[<65;')) herdrWebScrollDirection = 'down';
-              }
-              backend?.write(msg.data);
+              const disposition = await suspendWebTerminalWrites.submitAsync(async () => {
+                if (codexCliEffortOperation) {
+                  const target = backend;
+                  const lifetime = cliLifetimeNonce;
+                  await cancelCodexCliEffort();
+                  if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws)) return;
+                }
+                auditTerminalInput(auditUser, msg.data);
+                noteWebTerminalWrite();
+                if (usesHerdrSnapshotWebHistory()) {
+                  if (msg.data.includes('\x1b[<64;')) herdrWebScrollDirection = 'up';
+                  else if (msg.data.includes('\x1b[<65;')) herdrWebScrollDirection = 'down';
+                }
+                backend?.write(msg.data);
+              });
+              if (disposition === 'rejected') ws.close(1013, 'session suspending');
             } else if (msg.type === 'scroll' && typeof msg.data === 'string') {
               if (!allowReadOnlyRemoteScroll || authedClients.has(ws)) return;
               const parsed = parseReadOnlyRemoteScrollPayload(msg.data);
               if (!parsed) return;
               if (!readOnlyRemoteScrollLimiter.tryConsume(parsed.eventCount)) return;
-              if (usesHerdrSnapshotWebHistory()) herdrWebScrollDirection = parsed.direction;
-              backend?.write(msg.data);
+              const disposition = suspendWebTerminalWrites.submit(() => {
+                noteWebTerminalWrite();
+                if (usesHerdrSnapshotWebHistory()) herdrWebScrollDirection = parsed.direction;
+                backend?.write(msg.data);
+              });
+              if (disposition === 'rejected') ws.close(1013, 'session suspending');
             } else if (msg.type === 'mobile_input_mode' && (msg.mode === 'buffer' || msg.mode === 'live')) {
               if (!authedClients.has(ws)) return;
               setWebTerminalInputMode(msg.mode, sessionId);
@@ -28189,6 +28230,44 @@ if(isTouch&&hasToken){(function(){
 
 type TurnTerminalStatus = Extract<WorkerToDaemon, { type: 'turn_terminal' }>['status'];
 const emittedTurnTerminals = new TurnTerminalDeduper();
+const pendingTurnTerminalRequests = new Map<string, string>();
+const terminalRequestLogicalKeys = new Map<string, string>();
+let suspendPrepareRequestId: string | undefined;
+let terminalProductionState: 'active' | 'preparing' | 'quiesced' = 'active';
+const suspendDeferredMessages: unknown[] = [];
+const suspendWebTerminalWrites = createTurnFeedbackSuspendWriteFence(error => {
+  log(`Deferred Web Terminal write failed after suspend abort: ${error instanceof Error ? error.message : String(error)}`);
+});
+const hasWritableWebTerminal = (): boolean =>
+  [...wsClients].some(client => authedClients.has(client));
+const noteWebTerminalWrite = (): void => {
+  lastWebTerminalInputAtMs = Date.now();
+  webTerminalInputGeneration += 1;
+};
+
+function suspendReadyMarkerExists(requestId: string): boolean {
+  if (!lastInitConfig) return false;
+  try {
+    return readTurnFeedbackTerminalSuspendReady(terminalDeliveryDataDir, {
+      version: 1, ownerAppId: lastInitConfig.larkAppId, sessionId,
+      workerGeneration: lastInitConfig.workerGeneration, requestId,
+    });
+  } catch { return false; }
+}
+
+function reopenTerminalProduction(): void {
+  suspendPrepareRequestId = undefined;
+  terminalProductionState = 'active';
+  suspendWebTerminalWrites.resume();
+  const deferred = suspendDeferredMessages.splice(0);
+  for (const message of deferred) {
+    setImmediate(() => {
+      (process.emit as unknown as (event: 'message', message: unknown) => boolean)(
+        'message', message,
+      );
+    });
+  }
+}
 /** When a failed/ambiguous terminal or failure notice last went out: lets a
  *  Claude StopFailure report tell whether anything surfaced its failure. */
 let lastTurnFailureSurfacedAtMs: number | undefined;
@@ -28220,35 +28299,41 @@ function emitTurnTerminal(
   completedAtMs?: number,
 ): void {
   if (!sessionId || !turnId) return;
-  cancelSubmitFailureChainForTerminal(
-    submitFailureChains,
-    { turnId, dispatchAttempt },
-    cliSpawnGeneration,
-  );
-  if (!emittedTurnTerminals.claim(sessionId, turnId, dispatchAttempt, status)) {
+  if (terminalProductionState === 'quiesced') {
+    if (suspendPrepareRequestId && !suspendReadyMarkerExists(suspendPrepareRequestId)) {
+      reopenTerminalProduction();
+    } else {
+    log(`Ignored terminal after suspend quiescence turn=${turnId.slice(0, 12)}`);
+    return;
+    }
+  }
+  const logicalKey = `${sessionId}:${turnId}:${dispatchAttempt ?? 'generic'}`;
+  if (pendingTurnTerminalRequests.has(logicalKey)) {
+    terminalDelivery.flush();
+    return;
+  }
+  if (emittedTurnTerminals.statusOf(sessionId, turnId, dispatchAttempt) !== undefined) {
     // A duplicate terminal must not leave the start armed: the first emission
     // already published this turn's timing and consumed the entry, but a
     // *replay* whose first emission never ran through this path could.
     turnExecutionClock.forget(turnId, dispatchAttempt);
     return;
   }
-  if (status !== 'completed') lastTurnFailureSurfacedAtMs = Date.now();
-  traexAutoModelController?.endTurn(turnId);
-  const timing = turnExecutionClock.settle(turnId, dispatchAttempt, completedAtMs);
-  if (status !== 'completed') {
-    const dropped = codexBridgeQueue.dropPendingTurn(turnId, dispatchAttempt, true);
-    if (dropped) {
-      log(`Structured bridge retired terminal attempt turn=${turnId.slice(0, 12)} attempt=${dispatchAttempt ?? '-'} status=${status}`);
-    }
-  }
-  // Revoke before publishing terminal. A stale terminal from a superseded
-  // same-principal steer must not clear the newer turn's authority.
-  releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt });
-  if (thinkingTurn?.turnId === turnId && thinkingTurn.dispatchAttempt === dispatchAttempt) {
-    flushThinkingUpdate();
-  }
-  send({
+  const terminalRequestId = randomUUID();
+  const timing = turnExecutionClock.peek(turnId, dispatchAttempt, completedAtMs);
+  const record: TurnFeedbackTerminalRecord = {
+    version: 1, terminalRequestId,
+    ownerAppId: lastInitConfig?.larkAppId ?? process.env.LARK_APP_ID ?? '',
+    sessionId, turnId,
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    workerGeneration: lastInitConfig?.workerGeneration ?? 0, status,
+    ...(timing ? { completedAtMs: timing.completedAtMs } : {}),
+    ...(timing?.durationMs !== undefined ? { durationMs: timing.durationMs } : {}),
+    savedAtMs: Date.now(),
+  };
+  const payload: Extract<WorkerToDaemon, { type: 'turn_terminal' }> = {
     type: 'turn_terminal',
+    terminalRequestId,
     sessionId,
     turnId,
     status,
@@ -28258,20 +28343,40 @@ function emitTurnTerminal(
     ...(retryable !== undefined ? { retryable } : {}),
     ...(timing ? { completedAtMs: timing.completedAtMs } : {}),
     ...(timing?.durationMs !== undefined ? { durationMs: timing.durationMs } : {}),
-  });
-  let wakePending = false;
-  if (terminalReleasesDurableTurn(
-    { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },
-    { turnId, dispatchAttempt },
-  )) {
+  };
+  pendingTurnTerminalRequests.set(logicalKey, terminalRequestId);
+  terminalRequestLogicalKeys.set(terminalRequestId, logicalKey);
+  terminalDelivery.publish(record, payload, () => {
+    if (!emittedTurnTerminals.claim(sessionId, turnId, dispatchAttempt, status)) {
+      return;
+    }
+    cancelSubmitFailureChainForTerminal(
+      submitFailureChains, { turnId, dispatchAttempt }, cliSpawnGeneration,
+    );
+    if (status !== 'completed') lastTurnFailureSurfacedAtMs = Date.now();
+    traexAutoModelController?.endTurn(turnId);
+    turnExecutionClock.forget(turnId, dispatchAttempt);
+    if (status !== 'completed') {
+      const dropped = codexBridgeQueue.dropPendingTurn(turnId, dispatchAttempt, true);
+      if (dropped) {
+        log(`Structured bridge retired terminal attempt turn=${turnId.slice(0, 12)} attempt=${dispatchAttempt ?? '-'} status=${status}`);
+      }
+    }
+    releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt });
+    if (thinkingTurn?.turnId === turnId && thinkingTurn.dispatchAttempt === dispatchAttempt) flushThinkingUpdate();
+    let wakePending = false;
+    if (terminalReleasesDurableTurn(
+      { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },
+      { turnId, dispatchAttempt },
+    )) {
     // Durable replay ownership moves back to the receiver/hub at terminal.
     // Do not let a later CLI exit carry this already-settled attempt into the
     // fresh process behind the receiver's newer dispatch attempt.
     inflightInputs.onTurnComplete();
     durableTurnInFlight = false;
-    wakePending = true;
-  }
-  if (remoteRunnerRecoveredTurnInFlight
+      wakePending = true;
+    }
+    if (remoteRunnerRecoveredTurnInFlight
     && currentBotmuxTurnId === turnId
     && currentBotmuxDispatchAttempt === dispatchAttempt) {
     // Recovered ordinary turns intentionally have no dispatch attempt, so the
@@ -28279,14 +28384,15 @@ function emitTurnTerminal(
     // fence. Exact turn identity is sufficient: a later/stale terminal cannot
     // match after capture attribution advances.
     remoteRunnerRecoveredTurnInFlight = false;
-    wakePending = true;
-  }
-  if (wakePending) {
+      wakePending = true;
+    }
+    if (wakePending) {
     // The terminal may be emitted from inside an active flush continuation
     // (for example a synchronous hard-submit failure). Wake after that
     // continuation releases the mutex so queued work cannot remain stranded.
-    queueMicrotask(() => { void flushPending(); });
-  }
+      queueMicrotask(() => { void flushPending(); });
+    }
+  });
 }
 
 function workerIpcPayload(msg: WorkerToDaemon): WorkerToDaemon {
@@ -28549,8 +28655,86 @@ function log(msg: string): void {
 
 process.on('message', async (raw: unknown) => {
   const msg = raw as DaemonToWorker;
+  if (terminalProductionState !== 'active'
+    && msg.type !== 'prepare_suspend'
+    && msg.type !== 'abort_suspend'
+    && msg.type !== 'suspend') {
+    if (terminalProductionState === 'quiesced'
+      && suspendPrepareRequestId
+      && !suspendReadyMarkerExists(suspendPrepareRequestId)) {
+      reopenTerminalProduction();
+    } else {
+      suspendDeferredMessages.push(raw);
+      return;
+    }
+  }
 
   switch (msg.type) {
+    case 'prepare_suspend': {
+      if (!lastInitConfig || effectiveBackendType === 'riff') break;
+      if (suspendPrepareRequestId && suspendPrepareRequestId !== msg.requestId) break;
+      if (projectedRuntimeScreenStatus() !== 'idle'
+        || backgroundWaitTasks > 0
+        || durableTurnInFlight
+        || pendingMessages.length > 0
+        || hasWritableWebTerminal()
+        || (lastWebTerminalInputAtMs !== undefined
+          && lastWebTerminalInputAtMs >= msg.startedAtMs)) break;
+      suspendPrepareRequestId = msg.requestId;
+      terminalProductionState = 'preparing';
+      suspendWebTerminalWrites.prepare();
+      // Let terminal observations already queued before prepare cross their
+      // durable write boundary before readiness becomes visible.
+      await new Promise<void>(resolve => setImmediate(resolve));
+      if (projectedRuntimeScreenStatus() !== 'idle'
+        || backgroundWaitTasks > 0
+        || durableTurnInFlight
+        || pendingMessages.length > 0
+        || hasWritableWebTerminal()
+        || (lastWebTerminalInputAtMs !== undefined
+          && lastWebTerminalInputAtMs >= msg.startedAtMs)
+        || suspendWebTerminalWrites.pendingCount() > 0
+        || suspendDeferredMessages.length > 0
+        || suspendPrepareRequestId !== msg.requestId
+        || terminalProductionState !== 'preparing') {
+        reopenTerminalProduction();
+        break;
+      }
+      terminalProductionState = 'quiesced';
+      suspendWebTerminalWrites.commit();
+      terminalDelivery.flush();
+      if (!terminalDelivery.allPendingPersisted()) {
+        reopenTerminalProduction();
+        break;
+      }
+      try {
+        writeTurnFeedbackTerminalSuspendReady(terminalDeliveryDataDir, {
+          version: 1, ownerAppId: lastInitConfig.larkAppId, sessionId,
+          workerGeneration: lastInitConfig.workerGeneration, requestId: msg.requestId,
+        });
+      } catch {
+        reopenTerminalProduction();
+      }
+      break;
+    }
+    case 'abort_suspend': {
+      if (suspendPrepareRequestId !== msg.requestId || !lastInitConfig) break;
+      removeTurnFeedbackTerminalSuspendReady(terminalDeliveryDataDir, {
+        version: 1, ownerAppId: lastInitConfig.larkAppId, sessionId,
+        workerGeneration: lastInitConfig.workerGeneration, requestId: msg.requestId,
+      });
+      reopenTerminalProduction();
+      break;
+    }
+    case 'turn_terminal_persisted': {
+      if (terminalDelivery.acknowledge(msg)
+        && (msg.result === 'committed' || msg.result === 'conflict')) {
+        const logicalKey = terminalRequestLogicalKeys.get(msg.terminalRequestId);
+        if (logicalKey) pendingTurnTerminalRequests.delete(logicalKey);
+        terminalRequestLogicalKeys.delete(msg.terminalRequestId);
+      }
+      break;
+    }
     case 'link_ref_register_result': {
       const pending = pendingLinkRefRegistrations.get(msg.requestId);
       if (!pending) break;
@@ -30531,6 +30715,16 @@ process.on('message', async (raw: unknown) => {
         break;
       }
       log('Suspend requested');
+      if (suspendPrepareRequestId && lastInitConfig) {
+        try {
+          removeTurnFeedbackTerminalSuspendReady(terminalDeliveryDataDir, {
+            version: 1, ownerAppId: lastInitConfig.larkAppId, sessionId,
+            workerGeneration: lastInitConfig.workerGeneration,
+            requestId: suspendPrepareRequestId,
+          });
+        } catch { /* generation retirement makes stale marker harmless */ }
+      }
+      suspendWebTerminalWrites.discard();
       stopScreenshotLoop();
       stopBridgeWatcher();
       // A parked crash diagnostic shell has backend===null, so the
@@ -30617,6 +30811,7 @@ function cleanup(): void {
  * retain the historical killCli shutdown path.
  */
 function shutdownWorkerForParentExit(reason: string): void {
+  terminalDelivery.flush();
   stopScreenshotLoop();
   if (lastInitConfig?.existingAppServerEndpoint) {
     log(`Preserving existing-App-Server remote TUI during ${reason}`);
