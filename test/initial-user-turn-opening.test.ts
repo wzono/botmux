@@ -412,6 +412,41 @@ describe('empty-started session — first real business turn must use the new-to
     expect(envelope).toContain('标点和后文放在 `**` 外');
   });
 
+  it('live resumed transcript Claude hook receives format-only guidance in its sidecar', async () => {
+    const anchor = 'om_live_resumed_transcript_hook_emphasis_root';
+    const ds = seedEmptyStarted(anchor, { hasHistory: true, pending: false, cliId: 'claude-code' });
+    ds.session.backendType = 'pty';
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      replyDelivery: 'transcript',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+      envelopeInjection: 'auto' as const,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    preflightMock.mockReturnValue(true);
+
+    await handleThreadReply(
+      makeEventData('om_live_resumed_transcript_hook_emphasis', '继续', anchor),
+      makeCtx(anchor, 'om_live_resumed_transcript_hook_emphasis'),
+    );
+
+    const followUp = liveInputs()[0]!.content;
+    expect(followUp).toBe('继续');
+    const envelope = claimPromptContext(
+      ds.session.sessionId,
+      'om_live_resumed_transcript_hook_emphasis',
+      fingerprintPromptText(followUp),
+      prefixOf(followUp),
+    );
+    expect(envelope).toContain('<botmux_formatting>');
+    expect(envelope).toContain('短进度优先纯文本');
+    expect(envelope).not.toContain('botmux send');
+    expect(envelope).not.toContain('BOTMUX_NOTHING_TO_SEND');
+  });
+
   it('live worker: opening carries sender, mentions, available bots and attachments', async () => {
     const anchor = 'om_live_meta_root';
     seedEmptyStarted(anchor);
