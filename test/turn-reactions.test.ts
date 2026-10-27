@@ -615,6 +615,86 @@ describe('two-phase turn reactions', () => {
     expect(mocks.addReaction).not.toHaveBeenCalled();
   });
 
+  it('ignores an obsolete foreign alias when its durable owner moved to a newer root', async () => {
+    registerWith(false);
+    const ds = makeDs();
+    const foreignTurnId = 'om_foreign_b';
+    ds.session.quoteTargetId = foreignTurnId;
+    ds.session.quoteTargetSenderOpenId = 'ou_b';
+    ds.session.quoteTargetSenderIsBot = false;
+    beginReplyTargetTurn(ds, 'om_b_new_root', foreignTurnId, '2026-10-27T10:00:00.000Z', {
+      senderOpenId: 'ou_b', participants: [{ openId: 'ou_b', isBot: false }], inThread: true,
+    });
+    sessionStore.updateSession(ds.session);
+
+    beginReplyTargetTurn(ds, 'om_b_old_root', foreignTurnId, '2026-10-27T09:00:00.000Z', {
+      senderOpenId: 'ou_b', participants: [{ openId: 'ou_b', isBot: false }], inThread: true,
+    });
+    const admittedTurnId = 'om_admitted_a';
+    ds.session.quoteTargetId = admittedTurnId;
+    ds.session.quoteTargetSenderOpenId = 'ou_a';
+    ds.session.quoteTargetSenderIsBot = false;
+    beginReplyTargetTurn(ds, 'om_a_root', admittedTurnId, '2026-10-27T11:00:00.000Z', {
+      senderOpenId: 'ou_a', participants: [{ openId: 'ou_a', isBot: false }], inThread: true,
+    });
+
+    await noteTurnReceived(ds, admittedTurnId);
+
+    const durable = sessionStore.getSessionFresh(ds.session.sessionId);
+    expect(durable?.turnFeedback?.[admittedTurnId]).toMatchObject({
+      requesterOpenId: 'ou_a', requesterIsBot: false,
+    });
+    expect(durable?.replyTargets?.[foreignTurnId]).toMatchObject({
+      rootMessageId: 'om_b_new_root', updatedAt: '2026-10-27T10:00:00.000Z',
+    });
+    expect(durable?.turnReplyContexts?.[foreignTurnId]?.target).toEqual({
+      mode: 'thread', rootMessageId: 'om_b_new_root',
+    });
+    expect(durable?.replyThreadAliases?.om_b_new_root).toBeDefined();
+    expect(durable?.replyThreadAliases?.om_b_old_root).toBeUndefined();
+    expect(ds.replyThreadAliases).toEqual(durable?.replyThreadAliases);
+  });
+
+  it('rejects an uncommitted foreign alias without a strictly newer durable owner route', async () => {
+    registerWith(false);
+    const ds = makeDs();
+    const foreignTurnId = 'om_foreign_uncommitted';
+    ds.session.quoteTargetId = foreignTurnId;
+    ds.session.quoteTargetSenderOpenId = 'ou_b';
+    ds.session.quoteTargetSenderIsBot = false;
+    beginReplyTargetTurn(ds, 'om_b_root', foreignTurnId, '2026-10-27T10:00:00.000Z', {
+      senderOpenId: 'ou_b', participants: [{ openId: 'ou_b', isBot: false }], inThread: true,
+    });
+    delete ds.session.replyThreadAliases?.om_b_root;
+    sessionStore.updateSession(ds.session);
+
+    const admittedTurnId = 'om_admitted_alias_guard';
+    ds.session.quoteTargetId = admittedTurnId;
+    ds.session.quoteTargetSenderOpenId = 'ou_a';
+    ds.session.quoteTargetSenderIsBot = false;
+    beginReplyTargetTurn(ds, 'om_a_guard_root', admittedTurnId, '2026-10-27T11:00:00.000Z', {
+      senderOpenId: 'ou_a', participants: [{ openId: 'ou_a', isBot: false }], inThread: true,
+    });
+    const aliases = {
+      ...(ds.session.replyThreadAliases ?? {}),
+      om_b_root: {
+        createdAt: '2026-10-27T10:00:00.000Z', lastUsedAt: '2026-10-27T10:00:00.000Z',
+      },
+    };
+    ds.session.replyThreadAliases = aliases;
+    ds.replyThreadAliases = aliases;
+    const before = structuredClone(ds.session);
+    expect(ds.session.replyThreadAliases?.om_b_root).toBeDefined();
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.replyThreadAliases?.om_b_root).toBeUndefined();
+
+    await expect(noteTurnReceived(ds, admittedTurnId))
+      .rejects.toThrow('foreign live routing conflict: replyThreadAliases');
+
+    expect(ds.session).toEqual(before);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.[admittedTurnId]).toBeUndefined();
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.replyThreadAliases?.om_b_root).toBeUndefined();
+  });
+
   it('persists a stamped meeting-origin turn before the reaction early return', async () => {
     registerWith(true);
     const ds = makeDs();

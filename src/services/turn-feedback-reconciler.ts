@@ -176,6 +176,42 @@ function persistenceEquivalent(left: unknown, right: unknown): boolean {
   return isDeepStrictEqual(normalize(left), normalize(right));
 }
 
+function turnRootIds(session: LiveRoutingSnapshot, turnId: string): Set<string> {
+  const roots = new Set<string>();
+  const replyRoot = session.replyTargets?.[turnId]?.rootMessageId;
+  if (replyRoot) roots.add(replyRoot);
+  const contextTarget = session.turnReplyContexts?.[turnId]?.target;
+  if (contextTarget && contextTarget.mode !== 'plain') roots.add(contextTarget.rootMessageId);
+  if (session.currentReplyTarget?.turnId === turnId) {
+    roots.add(session.currentReplyTarget.rootMessageId);
+  }
+  return roots;
+}
+
+function aliasOwnerTurnIds(session: LiveRoutingSnapshot, rootMessageId: string): string[] {
+  const turnIds = new Set([
+    ...Object.keys(session.replyTargets ?? {}),
+    ...Object.keys(session.turnReplyContexts ?? {}),
+  ]);
+  return [...turnIds].filter(turnId => turnRootIds(session, turnId).has(rootMessageId));
+}
+
+function obsoleteForeignAlias(
+  fresh: Session,
+  live: LiveRoutingSnapshot,
+  rootMessageId: string,
+  admittedTurnId: string,
+): boolean {
+  const owners = aliasOwnerTurnIds(live, rootMessageId)
+    .filter(turnId => turnId !== admittedTurnId);
+  return owners.length > 0 && owners.every(turnId => {
+    const liveAt = live.replyTargets?.[turnId]?.updatedAt;
+    const durableAt = fresh.replyTargets?.[turnId]?.updatedAt;
+    if (!liveAt || !durableAt || durableAt <= liveAt) return false;
+    return !turnRootIds(fresh, turnId).has(rootMessageId);
+  });
+}
+
 function assertNoForeignLiveRouting(
   fresh: Session,
   live: LiveRoutingSnapshot,
@@ -205,10 +241,14 @@ function assertNoForeignLiveRouting(
   }
   const admittedRoots = new Set(admitted.replyThreadAliases.map(alias => alias.rootMessageId));
   for (const [rootMessageId, alias] of Object.entries(live.replyThreadAliases ?? {})) {
-    if (admittedRoots.has(rootMessageId)
+    const owners = aliasOwnerTurnIds(live, rootMessageId);
+    const admittedOwnsAlias = admittedRoots.has(rootMessageId)
+      && owners.includes(admittedTurnId);
+    if (admittedOwnsAlias
       || persistenceEquivalent(fresh.replyThreadAliases?.[rootMessageId], alias)) continue;
     const durable = fresh.replyThreadAliases?.[rootMessageId];
     if (durable && durable.lastUsedAt > alias.lastUsedAt) continue;
+    if (obsoleteForeignAlias(fresh, live, rootMessageId, admittedTurnId)) continue;
     throwForeignRoutingConflict('replyThreadAliases', rootMessageId);
   }
   const liveCurrent = live.currentReplyTarget;
