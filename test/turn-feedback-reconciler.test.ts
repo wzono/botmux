@@ -101,6 +101,55 @@ describe('turn feedback admission', () => {
     expect(admitted?.receivedReactionEmoji).toBe('Get');
   });
 
+  it('never combines requester identity fields from different requester ids', () => {
+    const target = createTarget({
+      replyTargets: {
+        'turn-requester': {
+          updatedAt: '2026-10-27T08:00:00.000Z',
+          senderOpenId: 'ou_first',
+          participants: [{ openId: 'ou_first' }],
+        },
+      },
+    });
+    const { reconciler } = createHarness();
+    reconciler.admit(target, { turnId: 'turn-requester', messageId: 'om_requester' });
+
+    target.session.replyTargets!['turn-requester'] = {
+      updatedAt: '2026-10-27T08:01:00.000Z',
+      senderOpenId: 'ou_second',
+      participants: [{ openId: 'ou_second', isBot: true }],
+    };
+    reconciler.admit(target, { turnId: 'turn-requester', messageId: 'om_requester' });
+
+    const row = sessionStore.getSessionFresh(target.session.sessionId)?.turnFeedback?.['turn-requester'];
+    expect(row?.requesterOpenId).toBe('ou_first');
+    expect(row).not.toHaveProperty('requesterIsBot');
+  });
+
+  it('safely enriches unknown requester bot state only for the same requester id', () => {
+    const target = createTarget({
+      replyTargets: {
+        'turn-requester': {
+          updatedAt: '2026-10-27T08:00:00.000Z',
+          senderOpenId: 'ou_same',
+          participants: [{ openId: 'ou_same' }],
+        },
+      },
+    });
+    const { reconciler } = createHarness();
+    reconciler.admit(target, { turnId: 'turn-requester', messageId: 'om_requester' });
+
+    target.session.replyTargets!['turn-requester'] = {
+      updatedAt: '2026-10-27T08:01:00.000Z',
+      senderOpenId: 'ou_same',
+      participants: [{ openId: 'ou_same', isBot: false }],
+    };
+    reconciler.admit(target, { turnId: 'turn-requester', messageId: 'om_requester' });
+
+    expect(sessionStore.getSessionFresh(target.session.sessionId)?.turnFeedback?.['turn-requester'])
+      .toMatchObject({ requesterOpenId: 'ou_same', requesterIsBot: false });
+  });
+
   it('restore is inert for legacy missing maps and retains existing rows without pruning', () => {
     const legacy = createTarget();
     const existing = createTarget({

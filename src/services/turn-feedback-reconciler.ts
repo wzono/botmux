@@ -384,8 +384,13 @@ export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
       // Duplicate admission may complete missing immutable admission metadata,
       // but it never rewrites phase, capacity, attention, reaction, or time.
       existing.messageId ??= input.messageId;
-      existing.requesterOpenId ??= requester.requesterOpenId;
-      existing.requesterIsBot ??= requester.requesterIsBot;
+      if (existing.requesterOpenId === undefined && requester.requesterOpenId !== undefined) {
+        existing.requesterOpenId = requester.requesterOpenId;
+        existing.requesterIsBot = requester.requesterIsBot;
+      } else if (existing.requesterOpenId === requester.requesterOpenId
+        && existing.requesterIsBot === undefined) {
+        existing.requesterIsBot = requester.requesterIsBot;
+      }
       existing.receivedReactionEmoji ??= input.receivedReactionEmoji;
       existing.silent ??= input.silent;
       existing.background ??= input.background;
