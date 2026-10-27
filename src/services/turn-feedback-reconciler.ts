@@ -19,6 +19,8 @@ export interface TurnFeedbackAdmission {
   receivedReactionEmoji?: string;
   silent?: boolean;
   background?: boolean;
+  /** Daemon-derived folded roots created for this exact turn immediately before admission. */
+  ownedReplyAliasRoots?: readonly string[];
 }
 
 type CurrentReplyTarget = NonNullable<Session['currentReplyTarget']>;
@@ -31,6 +33,7 @@ interface ExactTurnRoutingSnapshot {
   docCommentTarget?: DocCommentTarget;
   currentReplyTarget?: CurrentReplyTarget;
   replyThreadAliases: Array<{ rootMessageId: string; value: ReplyThreadAlias }>;
+  ownedReplyAliasRoots: readonly string[];
   quoteTarget?: { id: string; senderOpenId?: string; senderIsBot?: boolean };
 }
 
@@ -83,7 +86,11 @@ function freezeLiveRouting(session: Session): LiveRoutingSnapshot {
   });
 }
 
-function freezeExactTurnRouting(session: LiveRoutingSnapshot, turnId: string): ExactTurnRoutingSnapshot {
+function freezeExactTurnRouting(
+  session: LiveRoutingSnapshot,
+  turnId: string,
+  ownedReplyAliasRoots: readonly string[] = [],
+): ExactTurnRoutingSnapshot {
   const replyTarget = session.replyTargets?.[turnId];
   const replyContext = session.turnReplyContexts?.[turnId];
   const docCommentTarget = session.docCommentTargets?.[turnId];
@@ -96,6 +103,9 @@ function freezeExactTurnRouting(session: LiveRoutingSnapshot, turnId: string): E
   if (replyContext && replyContext.target.mode !== 'plain') {
     rootMessageIds.add(replyContext.target.rootMessageId);
   }
+  const explicitAliasRoots = [...new Set(ownedReplyAliasRoots)]
+    .filter(rootMessageId => session.replyThreadAliases?.[rootMessageId] !== undefined);
+  for (const rootMessageId of explicitAliasRoots) rootMessageIds.add(rootMessageId);
   const replyThreadAliases = [...rootMessageIds].flatMap(rootMessageId => {
     const value = session.replyThreadAliases?.[rootMessageId];
     return value ? [{ rootMessageId, value: structuredClone(value) }] : [];
@@ -112,6 +122,7 @@ function freezeExactTurnRouting(session: LiveRoutingSnapshot, turnId: string): E
     ...(docCommentTarget ? { docCommentTarget: structuredClone(docCommentTarget) } : {}),
     ...(currentReplyTarget ? { currentReplyTarget: structuredClone(currentReplyTarget) } : {}),
     replyThreadAliases,
+    ownedReplyAliasRoots: explicitAliasRoots,
     ...(ownsQuoteTarget
       ? {
           quoteTarget: {
@@ -250,8 +261,8 @@ function assertNoForeignLiveRouting(
   const admittedRoots = new Set(admitted.replyThreadAliases.map(alias => alias.rootMessageId));
   for (const [rootMessageId, alias] of Object.entries(live.replyThreadAliases ?? {})) {
     const owners = aliasOwnerTurnIds(live, rootMessageId);
-    const admittedOwnsAlias = admittedRoots.has(rootMessageId)
-      && owners.includes(admittedTurnId);
+    const admittedOwnsAlias = admitted.ownedReplyAliasRoots.includes(rootMessageId)
+      || (admittedRoots.has(rootMessageId) && owners.includes(admittedTurnId));
     if (admittedOwnsAlias
       || persistenceEquivalent(fresh.replyThreadAliases?.[rootMessageId], alias)) continue;
     const durable = fresh.replyThreadAliases?.[rootMessageId];
@@ -348,7 +359,11 @@ function applyExactTurnRouting(
 export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
   function admit(target: TurnFeedbackTarget, input: TurnFeedbackAdmission): Session {
     const liveRouting = freezeLiveRouting(target.session);
-    const routing = freezeExactTurnRouting(liveRouting, input.turnId);
+    const routing = freezeExactTurnRouting(
+      liveRouting,
+      input.turnId,
+      input.ownedReplyAliasRoots,
+    );
     return deps.commit(target, fresh => {
       assertNoForeignLiveRouting(fresh, liveRouting, input.turnId, routing);
       applyExactTurnRouting(fresh, input.turnId, routing);

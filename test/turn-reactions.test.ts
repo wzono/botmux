@@ -740,6 +740,42 @@ describe('two-phase turn reactions', () => {
     expect(mocks.addReaction).not.toHaveBeenCalled();
   });
 
+  it('persists an explicitly owned folded-root alias for the admitted turn', async () => {
+    registerWith(false);
+    const ds = makeDs();
+    const turnId = 'om_folded_turn';
+    beginReplyTargetTurn(ds, undefined, turnId, '2026-10-27T12:05:00.000Z', {
+      senderOpenId: 'ou_folded',
+      participants: [{ openId: 'ou_folded', isBot: false }],
+      inThread: true,
+      foldedRootId: 'om_folded_root',
+    });
+    expect(ds.session.replyTargets?.[turnId]?.rootMessageId).toBeUndefined();
+    expect(ds.session.turnReplyContexts?.[turnId]?.target).toEqual({ mode: 'plain', chatId: 'oc_x' });
+    expect(ds.session.currentReplyTarget).toBeUndefined();
+    expect(ds.session.replyThreadAliases?.om_folded_root).toBeDefined();
+
+    await noteTurnReceived(
+      ds,
+      turnId,
+      undefined,
+      undefined,
+      turnId,
+      undefined,
+      ['om_folded_root'],
+    );
+
+    const durable = sessionStore.getSessionFresh(ds.session.sessionId);
+    expect(durable?.turnFeedback?.[turnId]).toMatchObject({
+      requesterOpenId: 'ou_folded', requesterIsBot: false,
+    });
+    expect(durable?.replyThreadAliases?.om_folded_root).toEqual({
+      createdAt: '2026-10-27T12:05:00.000Z',
+      lastUsedAt: '2026-10-27T12:05:00.000Z',
+    });
+    expect(ds.replyThreadAliases).toEqual(durable?.replyThreadAliases);
+  });
+
   it('ignores an obsolete foreign alias when its durable owner moved to a newer root', async () => {
     registerWith(false);
     const ds = makeDs();

@@ -4126,6 +4126,7 @@ export async function noteTurnReceived(
   _sender?: { name?: string },
   _turnId?: string,
   receivedReactionEmoji?: string,
+  ownedReplyAliasRoots?: readonly string[],
 ): Promise<void> {
   const turnId = _turnId ?? triggerMessageId;
   // Durable admission is the synchronous linearization point. It must complete
@@ -4134,7 +4135,7 @@ export async function noteTurnReceived(
   if (typeof turnFeedbackReconciler !== 'undefined') {
     const committed = turnFeedbackReconciler.admit(
       { session: ds.session, larkAppId: ds.larkAppId },
-      { turnId, messageId: triggerMessageId, receivedReactionEmoji },
+      { turnId, messageId: triggerMessageId, receivedReactionEmoji, ownedReplyAliasRoots },
     );
     syncReplyTargetState(ds, committed);
   }
@@ -25071,7 +25072,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     const availableBots = await getAvailableBots(larkAppId, chatId);
     // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
     // (5th arg) is the reply anchor so provenance holds on session-group births.
-    await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+    await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined, ctx.foldedRootId ? [ctx.foldedRootId] : undefined);
     const primaryAdmission = durablePrimaryWorkerAdmission(ctx, ds, replyAnchorId);
     forkReservedInitialSession(ds, availableBots, trustedCaller, primaryAdmission?.options);
     primaryAdmission?.markForkReturned();
@@ -25155,7 +25156,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     const availableBots = await getAvailableBots(larkAppId, chatId);
     // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
     // (5th arg) is the reply anchor so provenance holds on session-group births.
-    await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+    await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined, ctx.foldedRootId ? [ctx.foldedRootId] : undefined);
     const primaryAdmission = durablePrimaryWorkerAdmission(ctx, ds, replyAnchorId);
     forkReservedInitialSession(ds, availableBots, trustedCaller, primaryAdmission?.options);
     primaryAdmission?.markForkReturned();
@@ -27826,7 +27827,7 @@ async function handleThreadReplyAdmitted(
       if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
       ensureSessionWhiteboard(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
-      await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+      await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined, ctx.foldedRootId ? [ctx.foldedRootId] : undefined);
       const primaryAdmission = durablePrimaryWorkerAdmission(ctx, newDs, parsed.messageId);
       forkReservedInitialSession(newDs, availableBots, threadTrustedCaller, primaryAdmission?.options);
       primaryAdmission?.markForkReturned();
@@ -27892,7 +27893,7 @@ async function handleThreadReplyAdmitted(
       newDs.pendingRepo = false;
       ensureSessionWhiteboard(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
-      await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+      await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined, ctx.foldedRootId ? [ctx.foldedRootId] : undefined);
       const primaryAdmission = durablePrimaryWorkerAdmission(ctx, newDs, parsed.messageId);
       forkReservedInitialSession(newDs, availableBots, threadTrustedCaller, primaryAdmission?.options);
       primaryAdmission?.markForkReturned();
@@ -27931,7 +27932,7 @@ async function handleThreadReplyAdmitted(
     messageQueue.appendMessage(anchor, parsed);
     publishSessionMessagePreviewPatch(ds);
     if (!ctx.effortTaskReentry) markIngressAdmitted(ctx);
-    await noteTurnReceived(ds, parsed.messageId, parsed.content, sender, parsed.messageId);
+    await noteTurnReceived(ds, parsed.messageId, parsed.content, sender, parsed.messageId, undefined, ctx.foldedRootId ? [ctx.foldedRootId] : undefined);
     if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
     await stageCrossPrincipalInterruption({
       ds,
@@ -28075,7 +28076,7 @@ async function handleThreadReplyAdmitted(
         linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
         });
     if (!ctx.completionProposalContinuation) {
-      await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+      await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined, ctx.foldedRootId ? [ctx.foldedRootId] : undefined);
     }
     if (threadTrustedCaller) {
       cliInput.rerouteEnvelope = {
@@ -28311,6 +28312,7 @@ async function handleThreadReplyAdmitted(
         await getThreadSender(),
         parsed.messageId,
         substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined,
+        ctx.foldedRootId ? [ctx.foldedRootId] : undefined,
       );
     };
     // Codex App may retain an ACK journal/FIFO head after its worker dies. A
@@ -28498,7 +28500,7 @@ async function handleThreadReplyAdmitted(
       }
     }
     if (!queuedHasDurableTail && !ctx.completionProposalContinuation) {
-      await noteTurnReceived(ds, parsed.messageId, parsed.content, reforkSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+      await noteTurnReceived(ds, parsed.messageId, parsed.content, reforkSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined, ctx.foldedRootId ? [ctx.foldedRootId] : undefined);
     }
     // A dead worker must not let a newly-arrived turn jump ahead of a durable
     // principal-lane follower. Append this exact rebuilt input and wake the
