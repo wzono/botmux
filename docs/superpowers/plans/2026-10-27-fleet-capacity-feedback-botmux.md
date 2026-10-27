@@ -127,6 +127,8 @@ git commit -m "feat(feedback): 持久化逐回合反馈归属"
 ### Task 3: Crash-recoverable phase reactions
 
 **Files:**
+- Modify: `src/types.ts`
+- Modify: `src/daemon.ts`
 - Modify: `src/im/lark/client.ts`
 - Modify: `src/services/turn-feedback-reconciler.ts`
 - Modify: `src/core/worker-pool.ts`
@@ -165,7 +167,7 @@ Implement `pruneTurnFeedback` only after terminal and pending-obligation fields 
 
 ```bash
 bun run test -- test/turn-reactions.test.ts test/turn-feedback-recovery.test.ts test/turn-feedback-retention.test.ts
-git add src/im/lark/client.ts src/services/turn-feedback-reconciler.ts src/core/worker-pool.ts test/turn-reactions.test.ts test/turn-feedback-recovery.test.ts test/turn-feedback-retention.test.ts
+git add src/types.ts src/daemon.ts src/im/lark/client.ts src/services/turn-feedback-reconciler.ts src/core/worker-pool.ts test/turn-reactions.test.ts test/turn-feedback-recovery.test.ts test/turn-feedback-retention.test.ts
 git commit -m "feat(feedback): 恢复一致的回合表情"
 ```
 
