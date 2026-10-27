@@ -24,7 +24,7 @@ import {
 /** 设计 §10 的字母表：命令 / 子命令 / 透传 / 冷启动 / 未注册 / 多行豁免 / 占位符 / 中文 / latin / 引号 / 大小写。 */
 const ALPHABET = [
   '/cd', '/repo', 'wt', '/rename', '/sessions', '/card', '/cot', '/term', '/vc-auth',
-  '/context-sharing', '/effort', '/queue', '/resume',
+  '/context-sharing', '/effort', '/queue', '/resume', '/dash',
   '/compact', '/model', '/goal', '/foo', '/schedule', '/role', '/fork', '/watch-comment', 'list',
   '<pane>', '中文', 'latin', '"x y"', '/T',
 ];
@@ -88,6 +88,10 @@ function normalizeNext(d: SlashRouteDecision): unknown {
 
 /** §9 有意变化名单：返回 true 表示这组 (输入, 老决策, 新决策) 是登记过的变化。 */
 const INTENTIONAL: Array<(input: SlashRouteInput, legacy: any, next: any) => boolean> = [
+  // Native Codex /effort now drives the model menu; other CLIs still pass through.
+  (input, legacy, next) => input.cliId === 'codex'
+    && (legacy.kind === 'passthrough' || (legacy.kind === 'forward' && legacy.reason === 'unknown_slash'))
+    && next.kind === 'daemon' && next.cmd === '/effort' && next.sessionPolicy === 'existing_only',
   // /queue is an explicit existing-session daemon command, not model text.
   (input, legacy, next) => legacy.kind === 'forward'
     && (legacy.reason === 'unknown_slash' || legacy.reason === 'discussion')
@@ -104,6 +108,16 @@ const INTENTIONAL: Array<(input: SlashRouteInput, legacy: any, next: any) => boo
     input.text.trim().toLowerCase().startsWith('/context-sharing')
     && legacy.kind === 'forward' && legacy.reason === 'unknown_slash'
     && next.kind === 'daemon' && next.cmd === '/context-sharing'
+    && next.sessionPolicy === 'sessionless',
+  // /dash（=/dashboard link）是新增的内置 sessionless daemon 命令，群里免 @ 寻址；
+  // 冻结 oracle 没有该命令，视为 unknown slash 转发。单行（含参数，如 `/dash /cd`）
+  // 归此条；多段（第二行非空）两侧解析器都判 discussion，不产生差分。用 content
+  // 精确等于归一化输入来约束，避免吸收其它命令的差分。
+  (input, legacy, next) =>
+    input.text.trim().toLowerCase().split(/\s+/)[0] === '/dash'
+    && legacy.kind === 'forward' && legacy.reason === 'unknown_slash'
+    && next.kind === 'daemon' && next.cmd === '/dash'
+    && next.content === input.text.trim()
     && next.sessionPolicy === 'sessionless',
   // /resume 只在无会话时由 botmux 认领（恢复已关闭会话）；有会话时仍按未知命令转发给 CLI。
   (input, legacy, next) =>

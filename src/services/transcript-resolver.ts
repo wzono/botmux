@@ -12,7 +12,7 @@ import { config } from '../config.js';
 import { scratchViewPath, persistedScratchMappings, type ScratchPathMapping } from './scratch-host-view.js';
 import { cocoEventsPathForSession } from './coco-transcript.js';
 import { findCursorTranscriptByChatId } from './cursor-transcript.js';
-import { antigravityTranscriptPath } from './antigravity-transcript.js';
+import { resolveAntigravityTranscriptPath } from './antigravity-transcript.js';
 import { findTraexRolloutBySessionId, findTraexSessionIdByBotmuxSessionId } from './traex-transcript.js';
 import { findPiTranscriptBySessionId } from './pi-transcript.js';
 import { findGrokUpdatesBySessionId } from './grok-transcript.js';
@@ -29,7 +29,7 @@ export interface TranscriptPathQuery {
    *  (CLI-data-redirected) bots whose transcripts live under
    *  `<botmuxHome>/bots/<appId>/claude` instead of the global data dir. */
   larkAppId?: string;
-  /** Bypass a cached miss for lazily-created transcripts. */
+  /** Bypass a cached miss; for Codex also refresh a possibly rotated path. */
   fresh?: boolean;
 }
 
@@ -43,6 +43,7 @@ const SESSION_PATH_CACHE_MAX_ENTRIES = 1024;
 /** A missed lookup (transcript not on disk yet) is retried only after this
  *  window — fresh sessions otherwise trigger a directory scan per row render. */
 const PATH_MISS_RETRY_MS = 30_000;
+const CODEX_PATH_HIT_TTL_MS = 5_000;
 
 export function __resetTranscriptResolverCacheForTest(): void {
   sessionPathCache.clear();
@@ -295,14 +296,14 @@ function codexRolloutInHome(
   };
   let path = cachedTranscriptPathLookup(
     key,
-    null,
+    CODEX_PATH_HIT_TTL_MS,
     lookup,
-    { retryMiss: q.fresh },
+    { retryMiss: q.fresh, refreshHit: q.fresh },
   );
   // Positive entries were historically cached forever. Refresh immediately if
   // the file vanished or was replaced by a symlink/non-regular node.
   if (path && candidateMtime(path) === null) {
-    path = cachedTranscriptPathLookup(key, null, lookup, { refreshHit: true, retryMiss: true });
+    path = cachedTranscriptPathLookup(key, CODEX_PATH_HIT_TTL_MS, lookup, { refreshHit: true, retryMiss: true });
   }
   return candidateMtime(path) === null ? null : path;
 }
@@ -314,6 +315,8 @@ function codexRolloutInHome(
  *  offer a control that is always empty. */
 const USAGE_RESOLVABLE_CLI_IDS: ReadonlySet<string> = new Set([
   'claude-code', 'aiden', 'seed', 'relay', 'codex', 'coco', 'cursor', 'traex', 'pi', 'grok', 'antigravity', 'minimax',
+  // ZCode reports usage from its own ledger (services/zcode-usage.ts), not a transcript.
+  'zcode',
 ]);
 
 /** True when this CLI can produce native usage (has a resolvable transcript).
@@ -460,11 +463,11 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
     case 'antigravity': {
       // The conversation id is interpolated into the brain path; the helper
       // validates the charset (traversal / separators). Read it through the
-      // per-session scratch overlay like every other host-derived root, and
-      // existsSync keeps the null-when-absent contract every branch honors.
-      const pReal = antigravityTranscriptPath(q.cliSessionId);
-      const p = pReal ? v(pReal) : null;
-      return p && existsSync(p) ? { path: p, kind: 'antigravity' } : null;
+      // per-session scratch overlay like every other host-derived root; the
+      // untruncated transcript_full.jsonl wins over the compact log, and the
+      // existence check keeps the null-when-absent contract every branch honors.
+      const p = resolveAntigravityTranscriptPath(q.cliSessionId, { mapPath: v });
+      return p ? { path: p, kind: 'antigravity' } : null;
     }
     default:
       return null;

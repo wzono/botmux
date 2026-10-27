@@ -4,7 +4,7 @@ import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
 import { dispatchCallerFromReply, scheduleCreateCapabilities } from '../src/core/dispatch-user-delegation.js';
-import { pickTurnReplyTarget } from '../src/core/reply-target.js';
+import { pickTurnReplyTarget, registryTurnMayAuthenticateHuman } from '../src/core/reply-target.js';
 import { computeInputHash } from '../src/utils/canonical-input-hash.js';
 import { SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN } from '../src/global-config.js';
 import { TRIGGER_USER_AUTH_TOOLS } from '../src/services/trigger-user-auth.js';
@@ -56,7 +56,7 @@ function harness(overrides: Record<string, unknown> = {}) {
     readGlobalConfig: () => ({ scheduleDelegation: { createEnabled: true } }),
     getBot: () => ({ config: { triggerUserAuth: { enabled: true,
       tools: ['lark-cli', 'bytedcli'] } } }),
-    pickTurnReplyTarget, dispatchCallerFromReply,
+    pickTurnReplyTarget, dispatchCallerFromReply, registryTurnMayAuthenticateHuman,
     dispatchUserForTurn: async () => ({
       domain: 'botmux.dispatch-user.v2', deliveryId: 'delivery-1', messageId: turnId,
       sourceSessionId: 'source-session', sourceAppId: 'cli_source', sourceTurnId: 'om_human',
@@ -252,7 +252,71 @@ function directHumanHarness() {
   return h;
 }
 
+describe('until-done schedule creation', () => {
+  const untilDone = { deadline: '2026-11-20T00:00:00.000Z' };
+
+  it('passes until-done and notify settings from a direct human turn to addTask', async () => {
+    const h = directHumanHarness();
+    h.body.task.untilDone = untilDone;
+    h.body.task.notify = ['failing', 'expired'];
+    expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
+      untilDone, notify: ['failing', 'expired'], ownerOpenId: 'ou_user_target',
+    }));
+  });
+
+  it('passes until-done settings from the host terminal to addTask', async () => {
+    const h = harness({ sessionId: '' });
+    h.scope.findActiveBySessionId = () => undefined;
+    h.scope.isTrustedHostIpcRequest = () => true;
+    h.body.task.untilDone = { retryMinutes: 360 };
+    expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
+      untilDone: { retryMinutes: 360 },
+    }));
+  });
+
+  it.each([
+    ['untilDone', untilDone],
+    ['notify', ['failing']],
+  ] as const)('keeps %s out of a bot-delegated grant', async (field, value) => {
+    const h = harness();
+    h.body.task[field] = value;
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_delegation_scope_invalid' } });
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['untilDone', 'tomorrow'],
+    ['untilDone', { deadline: 20261120 }],
+    ['untilDone', { retryMinutes: '6h' }],
+    ['notify', 'failing'],
+    ['notify', [1]],
+  ] as const)('rejects malformed %s %j before any commit', async (field, value) => {
+    const h = directHumanHarness();
+    h.body.task[field] = value;
+    expect(await h.run()).toMatchObject({ status: 400, value: { error: 'schedule_delegation_scope_invalid' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+});
+
 describe('direct schedule creation after the active-turn hint is cleared', () => {
+  it.each(['om_current_topic', 'om_explicit_destination'])('keeps creator notifications in the current topic when executing in %s', async root => {
+    const h = directHumanHarness();
+    h.ds.scope = h.ds.session.scope = 'chat';
+    h.ds.session.rootMessageId = 'om_unrelated_first_message';
+    h.ds.session.replyTargets.om_kickoff.rootMessageId = 'om_current_topic';
+    h.ds.session.currentReplyTarget = { turnId: 'om_queued', rootMessageId: 'om_queued_topic' };
+    h.body.task.executionPosition = 'topic';
+    h.body.task.rootMessageId = root;
+    expect(await h.run()).toMatchObject({ status: 201, value: { task: {
+      rootMessageId: root, creatorRootMessageId: 'om_current_topic',
+    } } });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({
+      rootMessageId: root, creatorRootMessageId: 'om_current_topic',
+    }));
+  });
+
   it.each(['thread', 'chat'] as const)('uses the exact human sender in %s scope with delegation disabled', async scope => {
     const h = directHumanHarness();
     h.ds.scope = h.ds.session.scope = scope;
@@ -376,6 +440,49 @@ describe('direct schedule creation after the active-turn hint is cleared', () =>
       return 'on_user';
     };
     expect(await h.run()).toMatchObject({ status: 409, value: { error: 'schedule_delegation_turn_changed' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+});
+
+describe('auto-start-on-join first turn (join_ synthetic id)', () => {
+  const JOIN_TURN_ID = 'join_9f2b1caa-0000-4000-8000-000000000000';
+  function joinHarness() {
+    const h = directHumanHarness();
+    h.ds.managedTurnOrigin.turnId = h.body.originTurnId = JOIN_TURN_ID;
+    // The registry entry handleBotAdded writes at session birth: the operator
+    // who added the bot, with the mention-safe incomplete window marker.
+    h.ds.session.replyTargets = {
+      [JOIN_TURN_ID]: {
+        senderOpenId: 'ou_user_target',
+        participants: [{ openId: 'ou_user_target', isBot: false }],
+        participantsIncomplete: true,
+        updatedAt: '2026-10-19T00:00:00.000Z',
+      },
+    };
+    return h;
+  }
+
+  it('resolves the operator who added the bot as the direct human creator', async () => {
+    const h = joinHarness();
+    expect(await h.run()).toMatchObject({ status: 201, value: { task: {
+      ownerOpenId: 'ou_user_target', ownerUnionId: 'on_user',
+    } } });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledOnce();
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('still fails closed when the join turn entry carries no human sender', async () => {
+    const h = joinHarness();
+    h.ds.session.replyTargets = { [JOIN_TURN_ID]: { updatedAt: '2026-10-19T00:00:00.000Z' } };
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_delegation_disabled' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it.each(['bmx-recovery-123', 'schedule:a1b2c3d4:run'])('keeps other synthetic prefixes excluded: %s', async turnId => {
+    const h = joinHarness();
+    h.ds.session.replyTargets[turnId] = h.ds.session.replyTargets[JOIN_TURN_ID];
+    h.ds.managedTurnOrigin.turnId = h.body.originTurnId = turnId;
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_delegation_disabled' } });
     expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
   });
 });

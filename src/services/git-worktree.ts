@@ -26,6 +26,9 @@ export interface WorktreeCreation {
   /** Ref the branch was created from (e.g. `origin/master`); equals `branch`
    *  when an existing local branch was checked out instead. */
   baseRef: string;
+  /** Set when `reuseExisting` handed back a worktree that was already on disk
+   *  instead of creating one — botmux did not create that directory. */
+  reused?: true;
 }
 
 export interface CreateRepoWorktreeOptions {
@@ -151,7 +154,7 @@ async function reuseCompatibleWorktree(
     );
   }
   logger.info(`[git-worktree] reusing existing worktree ${worktreePath} on branch ${branch}`);
-  return { path: worktreePath, branch, baseRef: branch };
+  return { path: worktreePath, branch, baseRef: branch, reused: true };
 }
 
 async function addWorktreeOrReuseAfterRace(
@@ -713,6 +716,14 @@ export async function removeRepoWorktree(repo: string, worktreePath: string): Pr
   logger.info(`[git-worktree] removed worktree ${worktreePath}`);
 }
 
+/** `git worktree remove` WITHOUT `--force`: git itself still refuses a worktree
+ *  with modified or untracked files, a locked one, or one holding submodules.
+ *  Ignored content goes with the directory; the branch is always kept. */
+export async function removeCleanWorktree(repo: string, worktreePath: string): Promise<void> {
+  await git(['worktree', 'remove', worktreePath], repo, 30_000);
+  logger.info(`[git-worktree] removed clean worktree ${worktreePath}`);
+}
+
 /**
  * `git check-ref-format --branch` — the ONLY branch-name validity check in the
  * repo. `createRepoWorktree` itself never validates: an illegal name only fails
@@ -726,6 +737,89 @@ export async function isValidBranchName(name: string): Promise<boolean> {
   if (!trimmed || trimmed.startsWith('-')) return false;
   // cwd 用 tmpdir：check-ref-format 不需要仓库，而 daemon 的 cwd 可能已被删除（ENOENT）。
   return (await tryGit(['check-ref-format', '--branch', trimmed], tmpdir())) !== null;
+}
+
+/** Where a linked worktree that is gone from disk came from. */
+export interface DeletedWorktreeOrigin {
+  /** Main checkout the worktree belonged to. */
+  repo: string;
+  /** Branch it had checked out (local, or `origin/<branch>` only). */
+  branch: string;
+}
+
+/** `git worktree list --porcelain` entries as `{ path, branch }` (branch without `refs/heads/`). */
+function parseWorktreeList(listing: string): Array<{ path: string; branch?: string }> {
+  const entries: Array<{ path: string; branch?: string }> = [];
+  for (const line of listing.split('\n')) {
+    if (line.startsWith('worktree ')) entries.push({ path: line.slice('worktree '.length) });
+    else if (line.startsWith('branch refs/heads/') && entries.length > 0) {
+      entries[entries.length - 1]!.branch = line.slice('branch refs/heads/'.length);
+    }
+  }
+  return entries;
+}
+
+/**
+ * Recover the repo and branch of a deleted linked worktree from git alone —
+ * sessions store only the path. {@link createRepoWorktree} names a worktree
+ * `<repo>-<dirSuffixForBranch(branch)>` next to its main checkout, so the main
+ * checkout is a sibling whose name plus `-` prefixes the deleted one (longest
+ * prefix first). The branch is read from the worktree's registration when a
+ * plain `rm -rf` left it behind, else matched by suffix among local and
+ * `origin/*` branches; `null` when the repo is unknown or the match is not
+ * unique.
+ */
+export async function resolveDeletedWorktreeOrigin(worktreePath: string): Promise<DeletedWorktreeOrigin | null> {
+  const target = resolve(worktreePath);
+  const parent = dirname(target);
+  const base = basename(target);
+  for (let i = base.lastIndexOf('-'); i > 0; i = base.lastIndexOf('-', i - 1)) {
+    const candidate = join(parent, base.slice(0, i));
+    if (!existsSync(candidate)) continue;
+    const listing = await tryGit(['worktree', 'list', '--porcelain'], candidate, 5_000);
+    if (!listing) continue;
+    const entries = parseWorktreeList(listing);
+    // Only a main checkout owns the naming; a shorter-named linked worktree
+    // of some other branch must not claim the path.
+    if (!entries[0] || resolve(entries[0].path) !== candidate) continue;
+    const registered = entries.find(entry => resolve(entry.path) === target);
+    if (registered?.branch) return { repo: candidate, branch: registered.branch };
+    const suffix = base.slice(i + 1);
+    const refs = await tryGit(
+      ['for-each-ref', '--format=%(refname)', 'refs/heads', 'refs/remotes/origin'],
+      candidate,
+      5_000,
+    );
+    const branches = new Set<string>();
+    for (const ref of refs?.split('\n') ?? []) {
+      const name = ref.startsWith('refs/heads/')
+        ? ref.slice('refs/heads/'.length)
+        : ref.startsWith('refs/remotes/origin/') ? ref.slice('refs/remotes/origin/'.length) : '';
+      if (name && name !== 'HEAD' && dirSuffixForBranch(name) === suffix) branches.add(name);
+    }
+    return branches.size === 1 ? { repo: candidate, branch: [...branches][0]! } : null;
+  }
+  return null;
+}
+
+/**
+ * Re-create a deleted linked worktree at its original path on its original
+ * branch. Committed work comes back; whatever was uncommitted is gone with the
+ * directory. A plain `rm -rf` leaves the worktree registered and `worktree add`
+ * refuses a registered path, so that one registration is removed first
+ * (`prune` would sweep every stale worktree of the repo).
+ */
+export async function restoreDeletedWorktree(
+  origin: DeletedWorktreeOrigin,
+  worktreePath: string,
+): Promise<WorktreeCreation> {
+  const target = resolve(worktreePath);
+  if (existsSync(target)) throw new Error(`worktree target already exists: ${target}`);
+  const listing = await git(['worktree', 'list', '--porcelain'], origin.repo);
+  if (parseWorktreeList(listing).some(entry => resolve(entry.path) === target)) {
+    await git(['worktree', 'remove', '--force', target], origin.repo, 30_000);
+  }
+  return createRepoWorktree(origin.repo, { branch: origin.branch, worktreePath: target });
 }
 
 /**
