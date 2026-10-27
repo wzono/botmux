@@ -471,6 +471,57 @@ describe('two-phase turn reactions', () => {
     });
   });
 
+  it('selects newer durable routing and requester over stale live state for the same turn', async () => {
+    registerWith(true);
+    const ds = makeDs();
+    const turnId = 'om_same_turn';
+
+    ds.session.quoteTargetId = turnId;
+    ds.session.quoteTargetSenderOpenId = 'ou_new';
+    ds.session.quoteTargetSenderIsBot = true;
+    beginReplyTargetTurn(ds, 'om_new_root', turnId, '2026-10-27T10:00:00.000Z', {
+      senderOpenId: 'ou_new',
+      participants: [{ openId: 'ou_new', isBot: true }],
+      inThread: true,
+    });
+    const durableWinner = {
+      replyTarget: structuredClone(ds.session.replyTargets?.[turnId]),
+      replyContext: structuredClone(ds.session.turnReplyContexts?.[turnId]),
+      current: structuredClone(ds.session.currentReplyTarget),
+    };
+    sessionStore.updateSession(ds.session);
+
+    ds.session.quoteTargetId = turnId;
+    ds.session.quoteTargetSenderOpenId = 'ou_old';
+    ds.session.quoteTargetSenderIsBot = false;
+    beginReplyTargetTurn(ds, 'om_old_root', turnId, '2026-10-27T09:00:00.000Z', {
+      senderOpenId: 'ou_old',
+      participants: [{ openId: 'ou_old', isBot: false }],
+      inThread: true,
+    });
+
+    await noteTurnReceived(ds, turnId, undefined, undefined, turnId);
+    await noteTurnReceived(ds, turnId, undefined, undefined, turnId);
+
+    const durable = sessionStore.getSessionFresh(ds.session.sessionId);
+    expect(durable?.replyTargets?.[turnId]).toEqual(durableWinner.replyTarget);
+    expect(durable?.turnReplyContexts?.[turnId]).toEqual(durableWinner.replyContext);
+    expect(durable?.currentReplyTarget).toEqual(durableWinner.current);
+    expect(durable).toMatchObject({
+      quoteTargetId: turnId,
+      quoteTargetSenderOpenId: 'ou_new',
+      quoteTargetSenderIsBot: true,
+    });
+    expect(durable?.turnFeedback?.[turnId]).toMatchObject({
+      turnId,
+      messageId: turnId,
+      requesterOpenId: 'ou_new',
+      requesterIsBot: true,
+    });
+    expect(mocks.addReaction).toHaveBeenCalledTimes(1);
+    expect(ds.pendingAckReactions?.map(item => item.messageId)).toEqual([turnId]);
+  });
+
   it('persists a stamped meeting-origin turn before the reaction early return', async () => {
     registerWith(true);
     const ds = makeDs();

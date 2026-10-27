@@ -128,10 +128,14 @@ function applyExactTurnRouting(
 ): void {
   const durableQuoteOwnerAt = quoteOwnerUpdatedAt(fresh);
   const incomingAt = snapshot.currentReplyTarget?.updatedAt ?? snapshot.replyTarget?.updatedAt;
+  const durableTurnAt = fresh.replyTargets?.[turnId]?.updatedAt
+    ?? (fresh.currentReplyTarget?.turnId === turnId ? fresh.currentReplyTarget.updatedAt : undefined);
+  const liveWinsExactTurn = incomingAt !== undefined
+    && (durableTurnAt === undefined || durableTurnAt < incomingAt);
   if (snapshot.replyTarget) {
     const replyTargets = fresh.replyTargets ??= {};
     const existing = replyTargets[turnId];
-    if (!existing || existing.updatedAt <= snapshot.replyTarget.updatedAt) {
+    if (!existing || existing.updatedAt < snapshot.replyTarget.updatedAt) {
       replyTargets[turnId] = snapshot.replyTarget;
       fresh.replyTargetsPrunedThrough = pruneReplyTargets(
         replyTargets,
@@ -142,7 +146,7 @@ function applyExactTurnRouting(
   }
   if (snapshot.replyContext) {
     const contexts = fresh.turnReplyContexts ??= {};
-    if (!contexts[turnId]) {
+    if (!contexts[turnId] || liveWinsExactTurn) {
       contexts[turnId] = snapshot.replyContext;
       const overflow = Object.keys(contexts).length - 256;
       if (overflow > 0) {
@@ -150,26 +154,29 @@ function applyExactTurnRouting(
       }
     }
   }
-  if (snapshot.docCommentTarget) {
+  if (snapshot.docCommentTarget
+    && (fresh.docCommentTargets?.[turnId] === undefined || liveWinsExactTurn)) {
     const targets = fresh.docCommentTargets ??= {};
-    targets[turnId] ??= snapshot.docCommentTarget;
+    targets[turnId] = snapshot.docCommentTarget;
   }
-  for (const alias of snapshot.replyThreadAliases) {
-    const aliases = fresh.replyThreadAliases ??= {};
-    aliases[alias.rootMessageId] = mergeReplyThreadAlias(aliases[alias.rootMessageId], alias.value);
+  if (durableTurnAt === undefined || liveWinsExactTurn) {
+    for (const alias of snapshot.replyThreadAliases) {
+      const aliases = fresh.replyThreadAliases ??= {};
+      aliases[alias.rootMessageId] = mergeReplyThreadAlias(aliases[alias.rootMessageId], alias.value);
+    }
   }
-  if (snapshot.currentReplyTarget
+  if (liveWinsExactTurn
+    && snapshot.currentReplyTarget
     && (!fresh.currentReplyTarget
-      || fresh.currentReplyTarget.turnId === turnId
-      || fresh.currentReplyTarget.updatedAt <= snapshot.currentReplyTarget.updatedAt)) {
+      || fresh.currentReplyTarget.updatedAt < snapshot.currentReplyTarget.updatedAt)) {
     fresh.currentReplyTarget = snapshot.currentReplyTarget;
   }
-  if (snapshot.quoteTarget
+  if (liveWinsExactTurn
+    && snapshot.quoteTarget
     && (fresh.quoteTargetId === undefined
-      || fresh.quoteTargetId === snapshot.quoteTarget.id
       || (incomingAt !== undefined
         && durableQuoteOwnerAt !== undefined
-        && durableQuoteOwnerAt <= incomingAt))) {
+        && durableQuoteOwnerAt < incomingAt))) {
     fresh.quoteTargetId = snapshot.quoteTarget.id;
     fresh.quoteTargetSenderOpenId = snapshot.quoteTarget.senderOpenId;
     fresh.quoteTargetSenderIsBot = snapshot.quoteTarget.senderIsBot;
@@ -179,9 +186,9 @@ function applyExactTurnRouting(
 export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
   function admit(target: TurnFeedbackTarget, input: TurnFeedbackAdmission): void {
     const routing = freezeExactTurnRouting(target.session, input.turnId);
-    const requester = requesterSnapshot(routing.replyTarget);
     deps.commit(target, fresh => {
       applyExactTurnRouting(fresh, input.turnId, routing);
+      const requester = requesterSnapshot(fresh.replyTargets?.[input.turnId]);
       const records = fresh.turnFeedback ??= {};
       const existing = records[input.turnId];
       if (!existing) {
