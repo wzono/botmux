@@ -15330,6 +15330,12 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   const useJson = rest.includes('--json') || questionsFile !== undefined;
   const multiSelect = rest.includes('--multi');
   const positionalArgs = positionals(rest, ['--json', '--multi']);
+  if (!sub && positionalArgs[0] === 'buttons') {
+    console.error(
+      'botmux ask: `buttons` 必须紧跟 `ask`。请使用 `botmux ask buttons --options ... \"问题\"`',
+    );
+    process.exit(2);
+  }
 
   let options;
   let questions;
@@ -15356,7 +15362,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     throw err;
   }
 
-  const prompt = positionalArgs.join(' ').trim();
+  const prompt = normalizePositionalSendContent(positionalArgs.join(' ')).trim();
   if (!questions && !prompt) {
     console.error(
       'botmux ask: 缺少 prompt。用法: botmux ask buttons --options "yes,no" "继续发版吗？"',
