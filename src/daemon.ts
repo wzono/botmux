@@ -4107,7 +4107,15 @@ const turnFeedbackReconciler = createTurnFeedbackReconciler({
       [target.session.sessionId],
       fresh => mutate(fresh.get(target.session.sessionId)!),
     );
-    target.session.turnFeedback = rows.get(target.session.sessionId)!.turnFeedback;
+    const committed = rows.get(target.session.sessionId)!;
+    if (committed !== target.session) {
+      for (const key of Object.keys(target.session)) {
+        delete (target.session as unknown as Record<string, unknown>)[key];
+      }
+      Object.assign(target.session, structuredClone(committed));
+      return target.session;
+    }
+    return committed;
   },
 });
 
@@ -4120,6 +4128,16 @@ export async function noteTurnReceived(
   receivedReactionEmoji?: string,
 ): Promise<void> {
   const turnId = _turnId ?? triggerMessageId;
+  // Durable admission is the synchronous linearization point. It must complete
+  // before identity publication or any other await lets a second live-only turn
+  // stage routing beside this one.
+  if (typeof turnFeedbackReconciler !== 'undefined') {
+    const committed = turnFeedbackReconciler.admit(
+      { session: ds.session, larkAppId: ds.larkAppId },
+      { turnId, messageId: triggerMessageId, receivedReactionEmoji },
+    );
+    syncReplyTargetState(ds, committed);
+  }
   if (getBot(ds.larkAppId).config.showReplyTiming === true) {
     const received = ds.turnReceivedAtMs ??= new Map();
     if (!received.has(turnId)) received.set(turnId, Date.now());
@@ -4140,15 +4158,6 @@ export async function noteTurnReceived(
   // happens once a bot has actually opted in.
   if (triggerUserAuthEnabledFor(ds)) {
     await refreshTurnCliIdentity(ds, turnId);
-  }
-  // The identity unit test still executes this function body in isolation via
-  // the repository's transitional function harness. The real daemon module
-  // always has this binding; only that source-extraction harness does not.
-  if (typeof turnFeedbackReconciler !== 'undefined') {
-    turnFeedbackReconciler.admit(
-      { session: ds.session, larkAppId: ds.larkAppId },
-      { turnId, messageId: triggerMessageId, receivedReactionEmoji },
-    );
   }
   // Replaces the old 「处理中」 placeholder card. That card existed only to be
   // PATCHed with the final answer, and `im.v1.message.patch` is silent (no Feishu

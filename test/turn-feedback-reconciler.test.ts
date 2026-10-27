@@ -22,7 +22,7 @@ function createHarness() {
       [target.session.sessionId],
       fresh => mutate(fresh.get(target.session.sessionId)!),
     );
-    target.session.turnFeedback = rows.get(target.session.sessionId)!.turnFeedback;
+    return rows.get(target.session.sessionId)!;
   });
   return { commit, reconciler: createTurnFeedbackReconciler({ commit, now: () => NOW }) };
 }
@@ -49,9 +49,10 @@ describe('turn feedback admission', () => {
     });
     const { reconciler } = createHarness();
 
-    reconciler.admit(target, { turnId: 'turn-1', messageId: 'comment_123' });
+    const committed = reconciler.admit(target, { turnId: 'turn-1', messageId: 'comment_123' });
 
     const row = sessionStore.getSessionFresh(target.session.sessionId)?.turnFeedback?.['turn-1'];
+    expect(committed).toBe(target.session);
     expect(row).toMatchObject({
       version: 1,
       turnId: 'turn-1',

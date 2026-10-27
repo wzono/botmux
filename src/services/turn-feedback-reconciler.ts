@@ -1,5 +1,6 @@
 import type { FrozenSessionReplyContext, ReplyTargetEntry, Session } from '../types.js';
 import { cronPinnedTurnIds, pruneReplyTargets } from '../core/reply-target.js';
+import { isDeepStrictEqual } from 'node:util';
 
 export interface TurnFeedbackTarget {
   session: Session;
@@ -8,7 +9,7 @@ export interface TurnFeedbackTarget {
 
 export interface TurnFeedbackDeps {
   /** Mutate and commit the fresh owned Session row before publishing it in memory. */
-  commit(target: TurnFeedbackTarget, mutate: (fresh: Session) => void): void;
+  commit(target: TurnFeedbackTarget, mutate: (fresh: Session) => void): Session;
   now(): number;
 }
 
@@ -33,6 +34,22 @@ interface ExactTurnRoutingSnapshot {
   quoteTarget?: { id: string; senderOpenId?: string; senderIsBot?: boolean };
 }
 
+type ReplyTargets = NonNullable<Session['replyTargets']>;
+type TurnReplyContexts = NonNullable<Session['turnReplyContexts']>;
+type DocCommentTargets = NonNullable<Session['docCommentTargets']>;
+type ReplyThreadAliases = NonNullable<Session['replyThreadAliases']>;
+
+interface LiveRoutingSnapshot {
+  replyTargets?: ReplyTargets;
+  turnReplyContexts?: TurnReplyContexts;
+  docCommentTargets?: DocCommentTargets;
+  currentReplyTarget?: CurrentReplyTarget;
+  replyThreadAliases?: ReplyThreadAliases;
+  quoteTargetId?: string;
+  quoteTargetSenderOpenId?: string;
+  quoteTargetSenderIsBot?: boolean;
+}
+
 function requesterSnapshot(replyTarget: ReplyTargetEntry | undefined): {
   requesterOpenId?: string;
   requesterIsBot?: boolean;
@@ -49,7 +66,24 @@ function requesterSnapshot(replyTarget: ReplyTargetEntry | undefined): {
   };
 }
 
-function freezeExactTurnRouting(session: Session, turnId: string): ExactTurnRoutingSnapshot {
+function freezeLiveRouting(session: Session): LiveRoutingSnapshot {
+  return structuredClone({
+    ...(session.replyTargets ? { replyTargets: session.replyTargets } : {}),
+    ...(session.turnReplyContexts ? { turnReplyContexts: session.turnReplyContexts } : {}),
+    ...(session.docCommentTargets ? { docCommentTargets: session.docCommentTargets } : {}),
+    ...(session.currentReplyTarget ? { currentReplyTarget: session.currentReplyTarget } : {}),
+    ...(session.replyThreadAliases ? { replyThreadAliases: session.replyThreadAliases } : {}),
+    ...(session.quoteTargetId ? { quoteTargetId: session.quoteTargetId } : {}),
+    ...(session.quoteTargetSenderOpenId
+      ? { quoteTargetSenderOpenId: session.quoteTargetSenderOpenId }
+      : {}),
+    ...(session.quoteTargetSenderIsBot === true || session.quoteTargetSenderIsBot === false
+      ? { quoteTargetSenderIsBot: session.quoteTargetSenderIsBot }
+      : {}),
+  });
+}
+
+function freezeExactTurnRouting(session: LiveRoutingSnapshot, turnId: string): ExactTurnRoutingSnapshot {
   const replyTarget = session.replyTargets?.[turnId];
   const replyContext = session.turnReplyContexts?.[turnId];
   const docCommentTarget = session.docCommentTargets?.[turnId];
@@ -121,6 +155,89 @@ function quoteOwnerUpdatedAt(session: Session): string | undefined {
   return timestamps.sort().at(-1);
 }
 
+function liveQuoteOwnedByTurn(session: LiveRoutingSnapshot, turnId: string): boolean {
+  const quoteTargetId = session.quoteTargetId;
+  if (!quoteTargetId) return false;
+  const context = session.turnReplyContexts?.[turnId];
+  return quoteTargetId === turnId
+    || (context?.quoteTargetId === quoteTargetId
+      && context.replyTargetSenderOpenId === session.quoteTargetSenderOpenId
+      && context.replyTargetSenderIsBot === session.quoteTargetSenderIsBot);
+}
+
+function throwForeignRoutingConflict(field: string, owner: string): never {
+  throw new Error(`foreign live routing conflict: ${field} (${owner})`);
+}
+
+function persistenceEquivalent(left: unknown, right: unknown): boolean {
+  const normalize = (value: unknown) => value === undefined
+    ? undefined
+    : JSON.parse(JSON.stringify(value)) as unknown;
+  return isDeepStrictEqual(normalize(left), normalize(right));
+}
+
+function assertNoForeignLiveRouting(
+  fresh: Session,
+  live: LiveRoutingSnapshot,
+  admittedTurnId: string,
+  admitted: ExactTurnRoutingSnapshot,
+): void {
+  for (const [turnId, entry] of Object.entries(live.replyTargets ?? {})) {
+    if (turnId === admittedTurnId) continue;
+    const durable = fresh.replyTargets?.[turnId];
+    if (!durable
+      || durable.updatedAt < entry.updatedAt
+      || (durable.updatedAt === entry.updatedAt && !persistenceEquivalent(durable, entry))) {
+      throwForeignRoutingConflict('replyTargets', turnId);
+    }
+  }
+  for (const [field, liveMap, durableMap] of [
+    ['turnReplyContexts', live.turnReplyContexts, fresh.turnReplyContexts],
+    ['docCommentTargets', live.docCommentTargets, fresh.docCommentTargets],
+  ] as const) {
+    for (const [turnId, entry] of Object.entries(liveMap ?? {})) {
+      if (turnId === admittedTurnId || persistenceEquivalent(durableMap?.[turnId], entry)) continue;
+      const liveAt = live.replyTargets?.[turnId]?.updatedAt;
+      const durableAt = fresh.replyTargets?.[turnId]?.updatedAt;
+      if (liveAt && durableAt && durableAt > liveAt) continue;
+      throwForeignRoutingConflict(field, turnId);
+    }
+  }
+  const admittedRoots = new Set(admitted.replyThreadAliases.map(alias => alias.rootMessageId));
+  for (const [rootMessageId, alias] of Object.entries(live.replyThreadAliases ?? {})) {
+    if (admittedRoots.has(rootMessageId)
+      || persistenceEquivalent(fresh.replyThreadAliases?.[rootMessageId], alias)) continue;
+    const durable = fresh.replyThreadAliases?.[rootMessageId];
+    if (durable && durable.lastUsedAt > alias.lastUsedAt) continue;
+    throwForeignRoutingConflict('replyThreadAliases', rootMessageId);
+  }
+  const liveCurrent = live.currentReplyTarget;
+  if (liveCurrent && liveCurrent.turnId !== admittedTurnId
+    && !persistenceEquivalent(fresh.currentReplyTarget, liveCurrent)) {
+    if (!fresh.currentReplyTarget || fresh.currentReplyTarget.updatedAt <= liveCurrent.updatedAt) {
+      throwForeignRoutingConflict('currentReplyTarget', liveCurrent.turnId);
+    }
+  }
+  const liveQuote = {
+    id: live.quoteTargetId,
+    senderOpenId: live.quoteTargetSenderOpenId,
+    senderIsBot: live.quoteTargetSenderIsBot,
+  };
+  const durableQuote = {
+    id: fresh.quoteTargetId,
+    senderOpenId: fresh.quoteTargetSenderOpenId,
+    senderIsBot: fresh.quoteTargetSenderIsBot,
+  };
+  if (live.quoteTargetId && !liveQuoteOwnedByTurn(live, admittedTurnId)
+    && !persistenceEquivalent(liveQuote, durableQuote)) {
+    const liveOwnerAt = quoteOwnerUpdatedAt(live as Session);
+    const durableOwnerAt = quoteOwnerUpdatedAt(fresh);
+    if (!liveOwnerAt || !durableOwnerAt || durableOwnerAt <= liveOwnerAt) {
+      throwForeignRoutingConflict('quoteTarget', live.quoteTargetId);
+    }
+  }
+}
+
 function applyExactTurnRouting(
   fresh: Session,
   turnId: string,
@@ -184,9 +301,11 @@ function applyExactTurnRouting(
 }
 
 export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
-  function admit(target: TurnFeedbackTarget, input: TurnFeedbackAdmission): void {
-    const routing = freezeExactTurnRouting(target.session, input.turnId);
-    deps.commit(target, fresh => {
+  function admit(target: TurnFeedbackTarget, input: TurnFeedbackAdmission): Session {
+    const liveRouting = freezeLiveRouting(target.session);
+    const routing = freezeExactTurnRouting(liveRouting, input.turnId);
+    return deps.commit(target, fresh => {
+      assertNoForeignLiveRouting(fresh, liveRouting, input.turnId, routing);
       applyExactTurnRouting(fresh, input.turnId, routing);
       const requester = requesterSnapshot(fresh.replyTargets?.[input.turnId]);
       const records = fresh.turnFeedback ??= {};

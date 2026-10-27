@@ -20,6 +20,7 @@ import { join } from 'path';
 const mocks = vi.hoisted(() => ({
   addReaction: vi.fn(),
   removeReaction: vi.fn(),
+  publishTurnCliIdentity: vi.fn(),
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
@@ -40,6 +41,11 @@ vi.mock('node-pty', () => ({
 vi.mock('../src/im/lark/client.js', async () => {
   const actual = await vi.importActual<any>('../src/im/lark/client.js');
   return { ...actual, addReaction: mocks.addReaction, removeReaction: mocks.removeReaction };
+});
+
+vi.mock('../src/core/turn-cli-identity.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/turn-cli-identity.js');
+  return { ...actual, publishTurnCliIdentity: mocks.publishTurnCliIdentity };
 });
 
 import { getBot, registerBot } from '../src/bot-registry.js';
@@ -78,7 +84,7 @@ function makeDs(over: Partial<DaemonSession> = {}): DaemonSession {
 
 // Reactions are auto-on for card-off sessions, so the gate is driven by
 // disableStreamingCard (streaming card on → no reactions; off → reactions).
-function registerWith(reactionsOn: boolean, opts: { silentTurnReactions?: boolean; receivedReactionEmoji?: string; doneReactionEmoji?: string; replyCardMode?: 'legacy' | 'unified' } = {}) {
+function registerWith(reactionsOn: boolean, opts: { silentTurnReactions?: boolean; receivedReactionEmoji?: string; doneReactionEmoji?: string; replyCardMode?: 'legacy' | 'unified'; triggerUserAuth?: boolean } = {}) {
   registerBot({
     larkAppId: APP,
     larkAppSecret: 's',
@@ -89,6 +95,9 @@ function registerWith(reactionsOn: boolean, opts: { silentTurnReactions?: boolea
     silentTurnReactions: opts.silentTurnReactions || undefined,
     receivedReactionEmoji: opts.receivedReactionEmoji,
     doneReactionEmoji: opts.doneReactionEmoji,
+    triggerUserAuth: opts.triggerUserAuth
+      ? { enabled: true, tools: ['lark-cli'] }
+      : undefined,
   });
 }
 
@@ -99,6 +108,7 @@ describe('two-phase turn reactions', () => {
     sessionStore.init(APP);
     mocks.addReaction.mockImplementation(async (_app: string, msgId: string) => `rid_${msgId}`);
     mocks.removeReaction.mockResolvedValue(undefined);
+    mocks.publishTurnCliIdentity.mockResolvedValue([]);
   });
 
   afterEach(() => {
@@ -186,9 +196,12 @@ describe('two-phase turn reactions', () => {
 
   it('substitute turn is card-off even when streaming card is globally enabled', async () => {
     registerWith(false);
-    const ds = makeDs({
-      currentReplyTarget: { rootMessageId: 'om_trigger', turnId: 'om_a', updatedAt: new Date().toISOString(), substitute: true },
-    });
+    const ds = makeDs();
+    const currentReplyTarget = {
+      rootMessageId: 'om_trigger', turnId: 'om_a', updatedAt: new Date().toISOString(), substitute: true,
+    };
+    ds.currentReplyTarget = currentReplyTarget;
+    ds.session.currentReplyTarget = currentReplyTarget;
 
     await noteTurnReceived(ds, 'om_a');
 
@@ -518,8 +531,88 @@ describe('two-phase turn reactions', () => {
       requesterOpenId: 'ou_new',
       requesterIsBot: true,
     });
+    expect(ds.currentReplyTarget).toEqual(durable?.currentReplyTarget);
+    expect(ds.replyThreadAliases).toEqual(durable?.replyThreadAliases);
     expect(mocks.addReaction).toHaveBeenCalledTimes(1);
     expect(ds.pendingAckReactions?.map(item => item.messageId)).toEqual([turnId]);
+  });
+
+  it('linearizes type-ahead admission before trigger-user identity awaits', async () => {
+    registerWith(false, { triggerUserAuth: true });
+    const ds = makeDs();
+    const releases = new Map<string, () => void>();
+    mocks.publishTurnCliIdentity.mockImplementation(({ turnId }: { turnId?: string }) => (
+      new Promise(resolve => { releases.set(turnId!, () => resolve([])); })
+    ));
+    const stage = (turnId: string, root: string, requester: string, updatedAt: string) => {
+      ds.session.quoteTargetId = turnId;
+      ds.session.quoteTargetSenderOpenId = requester;
+      ds.session.quoteTargetSenderIsBot = false;
+      beginReplyTargetTurn(ds, root, turnId, updatedAt, {
+        senderOpenId: requester,
+        participants: [{ openId: requester, isBot: false }],
+        inThread: true,
+      });
+    };
+
+    stage('om_typeahead_a', 'om_topic_a', 'ou_a', '2026-10-27T11:00:00.000Z');
+    const admissionA = noteTurnReceived(ds, 'om_typeahead_a');
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_typeahead_a)
+      .toMatchObject({ requesterOpenId: 'ou_a', requesterIsBot: false });
+
+    stage('om_typeahead_b', 'om_topic_b', 'ou_b', '2026-10-27T11:01:00.000Z');
+    const admissionB = noteTurnReceived(ds, 'om_typeahead_b');
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_typeahead_b)
+      .toMatchObject({ requesterOpenId: 'ou_b', requesterIsBot: false });
+
+    await vi.waitFor(() => expect(mocks.publishTurnCliIdentity).toHaveBeenCalledTimes(2));
+    releases.get('om_typeahead_b')!();
+    await admissionB;
+    releases.get('om_typeahead_a')!();
+    await admissionA;
+
+    const durable = sessionStore.getSessionFresh(ds.session.sessionId);
+    expect(Object.keys(durable?.turnFeedback ?? {})).toEqual(['om_typeahead_a', 'om_typeahead_b']);
+    expect(Object.keys(durable?.replyTargets ?? {})).toEqual(['om_typeahead_a', 'om_typeahead_b']);
+    expect(Object.keys(durable?.turnReplyContexts ?? {})).toEqual(['om_typeahead_a', 'om_typeahead_b']);
+    expect(durable?.replyThreadAliases).toMatchObject({
+      om_topic_a: expect.any(Object),
+      om_topic_b: expect.any(Object),
+    });
+    expect(durable?.turnFeedback).toMatchObject({
+      om_typeahead_a: { requesterOpenId: 'ou_a', requesterIsBot: false },
+      om_typeahead_b: { requesterOpenId: 'ou_b', requesterIsBot: false },
+    });
+    expect(ds.currentReplyTarget).toEqual(durable?.currentReplyTarget);
+    expect(ds.replyThreadAliases).toEqual(durable?.replyThreadAliases);
+  });
+
+  it('fails closed on multiple foreign live-only turns before identity or reaction effects', async () => {
+    registerWith(true, { triggerUserAuth: true });
+    const ds = makeDs();
+    const stage = (turnId: string, root: string, requester: string, updatedAt: string) => {
+      ds.session.quoteTargetId = turnId;
+      ds.session.quoteTargetSenderOpenId = requester;
+      ds.session.quoteTargetSenderIsBot = false;
+      beginReplyTargetTurn(ds, root, turnId, updatedAt, {
+        senderOpenId: requester,
+        participants: [{ openId: requester, isBot: false }],
+        inThread: true,
+      });
+    };
+    stage('om_live_a', 'om_live_topic_a', 'ou_a', '2026-10-27T12:00:00.000Z');
+    stage('om_live_b', 'om_live_topic_b', 'ou_b', '2026-10-27T12:01:00.000Z');
+    const liveSession = ds.session;
+    const before = structuredClone(ds.session);
+
+    await expect(noteTurnReceived(ds, 'om_live_a')).rejects.toThrow('foreign live routing conflict');
+
+    expect(ds.session).toBe(liveSession);
+    expect(ds.session).toEqual(before);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback).toBeUndefined();
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.replyTargets).toBeUndefined();
+    expect(mocks.publishTurnCliIdentity).not.toHaveBeenCalled();
+    expect(mocks.addReaction).not.toHaveBeenCalled();
   });
 
   it('persists a stamped meeting-origin turn before the reaction early return', async () => {
@@ -542,13 +635,14 @@ describe('two-phase turn reactions', () => {
   });
 
   it('fails closed before reaction when admission persistence fails', async () => {
-    registerWith(true);
+    registerWith(true, { triggerUserAuth: true });
     const ds = makeDs();
     sessionStore.__testOnly_setBeforeRowPersist(() => { throw new Error('simulated feedback admission failure'); });
 
     await expect(noteTurnReceived(ds, 'om_fail')).rejects.toThrow('simulated feedback admission failure');
 
     expect(mocks.addReaction).not.toHaveBeenCalled();
+    expect(mocks.publishTurnCliIdentity).not.toHaveBeenCalled();
     expect(ds.pendingAckReactions ?? []).toEqual([]);
   });
 
