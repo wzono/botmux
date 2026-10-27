@@ -7581,9 +7581,10 @@ ${SEND_HELP_BODY}
                                        --raw 附原始内容（卡片 → cardJson，其它 → rawContent）
   input-capture register|inspect|revoke|revoke-set --bot <appId> --session <id> ...
   ask buttons --questions-file <file>   多题卡片，支持 defaultSelectedKeys 预选；底部提交，返回 JSON
-  ask buttons [--multi] --options "a,b" "<问题>"
-                                       把选择题做成按钮卡片抛给飞书；--multi 返回逗号分隔的多个 key
-                                       （无 hook 的 CLI 用它把决策引到人；也可省略 buttons 走裸别名）
+  ask buttons [--multi] [--into <om_root>] --options "a,b" "<问题>"
+                                       把选择题做成按钮卡片抛给飞书；--multi 返回逗号分隔的多个 key；
+                                       --into 经当前会话鉴权后回复到同群指定话题（无 hook 的 CLI 用它把决策引到人；
+                                       也可省略 buttons 走裸别名）
   skill list                           列出本会话可用的技能（用户自定义 + botmux 内置）及其描述
   skill show <name>                    读取某技能的完整 SKILL.md 说明（prompt 注入模式下按需拉取内置技能全文）
 
@@ -16203,8 +16204,9 @@ async function cmdCreateGroupTeam(rest: string[]): Promise<void> {
  *     runHook 会重连重试。确定性 4xx（bad body / capability 拒绝 / unsupported)
  *     与非 JSON 是 retryable=false —— 重试 24h 也不会变,应立即 passthrough。
  */
-async function postAsk(body: Record<string, unknown>): Promise<import('./core/ask-types.js').AskResult> {
+async function postAsk(body: Record<string, unknown>): Promise<import('./core/ask-types.js').AskResult | import('./core/ask-types.js').AskPendingResult> {
   type AskResult = import('./core/ask-types.js').AskResult;
+  type AskPendingResult = import('./core/ask-types.js').AskPendingResult;
   type AskError = Error & { exitCode: number; retryable: boolean };
   const mkErr = (message: string, retryable: boolean): AskError =>
     Object.assign(new Error(message), { exitCode: 3, retryable });
@@ -16263,7 +16265,7 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
   }
 
   try {
-    return (await res.json()) as AskResult;
+    return (await res.json()) as AskResult | AskPendingResult;
   } catch (jsonErr) {
     // A malformed body is not something a retry fixes.
     throw mkErr(`botmux ask: daemon 返回非 JSON: ${jsonErr}`, false);
@@ -16297,7 +16299,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     process.exit(2);
   }
 
-  const { findMissingAskEnv, parseAskOptions, parseAskQuestionsFile, parseAskTimeoutSeconds, parseAskMention, AskArgsError } =
+  const { findMissingAskEnv, parseAskInto, parseAskOptions, parseAskQuestionsFile, parseAskTimeoutMode, parseAskMention, AskArgsError } =
     await import('./core/ask-args.js');
   type AskJsonOutput = import('./core/ask-types.js').AskJsonOutput;
   const { toLegacySelected, isCustomReply } = await import('./core/ask-types.js');
@@ -16316,14 +16318,17 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   const optionsRaw = argValue(rest, '--options');
   const timeoutRaw = argValue(rest, '--timeout');
   const mentionRaw = argValue(rest, '--mention');
+  const intoRaw = argValue(rest, '--into');
   const useJson = rest.includes('--json') || questionsFile !== undefined;
   const multiSelect = rest.includes('--multi');
-  const positionalArgs = positionals(rest, ['--json', '--multi']);
+  const noTimeout = rest.includes('--no-timeout');
+  const positionalArgs = positionals(rest, ['--json', '--multi', '--no-timeout']);
 
   let options;
   let questions;
   let timeoutMs;
   let mentionedOpenId;
+  let requestedRootMessageId;
   try {
     if (hasQuestionsFile && (!questionsFile || rest.some(arg => arg === '--options' || arg.startsWith('--options=')) || multiSelect || positionalArgs.length)) {
       throw new AskArgsError('questions_invalid', '--questions-file 需要文件路径，且不能与 --options、--multi 或位置参数混用');
@@ -16335,8 +16340,9 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
       catch { throw new AskArgsError('questions_invalid', '--questions-file 无法读取'); }
       questions = parseAskQuestionsFile(raw);
     } else options = parseAskOptions(optionsRaw);
-    timeoutMs = parseAskTimeoutSeconds(timeoutRaw);
+    timeoutMs = parseAskTimeoutMode({ timeoutRaw, noTimeout });
     mentionedOpenId = parseAskMention(mentionRaw);
+    requestedRootMessageId = parseAskInto(intoRaw);
   } catch (err) {
     if (err instanceof AskArgsError) {
       console.error(`botmux ask: ${err.message}`);
@@ -16370,6 +16376,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     rootMessageId: process.env.BOTMUX_SESSION_SCOPE === 'chat'
       ? null
       : process.env.BOTMUX_ROOT_MESSAGE_ID || null,
+    ...(requestedRootMessageId ? { requestedRootMessageId } : {}),
     ...(questions ? { questions } : multiSelect
       ? { questions: [{ prompt, options, multiSelect: true }] }
       : { options, prompt }),
@@ -16392,13 +16399,13 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     console.error('botmux ask: 正在等待真人回答；Ctrl-C 不取消确认，请等待回答或正常超时。');
   };
   process.on('SIGINT', protectAskWait);
-  const reconnectDeadline = Date.now() + timeoutMs + 60_000;
-  let result: import('./core/ask-types.js').AskResult;
+  const reconnectDeadline = timeoutMs === null ? null : Date.now() + timeoutMs + 60_000;
+  let result: import('./core/ask-types.js').AskResult | import('./core/ask-types.js').AskPendingResult;
   try {
     while (true) {
       try { result = await postAsk(body); break; }
       catch (err) {
-        if (!(err as { retryable?: boolean }).retryable || Date.now() >= reconnectDeadline) throw err;
+        if (!(err as { retryable?: boolean }).retryable || (reconnectDeadline !== null && Date.now() >= reconnectDeadline)) throw err;
         // The daemon owns the deadline and receipt. Reuse the same request;
         // don't convert a transport failure into a human decision/timeout.
         await new Promise(resolve => setTimeout(resolve, 1000));
@@ -16408,6 +16415,13 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     process.removeListener('SIGINT', protectAskWait);
     console.error((err as Error).message);
     process.exit((err as { exitCode?: number }).exitCode ?? 3);
+  }
+
+  if (result.kind === 'pending') {
+    process.stdout.write(JSON.stringify(result) + '\n');
+    await new Promise<void>(resolve => process.stdout.write('', () => resolve()));
+    process.removeListener('SIGINT', protectAskWait);
+    process.exit(0);
   }
 
   // result.kind==='answered' 时用 toLegacySelected 取回旧的 string（单问单选）
@@ -16468,7 +16482,9 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     case 'answered':
       process.exit(0);
     case 'timedOut':
-      console.error(`botmux ask: 超时（${timeoutMs / 1000}s），无回复`);
+      console.error(timeoutMs === null
+        ? 'botmux ask: 已失效（永久等待模式下 broker 返回 timedOut）'
+        : `botmux ask: 超时（${timeoutMs / 1000}s），无回复`);
       process.exit(124);
     case 'invalidated':
       console.error(`botmux ask: 已失效 (${result.reason})`);
@@ -16498,7 +16514,8 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
 export async function runHook(
   payload: unknown,
   env: Record<string, string | undefined>,
-  postAskFn: (body: Record<string, unknown>) => Promise<import('./core/ask-types.js').AskResult>,
+  postAskFn: (body: Record<string, unknown>) =>
+    Promise<import('./core/ask-types.js').AskResult | import('./core/ask-types.js').AskPendingResult>,
   cliId: string,
   resolveAdoptRouteFn?: () => Promise<import('./adapters/adopt-route.js').AdoptRoute | null>,
   /** 按 OpenCode 原生会话 id（payload.session_id，ses_*）反查所属 botmux 会话；
@@ -16684,12 +16701,15 @@ export async function runHook(
   // stable key, so the SAME card resolves through the normal hook directive.
   // Blocking here keeps Claude spinning; the native picker never renders.
   const deadline = Date.now() + timeoutMs;
-  let result: import('./core/ask-types.js').AskResult | undefined;
+  let result: import('./core/ask-types.js').AskResult | import('./core/ask-types.js').AskPendingResult | undefined;
   let attempt = 0;
   while (true) {
     try {
-      result = await postAskFn(body);
-      break;
+      const posted = await postAskFn(body);
+      // Hook flow drives the native picker via a terminal directive; that only
+      // exists for a settled answer. An acknowledge-only pending receipt means
+      // another waiter owns the card — keep reconnecting until it settles.
+      if (posted.kind !== 'pending') { result = posted; break; }
     } catch (err) {
       // Retry ONLY genuinely transient failures (daemon unreachable / network /
       // 502-503-504 startup-not-ready — see postAsk's `retryable`). That is the

@@ -19,7 +19,9 @@ export class AskArgsError extends Error {
       | 'options_duplicate_key'
       | 'timeout_out_of_range'
       | 'timeout_not_number'
-      | 'mention_not_open_id',
+      | 'timeout_mode_conflict'
+      | 'mention_not_open_id'
+      | 'into_not_root_message_id',
     message: string,
   ) {
     super(message);
@@ -86,6 +88,20 @@ export function parseAskOptions(raw: string | undefined): AskOption[] {
   return out;
 }
 
+/** Select the explicit ask lifetime. `null` is an intentional permanent ask. */
+export function parseAskTimeoutMode(input: {
+  timeoutRaw: string | undefined;
+  noTimeout: boolean;
+}): number | null {
+  if (input.noTimeout && input.timeoutRaw !== undefined) {
+    throw new AskArgsError(
+      'timeout_mode_conflict',
+      '--no-timeout 不能与 --timeout 同时使用',
+    );
+  }
+  return input.noTimeout ? null : parseAskTimeoutSeconds(input.timeoutRaw);
+}
+
 /** Parse `--timeout <seconds>` → milliseconds. Bounds match §7:
  *   - lower bound: 10s (sub-10s asks are almost always a bug)
  *   - upper bound: 3600s (1h — past that, recovery should kick in v0.1.8)
@@ -115,6 +131,19 @@ export function parseAskTimeoutSeconds(
     );
   }
   return n * 1000;
+}
+
+/** Parse `--into <om_root>` without mixing it with the ambient session root. */
+export function parseAskInto(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  const value = raw.trim();
+  if (!/^om_[A-Za-z0-9_-]{1,128}$/.test(value)) {
+    throw new AskArgsError(
+      'into_not_root_message_id',
+      `--into 只接受话题根消息 ID（om_ 开头），收到 "${value}"`,
+    );
+  }
+  return value;
 }
 
 /** Parse `--mention <value>` → a human open_id.
