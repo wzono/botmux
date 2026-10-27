@@ -175,7 +175,17 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
   let dir: string;
   let socket: string;
   const saved: Record<string, string | undefined> = {};
-  const tmux = (...args: string[]) => spawnSync(realTmux!, ['-S', socket, ...args], { encoding: 'utf8' });
+  // Per-call ceiling. Read-count bounding below answers "how many reads still
+  // saw nothing", but a single hung call blocks synchronously and never
+  // reaches the counter — without a spawnSync timeout one stuck display-message
+  // (or the two new-session setups in beforeEach) eats the whole 30s hook
+  // budget and the failure surfaces as the harder-to-read "Hook timed out".
+  // A normal tmux client answers in milliseconds; 5s only bites on a starved
+  // shard, and a timed-out call returns status=null, which the read loop below
+  // treats like resolvePaneDeath's `unknown` and retries.
+  const TMUX_CALL_TIMEOUT_MS = 5_000;
+  const tmux = (...args: string[]) =>
+    spawnSync(realTmux!, ['-S', socket, ...args], { encoding: 'utf8', timeout: TMUX_CALL_TIMEOUT_MS });
 
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), 'tmux-corpse-'));
@@ -186,19 +196,21 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
     for (const key of ['PATH', 'SHELL']) saved[key] = process.env[key];
     process.env.PATH = `${bin}:${process.env.PATH}`;
     process.env.SHELL = '/bin/sh';
-    // One live session keeps the server up; the corpse is a second session
-    // that opted into remain-on-exit.
+    // The corpse CLI exits IMMEDIATELY, with no sleep before the exit. We only
+    // need a dead pane that recorded a status; we do NOT need one that lived
+    // briefly. A `sleep N` ties "when is the pane dead" to the sh process
+    // being scheduled for N wall-seconds — under a heavily starved shard that
+    // death (and hence the first observable `1:77`) was pushed past the hook
+    // timeout even though the option below is set atomically. Exiting at once
+    // makes the pane dead essentially at creation; the atomic chain still
+    // guarantees remain-on-exit is in effect, so status 77 is recorded.
     // The option MUST be chained ATOMICALLY into new-session (`\; set-option`,
-    // one server queue, in order) — the same way createDetachedSession does
-    // it. A separate set-option after creation can land AFTER the short CLI
-    // exits under CI load: tmux then keeps a dead pane WITHOUT recording its
-    // status (`1:` forever), and the setup assertion raced (observed on a shard).
-    // The option is per session and must target the corpse itself, not the
-    // neighbour — otherwise the corpse just vanishes on exit and the block
-    // tests nothing.
+    // one server queue, in order) — the same way createDetachedSession does it.
+    // It is per session and must target the corpse itself, not the neighbour
+    // — otherwise the corpse just vanishes on exit and the block tests nothing.
     tmux('new-session', '-d', '-s', 'bmx-live-one', 'sleep 60');
     tmux(
-      'new-session', '-d', '-s', 'bmx-corpse', 'sh -c "sleep 0.3; exit 77"',
+      'new-session', '-d', '-s', 'bmx-corpse', 'sh -c "exit 77"',
       ';', 'set-option', '-t', 'bmx-corpse', 'remain-on-exit', 'failed',
     );
     const deadStatus = await waitForDeadPane('bmx-corpse');
@@ -220,22 +232,48 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
    *
    * `#{pane_dead}` flips to 1 slightly BEFORE `#{pane_dead_status}` is readable
    * (observed on tmux 3.3a: `1:` then `1:77` a moment later). This describe's
-   * setup corpse always exits 77, so a non-empty status MUST arrive — an empty
-   * one at the deadline is a corpse built too late (the setup race), which we
-   * want to fail loudly rather than accept. Signal death, which legitimately
+   * setup corpse always exits 77 (immediately, with the option chained
+   * atomically into new-session), so a non-empty status MUST arrive — an empty
+   * one at the deadline means the corpse/option was not actually set up, which
+   * must fail loudly rather than be accepted. Signal death, which legitimately
    * has no status, is covered by the other describe's `kill -9 $$` test.
    */
+  // REDUCES, does not eliminate, the starvation flake: read-count bounding is
+  // immune to the worker being descheduled (wall-clock keeps running during a
+  // stall, reads do not happen), but a shard starved hard enough that tmux
+  // spawns and the lifecycle watcher barely run still fails other ways — under
+  // a controlled 4-core / 12×yes load, both this version and the old wall-clock
+  // one went 7/8 green across 8 rounds each, and one round also failed the
+  // unrelated `forwards 77` production-path case. That residual is tracked in
+  // #2408, not here.
+  //
+  // BOUND BY READ COUNT, NOT WALL CLOCK. An absolute ~10s deadline lost a
+  // perfectly good `1:77` on a scheduler-starved shard: when the worker
+  // process isn't scheduled for >10s, the first display-message it gets to run
+  // AFTER the pause already reads `1:77` (tmux latches death server-side), but
+  // the wall clock had expired so the fixture rejected it (~1/9 under a
+  // 4-core / heavy load). tmux publishes status within ~500ms of death on a
+  // healthy server, so "N reads still see no status" is the meaningful failure
+  // signal regardless of how starvation stretches wall-time; under load the
+  // reads space themselves out. Measured wall-time of 240 reads under the same
+  // 4-core / 12×yes load: 13.8–14.5s nominal (vs ~6s unloaded) — plus the two
+  // new-session calls in beforeEach (each capped at TMUX_CALL_TIMEOUT_MS), so
+  // the 30s hook timeout stays the backstop with about half its headroom even
+  // starved. The vitest hook timeout (30s) is the absolute floor.
+  const DEAD_PANE_POLL_INTERVAL_MS = 25;
+  const DEAD_PANE_MAX_READS = 240; // ~6s nominal 25ms polling; far more wall-time under starvation
   const waitForDeadPane = async (name: string): Promise<{ dead: boolean; status: string }> => {
-    const deadline = Date.now() + 10_000;
-    for (;;) {
+    let last = { dead: false, status: '' };
+    for (let reads = 0; reads < DEAD_PANE_MAX_READS; reads += 1) {
       const out = tmux('display-message', '-p', '-t', name, '#{pane_dead}:#{pane_dead_status}');
       const text = String(out.stdout ?? '').trim();
       const [dead, status] = text.split(':');
       const value = status ?? '';
+      last = { dead: dead === '1', status: value };
       if (dead === '1' && value !== '') return { dead: true, status: value };
-      if (Date.now() > deadline) return { dead: dead === '1', status: value };
-      await new Promise(r => setTimeout(r, 25));
+      await new Promise(r => setTimeout(r, DEAD_PANE_POLL_INTERVAL_MS));
     }
+    return last;
   };
 
   // 前提本身也要钉住，否则下面两条断言可能因为尸体早被回收而假绿。
@@ -345,21 +383,21 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
  * exactly the window that turned a real `exit 3` into the fallback code 1
  * under CI load, so it must not rely on a timing-dependent end-to-end test.
  */
-describe('resolvePaneDeath waits for pane_dead_status without inventing one', () => {
+describe('resolvePaneDeath three-way verdict: alive / dead / unknown', () => {
   const noSleep = () => {};
   const OPTS = { attempts: 5, intervalMs: 0 };
 
-  it('returns the status immediately when the first read already carries it (no re-read)', () => {
+  it('returns the dead status immediately when the first read carries it (no re-read)', () => {
     let reads = 0;
     const r = resolvePaneDeath('1:77', () => { reads += 1; return '1:77'; }, noSleep, OPTS);
-    expect(r).toEqual({ dead: true, status: 77 });
+    expect(r).toEqual({ kind: 'dead', status: 77 });
     expect(reads).toBe(0);
   });
 
-  it('a live pane (dead=0) is not dead and never re-read', () => {
+  it('a live pane (0:) is alive and never re-read', () => {
     let reads = 0;
     const r = resolvePaneDeath('0:', () => { reads += 1; return '0:'; }, noSleep, OPTS);
-    expect(r).toEqual({ dead: false, status: null });
+    expect(r).toEqual({ kind: 'alive' });
     expect(reads).toBe(0);
   });
 
@@ -367,42 +405,83 @@ describe('resolvePaneDeath waits for pane_dead_status without inventing one', ()
     const lines = ['1:', '1:3'];
     let reads = 0;
     const r = resolvePaneDeath('1:', () => lines[Math.min(reads++, lines.length - 1)]!, noSleep, OPTS);
-    expect(r).toEqual({ dead: true, status: 3 });
+    expect(r).toEqual({ kind: 'dead', status: 3 });
     expect(reads).toBe(2);
   });
 
-  it('accepts a permanently-empty status as null after the budget (signal death has no status)', () => {
+  it('accepts a permanently-empty status as a status-less dead verdict (signal death)', () => {
     let reads = 0;
     const r = resolvePaneDeath('1:', () => { reads += 1; return '1:'; }, noSleep, OPTS);
-    expect(r).toEqual({ dead: true, status: null });
+    expect(r).toEqual({ kind: 'dead', status: null });
     expect(reads).toBe(OPTS.attempts);
   });
 
-  it('an inconclusive mid-poll read does not undo the already-confirmed death', () => {
-    // empty line = tmux error/timeout; the pane was already seen dead, so this
-    // contributes no status but must not flip the verdict back to alive.
+  it('an unreadable mid-poll line does not undo an already-confirmed death', () => {
     const lines = ['1:', '', '1:127'];
     let reads = 0;
     const r = resolvePaneDeath('1:', () => lines[Math.min(reads++, lines.length - 1)]!, noSleep, OPTS);
-    expect(r).toEqual({ dead: true, status: 127 });
+    expect(r).toEqual({ kind: 'dead', status: 127 });
   });
 
-  // The discriminating case for "inconclusive never undoes a confirmed death":
-  // AFTER the transient error there is no further successful read at all. If an
-  // empty line were allowed to overwrite the confirmed death, this returns
-  // {dead:false} and the corpse would never be reaped (a real session leak).
-  it('keeps the confirmed death when every read AFTER the transient error is inconclusive', () => {
+  it('keeps the confirmed death when every read after a transient error is unreadable', () => {
     const lines = ['1:', '', '', ''];
     let reads = 0;
     const r = resolvePaneDeath('1:', () => lines[Math.min(reads++, lines.length - 1)]!, noSleep, OPTS);
-    expect(r).toEqual({ dead: true, status: null });
+    expect(r).toEqual({ kind: 'dead', status: null });
   });
 
   it('respects the attempt bound when the status lands exactly on the last poll', () => {
     const lines = ['1:', '1:', '1:', '1:', '1:77'];
     let reads = 0;
     const r = resolvePaneDeath('1:', () => lines[Math.min(reads++, lines.length - 1)]!, noSleep, OPTS);
-    expect(r).toEqual({ dead: true, status: 77 });
+    expect(r).toEqual({ kind: 'dead', status: 77 });
     expect(reads).toBe(5);
   });
-});
+
+  // #2408 exit B: an UNREADABLE FIRST read used to return {dead:false} with
+  // ZERO re-reads, collapsing a transient tmux timeout into "pane is fine" and
+  // dropping both the real code and the corpse reap. It must retry.
+  it('retries when the FIRST read is unreadable and then adopts the dead code', () => {
+    // firstLine ('') is the unreadable first read and is passed directly; the
+    // injected reader returns only SUBSEQUENT reads (so it starts at 1:77).
+    let reads = 0;
+    const r = resolvePaneDeath('', () => { reads += 1; return '1:77'; }, noSleep, OPTS);
+    expect(r).toEqual({ kind: 'dead', status: 77 });
+    expect(reads).toBe(1);
+  });
+
+  it('retries an unreadable first read through the 1: → 1:<code> gap', () => {
+    const lines = ['1:', '1:127'];
+    let reads = 0;
+    const r = resolvePaneDeath('', () => lines[Math.min(reads++, lines.length - 1)]!, noSleep, OPTS);
+    expect(r).toEqual({ kind: 'dead', status: 127 });
+    expect(reads).toBe(2);
+  });
+
+  it('retries an unreadable first read and adopts an explicit alive answer', () => {
+    let reads = 0;
+    const r = resolvePaneDeath('', () => { reads += 1; return '0:'; }, noSleep, OPTS);
+    expect(r).toEqual({ kind: 'alive' });
+    expect(reads).toBe(1);
+  });
+
+  it('returns unknown only after the whole budget stays unreadable (never invents alive/dead)', () => {
+    let reads = 0;
+    const r = resolvePaneDeath('', () => { reads += 1; return ''; }, noSleep, OPTS);
+    expect(r).toEqual({ kind: 'unknown' });
+    // first read + attempts re-reads
+    expect(reads).toBe(OPTS.attempts);
+  });
+
+  it('a 0: after death was already observed does not un-latch the dead verdict (dead is irreversible)', () => {
+    const lines = ['1:77', '0:']; // first read already carries the code; returns at once
+    let reads = 0;
+    const r0 = resolvePaneDeath('1:77', () => lines[Math.min(reads++, lines.length - 1)]!, noSleep, OPTS);
+    expect(r0).toEqual({ kind: 'dead', status: 77 });
+    // and a glitch 0: while waiting on a status-less corpse does not revive it
+    const glitch = ['1:', '0:', '1:127'];
+    let r2 = 0;
+    const r1 = resolvePaneDeath('1:', () => glitch[Math.min(r2++, glitch.length - 1)]!, noSleep, OPTS);
+    expect(r1).toEqual({ kind: 'dead', status: 127 });
+  });
+});;

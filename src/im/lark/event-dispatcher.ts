@@ -1470,9 +1470,11 @@ export function learnSameOwnerSiblingCrossRef(
   } catch {
     return false;
   }
-  const name = entries.find(e => e.larkAppId === sibling.larkAppId)?.botName?.trim();
+  const rawName = entries.find(e => e.larkAppId === sibling.larkAppId)?.botName;
+  const name = typeof rawName === 'string' ? rawName.trim() : '';
   if (!name) return false;
-  const sameName = entries.filter(e => e.botName?.trim().toLowerCase() === name.toLowerCase()).length;
+  const sameName = entries.filter(e => typeof e.botName === 'string'
+    && e.botName.trim().toLowerCase() === name.toLowerCase()).length;
   if (sameName !== 1) return false;
   updateBotOpenIdCrossRef(dataDir, larkAppId, [{ name, id: { open_id: senderOpenId } }]);
   return isKnownPeerBot(dataDir, larkAppId, senderOpenId);
@@ -2810,6 +2812,8 @@ export interface RoutingContext {
   ingressAdmission?: { admitted: boolean; retryReason?: string };
   /** Ephemeral durable-primary claim identity; never persisted in Session. */
   durablePrimaryDispatch?: { attempt: number; signal: AbortSignal };
+  /** Preserve confirmed command state while its task remains in the Inbox. */
+  checkpointPreAdmissionSession?: (session: Session, isCurrent?: () => boolean) => Promise<void>;
   /** Durable-primary only: queue one provider effect behind fenced Session admission. */
   queuePostAdmissionOutput?: (output: DurableLarkPostAdmissionOutput) => void;
   /** Durable-primary only: queue one lifecycle control after Session admission. */
@@ -4986,6 +4990,9 @@ export function createLarkEventDispatcherRuntime(
     if (typeof primary.context.queuePostAdmissionControl === 'function') {
       ctx.queuePostAdmissionControl = primary.context.queuePostAdmissionControl;
     }
+    if (typeof primary.context.checkpointPreAdmissionSession === 'function') {
+      ctx.checkpointPreAdmissionSession = primary.context.checkpointPreAdmissionSession;
+    }
   };
 
   const assertPrimaryRouteOwner = async (
@@ -6116,6 +6123,9 @@ export function createLarkEventDispatcherRuntime(
                 queuePostAdmissionControl: (
                   primary.context as DurableLarkCanonicalHandlerContext
                 ).queuePostAdmissionControl,
+                checkpointPreAdmissionSession: (
+                  primary.context as DurableLarkCanonicalHandlerContext
+                ).checkpointPreAdmissionSession,
               }
             : {}
         ),
