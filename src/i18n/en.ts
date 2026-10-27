@@ -1932,6 +1932,7 @@ export const messages: Record<string, string> = {
 
   // Ask card
   'card.ask.field.deadline': 'Deadline',
+  'card.ask.permanent': 'Waiting for your response',
   'card.ask.field.answerable': 'Can answer',
   'card.ask.question_n': 'Question {n}',
   'card.ask.prompt_truncated': '(The question is too long and was truncated in this card; see the attached file in this thread for the full text.)',
