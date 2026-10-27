@@ -30804,6 +30804,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       });
     },
     onTurnInputCommitted(ds, receipt, context) {
+      ds.scheduledTurnRuns?.get(receipt.turnId)?.acceptInput(
+        ds.session.sessionId,
+        receipt.turnId,
+        context.workerGeneration,
+      );
       // A recovered Remote Runner turn can conservatively classify an
       // attempt-bearing Lark message as durable-primary. Keep that recovery
       // hint entirely inert for disabled/shadow/default deployments.
@@ -30811,6 +30816,20 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           || !durablePrimaryRuntimeByApp.has(ds.larkAppId)) return;
       if (ds.session.workerGeneration !== context.workerGeneration) return;
       recordDurablePrimaryInputCommit(ds, receipt, context.workerGeneration);
+    },
+    onTurnInputReceived(ds, context) {
+      ds.scheduledTurnRuns?.get(context.turnId)?.acceptInput(
+        ds.session.sessionId,
+        context.turnId,
+        context.workerGeneration,
+      );
+    },
+    onTurnInputRejected(ds, context) {
+      ds.scheduledTurnRuns?.get(context.turnId)?.rejectInput(
+        ds.session.sessionId,
+        context.turnId,
+        context.reason,
+      );
     },
     onNativeInputConsumed(ds, receipt, context) {
       // The worker proved this exact input entered its native conversation.
@@ -30835,6 +30854,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     async onTurnTerminal(ds, terminal, context) {
       const originalFailedCaller = failedTurnCaller(ds, terminal.turnId);
       const originalFailedSilent = isSilentScheduledTurn(ds, terminal.turnId);
+      ds.scheduledTurnRuns?.get(terminal.turnId)?.settleTerminal({
+        sessionId: terminal.sessionId,
+        turnId: terminal.turnId,
+        workerGeneration: context.workerGeneration,
+        status: terminal.status,
+        errorCode: terminal.errorCode,
+      });
       // Queue ACKs do not prove consumption. Only a matching completed native
       // turn confirms that this exact frozen input reached this conversation.
       if (terminal.status === 'completed' && ds.session.workerGeneration === context.workerGeneration) {
@@ -30956,6 +30982,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     onWorkerExit(ds, context) {
       ds.messageListenerCompletedTurnId = undefined;
+      for (const run of ds.scheduledTurnRuns?.values() ?? []) {
+        run.rejectWorkerExit(context.sessionId, context.workerGeneration);
+      }
       // A Node worker exit (including the SIGKILL backstop) proves this exact
       // generation can no longer write. Unlike onCliExit, this is safe for
       // persistent-pane backends and therefore owns crash-path release.
@@ -32670,20 +32699,25 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             const results = await executeScheduledTaskForTargets(
               task,
               targetChatIds,
-              targetTask => withBotTurnAdmission(
-                effectiveAppId,
-                () => executeScheduledTask(
-                  targetTask,
-                  activeSessions,
-                  refreshCliVersion,
-                  additionalPrompt,
-                  {
-                    prepareTurnIdentity: (session, turnId) =>
-                      prepareTurnCliIdentity(session, turnId),
-                    runId: executionContext.runId,
-                  },
-                ),
-              ),
+              async (targetTask) => {
+                const dispatched = await withBotTurnAdmission(
+                  effectiveAppId,
+                  () => executeScheduledTask(
+                    targetTask,
+                    activeSessions,
+                    refreshCliVersion,
+                    additionalPrompt,
+                    {
+                      prepareTurnIdentity: (session, turnId) =>
+                        prepareTurnCliIdentity(session, turnId),
+                      runId: executionContext.runId,
+                    },
+                  ),
+                );
+                // The dispatch admission is released before the model turn wait,
+                // so unrelated bot mutations and cancellations remain live.
+                await dispatched?.settlement;
+              },
             );
             if (targetChatIds.length > 1) targetResults = results;
           } catch (error) {

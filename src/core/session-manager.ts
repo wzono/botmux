@@ -68,6 +68,7 @@ import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js'
 import { normalizeRemoteRunnerBackendState } from '../adapters/backend/remote-runner-protocol.js';
 import type { ChatContext, CliTurnPayload, CodexAppAdditionalContextEntry, CodexAppTurnInput, LarkAttachment, LarkMention, ScheduledTask, Session, SubstituteTrigger } from '../types.js';
 import { trustedCallerForScheduledTask } from './scheduled-turn-provenance.js';
+import { createScheduledTurnRun, ScheduledTurnRunError } from './scheduled-turn-run.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
 import { hasUnsettledCodexAppDispatch } from '../utils/codex-app-dispatch-ledger.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
@@ -4392,7 +4393,7 @@ export async function executeScheduledTask(
      *  amend that run's execution-log record. */
     runId?: string;
   },
-): Promise<void> {
+): Promise<{ settlement?: Promise<void> } | void> {
   // Resolve which bot to use — prefer the task's original bot so replies come from
   // the same account the user set up the schedule with.
   const allBots = getAllBots();
@@ -4435,6 +4436,37 @@ export async function executeScheduledTask(
   // schedules persisted by older versions.
   const executionPosition = resolveScheduledTaskExecutionPosition(task);
   const scope = resolveScheduledTaskScope(task);
+  // A transfer owns routing. Defer before any banner/topic/link side effect so
+  // replay cannot duplicate visible schedule-start artifacts.
+  const preRoutingAnchor = executionPosition === 'new-topic'
+    ? undefined
+    : executionPosition === 'task'
+      ? task.rootMessageId?.trim() || `schedule-task:${task.id}`
+      : scope === 'chat'
+        ? task.chatId
+        : task.rootMessageId?.trim();
+  const transferringOwner = preRoutingAnchor
+    ? activeSessions.get(sessionKey(preRoutingAnchor, larkAppId))
+    : undefined;
+  if (transferringOwner && isSessionTransferring(transferringOwner)) {
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const settlement = new Promise<void>((onResolve, onReject) => {
+      resolve = onResolve;
+      reject = onReject;
+    });
+    const rerun = () => {
+      void executeScheduledTask(task, activeSessions, refreshCliVersion, additionalPrompt, runtime)
+        .then(result => result?.settlement)
+        .then(resolve, reject);
+    };
+    if (!deferUntilSessionTransferSettled(transferringOwner, rerun)) rerun();
+    logger.info(
+      `[scheduler] Task "${task.name}" deferred before routing until transfer settles `
+      + `session=${transferringOwner.session.sessionId}`,
+    );
+    return { settlement };
+  }
 
   // Silent execution posts no "🕐 task started" banner / creator notice.
   // A silent fresh-topic run receives a durable virtual anchor below; its real
@@ -4446,6 +4478,18 @@ export async function executeScheduledTask(
   // target when a chat-scope session already has another turn queued.
   const scheduledTurnId = `schedule:${task.id}:${randomUUID()}`;
   const scheduledTrustedCaller = trustedCallerForScheduledTask(task, larkAppId);
+  const registerScheduledRun = (session: DaemonSession) => {
+    const run = createScheduledTurnRun(session.session.sessionId, scheduledTurnId);
+    const runs = session.scheduledTurnRuns ??= new Map();
+    if (runs.has(scheduledTurnId)) {
+      throw new Error(`scheduled turn run already exists: ${scheduledTurnId}`);
+    }
+    runs.set(scheduledTurnId, run);
+    void run.promise.finally(() => {
+      if (runs.get(scheduledTurnId) === run) runs.delete(scheduledTurnId);
+    }).catch(() => undefined);
+    return run;
+  };
   const rawTopicTitle = task.topicTitle?.trim();
   const createsOwnTopic = executionPosition === 'new-topic' || executionPosition === 'task';
   const hasDynamicTopicTitle = !!rawTopicTitle
@@ -4782,7 +4826,6 @@ export async function executeScheduledTask(
           + `${existing.session.sessionId}; preserving it for recovery`,
         );
       }
-
       // Cold-resume the exact registered owner (master's resilience model). A
       // deliberately suspended session keeps its active registration with
       // worker=null; scheduled continuations must wake THAT same row instead of
@@ -4845,6 +4888,7 @@ export async function executeScheduledTask(
         rememberLastCliInput(existing, task.prompt, input);
         if (silent) armSilentScheduledTurn(existing, scheduledTurnId);
         if (existing.worker && !existing.worker.killed) {
+          const run = registerScheduledRun(existing);
           try {
             // sendWorkerInput reads the identity from OPTS, never from the
             // payload (unlike forkWorker, which reads payload ?? opts). Passing
@@ -4859,9 +4903,19 @@ export async function executeScheduledTask(
               scheduledTrustedCaller ? { trustedCaller: scheduledTrustedCaller } : {},
             )) {
               logger.info(`[scheduler] Task "${task.name}" injected into live session ${existing.session.sessionId}${silent ? ' (silent)' : ''}`);
-              return;
+              return { settlement: run.promise };
             }
+            run.cancelDispatch(new ScheduledTurnRunError(
+              'dispatch_rejected',
+              `scheduled turn was not accepted by live worker: ${scheduledTurnId}`,
+            ));
+            await run.promise.catch(() => undefined);
           } catch (err: any) {
+            run.cancelDispatch(new ScheduledTurnRunError(
+              'dispatch_rejected',
+              err instanceof Error ? err.message : String(err),
+            ));
+            await run.promise.catch(() => undefined);
             logger.warn(`[scheduler] Live injection threw (${err.message}); cold-resuming registered session`);
           }
         }
@@ -4869,14 +4923,40 @@ export async function executeScheduledTask(
           if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
           throw new Error(`scheduled continuation lost active session ${existing.session.sessionId}`);
         }
+        const run = registerScheduledRun(existing);
+        let admission: 'accepted' | 'deferred' | 'rejected' | undefined;
         try {
-          forkWorker(existing, input, { resume: existing.hasHistory, turnId: scheduledTurnId });
+          forkWorker(existing, input, { resume: existing.hasHistory, turnId: scheduledTurnId }, {
+            onAdmission: value => {
+              admission = value;
+              if (value === 'rejected') {
+                run.cancelDispatch(new ScheduledTurnRunError(
+                  'dispatch_rejected',
+                  `scheduled worker fork rejected: ${scheduledTurnId}`,
+                ));
+              }
+            },
+          });
         } catch (err) {
           if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
+          run.cancelDispatch(new ScheduledTurnRunError(
+            'dispatch_rejected',
+            err instanceof Error ? err.message : String(err),
+          ));
+          await run.promise.catch(() => undefined);
           throw err;
         }
+        if (admission === 'rejected') {
+          const error = new ScheduledTurnRunError(
+            'dispatch_rejected',
+            `scheduled worker fork rejected: ${scheduledTurnId}`,
+          );
+          run.cancelDispatch(error);
+          await run.promise.catch(() => undefined);
+          throw error;
+        }
         logger.info(`[scheduler] Task "${task.name}" cold-resumed session ${existing.session.sessionId}${silent ? ' (silent)' : ''}`);
-        return;
+        return { settlement: run.promise };
       }
 
       // Not a resumable conversation. A daemon-command scratch has no CLI
@@ -4991,17 +5071,44 @@ export async function executeScheduledTask(
     }
     rememberLastCliInput(ds, task.prompt, prompt);
     if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
+    const run = registerScheduledRun(ds);
+    let admission: 'accepted' | 'deferred' | 'rejected' | undefined;
     try {
-      forkWorker(ds, prompt, scheduledTurnId);
+      forkWorker(ds, prompt, scheduledTurnId, {
+        onAdmission: value => {
+          admission = value;
+          if (value === 'rejected') {
+            run.cancelDispatch(new ScheduledTurnRunError(
+              'dispatch_rejected',
+              `scheduled worker fork rejected: ${scheduledTurnId}`,
+            ));
+          }
+        },
+      });
     } catch (err) {
       if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
+      run.cancelDispatch(new ScheduledTurnRunError(
+        'dispatch_rejected',
+        err instanceof Error ? err.message : String(err),
+      ));
+      await run.promise.catch(() => undefined);
       await releaseStartRefusedForMissingDir(ds, err);
       throw err;
+    }
+    if (admission === 'rejected') {
+      const error = new ScheduledTurnRunError(
+        'dispatch_rejected',
+        `scheduled worker fork rejected: ${scheduledTurnId}`,
+      );
+      run.cancelDispatch(error);
+      await run.promise.catch(() => undefined);
+      throw error;
     }
     ds.initialStartPending = false;
     ds.pendingPrompt = undefined;
 
     logger.info(`[scheduler] Task "${task.name}" spawned (session: ${session.sessionId}, scope: ${runtimeScope}, anchor: ${anchor}, continuation: ${isContinuation}${silent ? ', silent' : ''})`);
+    return { settlement: run.promise };
   });
 }
 

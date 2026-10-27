@@ -28312,6 +28312,13 @@ process.on('message', async (raw: unknown) => {
     }
     case 'init': {
       const initStartedAtMs = Date.now();
+      const scheduleTurnId = !msg.adoptMode
+        && msg.dispatchAttempt === undefined
+        && !!msg.prompt
+        && msg.turnId?.startsWith('schedule:')
+        ? msg.turnId
+        : undefined;
+      if (scheduleTurnId) acknowledgeTurnInputReceived(scheduleTurnId);
       const ordinaryImTurnId = !msg.adoptMode
         && msg.dispatchAttempt === undefined
         && !!msg.prompt
@@ -28865,6 +28872,12 @@ process.on('message', async (raw: unknown) => {
       // to the backend (see flushPending) — applying at receive time made two
       // queued credential turns collapse to the newest value for both.
       const messageAdoptMode = lastInitConfig?.adoptMode === true;
+      const scheduleTurnId = !messageAdoptMode
+        && msg.dispatchAttempt === undefined
+        && msg.turnId?.startsWith('schedule:')
+        ? msg.turnId
+        : undefined;
+      if (scheduleTurnId) acknowledgeTurnInputReceived(scheduleTurnId);
       const ordinaryImTurnId = !messageAdoptMode
         && msg.dispatchAttempt === undefined
         // ordinary-turn 前缀族（om_ / bmx-recovery- / board: 决策看板批次）共用一套

@@ -428,6 +428,10 @@ export interface DaemonSession {
    *  real CLI input (rememberLastCliInput) — the next turn posts a card normally.
    *  In-memory only. See core/restart-report.ts. */
   suppressRecoveryCard?: boolean;
+  /** Full-lifecycle scheduled runs keyed by turn id. Runtime-only: scheduler
+   * awaits their promise outside the bot admission lease; worker receipts bind
+   * the exact generation and terminal/exit/abandon events settle them. */
+  scheduledTurnRuns?: Map<string, import('./scheduled-turn-run.js').ScheduledTurnRun>;
   /** Turn-exact ids for silent scheduled fires. Every worker→Lark output path
    *  checks its own turn id against this bounded in-memory registry, so a
    *  queued normal user turn cannot un-hush the schedule (or inherit its hush).

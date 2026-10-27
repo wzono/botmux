@@ -249,6 +249,57 @@ setInterval(() => {}, 1_000);
 
   // 跨身份隔离（XPI）现在由实验开关控制且默认关闭，所以这条用例必须显式打开它
   // ——它锁的正是「开关打开时」的拒绝行为。关闭态的镜像用例紧随其后。
+  it('acknowledges schedule init turns at the worker boundary', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-schedule-init-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+    const fakePi = join(root, 'fake-pi');
+    writeFakeCli(fakePi, `#!/usr/bin/env node
+setTimeout(() => process.stdout.write('Ready\\n'), 100);
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakePi, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-worker-schedule-init',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.send({
+      type: 'init',
+      sessionId: 'sid-worker-schedule-init',
+      chatId: 'oc_test',
+      rootMessageId: 'schedule-run:test',
+      workingDir: dataDir,
+      cliId: 'pi',
+      cliPathOverride: fakePi,
+      backendType: 'pty',
+      prompt: 'scheduled turn',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+      turnId: 'schedule:task1234:turn5678',
+    } satisfies DaemonToWorker);
+
+    await waitFor(() => messages.some(message =>
+      message.type === 'turn_input_received'
+      && message.turnId === 'schedule:task1234:turn5678'), []);
+    expect(messages).toContainEqual({
+      type: 'turn_input_received',
+      turnId: 'schedule:task1234:turn5678',
+    });
+  }, 15_000);
+
   it('rejects a different principal at the worker backstop before type-ahead can steer it (XPI on)', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-principal-queue-'));
     tempDirs.add(root);

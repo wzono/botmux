@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { parseHeadlessArgs } from '../src/cli/headless-command.js';
+import { buildHeadlessTriggerRequest, parseHeadlessArgs } from '../src/cli/headless-command.js';
 import {
   createHeadlessRecord,
   headlessChatId,
@@ -45,6 +45,53 @@ describe('headless command parsing', () => {
       kind: 'run',
       session: 'bmx-session',
       prompt: 'continue',
+    });
+  });
+
+  it('parses hidden thinking for run and send', () => {
+    expect(parseHeadlessArgs(['run', 'hl_123', 'check', '--hide-thinking'])).toMatchObject({
+      ok: true,
+      kind: 'run',
+      hideThinking: true,
+    });
+    expect(parseHeadlessArgs([
+      'send', '--session', 'bmx-session', '--prompt', 'check', '--hide-thinking',
+    ])).toMatchObject({
+      ok: true,
+      kind: 'run',
+      hideThinking: true,
+    });
+  });
+
+  it('maps hidden thinking onto trigger presentation without changing defaults', () => {
+    const daemon = { larkAppId: 'app_1' } as Parameters<typeof buildHeadlessTriggerRequest>[0]['daemon'];
+
+    expect(buildHeadlessTriggerRequest({
+      daemon,
+      sessionId: 'session-1',
+      prompt: 'check',
+      hideThinking: true,
+    }).presentation).toEqual({ thinking: 'hidden' });
+    expect(buildHeadlessTriggerRequest({
+      daemon,
+      sessionId: 'session-1',
+      prompt: 'check',
+      title: 'Watcher',
+      hideThinking: true,
+    }).presentation).toEqual({ title: 'Watcher', thinking: 'hidden' });
+    expect(buildHeadlessTriggerRequest({
+      daemon,
+      sessionId: 'session-1',
+      prompt: 'check',
+    }).presentation).toBeUndefined();
+  });
+
+  it('rejects a value assigned to the hidden-thinking boolean flag', () => {
+    expect(parseHeadlessArgs([
+      'send', '--session', 'bmx-session', '--prompt', 'check', '--hide-thinking=true',
+    ])).toMatchObject({
+      ok: false,
+      error: 'option --hide-thinking does not accept a value',
     });
   });
 

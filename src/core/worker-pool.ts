@@ -1089,6 +1089,16 @@ export interface WorkerPoolCallbacks {
     terminal: Extract<WorkerToDaemon, { type: 'turn_terminal' }>,
     context: { workerGeneration: number },
   ) => void | Promise<void>;
+  /** The worker accepted an exact turn-carrying IPC item. */
+  onTurnInputReceived?: (
+    ds: DaemonSession,
+    context: { turnId: string; workerGeneration: number },
+  ) => void;
+  /** The worker rejected an exact turn before it could produce a terminal. */
+  onTurnInputRejected?: (
+    ds: DaemonSession,
+    context: { turnId: string; workerGeneration: number; reason: string },
+  ) => void;
   /** The live worker generation proved that this exact input entered the
    * native conversation. Fenced to the current generation before delivery;
    * consumers cover shared background here instead of waiting for a terminal. */
@@ -9874,6 +9884,9 @@ export async function closeSession(
     }
     const after = sessionStore.getOwnedSession(sessionId);
     if (ds) {
+      for (const run of ds.scheduledTurnRuns?.values() ?? []) {
+        run.abandon(ds.session.sessionId, run.turnId, 'session_closed');
+      }
       ds.session.status = 'closed';
       ds.session.closedAt = after?.closedAt ?? ds.session.closedAt;
       ds.session.crossPrincipalInterruptions = undefined;
@@ -14047,7 +14060,20 @@ export function forkWorker(
   }
   if (deferWorkerSpawnDuringDeviceIsolation(ds.session.sessionId, () => {
     if (findActiveBySessionId(ds.session.sessionId) === ds) {
-      forkWorker(ds, promptInput, resumeOrTurnId);
+      forkWorker(ds, promptInput, resumeOrTurnId, opts);
+      return;
+    }
+    const deferredTurnId = typeof resumeOrTurnId === 'string'
+      ? resumeOrTurnId
+      : typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+        ? resumeOrTurnId.turnId
+        : undefined;
+    if (deferredTurnId) {
+      ds.scheduledTurnRuns?.get(deferredTurnId)?.abandon(
+        ds.session.sessionId,
+        deferredTurnId,
+        'device_isolation_session_unavailable',
+      );
     }
   })) {
     logger.info(`[${tag(ds)}] worker spawn deferred during device credential activation`);
@@ -14813,6 +14839,13 @@ export function forkWorker(
       // ChildProcess pointer until exit so it can decide whether abort/commit
       // was durably verified.
       try { worker.kill(); } catch { /* best-effort failed-child fence */ }
+    }
+    if (initAttributionTurnId) {
+      ds.scheduledTurnRuns?.get(initAttributionTurnId)?.abandon(
+        ds.session.sessionId,
+        initAttributionTurnId,
+        `worker_fork_error:${reason}`,
+      );
     }
     if (startupState.failureNotified) return;
     startupState.failureNotified = true;
@@ -15973,6 +16006,7 @@ function setupWorkerHandlers(
           break;
         }
         acknowledgeOrdinaryImDeliveryReceipt(ds, msg.turnId, workerGeneration);
+        cb.onTurnInputReceived?.(ds, { turnId: msg.turnId, workerGeneration });
         break;
       }
       case 'turn_input_rejected': {
@@ -15985,6 +16019,11 @@ function setupWorkerHandlers(
           break;
         }
         discardTriggerStreamingCard(ds, msg.turnId);
+        cb.onTurnInputRejected?.(ds, {
+          turnId: msg.turnId,
+          workerGeneration,
+          reason: msg.reason,
+        });
         await rejectOrdinaryImDelivery(ds, msg.turnId, workerGeneration, msg);
         // The turn never started and will never terminal. Run GC, but do NOT
         // release this turn's own ledger anchor here: a same-turnId redelivery
@@ -18022,6 +18061,9 @@ function setupWorkerHandlers(
         restartCounts.set(key, rc);
 
         if (rc.count > 3) {
+          for (const run of ds.scheduledTurnRuns?.values() ?? []) {
+            run.abandon(ds.session.sessionId, run.turnId, 'crash_loop');
+          }
           ds.managedTurnOrigin = undefined;
           logger.warn(`[${t}] ${sessionCliDisplayName(ds, botCfg)} crashed ${rc.count} times in 1 min, not auto-restarting`);
           const keepDiagnosticWorker = !!msg.canParkDiagnostic && !!ds.worker && !ds.worker.killed;

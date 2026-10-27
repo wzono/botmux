@@ -110,6 +110,8 @@ vi.mock('../src/core/worker-pool.js', () => ({
   }),
   setActiveSessionSafe: vi.fn(async (map: Map<string, any>, k: string, ds: any) => { map.set(k, ds); }),
   getActiveSessionsRegistry: vi.fn(() => null),
+  isSessionTransferring: vi.fn(() => false),
+  deferUntilSessionTransferSettled: vi.fn(() => false),
   // Daemon.ts module-load wires a couple of registry lookups at top level.
   findActiveBySessionId: vi.fn(() => undefined),
   retiringWorkersForSession: vi.fn(() => []),
@@ -305,7 +307,7 @@ describe('executeScheduledTask — silent thread fire', () => {
       expect(turnId).toMatch(/^schedule:task0001:/);
       prepared = true;
     });
-    await executeScheduledTask(
+    const settlement = await executeScheduledTask(
       baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
       active,
       refreshCliVersion,
@@ -316,6 +318,16 @@ describe('executeScheduledTask — silent thread fire', () => {
       expect.objectContaining({ session: expect.objectContaining({ sessionId: 'sess-1' }) }),
       expect.stringMatching(/^schedule:task0001:/),
     );
+    const ds = active.get(sessionKey(ROOT, APP))!;
+    const turnId = forkedTurnId();
+    ds.scheduledTurnRuns?.get(turnId)?.acceptInput(ds.session.sessionId, turnId, 1);
+    ds.scheduledTurnRuns?.get(turnId)?.settleTerminal({
+      sessionId: ds.session.sessionId,
+      turnId,
+      workerGeneration: 1,
+      status: 'completed',
+    });
+    await expect(settlement?.settlement).resolves.toBeUndefined();
   });
 
   it('posts nothing, anchors at rootMessageId, arms the exact forked turn, wraps the prompt', async () => {
@@ -522,7 +534,9 @@ describe('executeScheduledTask — fresh-topic execution', () => {
       executionPosition: 'top-level',
       topicTitle: '{{owner}}',
       ownerOpenId: undefined,
-    }), active, refreshCliVersion)).resolves.toBeUndefined();
+    }), active, refreshCliVersion)).resolves.toEqual({
+      settlement: expect.any(Promise),
+    });
   });
 
   it('thread task without a real root safely degrades to silent chat scope', async () => {
