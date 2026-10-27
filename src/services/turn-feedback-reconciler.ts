@@ -289,7 +289,7 @@ function applyExactTurnRouting(
     ?? (fresh.currentReplyTarget?.turnId === turnId ? fresh.currentReplyTarget.updatedAt : undefined);
   const liveWinsExactTurn = incomingAt !== undefined
     && (durableTurnAt === undefined || durableTurnAt < incomingAt);
-  if (snapshot.replyTarget) {
+  if (liveWinsExactTurn && snapshot.replyTarget) {
     const replyTargets = fresh.replyTargets ??= {};
     const existing = replyTargets[turnId];
     if (!existing || existing.updatedAt < snapshot.replyTarget.updatedAt) {

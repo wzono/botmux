@@ -620,6 +620,48 @@ describe('two-phase turn reactions', () => {
     expect(durable?.replyThreadAliases?.om_same_root).toBeUndefined();
   });
 
+  it('keeps a newer legacy current-only winner over stale live exact routing', async () => {
+    registerWith(false);
+    const ds = makeDs();
+    const turnId = 'om_legacy_current_only';
+    ds.session.currentReplyTarget = {
+      rootMessageId: 'om_durable_root', turnId, updatedAt: '2026-10-27T10:00:00.000Z',
+    };
+    ds.session.quoteTargetId = turnId;
+    ds.session.quoteTargetSenderOpenId = 'ou_durable';
+    ds.session.quoteTargetSenderIsBot = true;
+    sessionStore.updateSession(ds.session);
+
+    ds.session.quoteTargetId = turnId;
+    ds.session.quoteTargetSenderOpenId = 'ou_live';
+    ds.session.quoteTargetSenderIsBot = false;
+    beginReplyTargetTurn(ds, 'om_live_root', turnId, '2026-10-27T09:00:00.000Z', {
+      senderOpenId: 'ou_live', participants: [{ openId: 'ou_live', isBot: false }], inThread: true,
+    });
+    (ds.session.docCommentTargets ??= {})[turnId] = {
+      fileToken: 'doccn_stale', fileType: 'docx', commentId: 'comment_stale', turnId,
+    };
+
+    await noteTurnReceived(ds, turnId);
+
+    const durable = sessionStore.getSessionFresh(ds.session.sessionId);
+    expect(durable?.replyTargets?.[turnId]).toBeUndefined();
+    expect(durable?.turnReplyContexts?.[turnId]).toBeUndefined();
+    expect(durable?.docCommentTargets?.[turnId]).toBeUndefined();
+    expect(durable?.replyThreadAliases?.om_live_root).toBeUndefined();
+    expect(durable?.currentReplyTarget).toEqual({
+      rootMessageId: 'om_durable_root', turnId, updatedAt: '2026-10-27T10:00:00.000Z',
+    });
+    expect(durable).toMatchObject({
+      quoteTargetId: turnId, quoteTargetSenderOpenId: 'ou_durable', quoteTargetSenderIsBot: true,
+    });
+    expect(durable?.turnFeedback?.[turnId]).toMatchObject({ turnId, messageId: turnId });
+    expect(durable?.turnFeedback?.[turnId]).not.toHaveProperty('requesterOpenId');
+    expect(durable?.turnFeedback?.[turnId]).not.toHaveProperty('requesterIsBot');
+    expect(ds.currentReplyTarget).toEqual(durable?.currentReplyTarget);
+    expect(ds.replyThreadAliases).toEqual(durable?.replyThreadAliases);
+  });
+
   it('linearizes type-ahead admission before trigger-user identity awaits', async () => {
     registerWith(false, { triggerUserAuth: true });
     const ds = makeDs();
