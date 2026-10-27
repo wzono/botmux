@@ -132,6 +132,7 @@ git commit -m "feat(feedback): 持久化逐回合反馈归属"
 - Modify: `src/core/worker-pool.ts`
 - Test: `test/turn-reactions.test.ts`
 - Test: `test/turn-feedback-recovery.test.ts`
+- Test: `test/turn-feedback-retention.test.ts`
 
 - [ ] **Step 1: Write failing convergence tests**
 
@@ -143,20 +144,28 @@ type OwnReactionListResult =
   | { status: 'gone' | 'ambiguous' | 'failed' };
 ```
 
+Add retention tests before implementation:
+
+- nonterminal rows are never pruned;
+- terminal rows with `reactionReconcilePending`, a reaction operation, attention residue, capacity residue, an unclosed reminder, or a saved reaction not matching terminal policy are never pruned;
+- only settled terminal rows are bounded to 7 days and the newest 512 rows;
+- pruning 10,000 settled rows returns the exact retained set without mutating input.
+
 - [ ] **Step 2: Run RED**
 
-Run: `bun run test -- test/turn-reactions.test.ts test/turn-feedback-recovery.test.ts`
+Run: `bun run test -- test/turn-reactions.test.ts test/turn-feedback-recovery.test.ts test/turn-feedback-retention.test.ts`
 Expected: recovery cases fail before the operation journal exists.
 
 - [ ] **Step 3: Implement minimal operation journal**
 
 Persist immutable desired emoji/message/op ID before DELETE/CREATE. On ambiguous replay, list own reactions, adopt desired, then persist duplicate cleanup IDs before deleting.
+Implement `pruneTurnFeedback` only after terminal and pending-obligation fields exist. Apply it inside the owned Session mutation on terminal/recovery cleanup; never prune unresolved or uncertain operations. This retention gate must pass before any candidate build or deployment.
 
 - [ ] **Step 4: Run GREEN and commit**
 
 ```bash
-bun run test -- test/turn-reactions.test.ts test/turn-feedback-recovery.test.ts
-git add src/im/lark/client.ts src/services/turn-feedback-reconciler.ts src/core/worker-pool.ts test/turn-reactions.test.ts test/turn-feedback-recovery.test.ts
+bun run test -- test/turn-reactions.test.ts test/turn-feedback-recovery.test.ts test/turn-feedback-retention.test.ts
+git add src/im/lark/client.ts src/services/turn-feedback-reconciler.ts src/core/worker-pool.ts test/turn-reactions.test.ts test/turn-feedback-recovery.test.ts test/turn-feedback-retention.test.ts
 git commit -m "feat(feedback): 恢复一致的回合表情"
 ```
 
@@ -356,7 +365,7 @@ git commit -m "feat(capacity): 增加 fleet 策略与证据"
 - [ ] **Step 1: Run focused suites**
 
 ```bash
-bun run test -- test/capacity-wait-evidence.test.ts test/turn-feedback-state.test.ts test/turn-feedback-reconciler.test.ts test/turn-feedback-recovery.test.ts test/worker-capacity-wait.test.ts test/worker-capacity-wait.integration.test.ts test/dashboard-capacity-wait.test.ts test/session-card-model.test.ts test/capacity-wait-reminder.test.ts test/capacity-sideband-consumer.test.ts test/capacity-sideband-runtime.test.ts test/capacity-rollout-store.test.ts test/capacity-wait-audit.test.ts test/capacity-cli.test.ts test/turn-reactions.test.ts test/worker-pool-native-input-receipt.test.ts test/command-handler.test.ts
+bun run test -- test/capacity-wait-evidence.test.ts test/turn-feedback-state.test.ts test/turn-feedback-reconciler.test.ts test/turn-feedback-recovery.test.ts test/turn-feedback-retention.test.ts test/worker-capacity-wait.test.ts test/worker-capacity-wait.integration.test.ts test/dashboard-capacity-wait.test.ts test/session-card-model.test.ts test/capacity-wait-reminder.test.ts test/capacity-sideband-consumer.test.ts test/capacity-sideband-runtime.test.ts test/capacity-rollout-store.test.ts test/capacity-wait-audit.test.ts test/capacity-cli.test.ts test/turn-reactions.test.ts test/worker-pool-native-input-receipt.test.ts test/command-handler.test.ts
 ```
 
 Expected: all pass with zero unhandled errors.
