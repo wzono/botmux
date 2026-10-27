@@ -537,6 +537,89 @@ describe('two-phase turn reactions', () => {
     expect(ds.pendingAckReactions?.map(item => item.messageId)).toEqual([turnId]);
   });
 
+  it('keeps one durable winner on an equal-time conflicting live route', async () => {
+    registerWith(false);
+    const ds = makeDs();
+    const turnId = 'om_equal_conflict';
+    const updatedAt = '2026-10-27T10:00:00.000Z';
+    ds.session.replyTargets = {
+      [turnId]: {
+        rootMessageId: 'om_durable_root', updatedAt, senderOpenId: 'ou_durable',
+        participants: [{ openId: 'ou_durable', isBot: true }],
+      },
+    };
+    ds.session.currentReplyTarget = { rootMessageId: 'om_durable_root', turnId, updatedAt };
+    ds.session.quoteTargetId = turnId;
+    ds.session.quoteTargetSenderOpenId = 'ou_durable';
+    ds.session.quoteTargetSenderIsBot = true;
+    sessionStore.updateSession(ds.session);
+
+    ds.session.quoteTargetId = turnId;
+    ds.session.quoteTargetSenderOpenId = 'ou_live';
+    ds.session.quoteTargetSenderIsBot = false;
+    beginReplyTargetTurn(ds, 'om_live_root', turnId, updatedAt, {
+      senderOpenId: 'ou_live', participants: [{ openId: 'ou_live', isBot: false }], inThread: true,
+    });
+    (ds.session.docCommentTargets ??= {})[turnId] = {
+      fileToken: 'doccn_losing', fileType: 'docx', commentId: 'comment_losing', turnId,
+    };
+
+    await noteTurnReceived(ds, turnId);
+
+    const durable = sessionStore.getSessionFresh(ds.session.sessionId);
+    expect(durable?.replyTargets?.[turnId]).toMatchObject({
+      rootMessageId: 'om_durable_root', updatedAt, senderOpenId: 'ou_durable',
+      participants: [{ openId: 'ou_durable', isBot: true }],
+    });
+    expect(durable?.currentReplyTarget).toEqual({ rootMessageId: 'om_durable_root', turnId, updatedAt });
+    expect(durable).toMatchObject({
+      quoteTargetId: turnId, quoteTargetSenderOpenId: 'ou_durable', quoteTargetSenderIsBot: true,
+    });
+    expect(durable?.turnFeedback?.[turnId]).toMatchObject({
+      requesterOpenId: 'ou_durable', requesterIsBot: true,
+    });
+    expect(durable?.turnReplyContexts?.[turnId]).toBeUndefined();
+    expect(durable?.docCommentTargets?.[turnId]).toBeUndefined();
+    expect(durable?.replyThreadAliases?.om_live_root).toBeUndefined();
+    expect(ds.currentReplyTarget).toEqual(durable?.currentReplyTarget);
+    expect(ds.replyThreadAliases).toEqual(durable?.replyThreadAliases);
+  });
+
+  it('does not backfill absent metadata from an equal-time equivalent live route', async () => {
+    registerWith(false);
+    const ds = makeDs();
+    const turnId = 'om_equal_equivalent';
+    const updatedAt = '2026-10-27T10:05:00.000Z';
+    const durableTarget = {
+      rootMessageId: 'om_same_root', updatedAt, senderOpenId: 'ou_same',
+      participants: [{ openId: 'ou_same', isBot: false }],
+    };
+    ds.session.replyTargets = { [turnId]: durableTarget };
+    ds.session.currentReplyTarget = { rootMessageId: 'om_same_root', turnId, updatedAt };
+    ds.session.quoteTargetId = turnId;
+    ds.session.quoteTargetSenderOpenId = 'ou_same';
+    ds.session.quoteTargetSenderIsBot = false;
+    sessionStore.updateSession(ds.session);
+
+    beginReplyTargetTurn(ds, 'om_same_root', turnId, updatedAt, {
+      senderOpenId: 'ou_same', participants: [{ openId: 'ou_same', isBot: false }], inThread: true,
+    });
+    (ds.session.docCommentTargets ??= {})[turnId] = {
+      fileToken: 'doccn_equal', fileType: 'docx', commentId: 'comment_equal', turnId,
+    };
+
+    await noteTurnReceived(ds, turnId);
+
+    const durable = sessionStore.getSessionFresh(ds.session.sessionId);
+    expect(durable?.replyTargets?.[turnId]).toEqual(durableTarget);
+    expect(durable?.turnFeedback?.[turnId]).toMatchObject({
+      requesterOpenId: 'ou_same', requesterIsBot: false,
+    });
+    expect(durable?.turnReplyContexts?.[turnId]).toBeUndefined();
+    expect(durable?.docCommentTargets?.[turnId]).toBeUndefined();
+    expect(durable?.replyThreadAliases?.om_same_root).toBeUndefined();
+  });
+
   it('linearizes type-ahead admission before trigger-user identity awaits', async () => {
     registerWith(false, { triggerUserAuth: true });
     const ds = makeDs();

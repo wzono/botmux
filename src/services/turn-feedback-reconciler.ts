@@ -301,22 +301,19 @@ function applyExactTurnRouting(
       );
     }
   }
-  if (snapshot.replyContext) {
+  if (liveWinsExactTurn && snapshot.replyContext) {
     const contexts = fresh.turnReplyContexts ??= {};
-    if (!contexts[turnId] || liveWinsExactTurn) {
-      contexts[turnId] = snapshot.replyContext;
-      const overflow = Object.keys(contexts).length - 256;
-      if (overflow > 0) {
-        for (const staleTurnId of Object.keys(contexts).slice(0, overflow)) delete contexts[staleTurnId];
-      }
+    contexts[turnId] = snapshot.replyContext;
+    const overflow = Object.keys(contexts).length - 256;
+    if (overflow > 0) {
+      for (const staleTurnId of Object.keys(contexts).slice(0, overflow)) delete contexts[staleTurnId];
     }
   }
-  if (snapshot.docCommentTarget
-    && (fresh.docCommentTargets?.[turnId] === undefined || liveWinsExactTurn)) {
+  if (liveWinsExactTurn && snapshot.docCommentTarget) {
     const targets = fresh.docCommentTargets ??= {};
     targets[turnId] = snapshot.docCommentTarget;
   }
-  if (durableTurnAt === undefined || liveWinsExactTurn) {
+  if (liveWinsExactTurn) {
     for (const alias of snapshot.replyThreadAliases) {
       const aliases = fresh.replyThreadAliases ??= {};
       aliases[alias.rootMessageId] = mergeReplyThreadAlias(aliases[alias.rootMessageId], alias.value);
