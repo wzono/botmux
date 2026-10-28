@@ -3,6 +3,7 @@ import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readF
 import { join, resolve } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { readProcessStartIdentity } from '../utils/process-identity.js';
+import { withFileLock } from '../utils/file-lock.js';
 
 export interface CapacitySidebandEventV3 {
   schema_version: 'capacity-wait.v3';
@@ -117,6 +118,7 @@ export interface CapacitySidebandDirectoryDeps {
 export function createCapacitySidebandDirectoryConsumer(deps: CapacitySidebandDirectoryDeps) {
   const directory = resolve(deps.root, 'owners', deps.ownerAppId, 'events');
   const checkpointPath = join(directory, '.checkpoint.json');
+  const ownerLeasePath = join(directory, '.consumer-owner');
   let running = false;
   const claimGeneration = readProcessStartIdentity(process.pid)?.replace(/[^A-Za-z0-9._-]/g, '_')
     ?? 'unknown';
@@ -188,9 +190,10 @@ export function createCapacitySidebandDirectoryConsumer(deps: CapacitySidebandDi
       throw new Error('untrusted sideband owner directory');
     }
     running = true;
-    let accepted = 0;
-    let quarantined = false;
     try {
+      return await withFileLock(ownerLeasePath, async () => {
+      let accepted = 0;
+      let quarantined = false;
       const checkpoint = readCheckpoint();
       const names = readdirSync(directory)
         .filter(name => name.endsWith('.json') && name !== '.checkpoint.json')
@@ -252,6 +255,7 @@ export function createCapacitySidebandDirectoryConsumer(deps: CapacitySidebandDi
         accepted += 1;
       }
       return quarantined ? 0 : accepted;
+      }, { maxWaitMs: 1 });
     } finally {
       running = false;
     }
