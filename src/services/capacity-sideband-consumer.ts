@@ -2,6 +2,7 @@ import { createPublicKey, verify } from 'node:crypto';
 import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { readProcessStartIdentity } from '../utils/process-identity.js';
 
 export interface CapacitySidebandEventV3 {
   schema_version: 'capacity-wait.v3';
@@ -117,6 +118,8 @@ export function createCapacitySidebandDirectoryConsumer(deps: CapacitySidebandDi
   const directory = resolve(deps.root, 'owners', deps.ownerAppId, 'events');
   const checkpointPath = join(directory, '.checkpoint.json');
   let running = false;
+  const claimGeneration = readProcessStartIdentity(process.pid)?.replace(/[^A-Za-z0-9._-]/g, '_')
+    ?? 'unknown';
 
   function retryPending(): void {
     if (!existsSync(directory)) return;
@@ -135,15 +138,21 @@ export function createCapacitySidebandDirectoryConsumer(deps: CapacitySidebandDi
       }
       renameSync(entry.path, join(directory, entry.name.slice(0, -'.pending'.length)));
     }
-    for (const name of readdirSync(directory).filter(name => /\.json\.claim-[0-9]+$/.test(name))) {
-      const match = /\.claim-([0-9]+)$/.exec(name);
+    for (const name of readdirSync(directory).filter(name => /\.json\.claim-[0-9]+(?:-[A-Za-z0-9._-]+)?$/.test(name))) {
+      const match = /\.claim-([0-9]+)(?:-([A-Za-z0-9._-]+))?$/.exec(name);
       const pid = Number(match?.[1]);
+      const generation = match?.[2];
       let live = false;
       if (Number.isSafeInteger(pid) && pid > 1) {
-        try { process.kill(pid, 0); live = true; }
-        catch (error) { live = (error as NodeJS.ErrnoException).code === 'EPERM'; }
+        if (generation && generation !== 'unknown') {
+          const current = readProcessStartIdentity(pid);
+          live = current === undefined || current.replace(/[^A-Za-z0-9._-]/g, '_') === generation;
+        } else {
+          try { process.kill(pid, 0); live = true; }
+          catch (error) { live = (error as NodeJS.ErrnoException).code === 'EPERM'; }
+        }
       }
-      if (!live) renameSync(join(directory, name), join(directory, name.replace(/\.claim-[0-9]+$/, '')));
+      if (!live) renameSync(join(directory, name), join(directory, name.replace(/\.claim-[0-9]+(?:-[A-Za-z0-9._-]+)?$/, '')));
     }
   }
 
@@ -188,7 +197,7 @@ export function createCapacitySidebandDirectoryConsumer(deps: CapacitySidebandDi
         .sort();
       for (const name of names) {
         const source = join(directory, name);
-        const claimed = `${source}.claim-${process.pid}`;
+        const claimed = `${source}.claim-${process.pid}-${claimGeneration}`;
         try { renameSync(source, claimed); } catch { continue; }
         let fd: number | undefined;
         let raw: string;
@@ -252,7 +261,12 @@ export function createCapacitySidebandDirectoryConsumer(deps: CapacitySidebandDi
     directory, checkpointPath, poll,
     retryPending,
     start(intervalMs = 250) {
-      const timer = setInterval(() => { retryPending(); void poll().catch(() => undefined); }, intervalMs);
+      let ticks = 0;
+      const timer = setInterval(() => {
+        ticks += 1;
+        if (ticks % 20 === 0) retryPending();
+        void poll().catch(() => undefined);
+      }, intervalMs);
       timer.unref?.();
       void poll().catch(() => undefined);
       return () => clearInterval(timer);
