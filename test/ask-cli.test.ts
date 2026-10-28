@@ -139,7 +139,7 @@ describe('botmux ask — CLI boundary', () => {
         rootMessageId: 'om_test', workerGeneration: 3,
       } });
 
-      expect((await runAsk(dataDir)).status).toBe(0);
+      expect((await runAsk(dataDir, undefined, { BOTMUX_WORKER_GENERATION: '3' })).status).toBe(0);
       expect(requests).toHaveLength(2);
       expect(requests[0]).toMatchObject({ originWorkerGeneration: 3 });
       expect(requests[1]).toMatchObject({ originWorkerGeneration: 3, acknowledge: true });
