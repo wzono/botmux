@@ -1,5 +1,5 @@
 import { createPublicKey, verify } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
