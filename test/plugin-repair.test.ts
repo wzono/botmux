@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -32,8 +32,10 @@ afterEach(() => {
 
 function legacyFixture() {
   const runtime = pluginRuntimeDir('demo');
+  const source = join(home, 'source-demo');
   mkdirSync(join(runtime, 'service'), { recursive: true });
-  writeFileSync(join(home, '.botmux', 'plugins', 'demo', 'package.json'), JSON.stringify({
+  mkdirSync(source, { recursive: true });
+  writeFileSync(join(source, 'package.json'), JSON.stringify({
     name: '@botmux/plugin-demo', version: '1.0.0', keywords: ['botmux-plugin'],
     botmux: { schemaVersion: 1, id: 'demo', service: { mode: 'auto' } },
   }));
@@ -48,11 +50,23 @@ function legacyFixture() {
     pm2: { script: 'service/server.js', env: { HOST: '127.0.0.1' } }
   };`);
   writeFileSync(join(runtime, 'service', 'server.js'), 'setInterval(() => {}, 1000);');
+  mkdirSync(join(source, 'dist'), { recursive: true });
+  const copy = (from: string, to: string) => {
+    mkdirSync(to, { recursive: true });
+    for (const name of ['service', 'service-http', 'dashboard']) {
+      mkdirSync(join(to, name), { recursive: true });
+      for (const file of ['index.js', 'index.json', 'server.js']) {
+        const src = join(from, name, file);
+        if (existsSync(src)) writeFileSync(join(to, name, file), readFileSync(src));
+      }
+    }
+  };
+  copy(runtime, join(source, 'dist'));
   const now = '2026-10-28T00:00:00.000Z';
   mkdirSync(join(home, '.botmux'), { recursive: true });
   writeFileSync(pluginRegistryPath(), JSON.stringify({ schemaVersion: 1, plugins: { demo: {
     id: 'demo', packageName: '@botmux/plugin-demo', version: '1.0.0',
-    source: { type: 'local', spec: '/original/source' },
+    source: { type: 'local', spec: source },
     manifest: { schemaVersion: 1, id: 'demo', service: { mode: 'auto' } },
     contributions: {
       dashboard: [{ id: 'demo', entry: 'dashboard/index.js' }],
