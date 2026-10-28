@@ -1,8 +1,8 @@
 # Botmux 全量可信容量反馈设计
 
-日期：2026-10-27
+日期：2026-10-27；2026-10-28 收窄恢复保证
 
-状态：已确认设计，待实施计划
+状态：收窄设计已确认，待重写实施计划
 
 目标分支：`topic/capacity-wait-feedback`
 
@@ -12,9 +12,11 @@
 
 容量反馈作为一个独立 topic 进入定制版 `dev`。全部 Botmux 机器人运行同一份代码，并最终启用同一套逐 turn 状态、Dashboard、飞书工作卡、表情和提醒能力。
 
+本功能只保证**反馈状态自身**的持久化与收敛：逐 turn 行或 reaction intent 一旦成功写入 SessionStore，daemon 重启后必须继续恢复；provider ACK 不确定时，必须先读取自身 reaction 再决定下一步，不能盲目重发。它不接管 Botmux 的完整 terminal lifecycle，也不承诺 terminal 在首次 SessionStore 终态提交前恰好发生 daemon/worker 崩溃时无损恢复。
+
 发布不再限定单个机器人。采用“统一 release、按可信信号路径分批启用、最终全量”的策略：先验证 TraeX 原生信号，再验证 Codex/Claude Proxy sideband，最后覆盖剩余机器人。分批仅用于控制发布风险，不形成长期版本或能力分叉。
 
-旧的 Evan-only 候选二进制、端口、系统身份和发布清单均为历史材料，不得执行。
+旧的 Evan-only 候选二进制、端口、系统身份和发布清单均为历史材料，不得执行。未通过完整规格审查的 Task 3 提交 `418dcf172` 也不得进入 `dev`、候选构建或发布；新版实施前须先可恢复地撤销该提交。
 
 ## 2. 背景与现状
 
@@ -25,7 +27,7 @@
 
 它还没有以下完整能力：
 
-- 把明确容量等待建模为逐 turn、可恢复状态。
+- 把明确容量等待建模为逐 turn 持久反馈；成功写入 SessionStore 后可恢复。
 - 展示排位、观测时间和“尚未开始执行”。
 - 在 Dashboard、飞书工作卡与触发消息表情之间保持一致。
 - 在交互任务 2 分钟、后台任务 10 分钟时更新一次提醒。
@@ -40,6 +42,8 @@
 
 这些分支相对当前 `dev` 带有大量历史差异，不能整体合并。实施时只移植经新 spec 要求的功能，并用测试先行重新建立行为证据。
 
+当前 topic 已完成两个通过独立规格与质量审查的实现阶段：纯状态机 `92b354729`，以及 exact-turn admission 到 `98b0c308d`。后续 Task 3 曾把范围扩大到 worker terminal outbox、两阶段 suspend 与完整 terminal lifecycle 恢复；完整规格审查证明这需要贯穿 ordinary、queued、Codex、VC、readonly、recovery 六类入口的独立协议，因此本需求明确放弃这部分扩展。
+
 当前 fleet 有 29 个机器人；运行时配置归一为 5 个 TraeX、11 个 Codex、13 个 Claude Code。部分 Codex/Claude 走共享 Trae Proxy，部分走直接订阅或 Relay。功能必须部署到全部 29 个机器人，但只有收到权威容量信号时才能进入“等待模型容量”；不能为了覆盖率从静默或普通文本猜测排队。
 
 ## 3. 目标与非目标
@@ -49,7 +53,7 @@
 1. 全部机器人使用同一 `dev` release 和同一状态模型。
 2. 明确容量等待在 5 秒内出现在 Dashboard 或飞书工作卡。
 3. 状态严格绑定 `app + session + turn + attempt + worker generation + native identity`，不能串到别的机器人或任务。
-4. 排队、等待用户、处理中、完成、失败的表情和卡片状态一致且可恢复。
+4. 排队、等待用户、处理中、完成、失败的表情和卡片状态一致；已成功写入 SessionStore 的反馈状态和 reaction intent 可在 daemon 重启后恢复。
 5. 误报时只关闭对应 `机器人 × adapter`，其余机器人继续工作。
 6. 每日定制版重建能从 manifest 恢复该 topic，不依赖 stash 或 live checkout 的未提交文件。
 
@@ -61,6 +65,10 @@
 - 不记录 prompt、模型回答、终端屏幕原文或队列错误正文。
 - 不要求没有权威排队信号的 provider 伪造排位。
 - 不长期维护 Evan-only 或其它单席二进制。
+- 不新增 worker terminal outbox、daemon terminal lifecycle store、opaque attempt reference 或 terminal effect receipts。
+- 不修改 ordinary、queued、Codex、VC、readonly、recovery 六类入口的既有 terminal ownership。
+- 不承诺 terminal 在首次 SessionStore 终态提交成功前恰好发生 daemon/worker 崩溃时无损；该窗口沿用 Botmux 现有行为。
+- 不为本功能新增两阶段 suspend、Web Terminal 写栅栏或完整 terminal lifecycle 重放。
 
 ## 4. 方案选择
 
@@ -80,11 +88,11 @@
 
 ## 5. 模块与接口
 
-设计使用四个深模块。调用者只接触小接口；文件系统、签名、恢复和状态机复杂度留在各模块内部。
+设计使用五个深模块。调用者只接触小接口；文件系统、签名、恢复和状态机复杂度留在各模块内部。
 
 ### 5.1 `TurnFeedbackRuntime`
 
-接口：接收规范化的 `waiting | clear | terminal | needs_user` 观测，并投影当前 turn 的持久状态。
+接口：接收规范化的 `waiting | clear | terminal | needs_user` 观测，并投影当前 turn 的持久状态。`terminal` 仍由现有 live worker/daemon 路径提供，不成为本模块新建的跨重启事实源。
 
 职责：
 
@@ -95,7 +103,20 @@
 
 它不知道 TraeX viewport、Proxy 文件或签名格式。
 
-### 5.2 `CapacityEvidenceAdapter`
+### 5.2 `ReactionProjection`
+
+接口：`reconcile(target, desiredReaction)`。
+
+职责：
+
+- 在 provider CREATE/DELETE 前，先把 immutable operation intent 写入 SessionStore。
+- 通过完整 own-reaction 列表收敛为最多一个目标表情；不同类型的旧表情也必须清理。
+- provider ACK 不确定、ID 持久化失败或 daemon 重启时，从已落库 intent 恢复；先 LIST，再决定 adopt、DELETE 或 CREATE。
+- 保留 1s/5s/15s 的短暂恢复，以及 5m/30m/2h 的受阻恢复；永久错误不盲目重试。
+- 只恢复已经成功写入 SessionStore 的 intent；它不持久化、重放或接管 terminal 事件本身。
+- live terminal 到达时，反馈终态与 reaction intent 应在同一 SessionStore mutation 中提交；该 mutation 失败时跳过本次反馈 reaction、记录明确错误，但不阻断或重放 Botmux 原有 terminal lifecycle，也不伪造可恢复成功。
+
+### 5.3 `CapacityEvidenceAdapter`
 
 接口：把某个 CLI 路径的权威信号转换为规范化观测，并附带 native identity 和观测时间。
 
@@ -105,13 +126,13 @@
 - Codex/Claude Proxy：只读取已验证的 fleet `capacity-wait.v3` sideband；旧 `v2` 不进入全量 consumer。
 - 其它直接 provider：仅在该 CLI 暴露同等强度的权威结构化事件或当前 UI 时增加 adapter。未适配时保持 processing，不从文本、日志或静默推断。
 
-### 5.3 `FleetCapacitySideband`
+### 5.4 `FleetCapacitySideband`
 
 接口：Proxy 发布签名事件；每个 Botmux daemon 只消费自己 app 命名空间中的事件。
 
 职责：签名验证、owner 路由、claim、重放保护、checkpoint、pending/quarantine、恢复和逐 adapter fail-closed。
 
-### 5.4 `CapacityRolloutPolicy`
+### 5.5 `CapacityRolloutPolicy`
 
 接口：`isEnabled(appId, adapter)`、`disable(appId, adapter, reason)`、`phase()`。
 
@@ -245,6 +266,9 @@
 - kill switch 只影响一个 `app × adapter`。
 - restart、checkpoint 写失败、pending 恢复、目录/文件权限和 symlink/rename race。
 - Dashboard、工作卡和 reaction 的实际投影行为；不以源码文本断言代替行为测试。
+- reaction intent 写入后模拟进程死亡：重启只能从该 intent 恢复，必须 LIST-before-mutate，且不能重复 CREATE/DELETE。
+- terminal 首次 SessionStore 提交失败窗口只验证“不会冒称已恢复”，不为此创建 outbox、attemptRef 或跨入口 lifecycle 协议。
+- 留存规则：非终态和任何未解决反馈义务永不裁剪；已收敛终态保留 7 天／最新 512，永久诊断保留 7 天／最新 128；10,000 行夹具验证精确结果且不修改输入。
 
 ### 10.2 代码门禁
 
@@ -262,6 +286,7 @@
 - 思考、工具执行、普通静默和用户引用排队文案均为 0 误报。
 - 跨机器人、跨 session、跨 turn 和旧 attempt 均为 0 串线。
 - 最终 29/29 online、同一 release、Dashboard healthy；实际数量变化时以实时 fleet 为准。
+- 验收记录必须明确：反馈恢复保证从 SessionStore 成功写入开始；首次 terminal 持久化前的 daemon/worker crash 窗口不在承诺内。
 
 ## 11. 回滚
 
@@ -281,6 +306,8 @@
 - Proxy producer 保持独立功能分支并进入其正式维护清单。
 - 不修改 release 目录；release 只由现有发布工具生成。
 - 历史 Evan-only `RELEASE.md` 仅作审计证据，不得作为新发布输入。
+- Task 3 提交 `418dcf172` 只保留为失败实验与审查证据，实施前通过 `git revert 418dcf172` 生成可追溯撤销提交；禁止 reset、改写历史或从其中整体 cherry-pick。
+- 完整 terminal lifecycle 若未来重开，必须另立 spec，定义 opaque attemptRef、六类 owner adapter、逐 effect durable receipt 和迁移策略；不得悄悄回流本 topic。
 
 ## 13. 设计自检
 
@@ -288,4 +315,5 @@
 - 全量目标与分批节奏已分离，不再把 canary 误写为最终范围。
 - “所有机器人具备功能”与“没有权威信号时不猜测排队”没有冲突：统一框架全量生效，waiting 只由可信 evidence 触发。
 - sideband 从单 app 静态配置改为 owner 命名空间，解决多 daemon 竞争和跨机器人串线。
+- feedback restart recovery 与完整 terminal lifecycle recovery 已明确分界，不再把后者当成本功能的隐含保证。
 - 所有完成标准都有对应测试或线上回读门禁。
