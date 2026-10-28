@@ -7,15 +7,6 @@ import { trackStartingCardPublication } from './starting-card-publication.js';
 import { privateReplyEnabled } from './private-reply.js';
 import { currentGatewayCallerOpenId } from './gateway-turn-caller.js';
 export { currentGatewayCallerOpenId } from './gateway-turn-caller.js';
-import { turnFeedbackReconciler } from '../services/turn-feedback-reconciler.js';
-import {
-  hasPendingTurnFeedbackTerminalOutbox,
-  readTurnFeedbackTerminalSuspendReady,
-  readTurnFeedbackTerminalRequest,
-  removeTurnFeedbackTerminalSuspendReady,
-  settleTurnFeedbackTerminalOutboxForSuspend,
-  type TurnFeedbackTerminalRecord,
-} from '../services/turn-feedback-terminal-outbox.js';
 import { handoffCardClosed, handoffCardBlocksStreaming, applyHandoffCardEvent, type HandoffCardEvent } from './handoff-card-lifecycle.js';
 import { assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from '../cli/topic-send-guard.js';
 import { REPLY_CARD_FOOTER_ELEMENT_ID } from '../im/lark/reply-card-footer-signature.js';
@@ -9085,88 +9076,21 @@ export function destroySuspendBackingVerified(
 }
 
 let suspendBackingVerifier: (ds: DaemonSession) => boolean = destroySuspendBackingVerified;
-type SuspendPreparation = { requestId: string; prepared: boolean };
-let suspendPreparationVerifier: (
-  ds: DaemonSession, worker: ChildProcess, requestId: string, startedAtMs: number,
-) => boolean = waitForSuspendPreparation;
-const pendingTerminalCommits = new WeakMap<ChildProcess, Set<string>>();
-
-function markPendingTerminalCommit(worker: ChildProcess, requestId: string): void {
-  const pending = pendingTerminalCommits.get(worker) ?? new Set<string>();
-  pending.add(requestId);
-  pendingTerminalCommits.set(worker, pending);
-}
-
-function clearPendingTerminalCommit(worker: ChildProcess, requestId: string): void {
-  const pending = pendingTerminalCommits.get(worker);
-  pending?.delete(requestId);
-  if (pending?.size === 0) pendingTerminalCommits.delete(worker);
-}
 
 /** Unit-test seam; production never overrides the exact kill + post-probe path. */
 export function __testOnly_setSuspendBackingVerifier(
   verifier?: (ds: DaemonSession) => boolean,
 ): void {
   suspendBackingVerifier = verifier ?? destroySuspendBackingVerified;
-  // Existing suspend unit tests use synthetic EventEmitters rather than real
-  // child processes. Pair their backing seam with a proven prepare unless a
-  // test explicitly installs the preparation interleaving seam below.
-  suspendPreparationVerifier = verifier ? () => true : waitForSuspendPreparation;
-}
-
-export function __testOnly_setSuspendPreparationVerifier(
-  verifier?: (ds: DaemonSession, worker: ChildProcess, requestId: string, startedAtMs: number) => boolean,
-): void {
-  suspendPreparationVerifier = verifier ?? waitForSuspendPreparation;
-}
-
-function waitForSuspendPreparation(
-  ds: DaemonSession,
-  worker: ChildProcess,
-  requestId: string,
-  startedAtMs: number,
-): boolean {
-  try { worker.send({ type: 'prepare_suspend', requestId, startedAtMs } as DaemonToWorker); }
-  catch { return false; }
-  const expected = {
-    version: 1 as const, ownerAppId: ds.larkAppId, sessionId: ds.session.sessionId,
-    workerGeneration: ds.workerGeneration!, requestId,
-  };
-  for (let attempt = 0; attempt < 200; attempt += 1) {
-    try {
-      if (readTurnFeedbackTerminalSuspendReady(config.session.dataDir, expected)) return true;
-    } catch { return false; }
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
-  }
-  return false;
-}
-
-function abortSuspendPreparation(
-  ds: DaemonSession, worker: ChildProcess, preparation: SuspendPreparation,
-): void {
-  try {
-    worker.send({ type: 'abort_suspend', requestId: preparation.requestId } as DaemonToWorker);
-  } catch { /* worker may have exited */ }
-  try {
-    removeTurnFeedbackTerminalSuspendReady(config.session.dataDir, {
-      version: 1, ownerAppId: ds.larkAppId, sessionId: ds.session.sessionId,
-      workerGeneration: ds.workerGeneration!, requestId: preparation.requestId,
-    });
-  } catch { /* exact marker cleanup remains best-effort on an abort */ }
 }
 
 export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boolean {
-  const suspendStartedAtMs = Date.now();
   if (hasProtectedSessionMutationOwnership(ds)) {
     logger.warn(`[${tag(ds)}] Refused worker suspend (${reason}) while Codex App dispatch ownership is non-empty`);
     return false;
   }
   if (isSessionTransferring(ds)) {
     logger.warn(`[${tag(ds)}] Suspend refused while routing transfer is in progress`);
-    return false;
-  }
-  if (ds.worker && (pendingTerminalCommits.get(ds.worker)?.size ?? 0) > 0) {
-    logger.warn(`[${tag(ds)}] Suspend refused while terminal feedback commit is pending`);
     return false;
   }
   if (!ds.worker || ds.worker.killed) {
@@ -9178,88 +9102,12 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
     invalidateTuiPrompt(ds, 'suspendWorker:no_worker');
     return false;
   }
-  const terminalProtocolGeneration = Number.isSafeInteger(ds.workerGeneration)
-    && (ds.workerGeneration ?? 0) > 0
-    && ds.session.workerGeneration === ds.workerGeneration
-    ? ds.workerGeneration : undefined;
-  try {
-    if (terminalProtocolGeneration === undefined) throw new Error('legacy generation');
-    const pending = hasPendingTurnFeedbackTerminalOutbox(config.session.dataDir, {
-      ownerAppId: ds.larkAppId,
-      sessionId: ds.session.sessionId,
-      workerGeneration: ds.workerGeneration!,
-    }, record => {
-      const receipt = ds.session.turnFeedback?.[record.turnId]?.terminalReceipt;
-      return receipt?.terminalRequestId === record.terminalRequestId
-        && receipt.workerGeneration === record.workerGeneration
-        && receipt.dispatchAttempt === record.dispatchAttempt
-        && receipt.status === record.status
-        && receipt.completedAtMs === record.completedAtMs
-        && receipt.durationMs === record.durationMs
-        && receipt.savedAtMs === record.savedAtMs;
-    });
-    if (pending) {
-      logger.warn(`[${tag(ds)}] Suspend refused while terminal feedback outbox is pending`);
-      return false;
-    }
-  } catch (error) {
-    if (terminalProtocolGeneration === undefined) {
-      // Pre-terminal-outbox workers do not publish generation-bound terminal
-      // records, so they retain the historical suspend path.
-    } else {
-    logger.warn(
-      `[${tag(ds)}] Suspend refused because terminal feedback outbox could not be scanned: `
-      + `${error instanceof Error ? error.message : String(error)}`,
-    );
-    return false;
-    }
-  }
   if (!isSuspendableBackendType(ds.initConfig?.backendType)) return false;
 
   const w = ds.worker;
-  const preparation: SuspendPreparation = { requestId: randomUUID(), prepared: false };
-  preparation.prepared = terminalProtocolGeneration === undefined
-    || suspendPreparationVerifier(ds, w, preparation.requestId, suspendStartedAtMs);
-  if (!preparation.prepared) {
-    logger.warn(`[${tag(ds)}] Suspend refused because worker quiescence was not proven`);
-    abortSuspendPreparation(ds, w, preparation);
-    return false;
-  }
-  let outboxSettled = terminalProtocolGeneration === undefined;
-  try {
-    if (terminalProtocolGeneration === undefined) throw new Error('legacy generation');
-    outboxSettled = settleTurnFeedbackTerminalOutboxForSuspend(
-      config.session.dataDir,
-      {
-        ownerAppId: ds.larkAppId, sessionId: ds.session.sessionId,
-        workerGeneration: ds.workerGeneration!,
-      },
-      record => {
-        const receipt = ds.session.turnFeedback?.[record.turnId]?.terminalReceipt;
-        return receipt?.terminalRequestId === record.terminalRequestId
-          && receipt.workerGeneration === record.workerGeneration
-          && receipt.dispatchAttempt === record.dispatchAttempt
-          && receipt.status === record.status
-          && receipt.completedAtMs === record.completedAtMs
-          && receipt.durationMs === record.durationMs
-          && receipt.savedAtMs === record.savedAtMs;
-      },
-    );
-  } catch (error) {
-    if (terminalProtocolGeneration === undefined) {
-      outboxSettled = true;
-    } else {
-    logger.warn(`[${tag(ds)}] Suspend refused during final terminal outbox scan: ${String(error)}`);
-    }
-  }
-  if (!outboxSettled) {
-    abortSuspendPreparation(ds, w, preparation);
-    return false;
-  }
   trackLifecycleRetirement(ds, w);
   if (!suspendBackingVerifier(ds)) {
     clearLifecycleRetirement(ds, w);
-    abortSuspendPreparation(ds, w, preparation);
     return false;
   }
   try {
@@ -15067,7 +14915,6 @@ export function forkWorker(
   initMsg = {
     type: 'init',
     sessionId: ds.session.sessionId,
-    workerGeneration,
     chatId: ds.chatId,
     chatType: ds.chatType,
     rootMessageId: sessionAnchorId(ds),
@@ -15679,10 +15526,6 @@ function setupWorkerHandlers(
     );
   const ownsLifecycleMutation = (): boolean =>
     ownsWorkerSession() && !isSessionTransferring(ds);
-  const terminalFeedbackReceipts = new Map<string, {
-    record: TurnFeedbackTerminalRecord;
-    result: 'committed' | 'conflict';
-  }>();
   // A new worker generation is starting. As a backstop, invalidate any
   // stuck-warning card posted by the previous generation — explicit kill/suspend/
   // exit paths should already have done this, but fork/refork/takeover paths
@@ -18818,111 +18661,6 @@ function setupWorkerHandlers(
           );
           break;
         }
-        const terminalRequestId = msg.terminalRequestId;
-        if (terminalRequestId) {
-          let durableTerminal: TurnFeedbackTerminalRecord | undefined;
-          try {
-            durableTerminal = readTurnFeedbackTerminalRequest(config.session.dataDir, {
-              ownerAppId: ds.larkAppId, sessionId: msg.sessionId,
-              workerGeneration, terminalRequestId,
-            });
-          } catch (error) {
-            logger.warn(`[reaction] invalid terminal outbox request ${terminalRequestId}: ${String(error)}`);
-          }
-          const exact = durableTerminal
-            && durableTerminal.turnId === msg.turnId
-            && durableTerminal.dispatchAttempt === msg.dispatchAttempt
-            && durableTerminal.status === msg.status
-            && durableTerminal.completedAtMs === msg.completedAtMs
-            && durableTerminal.durationMs === msg.durationMs;
-          if (!durableTerminal || !exact || !ownsLifecycleMutation() || !ds.session.turnFeedback?.[msg.turnId]) {
-            try {
-              worker.send({
-                type: 'turn_terminal_persisted', terminalRequestId,
-                sessionId: msg.sessionId, turnId: msg.turnId,
-                ...(msg.dispatchAttempt !== undefined ? { dispatchAttempt: msg.dispatchAttempt } : {}),
-                status: msg.status, result: 'conflict',
-              });
-            } catch { /* worker outbox preserves evidence */ }
-            break;
-          }
-          const highWater = ds.turnDispatchAttemptHighWater;
-          if (highWater?.turnId === msg.turnId
-            && (msg.dispatchAttempt === undefined
-              || msg.dispatchAttempt !== highWater.dispatchAttempt)) {
-            try {
-              worker.send({
-                type: 'turn_terminal_persisted', terminalRequestId,
-                sessionId: msg.sessionId, turnId: msg.turnId,
-                dispatchAttempt: msg.dispatchAttempt, status: msg.status, result: 'conflict',
-              });
-            } catch { /* worker outbox retains conflict evidence */ }
-            break;
-          }
-          markPendingTerminalCommit(worker, terminalRequestId);
-          const previous = terminalFeedbackReceipts.get(terminalRequestId);
-          const previousMatches = previous
-            && JSON.stringify(previous.record) === JSON.stringify(durableTerminal);
-          const result = previous ? previousMatches ? previous.result : 'conflict' : undefined;
-          if (result) {
-            try {
-              worker.send({
-                type: 'turn_terminal_persisted', terminalRequestId,
-                sessionId: msg.sessionId, turnId: msg.turnId,
-                ...(msg.dispatchAttempt !== undefined ? { dispatchAttempt: msg.dispatchAttempt } : {}),
-                status: msg.status, result,
-              });
-            } catch { /* worker outbox retains and resends */ }
-            clearPendingTerminalCommit(worker, terminalRequestId);
-            break;
-          }
-          try {
-            const commit = turnFeedbackReconciler.commitTerminalReceipt(ds, durableTerminal);
-            const ackResult = commit === 'conflict' ? 'conflict' : 'committed';
-            if (commit === 'missing') throw new Error('terminal feedback row missing');
-            terminalFeedbackReceipts.set(terminalRequestId, { record: durableTerminal, result: ackResult });
-            if (terminalFeedbackReceipts.size > 256) {
-              terminalFeedbackReceipts.delete(terminalFeedbackReceipts.keys().next().value!);
-            }
-            try {
-              worker.send({
-                type: 'turn_terminal_persisted', terminalRequestId,
-                sessionId: msg.sessionId, turnId: msg.turnId,
-                ...(msg.dispatchAttempt !== undefined ? { dispatchAttempt: msg.dispatchAttempt } : {}),
-                status: msg.status, result: ackResult,
-              });
-            } catch { /* committed outbox resends; lifecycle still runs once */ }
-            clearPendingTerminalCommit(worker, terminalRequestId);
-            if (ackResult === 'conflict' || commit === 'duplicate') break;
-            void turnFeedbackReconciler.reconcile(ds, msg.turnId).catch(error => {
-              logger.warn(`[reaction] terminal reconcile failed for ${msg.turnId}: ${String(error)}`);
-            });
-          } catch (error) {
-            try {
-              worker.send({
-                type: 'turn_terminal_persisted', terminalRequestId,
-                sessionId: msg.sessionId, turnId: msg.turnId,
-                ...(msg.dispatchAttempt !== undefined ? { dispatchAttempt: msg.dispatchAttempt } : {}),
-                status: msg.status, result: 'retry',
-              });
-            } catch { /* worker outbox retains and resends */ }
-            logger.warn(`[reaction] terminal persistence failed for ${msg.turnId}: ${String(error)}`);
-            break;
-          }
-        } else if (ownsLifecycleMutation() && ds.session.turnFeedback?.[msg.turnId]) {
-          try {
-            await turnFeedbackReconciler.terminal(
-              ds,
-              msg.turnId,
-              msg.status === 'completed' ? 'completed' : 'failed',
-              msg.completedAtMs,
-            );
-          } catch (error) {
-            logger.warn(
-              `[reaction] terminal persistence failed for ${msg.turnId}: ${String(error)}`,
-            );
-          }
-        }
         try {
           getLinkRefRuntime()?.settleTurn({
             appId: ds.larkAppId,
@@ -20780,8 +20518,20 @@ function shouldDropMismatchedHermesFinalOutput(
   return true;
 }
 
-/** Finish only pre-journal reaction entries left by an older daemon. Durable
- * turnFeedback rows are owned by the reconciler and skipped here. */
+/**
+ * Turn-end half of the two-phase turn reactions (auto-on for card-off sessions,
+ * i.e. streaming card disabled). The 冲! "received" reactions are added per-message at the daemon
+ * acceptance point (`noteTurnReceived`); the screen_update handler calls this
+ * only on working|analyzing → idle|limited (not cold-start starting→idle), to
+ * flip every pending ✋ on this session to ✅ DONE and clear the list. When
+ * silentTurnReactions is enabled after a ✋ has already landed, we only remove
+ * that received reaction and do not add DONE. Binding the start to the message
+ * (not a status edge) means type-ahead / busy-batched messages each get their
+ * own reaction and all settle together here.
+ *
+ * Every Feishu call is best-effort — a failure only means a missing emoji, so it
+ * must never throw into the status pipeline (callers invoke as `void`).
+ */
 async function finishTurnReactions(ds: DaemonSession): Promise<void> {
   const list = ds.pendingAckReactions;
   if (!list || list.length === 0) return;
@@ -20795,11 +20545,6 @@ async function finishTurnReactions(ds: DaemonSession): Promise<void> {
   const silent = silentTurnReactions(ds);
   const doneEmoji = doneReactionEmojiFor(ds);
   for (const ack of list) {
-    if (Object.values(ds.session.turnFeedback ?? {})
-      .some(record => record.messageId === ack.messageId
-        && (record.reaction !== undefined
-          || record.reactionOperation !== undefined
-          || record.reactionReconcilePending === true))) continue;
     if (ack.reactionId) {
       try {
         await removeReaction(ds.larkAppId, ack.messageId, ack.reactionId);
@@ -22273,7 +22018,6 @@ export function forkAdoptWorker(
   initMsg = {
     type: 'init',
     sessionId: ds.session.sessionId,
-    workerGeneration,
     chatId: ds.chatId,
     chatType: ds.chatType,
     rootMessageId: sessionAnchorId(ds),

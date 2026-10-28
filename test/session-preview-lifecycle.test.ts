@@ -11,9 +11,6 @@
  */
 
 import { EventEmitter } from 'node:events';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../src/im/lark/client.js', () => ({
@@ -43,7 +40,7 @@ vi.mock('../src/bot-registry.js', () => ({
 vi.mock('../src/config.js', () => ({
   config: {
     web: { externalHost: 'localhost' },
-    session: { get dataDir() { return process.env.SESSION_DATA_DIR ?? '/tmp/test-preview-lifecycle'; } },
+    session: { dataDir: '/tmp/test-preview-lifecycle' },
     daemon: { backendType: 'tmux', cliId: 'claude-code' },
   },
 }));
@@ -104,7 +101,6 @@ import {
   __testOnly_reserveWorkerGeneration,
   __testOnly_setupWorkerHandlers,
   __testOnly_setSuspendBackingVerifier,
-  __testOnly_setSuspendPreparationVerifier,
 } from '../src/core/worker-pool.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as sessionStore from '../src/services/session-store.js';
@@ -174,9 +170,7 @@ function previewClearEvents(): unknown[] {
 }
 
 beforeEach(() => {
-  process.env.SESSION_DATA_DIR = mkdtempSync(join(tmpdir(), 'botmux-preview-lifecycle-'));
   __testOnly_setSuspendBackingVerifier(() => true);
-  __testOnly_setSuspendPreparationVerifier(() => true);
   vi.clearAllMocks();
   initWorkerPool({
     sessionReply: vi.fn(async () => 'om_reply'),
@@ -186,10 +180,7 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => {
-  __testOnly_setSuspendPreparationVerifier();
-  __testOnly_setSuspendBackingVerifier();
-});
+afterEach(() => __testOnly_setSuspendBackingVerifier());
 
 describe('P1-13 worker generation boundaries drop the preview target', () => {
   it('clears and persists on generation reservation (refork / CLI switch / adopt all reserve here)', () => {

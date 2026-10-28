@@ -84,7 +84,7 @@ import { botmuxVersion } from './utils/install-info.js';
 import { SESSION_STORE_PROTOCOL } from './utils/daemon-version-display.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
-import { deleteMessage, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { addReaction, deleteMessage, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -127,11 +127,7 @@ import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
-import { turnFeedbackReconciler } from './services/turn-feedback-reconciler.js';
-import {
-  listTurnFeedbackTerminalOutbox,
-  removeTurnFeedbackTerminalOutbox,
-} from './services/turn-feedback-terminal-outbox.js';
+import { createTurnFeedbackReconciler } from './services/turn-feedback-reconciler.js';
 import { initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
 import { closeLinkRefRuntime, initializeLinkRefRuntime } from './services/link-ref-runtime.js';
 import { startDurableInboxShadowConsumer } from './services/durable-inbox-shadow-consumer.js';
@@ -389,7 +385,7 @@ import { buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCl
 import { codexServiceTierBadge } from './services/codex-service-tier.js';
 import { sessionConfiguredRuntimeDisplayName } from './core/cli-runtime-display.js';
 import { isLocalCliOpenReady } from './services/local-cli-opener.js';
-import { SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE } from './core/pending-response.js';
+import { RECEIVED_REACTION_EMOJI_TYPE, SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE } from './core/pending-response.js';
 import { t as tr, localeForBot } from './i18n/index.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import {
@@ -1204,67 +1200,7 @@ async function restoreSessionsAndScheduleStartupRecovery(opts: {
   driveRestoredXpiGroup: (groupId: string) => void;
   driveRestoredPrincipalLane: (ds: DaemonSession) => void;
 }): Promise<Array<XpiSharedCwdStartupNotice | PrincipalLaneStartupNotice>> {
-  const replay = listTurnFeedbackTerminalOutbox(config.session.dataDir, opts.larkAppId);
-  for (const item of replay.records) {
-    const record = item.record;
-    const session = sessionStore.getSessionFresh(record.sessionId)
-      ?? sessionStore.readBotSessionsStrict(opts.larkAppId)
-        .find(candidate => candidate.sessionId === record.sessionId);
-    if (!session || session.larkAppId && session.larkAppId !== opts.larkAppId) continue;
-    if (session.workerGeneration !== record.workerGeneration) continue;
-    const row = session.turnFeedback?.[record.turnId];
-    if (!row) continue;
-    {
-      const attempts = new Set<number>();
-      if (session.queuedActivationTurnId === record.turnId
-        && session.queuedActivationDispatchAttempt !== undefined) {
-        attempts.add(session.queuedActivationDispatchAttempt);
-      }
-      for (const entry of session.codexAppDispatchLedger ?? []) {
-        if (entry.turnId === record.turnId && entry.dispatchAttempt !== undefined) {
-          attempts.add(entry.dispatchAttempt);
-        }
-      }
-      if (row.capacityBinding?.dispatchAttempt !== undefined) {
-        attempts.add(row.capacityBinding.dispatchAttempt);
-      }
-      if (record.dispatchAttempt !== undefined && attempts.size === 0) continue;
-      if (attempts.size > 0
-        && (record.dispatchAttempt === undefined || !attempts.has(record.dispatchAttempt))) continue;
-    }
-    try {
-      const committed = turnFeedbackReconciler.commitTerminalReceipt(
-        { session, larkAppId: opts.larkAppId }, record,
-      );
-      if (committed === 'conflict' || committed === 'missing') continue;
-      await turnFeedbackReconciler.reconcile(
-        { session, larkAppId: opts.larkAppId },
-        record.turnId,
-      );
-      removeTurnFeedbackTerminalOutbox(config.session.dataDir, record);
-    } catch (error) {
-      logger.warn(
-        `[reaction] terminal outbox replay failed for ${record.sessionId}/${record.turnId}: ${String(error)}`,
-      );
-    }
-  }
   const restoredQuarantineNotices = await opts.restoreSessions();
-  await turnFeedbackReconciler.restore(
-    [...activeSessions.values()].filter(session => session.larkAppId === opts.larkAppId),
-  ).catch(error => {
-    logger.warn(`[reaction] active startup repair failed: ${String(error)}`);
-  });
-  for (const session of sessionStore.readBotSessionsStrict(opts.larkAppId)) {
-    if (session.status !== 'closed' || !session.turnFeedback) continue;
-    await turnFeedbackReconciler.repairClosedFeedback({
-      session,
-      larkAppId: opts.larkAppId,
-    }).catch(error => {
-      logger.warn(
-        `[reaction] closed startup repair failed for ${session.sessionId}: ${String(error)}`,
-      );
-    });
-  }
   const restoredAt = Date.now();
   const quarantineNotices = restoredQuarantineNotices ?? [];
   scheduleRestoredStreamingCardPinRecovery(opts.larkAppId);
@@ -4152,6 +4088,37 @@ function streamingCardDisabledFor(ds: DaemonSession, turnId?: string): boolean {
   } catch { return false; }
 }
 
+function silentTurnReactionsFor(ds: DaemonSession): boolean {
+  try {
+    return getBot(ds.larkAppId).config.silentTurnReactions === true;
+  } catch { return false; }
+}
+
+function receivedReactionEmojiFor(ds: DaemonSession): string {
+  try {
+    return getBot(ds.larkAppId).config.receivedReactionEmoji || RECEIVED_REACTION_EMOJI_TYPE;
+  } catch { return RECEIVED_REACTION_EMOJI_TYPE; }
+}
+
+const turnFeedbackReconciler = createTurnFeedbackReconciler({
+  now: () => Date.now(),
+  commit(target, mutate) {
+    const { rows } = sessionStore.mutateOwnedSessionsAtomically(
+      [target.session.sessionId],
+      fresh => mutate(fresh.get(target.session.sessionId)!),
+    );
+    const committed = rows.get(target.session.sessionId)!;
+    if (committed !== target.session) {
+      for (const key of Object.keys(target.session)) {
+        delete (target.session as unknown as Record<string, unknown>)[key];
+      }
+      Object.assign(target.session, structuredClone(committed));
+      return target.session;
+    }
+    return committed;
+  },
+});
+
 export async function noteTurnReceived(
   ds: DaemonSession,
   triggerMessageId: string,
@@ -4162,27 +4129,13 @@ export async function noteTurnReceived(
   ownedReplyAliasRoots?: readonly string[],
 ): Promise<void> {
   const turnId = _turnId ?? triggerMessageId;
-  const legacyPendingReaction = ds.pendingAckReactions?.some(
-    reaction => reaction.messageId === triggerMessageId,
-  ) === true;
   // Durable admission is the synchronous linearization point. It must complete
   // before identity publication or any other await lets a second live-only turn
   // stage routing beside this one.
   if (typeof turnFeedbackReconciler !== 'undefined') {
-    const silent = legacyPendingReaction
-      || !streamingCardDisabledFor(ds, turnId)
-      || getBot(ds.larkAppId).config.silentTurnReactions === true
-      || (ds.session.vcMeetingReceiver
-        && resolveVcMeetingImTurnOrigin(ds.session, triggerMessageId) !== undefined);
     const committed = turnFeedbackReconciler.admit(
       { session: ds.session, larkAppId: ds.larkAppId },
-      {
-        turnId,
-        messageId: triggerMessageId,
-        receivedReactionEmoji,
-        ...(silent ? { silent: true } : {}),
-        ownedReplyAliasRoots,
-      },
+      { turnId, messageId: triggerMessageId, receivedReactionEmoji, ownedReplyAliasRoots },
     );
     syncReplyTargetState(ds, committed);
   }
@@ -4228,16 +4181,29 @@ export async function noteTurnReceived(
   // reaction-free (it is meeting-driven and routes through the audited listener
   // action, not the ordinary progress-reaction channel). Transcript deliveries
   // never reach this inbound-message acceptance point at all.
-  if (typeof turnFeedbackReconciler !== 'undefined') {
-    try {
-      await turnFeedbackReconciler.reconcile(
-        { session: ds.session, larkAppId: ds.larkAppId },
-        turnId,
-      );
-    } catch (err) {
-      logger.debug(`[reaction] received reconcile failed for ${triggerMessageId}: ${err instanceof Error ? err.message : String(err)}`);
-    }
+  if (ds.session.vcMeetingReceiver
+    && resolveVcMeetingImTurnOrigin(ds.session, triggerMessageId) !== undefined) return;
+  // Turn-exact card-off check: the reaction ack belongs to THIS message's turn,
+  // not to whichever turn most recently overwrote currentReplyTarget.
+  if (!streamingCardDisabledFor(ds, triggerMessageId)) return;
+  if (silentTurnReactionsFor(ds)) return;
+  // Only Lark messages carry reactions — doc-comment ids / chat anchors can't.
+  if (!triggerMessageId.startsWith('om_')) return;
+  if ((ds.pendingAckReactions ??= []).some(a => a.messageId === triggerMessageId)) return;
+  // Add the ✋ FIRST, register the entry only after it lands. If we pushed the
+  // entry before awaiting addReaction, a previous turn's idle edge
+  // (finishTurnReactions) could detach this half-formed entry mid-flight —
+  // DONE-ing a message that hasn't even reached the worker yet and orphaning its
+  // reactionId. Callers await this before dispatching the message to the worker,
+  // so a registered entry is always in place before its own turn can go idle.
+  let reactionId: string;
+  try {
+    reactionId = await addReaction(ds.larkAppId, triggerMessageId, receivedReactionEmoji ?? receivedReactionEmojiFor(ds));
+  } catch (err) {
+    logger.debug(`[reaction] received add failed for ${triggerMessageId}: ${err instanceof Error ? err.message : String(err)}`);
+    return;
   }
+  (ds.pendingAckReactions ??= []).push({ messageId: triggerMessageId, reactionId });
 }
 
 /**

@@ -310,8 +310,7 @@ describe('suspendWorker', () => {
     };
 
     expect(suspendWorker(ds, 'idle_budget')).toBe(false);
-    expect(worker.send).not.toHaveBeenCalledWith({ type: 'suspend' });
-    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'abort_suspend' }));
+    expect(worker.send).not.toHaveBeenCalled();
     expect(ds.worker).toBe(worker);
     expect(ds.session.suspendedColdResume).toBeUndefined();
     expect(dashboardEventBus.publish).not.toHaveBeenCalled();
