@@ -1,5 +1,5 @@
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
-import { chmodSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
@@ -74,5 +74,67 @@ describe('owner directory capacity sideband consumer', () => {
 
     await expect(consumer.poll()).resolves.toBe(0);
     expect(readdirSync(ownerDirectory)).toContain('bad.json.quarantine-invalid');
+  });
+
+  it('rejects symlink and group-readable event files before parsing them', async () => {
+    const { root, ownerDirectory } = fixture();
+    const outside = join(root, 'outside.json');
+    writeFileSync(outside, JSON.stringify(event()), { mode: 0o600 });
+    symlinkSync(outside, join(ownerDirectory, 'link.json'));
+    writeFileSync(join(ownerDirectory, 'wide.json'), JSON.stringify(event()), { mode: 0o640 });
+    const observe = vi.fn();
+    const consumer = createCapacitySidebandDirectoryConsumer({
+      root, ownerAppId: 'cli_test', keyring: [{ keyId: KEY_ID, publicKeyDer: PUBLIC, minEpoch: 1, maxEpoch: 1 }],
+      now: () => Date.parse(AT),
+      resolve: () => ({ sessionId: 'session-a', turnId: 'turn-a', dispatchAttempt: 2, workerGeneration: 3 }),
+      observe,
+    });
+
+    await expect(consumer.poll()).resolves.toBe(0);
+    expect(observe).not.toHaveBeenCalled();
+    expect(readdirSync(ownerDirectory)).toEqual(expect.arrayContaining([
+      'link.json.quarantine-untrusted', 'wide.json.quarantine-untrusted',
+    ]));
+  });
+
+  it('uses one global sequence per signer epoch across request ids', async () => {
+    const { root, ownerDirectory } = fixture();
+    const newer = event(); newer.sequence = 2; newer.request_id = 'request-new';
+    const newerUnsigned = { ...newer } as any; delete newerUnsigned.signature;
+    newer.signature = sign(null, Buffer.from(JSON.stringify(newerUnsigned)), KEYS.privateKey).toString('base64url');
+    const replay = event(); replay.request_id = 'request-replay';
+    const replayUnsigned = { ...replay } as any; delete replayUnsigned.signature;
+    replay.signature = sign(null, Buffer.from(JSON.stringify(replayUnsigned)), KEYS.privateKey).toString('base64url');
+    writeFileSync(join(ownerDirectory, '1-newer.json'), JSON.stringify(newer), { mode: 0o600 });
+    writeFileSync(join(ownerDirectory, '2-replay.json'), JSON.stringify(replay), { mode: 0o600 });
+    const observe = vi.fn();
+    const consumer = createCapacitySidebandDirectoryConsumer({
+      root, ownerAppId: 'cli_test', keyring: [{ keyId: KEY_ID, publicKeyDer: PUBLIC, minEpoch: 1, maxEpoch: 1 }],
+      now: () => Date.parse(AT),
+      resolve: () => ({ sessionId: 'session-a', turnId: 'turn-a', dispatchAttempt: 2, workerGeneration: 3 }),
+      observe,
+    });
+
+    await expect(consumer.poll()).resolves.toBe(1);
+    expect(observe).toHaveBeenCalledTimes(1);
+    expect(observe).toHaveBeenCalledWith(expect.anything(), expect.anything(),
+      expect.objectContaining({ request_id: 'request-new' }));
+  });
+
+  it('recovers a claimed event left by a crashed consumer before polling', async () => {
+    const { root, ownerDirectory } = fixture();
+    writeFileSync(join(ownerDirectory, 'recovery.json.claim-12345'), JSON.stringify(event()), { mode: 0o600 });
+    const observe = vi.fn();
+    const consumer = createCapacitySidebandDirectoryConsumer({
+      root, ownerAppId: 'cli_test', keyring: [{ keyId: KEY_ID, publicKeyDer: PUBLIC, minEpoch: 1, maxEpoch: 1 }],
+      now: () => Date.parse(AT),
+      resolve: () => ({ sessionId: 'session-a', turnId: 'turn-a', dispatchAttempt: 2, workerGeneration: 3 }),
+      observe,
+    });
+
+    consumer.retryPending();
+    await expect(consumer.poll()).resolves.toBe(1);
+    expect(observe).toHaveBeenCalledTimes(1);
+    expect(readdirSync(ownerDirectory).some(name => name.includes('.claim-'))).toBe(false);
   });
 });

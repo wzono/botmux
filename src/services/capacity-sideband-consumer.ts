@@ -1,5 +1,5 @@
 import { createPublicKey, verify } from 'node:crypto';
-import { existsSync, lstatSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync } from 'node:fs';
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
@@ -153,7 +153,25 @@ export function createCapacitySidebandDirectoryConsumer(deps: CapacitySidebandDi
       const names = readdirSync(directory).filter(name => name.endsWith('.json')).sort();
       for (const name of names) {
         const source = join(directory, name);
-        const raw = readFileSync(source, 'utf8');
+        let fd: number | undefined;
+        let raw: string;
+        try {
+          fd = openSync(source, constants.O_RDONLY | constants.O_NOFOLLOW);
+          const info = fstatSync(fd);
+          if (!info.isFile() || info.nlink !== 1 || (info.mode & 0o077) !== 0
+            || typeof process.getuid === 'function' && info.uid !== process.getuid()) {
+            throw new Error('untrusted sideband event');
+          }
+          raw = readFileSync(fd, 'utf8');
+        } catch {
+          if (fd !== undefined) closeSync(fd);
+          renameSync(source, `${source}.quarantine-untrusted`);
+          continue;
+        } finally {
+          if (fd !== undefined) {
+            try { closeSync(fd); } catch { /* already closed */ }
+          }
+        }
         const event = verifyCapacitySidebandEventV3(
           raw, deps.keyring, deps.now?.() ?? Date.now(), deps.ownerAppId,
         );
@@ -165,8 +183,7 @@ export function createCapacitySidebandDirectoryConsumer(deps: CapacitySidebandDi
           continue;
         }
         const cursorKey = JSON.stringify([
-          event.adapter, event.signer_key_id, event.signer_epoch, event.request_id,
-          event.native_session_id ?? '', event.native_turn_id,
+          event.signer_key_id, event.signer_epoch,
         ]);
         if ((checkpoint[cursorKey] ?? 0) >= event.sequence) { unlinkSync(source); continue; }
         const target = deps.resolve(event);
@@ -192,6 +209,9 @@ export function createCapacitySidebandDirectoryConsumer(deps: CapacitySidebandDi
       if (!existsSync(directory)) return;
       for (const name of readdirSync(directory).filter(name => name.endsWith('.json.pending'))) {
         renameSync(join(directory, name), join(directory, name.slice(0, -'.pending'.length)));
+      }
+      for (const name of readdirSync(directory).filter(name => /\.json\.claim-[0-9]+$/.test(name))) {
+        renameSync(join(directory, name), join(directory, name.replace(/\.claim-[0-9]+$/, '')));
       }
     },
     start(intervalMs = 250) {

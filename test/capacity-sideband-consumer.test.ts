@@ -1,4 +1,6 @@
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   verifyCapacitySidebandEventV3,
@@ -52,5 +54,21 @@ describe('capacity-wait.v3 verification', () => {
       .toBeUndefined();
     expect(verifyCapacitySidebandEventV3(' '.repeat(16 * 1024 + 1), keyring, Date.parse(AT), 'cli_test'))
       .toBeUndefined();
+  });
+
+  it.each(['waiting', 'clear', 'terminal'])('keeps the %s fixture aligned with the wire shape', state => {
+    const fixture = JSON.parse(readFileSync(
+      join(process.cwd(), `test/fixtures/capacity-sideband/v3-${state}.json`),
+      'utf8',
+    )) as CapacitySidebandEventV3;
+    expect(fixture.schema_version).toBe('capacity-wait.v3');
+    expect(fixture.state).toBe(state);
+    expect(Object.keys(fixture).every(key => [
+      'schema_version', 'adapter', 'owner_app_id', 'signer_key_id', 'signer_epoch',
+      'native_session_id', 'native_turn_id', 'request_id', 'queue_id', 'state',
+      'position', 'observed_at', 'sequence', 'signature',
+    ].includes(key))).toBe(true);
+    if (state !== 'waiting') expect(fixture.position).toBeUndefined();
+    if (fixture.adapter === 'claude-code') expect(fixture.native_session_id).toBeTruthy();
   });
 });
