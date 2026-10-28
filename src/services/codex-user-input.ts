@@ -121,6 +121,7 @@ export async function postCodexAsk(
   const claim = readManagedOriginCapability(dataDir, context.sessionId,
     env.BOTMUX_SEND_RELAY, env.BOTMUX_ORIGIN_CHANNEL_ID);
   const originWorkerGeneration = context.originWorkerGeneration
+    ?? claim?.workerGeneration
     ?? (Number(env.BOTMUX_WORKER_GENERATION) > 0 ? Number(env.BOTMUX_WORKER_GENERATION) : undefined);
   if (claim && context.originTurnId && claim.turnId !== context.originTurnId) {
     throw new Error('requestUserInput no longer belongs to the current Botmux turn');

@@ -256,6 +256,14 @@ describe('capacity wait reminder', () => {
     });
     expect(h.row.reminder?.closeNextAttemptAt).toBeUndefined();
     expect(h.row.reminder?.closed).toBeUndefined();
+
+    const restarted = harness();
+    restarted.row.phase = 'completed';
+    delete restarted.row.capacity;
+    restarted.row.reminder = structuredClone(h.row.reminder);
+    restarted.reminder.restore([restarted.target]);
+    await vi.runAllTimersAsync();
+    expect(restarted.patch).not.toHaveBeenCalled();
   });
 
   it('bounds unavailable retries with persisted exponential backoff', async () => {

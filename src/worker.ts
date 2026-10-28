@@ -5071,6 +5071,8 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
             ...(capability.dispatchAttempt !== undefined
               ? { dispatchAttempt: capability.dispatchAttempt }
               : {}),
+            ...(Number(process.env.BOTMUX_WORKER_GENERATION) > 0
+              ? { workerGeneration: Number(process.env.BOTMUX_WORKER_GENERATION) } : {}),
             ...(authorityLinkRefMode ? { linkRefMode: authorityLinkRefMode } : {}),
             ...(daemonIpcPort !== undefined ? { ipcPort: daemonIpcPort } : {}),
           }),
@@ -5094,6 +5096,8 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
             ...(capability.dispatchAttempt !== undefined
               ? { dispatchAttempt: capability.dispatchAttempt }
               : {}),
+            ...(Number(process.env.BOTMUX_WORKER_GENERATION) > 0
+              ? { workerGeneration: Number(process.env.BOTMUX_WORKER_GENERATION) } : {}),
             ...(authorityLinkRefMode ? { linkRefMode: authorityLinkRefMode } : {}),
             ...(daemonIpcPort !== undefined ? { ipcPort: daemonIpcPort } : {}),
           }),

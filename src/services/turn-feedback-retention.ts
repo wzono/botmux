@@ -11,7 +11,10 @@ function terminal(record: PersistedTurnFeedback): boolean {
 
 function durableDiagnostic(record: PersistedTurnFeedback): boolean {
   const intent = record.reactionIntent;
-  return intent?.stage === 'permanent' && intent.diagnostic !== undefined
+  return record.reminder?.closed !== true
+    && record.reminder?.closeDiagnostic === 'card_mismatch'
+    && !record.reminder.closeNextAttemptAt
+    || intent?.stage === 'permanent' && intent.diagnostic !== undefined
     || intent?.stage === 'blocked' && intent.retryExhausted === true;
 }
 

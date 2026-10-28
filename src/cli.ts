@@ -16206,7 +16206,9 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   const larkAppId = process.env.BOTMUX_LARK_APP_ID!;
   const askSessionId = process.env.BOTMUX_SESSION_ID!;
   const liveAskOrigin = resolveSessionContext(resolveDataDir(), askSessionId);
-  const askWorkerGeneration = loadSessions().get(askSessionId)?.workerGeneration;
+  const askWorkerGeneration = liveAskOrigin?.workerGeneration
+    ?? (Number(process.env.BOTMUX_WORKER_GENERATION) > 0
+      ? Number(process.env.BOTMUX_WORKER_GENERATION) : undefined);
   const askRelayDir = process.env.BOTMUX_SEND_RELAY;
   const askOriginCapability = readManagedOriginCapability(
     resolveDataDir(),
@@ -16524,9 +16526,8 @@ export async function runHook(
   // routing cannot borrow this process's ambient turn identity.
   const hookOrigin = !explicitRoute && routeSessionId === sessionId && ['claude-code', 'codex'].includes(cliId)
     ? resolveTurnOriginFn(routeSessionId!) : undefined;
-  const hookWorkerGeneration = hookOrigin?.workerGeneration ?? (routeSessionId
-    ? loadSessions().get(routeSessionId)?.workerGeneration
-    : undefined);
+  const hookWorkerGeneration = hookOrigin?.workerGeneration
+    ?? (Number(env.BOTMUX_WORKER_GENERATION) > 0 ? Number(env.BOTMUX_WORKER_GENERATION) : undefined);
 
   const body: Record<string, unknown> = {
     sessionId: routeSessionId,

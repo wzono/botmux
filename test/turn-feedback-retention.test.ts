@@ -94,4 +94,28 @@ describe('turn feedback retention', () => {
     expect(result.diagnostic_128).toBeUndefined();
     expect(result.unresolved).toBeDefined();
   });
+
+  it('bounds permanent reminder diagnostics to seven days and the newest 128 of 10,000', () => {
+    const records: Record<string, PersistedTurnFeedback> = {};
+    for (let index = 0; index < 10_000; index += 1) {
+      records[`reminder_${index}`] = row(`reminder_${index}`, {
+        reaction: undefined, updatedAt: new Date(NOW - index).toISOString(),
+        reminder: { messageId: `om_${index}`, status: 'sent',
+          closeStatus: 'ambiguous', closeAttempts: 1, closeDiagnostic: 'card_mismatch' },
+      });
+    }
+    records.old = row('old', {
+      reaction: undefined, updatedAt: new Date(NOW - 8 * DAY).toISOString(),
+      reminder: { messageId: 'om_old', status: 'sent',
+        closeStatus: 'ambiguous', closeAttempts: 1, closeDiagnostic: 'card_mismatch' },
+    });
+
+    const result = pruneTurnFeedback(records, NOW, policy);
+
+    expect(Object.keys(result)).toHaveLength(128);
+    expect(result.reminder_0).toBeDefined();
+    expect(result.reminder_127).toBeDefined();
+    expect(result.reminder_128).toBeUndefined();
+    expect(result.old).toBeUndefined();
+  });
 });

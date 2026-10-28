@@ -56,6 +56,7 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
     if (row.phase === 'capacity_waiting' || row.phase === 'capacity_stale') return;
     const reminder = row.reminder!;
     const attempts = reminder.closeAttempts ?? 0;
+    if (reminder.closeDiagnostic === 'card_mismatch' && !reminder.closeNextAttemptAt) return;
     if (attempts >= MAX_CLOSE_ATTEMPTS) return;
     const nextAttemptAt = reminder.closeNextAttemptAt
       ? Date.parse(reminder.closeNextAttemptAt) : undefined;
