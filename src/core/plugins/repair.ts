@@ -132,6 +132,8 @@ async function repairOne(pluginId: string, dryRun: boolean): Promise<PluginRepai
   };
 
   const state = readPluginServiceState(pluginId);
+  const mutablePaths = [pluginConfigPath(pluginId), pluginSettingsPath(pluginId)];
+  const beforeMutable = mutablePaths.map(snapshot);
   let existingMaterialized: Record<string, unknown> | undefined;
   try {
     existingMaterialized = existsSync(pluginMaterializedPath(pluginId))
@@ -143,24 +145,51 @@ async function repairOne(pluginId: string, dryRun: boolean): Promise<PluginRepai
   if (currentComparable) delete currentComparable.updatedAt;
   const { updatedAt: _expectedUpdatedAt, ...expectedComparable } = expectedMaterialized;
   const materializedCurrent = stable(currentComparable) === stable(expectedComparable);
+  const currentProcess = record.manifest.service
+    ? readPluginProcesses().find(proc => proc.name === pluginServiceName(pluginId))
+    : undefined;
+  const supervisorIdentityValid = !record.manifest.service || (
+    currentProcess?.status === 'online'
+    && typeof currentProcess.pid === 'number'
+    && typeof currentProcess.processStart === 'string'
+    && readDurableProcessIdentity(currentProcess.pid) === currentProcess.processStart
+  );
+  const cachedIdentityCurrent = !record.manifest.service || (
+    supervisorIdentityValid
+    && state?.status === 'online'
+    && state.pid === currentProcess?.pid
+    && state.processStart === currentProcess?.processStart
+  );
   if (dryRun) {
     const needsRepair = stable(record.contributions) !== stable(nextRecord.contributions)
       || !materializedCurrent
-      || (record.manifest.service && (
-        state?.status !== 'online'
-        || typeof state.host !== 'string'
-        || typeof state.pid !== 'number'
-        || typeof state.processStart !== 'string'
-      ));
+      || !cachedIdentityCurrent
+      || (record.manifest.service && typeof state?.host !== 'string');
     return { pluginId, action: needsRepair ? 'repaired' : 'unchanged' };
   }
   let nextState = state;
   if (record.manifest.service) {
-    const definition = await loadPluginServiceDefinition(nextRecord, { readOnlyConfig: true });
+    let definition;
+    try {
+      definition = await loadPluginServiceDefinition(nextRecord, { readOnlyConfig: true });
+    } catch (error) {
+      mutablePaths.forEach((path, index) => restore(path, beforeMutable[index]));
+      throw error;
+    }
+    const mutated = mutablePaths.some((path, index) => {
+      const current = snapshot(path);
+      const before = beforeMutable[index];
+      return current.exists !== before.exists
+        || (current.exists && !current.bytes!.equals(before.bytes!));
+    });
+    if (mutated) {
+      mutablePaths.forEach((path, index) => restore(path, beforeMutable[index]));
+      throw new Error(`plugin_repair_config_write_forbidden:${pluginId}`);
+    }
     if (!definition) throw new Error(`plugin_service_definition_not_found:${pluginId}`);
-    const app = readPluginProcesses().find(proc => proc.name === pluginServiceName(pluginId));
-    if (app?.status !== 'online' || typeof app.pid !== 'number' || typeof app.processStart !== 'string'
-      || readDurableProcessIdentity(app.pid) !== app.processStart) {
+    const app = currentProcess;
+    if (!supervisorIdentityValid || app?.status !== 'online' || typeof app.pid !== 'number'
+      || typeof app.processStart !== 'string') {
       throw new Error(`plugin_repair_service_identity_invalid:${pluginId}`);
     }
     nextState = {
@@ -184,11 +213,10 @@ async function repairOne(pluginId: string, dryRun: boolean): Promise<PluginRepai
     && materializedCurrent;
   if (unchanged) return { pluginId, action: 'unchanged' };
 
-  const paths = [
-    pluginMaterializedPath(pluginId), pluginServiceStatePath(pluginId),
-    pluginConfigPath(pluginId), pluginSettingsPath(pluginId),
-  ];
+  const paths = [pluginMaterializedPath(pluginId), pluginServiceStatePath(pluginId)];
   const beforeFiles = paths.map(snapshot);
+  const rollbackPaths = [...paths, ...mutablePaths];
+  const rollbackFiles = [...beforeFiles, ...beforeMutable];
   let registryWritten = false;
   try {
     compareAndSwapInstalledPlugin(pluginId, record, nextRecord);
@@ -204,7 +232,7 @@ async function repairOne(pluginId: string, dryRun: boolean): Promise<PluginRepai
       try { restoreInstalledPluginAfterFailedRepair(pluginId, nextRecord, record); }
       catch (rollbackError) { rollbackErrors.push(rollbackError); }
     }
-    for (const [path, value] of paths.map((path, index) => [path, beforeFiles[index]] as const)) {
+    for (const [path, value] of rollbackPaths.map((path, index) => [path, rollbackFiles[index]] as const)) {
       try { restore(path, value); } catch (rollbackError) { rollbackErrors.push(rollbackError); }
     }
     if (rollbackErrors.length > 0) throw new Error(`plugin_repair_rollback_failed:${pluginId}`);
