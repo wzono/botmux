@@ -26,7 +26,14 @@ function validBody(over: Record<string, unknown> = {}) {
 
 describe('parseAskBody — happy path', () => {
   it('parses explicit result acknowledgement without treating it as a new Ask', () => {
-    expect(parseAskBody(validBody({ requestId: 'stable', originKind: 'explicit', acknowledge: true }))).toMatchObject({ acknowledge: true, requestId: 'stable' });
+    expect(parseAskBody(validBody({ requestId: 'stable', originKind: 'explicit', acknowledge: true,
+      originWorkerGeneration: 3 }))).toMatchObject({
+      acknowledge: true, requestId: 'stable', originWorkerGeneration: 3,
+    });
+  });
+  it.each([0, -1, 1.5, '3'])('rejects invalid originWorkerGeneration %s', originWorkerGeneration => {
+    expect(parseAskBody(validBody({ originWorkerGeneration })))
+      .toEqual({ error: 'bad_originWorkerGeneration' });
   });
   it.each(['true', 1, null])('rejects non-boolean acknowledgement %s', acknowledge => {
     expect(parseAskBody(validBody({ acknowledge }))).toEqual({ error: 'bad_acknowledge' });

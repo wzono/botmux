@@ -6,7 +6,9 @@ export interface CapacityReminderDeps {
   read(target: TurnFeedbackTarget): Session;
   commit(target: TurnFeedbackTarget, mutate: (session: Session) => void): void;
   send(target: TurnFeedbackTarget, row: PersistedTurnFeedback, uuid: string): Promise<string>;
-  patch(target: TurnFeedbackTarget, row: PersistedTurnFeedback, messageId: string): Promise<void>;
+  patch(target: TurnFeedbackTarget, row: PersistedTurnFeedback, messageId: string): Promise<
+    { kind: 'patched' | 'already_gone' | 'card_mismatch' | 'unavailable' }
+  >;
   now(): number;
   thresholds(target: TurnFeedbackTarget): { interactiveMs: number; backgroundMs: number };
 }
@@ -43,15 +45,19 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
     });
     closing.add(key);
     try {
-      await deps.patch(target, row, messageId);
-      deps.commit(target, fresh => {
-        const current = fresh.turnFeedback?.[turnId];
-        if (current?.reminder?.messageId === messageId) {
-          current.reminder.closed = true;
-          delete current.reminder.closeStatus;
-          delete current.reminder.closeAttemptedAt;
-        }
-      });
+      const outcome = await deps.patch(target, row, messageId);
+      if (outcome.kind === 'patched' || outcome.kind === 'already_gone') {
+        deps.commit(target, fresh => {
+          const current = fresh.turnFeedback?.[turnId];
+          if (current?.reminder?.messageId === messageId) {
+            current.reminder.closed = true;
+            delete current.reminder.closeStatus;
+            delete current.reminder.closeAttemptedAt;
+          }
+        });
+      } else {
+        throw new Error(`capacity reminder close ${outcome.kind}`);
+      }
     } catch {
       deps.commit(target, fresh => {
         const current = fresh.turnFeedback?.[turnId];

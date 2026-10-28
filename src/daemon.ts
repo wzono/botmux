@@ -4164,16 +4164,26 @@ const capacityWaitReminder = createCapacityWaitReminder({
   },
   patch: async (target, _row, messageId) => {
     const ds = findActiveBySessionId(target.session.sessionId);
-    if (!ds || ds.streamCardId !== messageId) return;
-    await updateMessage(target.larkAppId, messageId, buildStreamingCardJson(ds), {
-      beforeWrite: () => {
-        const current = findActiveBySessionId(target.session.sessionId);
-        if (current !== ds || current.streamCardId !== messageId
-          || current.currentTurnId !== _row.turnId) {
-          throw new Error('capacity reminder close no longer owns the work card');
-        }
-      },
-    });
+    if (!ds) return { kind: 'unavailable' as const };
+    if (ds.streamCardId !== messageId) return { kind: 'card_mismatch' as const };
+    try {
+      await updateMessage(target.larkAppId, messageId, buildStreamingCardJson(ds), {
+        beforeWrite: () => {
+          const current = findActiveBySessionId(target.session.sessionId);
+          if (current !== ds || current.streamCardId !== messageId
+            || current.currentTurnId !== _row.turnId) {
+            throw new Error('capacity reminder close no longer owns the work card');
+          }
+        },
+      });
+      return { kind: 'patched' as const };
+    } catch (error) {
+      const detail = String(error);
+      if (/message.*(?:withdrawn|deleted|not found)|230002/i.test(detail)) {
+        return { kind: 'already_gone' as const };
+      }
+      throw error;
+    }
   },
   now: () => Date.now(),
   thresholds(target) {
@@ -9249,6 +9259,8 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // Invocation identity (from the hook; enables cross-restart re-attach).
     requestId: boundAsk.requestId,
     originKind: boundAsk.originKind,
+    originWorkerGeneration: boundAsk.originWorkerGeneration
+      ?? askSession?.workerGeneration ?? askSession?.session.workerGeneration,
     ...((documentDelivery?.openId ?? asyncCaller)
       ? { answererOpenId: documentDelivery?.openId ?? asyncCaller } : {}),
     // Authoritative persistence gate (codex P1-4): derive resumability from the
@@ -9267,7 +9279,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     && Number.isSafeInteger(body.originDispatchAttempt)
     ? body.originDispatchAttempt
     : undefined;
-  const askWorkerGeneration = askSession?.workerGeneration ?? askSession?.session.workerGeneration;
+  const claimedWorkerGeneration = askInput.originWorkerGeneration;
   const ownsAskFeedback = () => {
     if (!askSession || !askTurnId) return false;
     let ownsSession = false;
@@ -9279,7 +9291,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
         currentTurnId: askSession.currentTurnId,
         claimedTurnId: askTurnId,
         claimedDispatchAttempt: claimedAttempt,
-        currentWorkerGeneration: askWorkerGeneration,
+        currentWorkerGeneration: claimedWorkerGeneration,
         liveWorkerGeneration: askSession.workerGeneration ?? askSession.session.workerGeneration,
         dispatchHighWater: askSession.turnDispatchAttemptHighWater,
         managedTurnOrigin: askSession.managedTurnOrigin,
@@ -9315,6 +9327,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
       return jsonRes(res, 200, {
         kind: 'pending', requestId: explicitInput.requestId,
         askId: delivery.askId, messageId: delivery.messageId, pending: true,
+        originWorkerGeneration: explicitInput.originWorkerGeneration,
       });
     } catch (error) {
       return jsonRes(res, 500, { error: error instanceof Error ? error.message : String(error) });

@@ -14,6 +14,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { readRequestBodyJson } from './helpers/read-request-body.js';
+import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 
 const CLI_PATH = join(__dirname, '..', 'src', 'cli.ts');
 const tempDirs: string[] = [];
@@ -114,6 +115,37 @@ describe('botmux ask — CLI boundary', () => {
       expect(requests[0]).toMatchObject({ timeoutMs: null, requestedRootMessageId: 'om_requested_topic' });
       expect(requests[0].acknowledge).toBeUndefined();
     } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+  });
+
+  it('carries the issuing worker generation on the result acknowledgement', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-generation-'));
+    tempDirs.push(dataDir);
+    const requests: Record<string, unknown>[] = [];
+    const server = createServer(async (req, res) => {
+      const request = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
+      requests.push(request!);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ kind: 'answered', answers: [['yes']], by: 'ou_test', comment: null }));
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const registryDir = join(dataDir, 'dashboard-daemons');
+      mkdirSync(registryDir, { recursive: true });
+      writeFileSync(join(registryDir, 'cli_test.json'), JSON.stringify({
+        larkAppId: 'cli_test', ipcPort: (server.address() as AddressInfo).port, lastHeartbeat: Date.now(),
+      }));
+      seedPersistedSessionRows(dataDir, 'cli_test', { sess_test: {
+        sessionId: 'sess_test', status: 'active', larkAppId: 'cli_test', chatId: 'oc_test',
+        rootMessageId: 'om_test', workerGeneration: 3,
+      } });
+
+      expect((await runAsk(dataDir)).status).toBe(0);
+      expect(requests).toHaveLength(2);
+      expect(requests[0]).toMatchObject({ originWorkerGeneration: 3 });
+      expect(requests[1]).toMatchObject({ originWorkerGeneration: 3, acknowledge: true });
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
   });
 
   it('rejects --no-timeout with --timeout before contacting the daemon', async () => {

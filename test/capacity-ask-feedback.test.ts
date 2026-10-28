@@ -107,6 +107,22 @@ describe('capacity Ask feedback lifecycle', () => {
     expect(resume).not.toHaveBeenCalled();
   });
 
+  it('does not let a later generation acknowledge a permanent Ask receipt', () => {
+    const resume = vi.fn();
+    const lifecycle = createCapacityAskFeedbackLifecycle({
+      owns: () => ownsCapacityAskFeedback({
+        ...currentOrigin, currentWorkerGeneration: 3, liveWorkerGeneration: 4,
+      }),
+      observe: vi.fn(),
+      resume,
+      onTransitionError: vi.fn(),
+    });
+
+    expect(lifecycle.acknowledge(() => ({ kind: 'answered' as const })))
+      .toEqual({ kind: 'answered' });
+    expect(resume).not.toHaveBeenCalled();
+  });
+
   it('retains needs_user when an acknowledgement has no settled result', () => {
     const h = harness();
 

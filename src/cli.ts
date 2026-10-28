@@ -16206,6 +16206,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   const larkAppId = process.env.BOTMUX_LARK_APP_ID!;
   const askSessionId = process.env.BOTMUX_SESSION_ID!;
   const liveAskOrigin = resolveSessionContext(resolveDataDir(), askSessionId);
+  const askWorkerGeneration = loadSessions().get(askSessionId)?.workerGeneration;
   const askRelayDir = process.env.BOTMUX_SEND_RELAY;
   const askOriginCapability = readManagedOriginCapability(
     resolveDataDir(),
@@ -16231,6 +16232,9 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     ...(liveAskOrigin?.turnId ? { originTurnId: liveAskOrigin.turnId } : {}),
     ...(liveAskOrigin?.dispatchAttempt !== undefined
       ? { originDispatchAttempt: liveAskOrigin.dispatchAttempt }
+      : {}),
+    ...(askWorkerGeneration !== undefined
+      ? { originWorkerGeneration: askWorkerGeneration }
       : {}),
     ...(askOriginCapability ? { originCapability: askOriginCapability } : {}),
     // `botmux ask --mention <open_id>`：daemon 在卡片问题正文前注入真实 <at>，

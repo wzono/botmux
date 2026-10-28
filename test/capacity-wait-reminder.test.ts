@@ -14,7 +14,7 @@ function harness(background = false) {
   const session = { sessionId: 'session-a', status: 'active', turnFeedback: { 'turn-a': row } } as Session;
   const target = { session, larkAppId: 'app-a' };
   const send = vi.fn(async () => 'om_reminder');
-  const patch = vi.fn(async () => {});
+  const patch = vi.fn(async () => ({ kind: 'patched' as const }));
   const commit = vi.fn((_target: unknown, mutate: (session: Session) => void) => mutate(session));
   const reminder = createCapacityWaitReminder({
     read: () => session, commit, send, patch, now: () => now,
@@ -214,5 +214,22 @@ describe('capacity wait reminder', () => {
     await vi.advanceTimersByTimeAsync(1_000);
     await vi.waitFor(() => expect(h.patch).toHaveBeenCalledTimes(2));
     expect(h.row.reminder).toMatchObject({ closed: true });
+  });
+
+  it('retains close obligation when the old work card is no longer active', async () => {
+    const h = harness();
+    h.row.phase = 'completed';
+    delete h.row.capacity;
+    h.row.reminder = {
+      episodeKey: String(START), uuid: 'capacity-terminal', status: 'sent',
+      messageId: 'om_old_work', sentAt: new Date(START).toISOString(),
+    };
+    h.patch.mockResolvedValue({ kind: 'card_mismatch' });
+
+    h.reminder.restore([h.target]);
+    await vi.waitFor(() => expect(h.patch).toHaveBeenCalledTimes(1));
+
+    expect(h.row.reminder).toMatchObject({ closeStatus: 'ambiguous' });
+    expect(h.row.reminder?.closed).toBeUndefined();
   });
 });
