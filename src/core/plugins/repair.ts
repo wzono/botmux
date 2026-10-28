@@ -1,6 +1,7 @@
 import {
   existsSync, lstatSync, readFileSync, realpathSync, rmSync,
 } from 'node:fs';
+import { parsePluginPackageManifest } from './manifest.js';
 import { join, resolve } from 'node:path';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { readDurableProcessIdentity } from '../../utils/process-identity.js';
@@ -69,6 +70,17 @@ async function repairOne(pluginId: string, dryRun: boolean): Promise<PluginRepai
   const record = registry.plugins[pluginId];
   if (!record) throw new Error(`plugin_not_installed:${pluginId}`);
   const runtime = assertRuntimeIdentity(record);
+  const packageFile = record.source.link
+    ? join(resolve(record.source.spec), 'package.json')
+    : join(pluginHome(record.id), 'package.json');
+  if (existsSync(packageFile)) {
+    const pkg = parsePluginPackageManifest(JSON.parse(readFileSync(packageFile, 'utf8')));
+    if (pkg.name !== record.packageName || pkg.version !== record.version || pkg.botmux.id !== record.id) {
+      throw new Error(`plugin_repair_package_identity_mismatch:${record.id}`);
+    }
+  } else if (record.source.link) {
+    throw new Error(`plugin_repair_package_identity_mismatch:${record.id}`);
+  }
   const scanned = scanPluginContributions(runtime, record.manifest);
   const { mcp: _privateMcp, ...publicScanned } = scanned ?? {};
   const contributions = scanned ? {
@@ -83,7 +95,7 @@ async function repairOne(pluginId: string, dryRun: boolean): Promise<PluginRepai
   const state = readPluginServiceState(pluginId);
   let nextState = state;
   if (record.manifest.service) {
-    const definition = await loadPluginServiceDefinition(nextRecord);
+    const definition = await loadPluginServiceDefinition(nextRecord, { readOnlyConfig: true });
     if (!definition) throw new Error(`plugin_service_definition_not_found:${pluginId}`);
     const app = readPluginProcesses().find(proc => proc.name === pluginServiceName(pluginId));
     if (app?.status !== 'online' || typeof app.pid !== 'number' || typeof app.processStart !== 'string'
@@ -106,8 +118,14 @@ async function repairOne(pluginId: string, dryRun: boolean): Promise<PluginRepai
     };
   }
 
+  const materialized = existsSync(pluginMaterializedPath(pluginId))
+    ? JSON.parse(readFileSync(pluginMaterializedPath(pluginId), 'utf8'))
+    : undefined;
+  const materializedCurrent = materialized
+    && stable(materialized.serviceHttp) === stable(nextRecord.contributions?.serviceHttp);
   const unchanged = stable(record.contributions) === stable(nextRecord.contributions)
-    && stable(state) === stable(nextState);
+    && stable(state) === stable(nextState)
+    && materializedCurrent;
   if (unchanged || dryRun) return { pluginId, action: unchanged ? 'unchanged' : 'repaired' };
 
   const paths = [
@@ -124,8 +142,14 @@ async function repairOne(pluginId: string, dryRun: boolean): Promise<PluginRepai
     }
     return { pluginId, action: 'repaired' };
   } catch (error) {
-    restore(pluginRegistryPath(), beforeRegistry);
-    paths.forEach((path, index) => restore(path, beforeFiles[index]));
+    const rollbackErrors: unknown[] = [];
+    for (const [path, value] of [
+      [pluginRegistryPath(), beforeRegistry],
+      ...paths.map((path, index) => [path, beforeFiles[index]] as const),
+    ] as const) {
+      try { restore(path, value); } catch (rollbackError) { rollbackErrors.push(rollbackError); }
+    }
+    if (rollbackErrors.length > 0) throw new Error(`plugin_repair_rollback_failed:${pluginId}`);
     throw error;
   }
 }
@@ -144,7 +168,9 @@ export async function repairPlugins(
         reports.push({
           pluginId: id,
           action: 'failed',
-          warning: error instanceof Error ? error.message : String(error),
+          warning: error instanceof Error
+            ? error.message.split(':').slice(0, 2).join(':').replace(/https?:\/\/\S+/g, '<redacted>')
+            : 'plugin_repair_failed',
         });
       }
     }

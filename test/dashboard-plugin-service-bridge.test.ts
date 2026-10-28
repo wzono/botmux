@@ -120,7 +120,7 @@ function state(port: number, patch: Partial<PluginServiceState> = {}): PluginSer
 describe('Dashboard plugin service bridge', () => {
   it('accepts only the current supervisor process generation across stop and restart', () => {
     const name = 'botmux-plugin-sample';
-    const cached = { pid: 4101, processStart: 'boot-a:100', port: 43210 };
+    const cached = { pid: 4101, processStart: 'boot-a:100', host: '127.0.0.1', port: 43210 };
     expect(assessPluginServiceIdentity(name, cached, [
       { name, status: 'online', pid: 4101, processStart: 'boot-a:100' },
     ], () => 'boot-a:100', () => true)).toBe('online');
@@ -133,12 +133,22 @@ describe('Dashboard plugin service bridge', () => {
     expect(assessPluginServiceIdentity(name, cached, [
       { name, status: 'online', pid: 4101, processStart: 'boot-a:100' },
     ], () => 'boot-a:999', () => true)).toBe('identity_mismatch');
-    expect(assessPluginServiceIdentity(name, { pid: 4102, processStart: 'boot-a:200', port: 43210 }, [
+    expect(assessPluginServiceIdentity(name, {
+      pid: 4102, processStart: 'boot-a:200', host: '127.0.0.1', port: 43210,
+    }, [
       { name, status: 'online', pid: 4102, processStart: 'boot-a:200' },
     ], () => 'boot-a:200', () => true)).toBe('online');
     expect(assessPluginServiceIdentity(name, cached, [
       { name, status: 'online', pid: 4101, processStart: 'boot-a:100' },
     ], () => 'boot-a:100', () => false)).toBe('identity_mismatch');
+    expect(assessPluginServiceIdentity(name, {
+      pid: 4101, processStart: 'boot-a:100', host: '::1', port: 43210,
+    }, [
+      { name, status: 'online', pid: 4101, processStart: 'boot-a:100' },
+    ], () => 'boot-a:100', (_pid, _port, host) => host === '::1')).toBe('online');
+    expect(assessPluginServiceIdentity(name, cached, [
+      { name, status: 'online', pid: 4101, processStart: 'boot-a:100' },
+    ], () => 'boot-a:100', (_pid, _port, host) => host === '::1')).toBe('identity_mismatch');
   });
 
   it('forwards allowlisted GET and POST JSON requests without browser credentials', async () => {
