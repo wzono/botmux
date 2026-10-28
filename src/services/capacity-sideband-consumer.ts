@@ -1,4 +1,7 @@
 import { createPublicKey, verify } from 'node:crypto';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
 export interface CapacitySidebandEventV3 {
   schema_version: 'capacity-wait.v3';
@@ -85,4 +88,111 @@ export function verifyCapacitySidebandEventV3(
   } catch {
     return undefined;
   }
+}
+
+export interface CapacitySidebandResolvedTarget {
+  sessionId: string;
+  turnId: string;
+  dispatchAttempt: number;
+  workerGeneration: number;
+}
+
+export interface CapacitySidebandDirectoryDeps {
+  root: string;
+  ownerAppId: string;
+  keyring: readonly CapacitySidebandKey[];
+  now?(): number;
+  resolve(event: CapacitySidebandEventV3): CapacitySidebandResolvedTarget | undefined;
+  observe(
+    target: CapacitySidebandResolvedTarget,
+    observation: { state: 'waiting' | 'clear'; position?: number; observedAtMs: number },
+    event: CapacitySidebandEventV3,
+  ): void | Promise<void>;
+}
+
+export function createCapacitySidebandDirectoryConsumer(deps: CapacitySidebandDirectoryDeps) {
+  const directory = resolve(deps.root, 'owners', deps.ownerAppId, 'events');
+  const checkpointPath = join(directory, '.checkpoint.json');
+  let running = false;
+
+  function readCheckpoint(): Record<string, number> {
+    if (!existsSync(checkpointPath)) return {};
+    try {
+      const leaf = lstatSync(checkpointPath);
+      const info = statSync(checkpointPath);
+      if (leaf.isSymbolicLink() || !info.isFile() || info.nlink !== 1 || (info.mode & 0o077) !== 0) {
+        throw new Error('untrusted sideband checkpoint');
+      }
+      const parsed = JSON.parse(readFileSync(checkpointPath, 'utf8')) as Record<string, unknown>;
+      if (Object.values(parsed).some(value => !Number.isSafeInteger(value) || (value as number) < 1)) {
+        throw new Error('invalid sideband checkpoint');
+      }
+      return parsed as Record<string, number>;
+    } catch (error) {
+      throw new Error(`invalid sideband checkpoint: ${String(error)}`);
+    }
+  }
+
+  function writeCheckpoint(checkpoint: Record<string, number>): void {
+    atomicWriteFileSync(checkpointPath, `${JSON.stringify(checkpoint)}\n`, {
+      mode: 0o600, durable: true, followTargetSymlink: false,
+    });
+  }
+
+  async function poll(): Promise<number> {
+    if (running || !existsSync(directory)) return 0;
+    const info = statSync(directory);
+    const leaf = lstatSync(directory);
+    if (leaf.isSymbolicLink() || !info.isDirectory() || (info.mode & 0o077) !== 0) {
+      throw new Error('untrusted sideband owner directory');
+    }
+    running = true;
+    let accepted = 0;
+    try {
+      const checkpoint = readCheckpoint();
+      const names = readdirSync(directory).filter(name => name.endsWith('.json')).sort();
+      for (const name of names) {
+        const source = join(directory, name);
+        const raw = readFileSync(source, 'utf8');
+        const event = verifyCapacitySidebandEventV3(
+          raw, deps.keyring, deps.now?.() ?? Date.now(), deps.ownerAppId,
+        );
+        if (!event) {
+          let parsedOwner: unknown;
+          try { parsedOwner = (JSON.parse(raw) as Record<string, unknown>).owner_app_id; } catch {}
+          if (parsedOwner !== undefined && parsedOwner !== deps.ownerAppId) continue;
+          renameSync(source, `${source}.quarantine-invalid`);
+          continue;
+        }
+        const cursorKey = JSON.stringify([
+          event.adapter, event.signer_key_id, event.signer_epoch, event.request_id,
+          event.native_session_id ?? '', event.native_turn_id,
+        ]);
+        if ((checkpoint[cursorKey] ?? 0) >= event.sequence) { unlinkSync(source); continue; }
+        const target = deps.resolve(event);
+        if (!target) { renameSync(source, `${source}.pending`); continue; }
+        const observation = event.state === 'waiting'
+          ? { state: 'waiting' as const, position: event.position, observedAtMs: Date.parse(event.observed_at) }
+          : { state: 'clear' as const, observedAtMs: Date.parse(event.observed_at) };
+        await deps.observe(target, observation, event);
+        checkpoint[cursorKey] = event.sequence;
+        writeCheckpoint(checkpoint);
+        unlinkSync(source);
+        accepted += 1;
+      }
+      return accepted;
+    } finally {
+      running = false;
+    }
+  }
+
+  return {
+    directory, checkpointPath, poll,
+    retryPending(): void {
+      if (!existsSync(directory)) return;
+      for (const name of readdirSync(directory).filter(name => name.endsWith('.json.pending'))) {
+        renameSync(join(directory, name), join(directory, name.slice(0, -'.pending'.length)));
+      }
+    },
+  };
 }

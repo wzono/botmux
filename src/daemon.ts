@@ -31027,6 +31027,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         logger.warn(`[capacity] feedback observation commit failed: ${String(error)}`);
       }
     },
+    onCapacitySidebandBinding(ds, binding) {
+      sessionStore.mutateOwnedSessionsAtomically([ds.session.sessionId], fresh => {
+        const session = fresh.get(ds.session.sessionId)!;
+        const record = session.turnFeedback?.[binding.turnId];
+        if (!record) return;
+        record.capacityBinding = {
+          adapter: binding.adapter, nativeTurnId: binding.nativeTurnId,
+          ...(binding.nativeSessionId ? { nativeSessionId: binding.nativeSessionId } : {}),
+          dispatchAttempt: binding.dispatchAttempt, workerGeneration: binding.workerGeneration,
+        };
+      });
+    },
     async onTurnTerminal(ds, terminal, context) {
       const originalFailedCaller = failedTurnCaller(ds, terminal.turnId);
       const originalFailedSilent = isSilentScheduledTurn(ds, terminal.turnId);

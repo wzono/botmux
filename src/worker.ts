@@ -2935,7 +2935,7 @@ function zeroPromptTerminalSync(): boolean {
  *  do not prove envelope consumption, so they stay on the terminal fallback. */
 function notifyNativeTranscriptConsumedLarkTurn(
   turn: { turnId: string; isLocal?: boolean; isScheduled?: boolean },
-  evidence: { fullContentMatch: boolean; sourceJsonlPath?: string },
+  evidence: { fullContentMatch: boolean; sourceJsonlPath?: string; nativeTurnId?: string },
 ): void {
   if (!evidence.fullContentMatch || turn.isLocal || turn.isScheduled) return;
   if (!cliAdapter?.claudeDataDir || lastInitConfig?.adoptMode) return;
@@ -2943,7 +2943,10 @@ function notifyNativeTranscriptConsumedLarkTurn(
   const nativeSessionId = base.endsWith('.jsonl') && /^[A-Za-z0-9-]{8,128}\.jsonl$/.test(base)
     ? base.slice(0, -'.jsonl'.length)
     : undefined;
-  acknowledgeNativeInputConsumed(turn.turnId, 'claude_transcript_user_record', nativeSessionId ?? lastInitConfig?.cliSessionId);
+  acknowledgeNativeInputConsumed(
+    turn.turnId, 'claude_transcript_user_record',
+    nativeSessionId ?? lastInitConfig?.cliSessionId, evidence.nativeTurnId,
+  );
 }
 
 function notifyTerminalTurnStarted(turn: { turnId: string; markTimeMs?: number; replyContextTurnId?: string }): void {
@@ -28400,6 +28403,18 @@ function acknowledgeNativeInputConsumed(
     ...(nativeSessionId ? { nativeSessionId } : {}),
     ...(nativeTurnId ? { nativeTurnId } : {}),
   });
+  const dispatchAttempt = currentBotmuxTurnId === turnId
+    ? currentBotmuxDispatchAttempt
+    : undefined;
+  const adapter = lastInitConfig?.cliId === 'codex'
+    ? 'codex'
+    : lastInitConfig?.cliId === 'claude-code' ? 'claude-code' : undefined;
+  if (adapter && nativeTurnId && dispatchAttempt !== undefined) {
+    send({
+      type: 'capacity_sideband_binding', adapter, sessionId, turnId, dispatchAttempt,
+      nativeTurnId, ...(nativeSessionId ? { nativeSessionId } : {}),
+    });
+  }
 }
 
 /** Codex tmux/paste mode proves acceptance by matching the exact submitted

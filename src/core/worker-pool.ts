@@ -1104,6 +1104,10 @@ export interface WorkerPoolCallbacks {
     observation: Extract<WorkerToDaemon, { type: 'capacity_wait' }>,
     context: { workerGeneration: number },
   ) => void;
+  onCapacitySidebandBinding?: (
+    ds: DaemonSession,
+    binding: Extract<WorkerToDaemon, { type: 'capacity_sideband_binding' }> & { workerGeneration: number },
+  ) => void;
   /** Provider submission proof for one durable-primary Lark Inbox turn. */
   onTurnInputCommitted?: (
     ds: DaemonSession,
@@ -16043,6 +16047,27 @@ function setupWorkerHandlers(
           cb.onCapacityWait?.(ds, msg, { workerGeneration });
         } catch (err) {
           logger.warn(`[${t}] capacity wait handler failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        break;
+      }
+      case 'capacity_sideband_binding': {
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+          || msg.sessionId !== ds.session.sessionId
+          || !ownsLifecycleMutation()
+          || ds.currentTurnId !== msg.turnId
+          || ds.turnDispatchAttemptHighWater?.turnId !== msg.turnId
+          || ds.turnDispatchAttemptHighWater.dispatchAttempt !== msg.dispatchAttempt
+        ) {
+          logger.warn(`[${t}] Ignored capacity_sideband_binding from stale or mismatched turn identity`);
+          break;
+        }
+        try {
+          cb.onCapacitySidebandBinding?.(ds, { ...msg, workerGeneration });
+        } catch (err) {
+          logger.warn(`[${t}] capacity sideband binding failed: ${err instanceof Error ? err.message : String(err)}`);
         }
         break;
       }

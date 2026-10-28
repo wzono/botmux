@@ -2223,6 +2223,15 @@ export type WorkerToDaemon =
    * acknowledgement; IPC arrival alone is not acceptance. */
   | { type: 'turn_input_committed'; turnId: string; dispatchAttempt?: number; durablePrimaryInbox?: true }
   | {
+      type: 'capacity_sideband_binding';
+      adapter: 'codex' | 'claude-code';
+      sessionId: string;
+      turnId: string;
+      dispatchAttempt: number;
+      nativeTurnId: string;
+      nativeSessionId?: string;
+    }
+  | {
       type: 'capacity_wait';
       sessionId: string;
       turnId: string;
