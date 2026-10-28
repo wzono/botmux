@@ -31005,6 +31005,28 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         { kind: receipt.proofKind, ...(receipt.nativeTurnId ? { nativeTurnId: receipt.nativeTurnId } : {}) });
       } catch { logger.warn('[group-context] native input receipt unavailable; background may repeat'); }
     },
+    onCapacityWait(ds, observation) {
+      try {
+        const changed = turnFeedbackReconciler.observeCapacity(
+          { session: ds.session, larkAppId: ds.larkAppId },
+          observation.turnId,
+          {
+            state: observation.state, observedAtMs: observation.observedAtMs,
+            ...(observation.position !== undefined ? { position: observation.position } : {}),
+          },
+        );
+        if (changed) {
+          void turnFeedbackReconciler.reconcile(
+            { session: ds.session, larkAppId: ds.larkAppId },
+            observation.turnId,
+          ).catch(error => logger.warn(
+            `[reaction] capacity reconcile failed turn=${observation.turnId.slice(0, 12)}: ${String(error)}`,
+          ));
+        }
+      } catch (error) {
+        logger.warn(`[capacity] feedback observation commit failed: ${String(error)}`);
+      }
+    },
     async onTurnTerminal(ds, terminal, context) {
       const originalFailedCaller = failedTurnCaller(ds, terminal.turnId);
       const originalFailedSilent = isSilentScheduledTurn(ds, terminal.turnId);

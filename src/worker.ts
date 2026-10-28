@@ -622,6 +622,7 @@ import {
   type TraexAutoModelAction,
 } from './services/traex-auto-model.js';
 import { readTraexModelLoads } from './services/traex-model-load.js';
+import { createCapacityWaitTracker } from './services/worker-capacity-wait.js';
 import { parseDaemonIpcPort } from './utils/daemon-discovery.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
@@ -12331,6 +12332,7 @@ let renderer: TerminalRenderer | null = null;
  *  have a fresh snapshot to read without needing their own tmux capture-pane
  *  call. (Historically also fed the AI ScreenAnalyzer, now removed.) */
 let lastAnalyzerSnapshot = '';
+const capacityWaitTracker = createCapacityWaitTracker();
 let screenUpdateTimer: ReturnType<typeof setInterval> | null = null;
 const SCREEN_UPDATE_INTERVAL_MS = 2_000;
 
@@ -19136,7 +19138,31 @@ function startScreenUpdates(): void {
       if (!snapshot) return;
 
       if (backend === capacityBackend && cliSpawnGeneration === capacityGeneration) {
-        observeTraexAutoModelCapacity(lastAnalyzerSnapshot || renderer?.rawSnapshot() || snapshot.content);
+        const evidenceScreen = lastAnalyzerSnapshot || renderer?.rawSnapshot() || snapshot.content;
+        observeTraexAutoModelCapacity(evidenceScreen);
+        if (lastInitConfig?.cliId === 'traex' && currentBotmuxTurnId) {
+          const identity = {
+            sessionId, turnId: currentBotmuxTurnId,
+            ...(currentBotmuxDispatchAttempt !== undefined
+              ? { dispatchAttempt: currentBotmuxDispatchAttempt }
+              : {}),
+            revision: backendScreenRevision,
+          };
+          const observation = capacityWaitTracker.observe(
+            identity, identity, evidenceScreen, Date.now(),
+          );
+          if (observation) {
+            send({
+              type: 'capacity_wait', sessionId, turnId: observation.identity.turnId,
+              ...(observation.identity.dispatchAttempt !== undefined
+                ? { dispatchAttempt: observation.identity.dispatchAttempt }
+                : {}),
+              source: 'traex-viewport', state: observation.type,
+              ...(observation.position !== undefined ? { position: observation.position } : {}),
+              observedAtMs: observation.observedAtMs, revision: observation.identity.revision,
+            });
+          }
+        }
       }
       const usageAware = usageLimitTracker.classify(snapshot.content, status);
       // Claude Code's permission dialogs — including one raised by a

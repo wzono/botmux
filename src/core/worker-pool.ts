@@ -1098,6 +1098,12 @@ export interface WorkerPoolCallbacks {
     receipt: Extract<WorkerToDaemon, { type: 'native_input_consumed' }>,
     context: { workerGeneration: number },
   ) => void;
+  /** Authoritative capacity evidence from the exact live TraeX viewport. */
+  onCapacityWait?: (
+    ds: DaemonSession,
+    observation: Extract<WorkerToDaemon, { type: 'capacity_wait' }>,
+    context: { workerGeneration: number },
+  ) => void;
   /** Provider submission proof for one durable-primary Lark Inbox turn. */
   onTurnInputCommitted?: (
     ds: DaemonSession,
@@ -16016,6 +16022,27 @@ function setupWorkerHandlers(
           cb.onNativeInputConsumed?.(ds, msg, { workerGeneration });
         } catch (err) {
           logger.warn(`[${t}] native input receipt handler failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        break;
+      }
+      case 'capacity_wait': {
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+          || msg.sessionId !== ds.session.sessionId
+          || !ownsLifecycleMutation()
+          || ds.currentTurnId !== msg.turnId
+          || (ds.turnDispatchAttemptHighWater?.turnId === msg.turnId
+            && ds.turnDispatchAttemptHighWater.dispatchAttempt !== msg.dispatchAttempt)
+        ) {
+          logger.warn(`[${t}] Ignored capacity_wait from stale or mismatched turn identity`);
+          break;
+        }
+        try {
+          cb.onCapacityWait?.(ds, msg, { workerGeneration });
+        } catch (err) {
+          logger.warn(`[${t}] capacity wait handler failed: ${err instanceof Error ? err.message : String(err)}`);
         }
         break;
       }

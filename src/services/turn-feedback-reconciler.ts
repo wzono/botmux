@@ -17,6 +17,7 @@ import {
   type TurnReactionPolicy,
 } from './turn-feedback-reaction.js';
 import { pruneTurnFeedback } from './turn-feedback-retention.js';
+import { reduceTurnFeedback } from './turn-feedback-state.js';
 
 export interface TurnFeedbackTarget {
   session: Session;
@@ -587,8 +588,37 @@ export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
     });
   }
 
-  // Reserved durable seams for later capacity and attention tasks.
-  function observeCapacity(_target: TurnFeedbackTarget, _turnId: string, _observation: unknown): void {}
+  function observeCapacity(
+    target: TurnFeedbackTarget,
+    turnId: string,
+    observation: { state: 'waiting' | 'clear'; position?: number; observedAtMs: number },
+  ): boolean {
+    let changed = false;
+    deps.commit(target, fresh => {
+      const record = fresh.turnFeedback?.[turnId];
+      if (!record) return;
+      const next = reduceTurnFeedback({
+        phase: record.phase, updatedAtMs: Date.parse(record.updatedAt), capacity: record.capacity,
+      }, observation.state === 'waiting'
+        ? { type: 'waiting', evidence: {
+            kind: 'waiting', source: 'pty', observedAtMs: observation.observedAtMs,
+            ...(observation.position !== undefined ? { position: observation.position } : {}),
+          } }
+        : { type: 'clear', observedAtMs: observation.observedAtMs });
+      if (next.phase === record.phase && next.capacity === record.capacity) return;
+      record.phase = next.phase;
+      record.updatedAt = new Date(next.updatedAtMs).toISOString();
+      record.capacity = next.capacity;
+      const plan = planReactionStep({
+        record, policy: policyFor(target),
+        newIntentId: deps.randomId?.() ?? randomUUID(),
+        nowIso: new Date(deps.now()).toISOString(),
+      });
+      if (plan.action === 'persist_intent') record.reactionIntent = plan.intent;
+      changed = true;
+    });
+    return changed;
+  }
   function observeAttention(_target: TurnFeedbackTarget, _turnId: string, _observation: unknown): void {}
   function disableCapacity(_target: TurnFeedbackTarget): void {}
   function terminal(
