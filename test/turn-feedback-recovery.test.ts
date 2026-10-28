@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { PersistedTurnFeedback, Session } from '../src/types.js';
+import { createTurnFeedbackReconciler, type TurnFeedbackTarget } from '../src/services/turn-feedback-reconciler.js';
 
 const lark = vi.hoisted(() => ({
   create: vi.fn(),
@@ -29,6 +31,47 @@ import {
 
 const APP = 'cli_test';
 const MESSAGE = 'om_message';
+const NOW = Date.parse('2026-10-28T08:00:00.000Z');
+
+function feedback(patch: Partial<PersistedTurnFeedback> = {}): PersistedTurnFeedback {
+  return {
+    version: 1, turnId: 'turn-a', messageId: MESSAGE, phase: 'processing',
+    updatedAt: new Date(NOW).toISOString(),
+    ...patch,
+  };
+}
+
+function reconcilerHarness(initial: PersistedTurnFeedback) {
+  const session = {
+    sessionId: 'session-a', status: 'active',
+    turnFeedback: { 'turn-a': structuredClone(initial) },
+  } as Session;
+  const target: TurnFeedbackTarget = { session, larkAppId: APP };
+  const effects: string[] = [];
+  const commit = vi.fn((_: TurnFeedbackTarget, mutate: (fresh: Session) => void) => {
+    mutate(session);
+    effects.push('commit');
+    return session;
+  });
+  const list = vi.fn(async () => {
+    effects.push('list');
+    return { kind: 'listed' as const, reactions: [] };
+  });
+  const create = vi.fn(async (_app: string, _message: string, type: string) => {
+    effects.push(`create:${type}`);
+    return { kind: 'created' as const, reaction: { id: `rid-${type}`, type } };
+  });
+  const remove = vi.fn(async (_app: string, _message: string, id: string) => {
+    effects.push(`delete:${id}`);
+    return { kind: 'deleted' as const };
+  });
+  const make = () => createTurnFeedbackReconciler({
+    commit, read: () => session, now: () => NOW, randomId: () => 'intent-a',
+    policy: () => ({ processing: 'GoGoGo', completed: 'DONE', failed: 'ERROR' }),
+    listOwnReactions: list, createReactionOnce: create, deleteReactionOnce: remove,
+  });
+  return { session, target, effects, commit, list, create, remove, make };
+}
 
 describe('typed one-shot reaction provider', () => {
   beforeEach(() => {
@@ -129,5 +172,100 @@ describe('typed one-shot reaction provider', () => {
     await expect(listOwnReactions(APP, MESSAGE)).resolves.toEqual({
       kind: 'retryable', reason: 'transport_uncertain',
     });
+  });
+});
+
+describe('persisted reaction intent orchestration', () => {
+  beforeEach(() => vi.useRealTimers());
+
+  it('commits intent before LIST and every receipt before the next provider action', async () => {
+    const h = reconcilerHarness(feedback());
+
+    await h.make().reconcile(h.target, 'turn-a');
+
+    expect(h.effects).toEqual(['commit', 'list', 'commit', 'create:GoGoGo', 'commit']);
+    expect(h.session.turnFeedback?.['turn-a']).toMatchObject({
+      reaction: { id: 'rid-GoGoGo', type: 'GoGoGo' },
+    });
+    expect(h.session.turnFeedback?.['turn-a'].reactionIntent).toBeUndefined();
+  });
+
+  it('restores only persisted intents and LISTs before adopting a prior CREATE ACK', async () => {
+    const h = reconcilerHarness(feedback({ reactionIntent: {
+      id: 'intent-a', messageId: MESSAGE, desiredType: 'GoGoGo',
+      createdAt: new Date(NOW).toISOString(), stage: 'create', deleteIds: [],
+    } }));
+    h.list.mockImplementation(async () => {
+      h.effects.push('list');
+      return { kind: 'listed', reactions: [{ id: 'provider-ack', type: 'GoGoGo' }] };
+    });
+
+    await h.make().restore([h.target]);
+
+    expect(h.effects).toEqual(['list', 'commit']);
+    expect(h.create).not.toHaveBeenCalled();
+    expect(h.session.turnFeedback?.['turn-a'].reaction).toEqual({
+      id: 'provider-ack', type: 'GoGoGo',
+    });
+    expect(h.session.turnFeedback?.['turn-a'].reactionIntent).toBeUndefined();
+  });
+
+  it('does not call the provider when the intent commit fails', async () => {
+    const h = reconcilerHarness(feedback());
+    h.commit.mockImplementationOnce(() => { throw new Error('session store unavailable'); });
+
+    await expect(h.make().reconcile(h.target, 'turn-a')).rejects.toThrow('session store unavailable');
+
+    expect(h.list).not.toHaveBeenCalled();
+    expect(h.create).not.toHaveBeenCalled();
+    expect(h.remove).not.toHaveBeenCalled();
+  });
+
+  it('retries transient uncertainty at 1s, 5s, and 15s while keeping the intent durable', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = reconcilerHarness(feedback({ reactionIntent: {
+        id: 'intent-a', messageId: MESSAGE, desiredType: 'GoGoGo',
+        createdAt: new Date(NOW).toISOString(), stage: 'observe', deleteIds: [],
+      } }));
+      h.list.mockResolvedValue({ kind: 'retryable', reason: 'transport_uncertain' });
+      const reconciler = h.make();
+
+      await reconciler.scheduleReactionRepair(h.target, 'turn-a');
+      expect(h.list).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1_000 + 5_000 + 15_000);
+
+      expect(h.list).toHaveBeenCalledTimes(4);
+      expect(h.create).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+      expect(h.session.turnFeedback?.['turn-a'].reactionIntent).toMatchObject({
+        id: 'intent-a', retryClass: 'transient',
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('retries blocked operations at 5m, 30m, and 2h then persists exhaustion', async () => {
+    vi.useFakeTimers();
+    try {
+      const h = reconcilerHarness(feedback({ reactionIntent: {
+        id: 'intent-a', messageId: MESSAGE, desiredType: 'GoGoGo',
+        createdAt: new Date(NOW).toISOString(), stage: 'observe', deleteIds: [],
+      } }));
+      h.list.mockResolvedValue({ kind: 'blocked', reason: 'permission_denied' });
+      const reconciler = h.make();
+
+      await reconciler.scheduleReactionRepair(h.target, 'turn-a');
+      await vi.advanceTimersByTimeAsync(300_000 + 1_800_000 + 7_200_000);
+
+      expect(h.list).toHaveBeenCalledTimes(4);
+      expect(h.session.turnFeedback?.['turn-a'].reactionIntent).toMatchObject({
+        stage: 'blocked', retryExhausted: true, diagnostic: 'permission_denied',
+      });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

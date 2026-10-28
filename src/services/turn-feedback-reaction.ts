@@ -138,6 +138,21 @@ export function reduceReactionReceipt(input: ReactionReceiptInput): ReactionPlan
     return failureResult(intent, receipt);
   }
   if (input.action === 'list' && receipt.kind === 'listed') {
+    const currentWanted = desiredReaction(input.record, input.policy);
+    if (currentWanted !== intent.desiredType) {
+      return {
+        reaction: undefined,
+        intent: {
+          ...intent,
+          ...(currentWanted ? { desiredType: currentWanted } : { desiredType: undefined }),
+          stage: receipt.reactions.length > 0 ? 'delete' : currentWanted ? 'create' : 'observe',
+          adopted: undefined,
+          deleteIds: receipt.reactions.map(reaction => reaction.id).sort(),
+          retryClass: undefined,
+          diagnostic: undefined,
+        },
+      };
+    }
     const wanted = intent.desiredType;
     const matches = receipt.reactions
       .filter(reaction => reaction.type === wanted)
@@ -168,9 +183,16 @@ export function reduceReactionReceipt(input: ReactionReceiptInput): ReactionPlan
     return { reaction: receipt.reaction, intent: undefined };
   }
   if (input.action === 'delete' && (receipt.kind === 'deleted' || receipt.kind === 'already_absent')) {
+    const deleteIds = intent.deleteIds.slice(1);
     return {
       reaction: input.record.reaction?.id === intent.deleteIds[0] ? undefined : input.record.reaction,
-      intent: { ...intent, deleteIds: intent.deleteIds.slice(1) },
+      intent: {
+        ...intent,
+        stage: deleteIds.length > 0
+          ? intent.adopted ? 'cleanup' : 'delete'
+          : intent.adopted ? 'cleanup' : intent.desiredType ? 'create' : 'observe',
+        deleteIds,
+      },
     };
   }
   return {};

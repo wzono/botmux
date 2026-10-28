@@ -20,6 +20,7 @@ import { join } from 'path';
 const mocks = vi.hoisted(() => ({
   addReaction: vi.fn(),
   removeReaction: vi.fn(),
+  ownReactions: new Map<string, Array<{ id: string; type: string }>>(),
   publishTurnCliIdentity: vi.fn(),
 }));
 
@@ -43,13 +44,36 @@ vi.mock('../src/im/lark/client.js', async () => {
   return { ...actual, addReaction: mocks.addReaction, removeReaction: mocks.removeReaction };
 });
 
+vi.mock('../src/im/lark/reaction-provider.js', () => ({
+  listOwnReactions: vi.fn(async (_app: string, messageId: string) => ({
+    kind: 'listed', reactions: structuredClone(mocks.ownReactions.get(messageId) ?? []),
+  })),
+  createReactionOnce: vi.fn(async (app: string, messageId: string, type: string) => {
+    const id = await mocks.addReaction(app, messageId, type);
+    mocks.ownReactions.set(messageId, [...(mocks.ownReactions.get(messageId) ?? []), { id, type }]);
+    return { kind: 'created', reaction: { id, type } };
+  }),
+  deleteReactionOnce: vi.fn(async (app: string, messageId: string, reactionId: string) => {
+    await mocks.removeReaction(app, messageId, reactionId);
+    mocks.ownReactions.set(
+      messageId,
+      (mocks.ownReactions.get(messageId) ?? []).filter(reaction => reaction.id !== reactionId),
+    );
+    return { kind: 'deleted' };
+  }),
+}));
+
 vi.mock('../src/core/turn-cli-identity.js', async () => {
   const actual = await vi.importActual<any>('../src/core/turn-cli-identity.js');
   return { ...actual, publishTurnCliIdentity: mocks.publishTurnCliIdentity };
 });
 
 import { getBot, registerBot } from '../src/bot-registry.js';
-import { noteTurnReceived } from '../src/daemon.js';
+import {
+  noteTurnReceived,
+  __testOnly_applyLiveTurnFeedbackTerminal as applyLiveFeedbackTerminal,
+  __testOnly_turnFeedbackReconciler as feedbackReconciler,
+} from '../src/daemon.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { beginReplyTargetTurn } from '../src/core/reply-target.js';
 import {
@@ -104,6 +128,7 @@ function registerWith(reactionsOn: boolean, opts: { silentTurnReactions?: boolea
 describe('two-phase turn reactions', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.ownReactions.clear();
     process.env.SESSION_DATA_DIR = mkdtempSync(join(tmpdir(), 'botmux-react-'));
     sessionStore.init(APP);
     mocks.addReaction.mockImplementation(async (_app: string, msgId: string) => `rid_${msgId}`);
@@ -178,7 +203,8 @@ describe('two-phase turn reactions', () => {
     expect(mocks.addReaction).toHaveBeenCalledTimes(2);
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'GoGoGo');
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_b', 'GoGoGo');
-    expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_a', 'om_b']);
+    expect(Object.values(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback ?? {})
+      .map(record => record.messageId)).toEqual(['om_a', 'om_b']);
     expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a).toEqual(firstAdmission);
     expect(Object.keys(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback ?? {})).toEqual(['om_a', 'om_b']);
   });
@@ -190,7 +216,7 @@ describe('two-phase turn reactions', () => {
     await noteTurnReceived(ds, 'om_sub', undefined, undefined, undefined, 'Get');
 
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_sub', 'Get');
-    expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_sub']);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_sub?.reaction?.type).toBe('Get');
     expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_sub?.receivedReactionEmoji).toBe('Get');
   });
 
@@ -206,7 +232,7 @@ describe('two-phase turn reactions', () => {
     await noteTurnReceived(ds, 'om_a');
 
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'GoGoGo');
-    expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_a']);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a?.reaction?.type).toBe('GoGoGo');
   });
 
   it('queued substitute turn A stays card-off after normal turn B overwrote the slot (per-turn gate)', async () => {
@@ -534,7 +560,7 @@ describe('two-phase turn reactions', () => {
     expect(ds.currentReplyTarget).toEqual(durable?.currentReplyTarget);
     expect(ds.replyThreadAliases).toEqual(durable?.replyThreadAliases);
     expect(mocks.addReaction).toHaveBeenCalledTimes(1);
-    expect(ds.pendingAckReactions?.map(item => item.messageId)).toEqual([turnId]);
+    expect(durable?.turnFeedback?.[turnId]?.reaction?.type).toBe('GoGoGo');
   });
 
   it('keeps one durable winner on an equal-time conflicting live route', async () => {
@@ -945,6 +971,39 @@ describe('two-phase turn reactions', () => {
     expect(ds.pendingAckReactions ?? []).toEqual([]);
   });
 
+  it('commits terminal phase and reaction intent atomically before convergence', async () => {
+    registerWith(true);
+    const ds = makeDs();
+    await noteTurnReceived(ds, 'om_terminal');
+    mocks.addReaction.mockClear();
+
+    applyLiveFeedbackTerminal(ds, {
+      turnId: 'om_terminal', status: 'completed', completedAtMs: Date.now(),
+    });
+
+    const committed = sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_terminal;
+    expect(committed).toMatchObject({ phase: 'completed' });
+    expect(committed?.reactionIntent ?? committed?.reaction).toBeDefined();
+  });
+
+  it('contains terminal feedback commit failure without calling the reaction provider', async () => {
+    registerWith(true);
+    const ds = makeDs();
+    await noteTurnReceived(ds, 'om_terminal_fail');
+    mocks.addReaction.mockClear();
+    mocks.removeReaction.mockClear();
+    sessionStore.__testOnly_setBeforeRowPersist(() => { throw new Error('terminal feedback write failed'); });
+
+    expect(() => applyLiveFeedbackTerminal(ds, {
+      turnId: 'om_terminal_fail', status: 'completed', completedAtMs: Date.now(),
+    })).not.toThrow();
+
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+    expect(mocks.removeReaction).not.toHaveBeenCalled();
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_terminal_fail?.phase)
+      .toBe('processing');
+  });
+
   it('type-ahead: two messages while busy each get 冲! then both flip to ✅ at idle', async () => {
     registerWith(true);
     const ds = makeDs();
@@ -955,14 +1014,18 @@ describe('two-phase turn reactions', () => {
     expect(mocks.addReaction).toHaveBeenCalledTimes(2);
 
     mocks.addReaction.mockClear();
-    await finishTurnReactions(ds);
+    feedbackReconciler.terminal(ds, 'om_a', 'completed');
+    feedbackReconciler.terminal(ds, 'om_b', 'completed');
+    await feedbackReconciler.reconcile(ds, 'om_a');
+    await feedbackReconciler.reconcile(ds, 'om_b');
 
     // Each ✋ removed and replaced with ✅ DONE — neither message is left behind.
     expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
     expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_b', 'rid_om_b');
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'DONE');
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_b', 'DONE');
-    expect(ds.pendingAckReactions).toEqual([]);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a?.phase).toBe('completed');
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_b?.phase).toBe('completed');
   });
 
   it('silentTurnReactions clears pending received reactions without adding DONE', async () => {
@@ -999,16 +1062,18 @@ describe('two-phase turn reactions', () => {
     expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_b', 'DONE');
     expect(ds.pendingAckReactions ?? []).toEqual([]);
 
-    // addReaction resolves → only now does om_b register.
+    // addReaction resolves → only now does om_b persist its provider receipt.
     releaseB('rid_om_b');
     await notePromise;
-    expect(ds.pendingAckReactions?.map((a) => a.messageId)).toEqual(['om_b']);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_b?.reaction)
+      .toEqual({ id: 'rid_om_b', type: 'GoGoGo' });
 
-    // om_b's own idle now flips it to ✅ exactly once.
-    await finishTurnReactions(ds);
+    // om_b's terminal now converges it to ✅ exactly once.
+    feedbackReconciler.terminal(ds, 'om_b', 'completed');
+    await feedbackReconciler.reconcile(ds, 'om_b');
     expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_b', 'rid_om_b');
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_b', 'DONE');
-    expect(ds.pendingAckReactions).toEqual([]);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_b?.phase).toBe('completed');
   });
 
   it('finishTurnReactions with no pending acks is a no-op', async () => {
@@ -1026,7 +1091,8 @@ describe('two-phase turn reactions', () => {
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'OK');
 
     mocks.addReaction.mockClear();
-    await finishTurnReactions(ds);
+    feedbackReconciler.terminal(ds, 'om_a', 'completed');
+    await feedbackReconciler.reconcile(ds, 'om_a');
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'Thumbsup');
   });
 
@@ -1040,9 +1106,11 @@ describe('two-phase turn reactions', () => {
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'GoGoGo');
 
     mocks.addReaction.mockClear();
-    await finishTurnReactions(ds);
-    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
-    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'GoGoGo');
+    feedbackReconciler.terminal(ds, 'om_a', 'completed');
+    await feedbackReconciler.reconcile(ds, 'om_a');
+    expect(mocks.removeReaction).not.toHaveBeenCalled();
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a?.reaction)
+      .toEqual({ id: 'rid_om_a', type: 'GoGoGo' });
     expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_a', 'DONE');
   });
 });

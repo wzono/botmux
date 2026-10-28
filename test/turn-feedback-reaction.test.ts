@@ -90,6 +90,38 @@ describe('pure turn reaction convergence', () => {
     });
   });
 
+  it('moves to CREATE after the final old reaction is deleted', () => {
+    const record = row({ reactionIntent: {
+      id: 'intent-a', messageId: 'om_a', desiredType: 'GoGoGo',
+      createdAt: '2026-10-28T08:01:00.000Z', stage: 'delete', deleteIds: ['old'],
+    } });
+
+    const reduced = reduceReactionReceipt({
+      record, policy, intentId: 'intent-a', action: 'delete', receipt: { kind: 'deleted' },
+    });
+
+    expect(reduced.intent).toMatchObject({ stage: 'create', deleteIds: [] });
+    expect(planReactionStep({ record: row({ reactionIntent: reduced.intent }), policy }))
+      .toEqual({ action: 'create', intentId: 'intent-a', messageId: 'om_a', type: 'GoGoGo' });
+  });
+
+  it('accounts for an old uncertain intent before converging to the new phase', () => {
+    const record = row({ phase: 'completed', reactionIntent: {
+      id: 'intent-old', messageId: 'om_a', desiredType: 'GoGoGo',
+      createdAt: '2026-10-28T08:01:00.000Z', stage: 'observe', deleteIds: [],
+    } });
+
+    const reduced = reduceReactionReceipt({
+      record, policy, intentId: 'intent-old', action: 'list',
+      receipt: { kind: 'listed', reactions: [{ id: 'old-ack', type: 'GoGoGo' }] },
+    });
+
+    expect(reduced.intent).toMatchObject({
+      id: 'intent-old', desiredType: 'DONE', stage: 'delete', deleteIds: ['old-ack'],
+    });
+    expect(reduced.reaction).toBeUndefined();
+  });
+
   it('does not mutate after uncertain LIST and persists blocked/permanent diagnostics', () => {
     const record = row({ reactionIntent: {
       id: 'intent-a', messageId: 'om_a', desiredType: 'GoGoGo',

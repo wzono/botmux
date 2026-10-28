@@ -1,6 +1,22 @@
-import type { FrozenSessionReplyContext, ReplyTargetEntry, Session } from '../types.js';
+import { randomUUID } from 'node:crypto';
+import type { FrozenSessionReplyContext, PersistedTurnFeedback, ReplyTargetEntry, Session } from '../types.js';
 import { cronPinnedTurnIds, pruneReplyTargets } from '../core/reply-target.js';
 import { isDeepStrictEqual } from 'node:util';
+import {
+  createReactionOnce,
+  deleteReactionOnce,
+  listOwnReactions,
+  type ReactionCreateReceipt,
+  type ReactionDeleteReceipt,
+  type ReactionListReceipt,
+} from '../im/lark/reaction-provider.js';
+import {
+  planReactionStep,
+  reduceReactionReceipt,
+  type ReactionPlanResult,
+  type TurnReactionPolicy,
+} from './turn-feedback-reaction.js';
+import { pruneTurnFeedback } from './turn-feedback-retention.js';
 
 export interface TurnFeedbackTarget {
   session: Session;
@@ -10,7 +26,13 @@ export interface TurnFeedbackTarget {
 export interface TurnFeedbackDeps {
   /** Mutate and commit the fresh owned Session row before publishing it in memory. */
   commit(target: TurnFeedbackTarget, mutate: (fresh: Session) => void): Session;
+  read?(target: TurnFeedbackTarget): Session;
   now(): number;
+  randomId?(): string;
+  policy?(target: TurnFeedbackTarget): TurnReactionPolicy;
+  listOwnReactions?(appId: string, messageId: string): Promise<ReactionListReceipt>;
+  createReactionOnce?(appId: string, messageId: string, type: string): Promise<ReactionCreateReceipt>;
+  deleteReactionOnce?(appId: string, messageId: string, reactionId: string): Promise<ReactionDeleteReceipt>;
 }
 
 export interface TurnFeedbackAdmission {
@@ -357,6 +379,159 @@ function applyExactTurnRouting(
 }
 
 export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
+  const listProvider = deps.listOwnReactions ?? listOwnReactions;
+  const createProvider = deps.createReactionOnce ?? createReactionOnce;
+  const deleteProvider = deps.deleteReactionOnce ?? deleteReactionOnce;
+  const inFlight = new Map<string, Promise<void>>();
+  const repairs = new Map<string, {
+    intentId: string;
+    attempt: number;
+    kind: 'transient' | 'blocked';
+    timer?: ReturnType<typeof setTimeout>;
+  }>();
+
+  const keyFor = (target: TurnFeedbackTarget, turnId: string) =>
+    JSON.stringify([target.larkAppId, target.session.sessionId, turnId]);
+
+  function readRow(target: TurnFeedbackTarget, turnId: string): PersistedTurnFeedback | undefined {
+    const fresh = deps.read?.(target) ?? target.session;
+    if (fresh !== target.session) target.session.turnFeedback = fresh.turnFeedback;
+    return fresh.turnFeedback?.[turnId];
+  }
+
+  function policyFor(target: TurnFeedbackTarget): TurnReactionPolicy {
+    return deps.policy?.(target) ?? {};
+  }
+
+  function applyResult(
+    target: TurnFeedbackTarget,
+    turnId: string,
+    intentId: string,
+    result: ReactionPlanResult,
+  ): void {
+    deps.commit(target, fresh => {
+      const record = fresh.turnFeedback?.[turnId];
+      if (!record || record.reactionIntent?.id !== intentId) return;
+      if (result.messageGone) record.reactionMessageGone = true;
+      if ('reaction' in result) record.reaction = result.reaction;
+      if ('intent' in result) record.reactionIntent = result.intent;
+    });
+  }
+
+  function cancelRepair(target: TurnFeedbackTarget, turnId: string): void {
+    const key = keyFor(target, turnId);
+    const repair = repairs.get(key);
+    if (repair?.timer) clearTimeout(repair.timer);
+    repairs.delete(key);
+  }
+
+  function scheduleNextRepair(
+    target: TurnFeedbackTarget,
+    turnId: string,
+    intentId: string,
+    kind: 'transient' | 'blocked',
+  ): void {
+    const key = keyFor(target, turnId);
+    let repair = repairs.get(key);
+    if (!repair || repair.intentId !== intentId || repair.kind !== kind) {
+      if (repair?.timer) clearTimeout(repair.timer);
+      repair = { intentId, attempt: 0, kind };
+      repairs.set(key, repair);
+    }
+    if (repair.timer) return;
+    const schedule = kind === 'transient'
+      ? [1_000, 5_000, 15_000]
+      : [300_000, 1_800_000, 7_200_000];
+    const delay = schedule[repair.attempt++];
+    if (delay === undefined) {
+      if (kind === 'blocked') {
+        deps.commit(target, fresh => {
+          const intent = fresh.turnFeedback?.[turnId]?.reactionIntent;
+          if (intent?.id === intentId && intent.stage === 'blocked') intent.retryExhausted = true;
+        });
+      }
+      repairs.delete(key);
+      return;
+    }
+    const captured = repair;
+    captured.timer = setTimeout(() => {
+      captured.timer = undefined;
+      if (repairs.get(key) !== captured) return;
+      if (readRow(target, turnId)?.reactionIntent?.id !== intentId) {
+        repairs.delete(key);
+        return;
+      }
+      void reconcile(target, turnId, true).finally(() => {
+        const intent = readRow(target, turnId)?.reactionIntent;
+        if (repairs.get(key) !== captured || intent?.id !== intentId) return;
+        if (intent.retryClass === kind) scheduleNextRepair(target, turnId, intentId, kind);
+        else cancelRepair(target, turnId);
+      });
+    }, delay);
+    captured.timer.unref?.();
+  }
+
+  async function run(target: TurnFeedbackTarget, turnId: string, freshProcess = false): Promise<void> {
+    let forceList = freshProcess;
+    for (;;) {
+      const record = readRow(target, turnId);
+      if (!record) return;
+      const plan = planReactionStep({
+        record, policy: policyFor(target),
+        newIntentId: deps.randomId?.() ?? randomUUID(),
+        nowIso: new Date(deps.now()).toISOString(),
+        freshProcess: forceList,
+      });
+      forceList = false;
+      if (plan.action === 'settled') { cancelRepair(target, turnId); return; }
+      if (plan.action === 'persist_intent') {
+        deps.commit(target, fresh => {
+          const current = fresh.turnFeedback?.[turnId];
+          if (!current || current.reactionIntent || current.reactionMessageGone) return;
+          current.reactionIntent = plan.intent;
+        });
+        continue;
+      }
+      const current = readRow(target, turnId);
+      if (!current?.reactionIntent || current.reactionIntent.id !== plan.intentId) continue;
+      const receipt = plan.action === 'list'
+        ? await listProvider(target.larkAppId, plan.messageId)
+        : plan.action === 'create'
+          ? await createProvider(target.larkAppId, plan.messageId, plan.type)
+          : await deleteProvider(target.larkAppId, plan.messageId, plan.reactionId);
+      const result = reduceReactionReceipt({
+        record: current, policy: policyFor(target), intentId: plan.intentId,
+        action: plan.action, receipt,
+      });
+      applyResult(target, turnId, plan.intentId, result);
+      const next = readRow(target, turnId)?.reactionIntent;
+      if (!next) { cancelRepair(target, turnId); return; }
+      if (next.retryClass) {
+        scheduleNextRepair(target, turnId, next.id, next.retryClass);
+        return;
+      }
+    }
+  }
+
+  function reconcile(
+    target: TurnFeedbackTarget,
+    turnId: string,
+    freshProcess = false,
+  ): Promise<void> {
+    const key = keyFor(target, turnId);
+    const existing = inFlight.get(key);
+    if (existing) return existing;
+    const promise = run(target, turnId, freshProcess).finally(() => {
+      if (inFlight.get(key) === promise) inFlight.delete(key);
+    });
+    inFlight.set(key, promise);
+    return promise;
+  }
+
+  async function scheduleReactionRepair(target: TurnFeedbackTarget, turnId: string): Promise<void> {
+    await reconcile(target, turnId, true);
+  }
+
   function admit(target: TurnFeedbackTarget, input: TurnFeedbackAdmission): Session {
     const liveRouting = freezeLiveRouting(target.session);
     const routing = freezeExactTurnRouting(
@@ -412,13 +587,57 @@ export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
     });
   }
 
-  // Reserved durable seams for later tasks. Admission is the only transition
-  // implemented here; these explicit no-ops cannot publish partial behavior.
+  // Reserved durable seams for later capacity and attention tasks.
   function observeCapacity(_target: TurnFeedbackTarget, _turnId: string, _observation: unknown): void {}
   function observeAttention(_target: TurnFeedbackTarget, _turnId: string, _observation: unknown): void {}
-  function terminal(_target: TurnFeedbackTarget, _turnId: string, _phase: 'completed' | 'failed'): void {}
   function disableCapacity(_target: TurnFeedbackTarget): void {}
-  function restore(_targets: Iterable<TurnFeedbackTarget>): void {}
+  function terminal(
+    target: TurnFeedbackTarget,
+    turnId: string,
+    phase: 'completed' | 'failed',
+    observedAtMs = deps.now(),
+  ): boolean {
+    let changed = false;
+    deps.commit(target, fresh => {
+      const record = fresh.turnFeedback?.[turnId];
+      if (!record || record.phase === 'completed' || record.phase === 'failed') return;
+      record.phase = phase;
+      record.updatedAt = new Date(Math.max(Date.parse(record.updatedAt), observedAtMs)).toISOString();
+      const desired = planReactionStep({
+        record, policy: policyFor(target),
+        newIntentId: deps.randomId?.() ?? randomUUID(),
+        nowIso: new Date(deps.now()).toISOString(),
+      });
+      if (desired.action === 'persist_intent') record.reactionIntent = desired.intent;
+      changed = true;
+      fresh.turnFeedback = pruneTurnFeedback(
+        fresh.turnFeedback ?? {}, deps.now(), policyFor(target),
+      );
+    });
+    return changed;
+  }
+  async function restore(targets: Iterable<TurnFeedbackTarget>): Promise<void> {
+    for (const target of targets) {
+      for (const record of Object.values(target.session.turnFeedback ?? {})) {
+        if (!record.reactionIntent) continue;
+        await scheduleReactionRepair(target, record.turnId);
+      }
+    }
+  }
 
-  return { admit, observeCapacity, observeAttention, terminal, disableCapacity, restore };
+  function dispose(target?: TurnFeedbackTarget): void {
+    const prefix = target
+      ? JSON.stringify([target.larkAppId, target.session.sessionId]).slice(0, -1)
+      : undefined;
+    for (const [key, repair] of repairs) {
+      if (prefix && !key.startsWith(prefix)) continue;
+      if (repair.timer) clearTimeout(repair.timer);
+      repairs.delete(key);
+    }
+  }
+
+  return {
+    admit, observeCapacity, observeAttention, terminal, disableCapacity, restore,
+    reconcile, scheduleReactionRepair, dispose,
+  };
 }
