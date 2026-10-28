@@ -299,7 +299,7 @@ describe('Dashboard plugin service bridge', () => {
       );
     }
     expect(targets).toEqual([
-      'http://localhost:43210/api/snapshot',
+      'http://127.0.0.1:43210/api/snapshot',
       'http://127.0.0.1:43210/api/snapshot',
       'http://[::1]:43210/api/snapshot',
       'http://[::1]:43210/api/snapshot',

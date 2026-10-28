@@ -39,9 +39,14 @@ function fail(code: PluginDashboardServiceErrorCode): never {
   throw new PluginDashboardServiceError(code);
 }
 
-function loopbackUrlHost(host: unknown): string | undefined {
-  if (host === '127.0.0.1' || host === 'localhost') return host;
-  if (host === '::1' || host === '[::1]') return '[::1]';
+export function normalizePluginServiceLoopbackHost(host: unknown): {
+  identityHost: '127.0.0.1' | '::1';
+  urlHost: '127.0.0.1' | '[::1]';
+} | undefined {
+  if (host === '127.0.0.1' || host === 'localhost') {
+    return { identityHost: '127.0.0.1', urlHost: '127.0.0.1' };
+  }
+  if (host === '::1' || host === '[::1]') return { identityHost: '::1', urlHost: '[::1]' };
   return undefined;
 }
 
@@ -99,14 +104,15 @@ export async function proxyPluginDashboardServiceRequest(
     .some(route => route.method === input.method && route.path === input.path);
   if (!allowed) fail('route_not_allowed');
   if (deps.state?.pluginId !== deps.record.id || deps.state.status !== 'online') fail('service_offline');
+  const target = normalizePluginServiceLoopbackHost(deps.state.host);
+  if (!target) fail('service_host_invalid');
+  const verifiedState = { ...deps.state, host: target.identityHost };
   try {
-    if (deps.verifyServiceIdentity(deps.state) !== 'online') fail('service_offline');
+    if (deps.verifyServiceIdentity(verifiedState) !== 'online') fail('service_offline');
   } catch (error) {
     if (error instanceof PluginDashboardServiceError) throw error;
     fail('service_offline');
   }
-  const targetHost = loopbackUrlHost(deps.state.host);
-  if (!targetHost) fail('service_host_invalid');
   if (!Number.isInteger(deps.state.port) || deps.state.port! < 1 || deps.state.port! > 65_535) {
     fail('service_port_invalid');
   }
@@ -124,7 +130,7 @@ export async function proxyPluginDashboardServiceRequest(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await (deps.fetchImpl ?? fetch)(`http://${targetHost}:${deps.state.port}${input.path}`, {
+    const response = await (deps.fetchImpl ?? fetch)(`http://${target.urlHost}:${deps.state.port}${input.path}`, {
       method: input.method,
       redirect: 'error',
       signal: controller.signal,
