@@ -7246,7 +7246,15 @@ codexBridgeQueue.setCotObserver((entries, turn) => {
 // Same evidence for the structured bridges (Pi, TraeX, Grok, …): the turn's
 // own user record is in the CLI's transcript.
 codexBridgeQueue.setTurnStartObserver((turn) => {
-  if (!turn.isLocal) inflightInputs.onTurnStarted(turn.turnId);
+  if (turn.isLocal) return;
+  inflightInputs.onTurnStarted(turn.turnId);
+  if (turn.sourceTurnId && turn.dispatchAttempt !== undefined) {
+    send({
+      type: 'capacity_sideband_binding', adapter: 'codex', sessionId, turnId: turn.turnId,
+      dispatchAttempt: turn.dispatchAttempt, nativeTurnId: turn.sourceTurnId,
+      ...(turn.sourceSessionId ? { nativeSessionId: turn.sourceSessionId } : {}),
+    });
+  }
 });
 codexBridgeQueue.setCotSupersededObserver((turn) => {
   if (!sessionId || turn.isLocal) return;
