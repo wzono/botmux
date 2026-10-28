@@ -128,6 +128,8 @@ import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescript
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
 import { createTurnFeedbackReconciler } from './services/turn-feedback-reconciler.js';
+import { createCapacitySidebandDirectoryConsumer, type CapacitySidebandKey } from './services/capacity-sideband-consumer.js';
+import { createCapacitySidebandRuntime } from './services/capacity-sideband-runtime.js';
 import { initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
 import { closeLinkRefRuntime, initializeLinkRefRuntime } from './services/link-ref-runtime.js';
 import { startDurableInboxShadowConsumer } from './services/durable-inbox-shadow-consumer.js';
@@ -4154,6 +4156,77 @@ function applyLiveTurnFeedbackTerminal(
 }
 
 export const __testOnly_applyLiveTurnFeedbackTerminal = applyLiveTurnFeedbackTerminal;
+
+const capacitySidebandRuntime = createCapacitySidebandRuntime(binding => {
+  const ds = findActiveBySessionId(binding.sessionId);
+  const persisted = ds?.session.turnFeedback?.[binding.turnId]?.capacityBinding;
+  return !!ds && persisted?.adapter === binding.adapter
+    && persisted.nativeTurnId === binding.nativeTurnId
+    && persisted.nativeSessionId === binding.nativeSessionId
+    && persisted.dispatchAttempt === binding.dispatchAttempt
+    && persisted.workerGeneration === binding.workerGeneration;
+});
+let stopCapacitySidebandConsumer: (() => void) | undefined;
+
+function decodeCapacitySidebandKeyring(raw: string | undefined): CapacitySidebandKey[] {
+  if (!raw) return [];
+  const parsed = JSON.parse(raw) as Array<{
+    keyId: string; publicKeyDer: string; minEpoch: number; maxEpoch: number;
+  }>;
+  return parsed.map(entry => ({
+    keyId: entry.keyId, publicKeyDer: Buffer.from(entry.publicKeyDer, 'base64url'),
+    minEpoch: entry.minEpoch, maxEpoch: entry.maxEpoch,
+  }));
+}
+
+function startCapacitySidebandConsumer(ownerAppId: string): void {
+  stopCapacitySidebandConsumer?.();
+  stopCapacitySidebandConsumer = undefined;
+  capacitySidebandRuntime.clear();
+  for (const session of sessionStore.listSessions()) {
+    if (session.larkAppId !== ownerAppId) continue;
+    for (const row of Object.values(session.turnFeedback ?? {})) {
+      const binding = row.capacityBinding;
+      if (binding) capacitySidebandRuntime.restore({
+        ...binding, sessionId: session.sessionId, turnId: row.turnId,
+      });
+    }
+  }
+  const root = process.env.BOTMUX_CAPACITY_SIDEBAND_ROOT;
+  let keyring: CapacitySidebandKey[] = [];
+  try { keyring = decodeCapacitySidebandKeyring(process.env.BOTMUX_CAPACITY_SIDEBAND_KEYRING); }
+  catch (error) { logger.error(`[capacity] invalid sideband keyring: ${String(error)}`); return; }
+  if (!root || keyring.length === 0) return;
+  const consumer = createCapacitySidebandDirectoryConsumer({
+    root, ownerAppId, keyring,
+    resolve(event) {
+      return capacitySidebandRuntime.resolve({
+        adapter: event.adapter, nativeTurnId: event.native_turn_id,
+        ...(event.native_session_id ? { nativeSessionId: event.native_session_id } : {}),
+      });
+    },
+    async observe(binding, observation, event) {
+      const ds = findActiveBySessionId(binding.sessionId);
+      const persisted = ds?.session.turnFeedback?.[binding.turnId]?.capacityBinding;
+      if (!ds || persisted?.dispatchAttempt !== binding.dispatchAttempt
+        || persisted.workerGeneration !== binding.workerGeneration) return;
+      const changed = turnFeedbackReconciler.observeCapacity(
+        { session: ds.session, larkAppId: ds.larkAppId }, binding.turnId, observation,
+      );
+      if (changed) await turnFeedbackReconciler.reconcile(ds, binding.turnId);
+      sessionStore.mutateOwnedSessionsAtomically([ds.session.sessionId], fresh => {
+        const row = fresh.get(ds.session.sessionId)?.turnFeedback?.[binding.turnId];
+        if (row) row.capacitySidebandCursor = {
+          adapter: event.adapter, signerKeyId: event.signer_key_id,
+          signerEpoch: event.signer_epoch, requestId: event.request_id,
+          sequence: event.sequence, observedAtMs: Date.parse(event.observed_at),
+        };
+      });
+    },
+  });
+  consumer.retryPending();
+  stopCapacitySidebandConsumer = consumer.start();
+}
 
 export async function noteTurnReceived(
   ds: DaemonSession,
@@ -30548,6 +30621,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   } catch (error) {
     logger.warn(`[reaction] startup feedback restore failed: ${String(error)}`);
   }
+  startCapacitySidebandConsumer(cfg.larkAppId);
   chatFirstSeenStore.init(cfg.larkAppId);
   initSessionGroups(cfg.larkAppId);
   const ambiguousOnBoot = reconcileVcMeetingDeliveriesOnBoot(
@@ -31038,6 +31112,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           dispatchAttempt: binding.dispatchAttempt, workerGeneration: binding.workerGeneration,
         };
       });
+      if (!capacitySidebandRuntime.bind({
+        adapter: binding.adapter, sessionId: ds.session.sessionId, turnId: binding.turnId,
+        dispatchAttempt: binding.dispatchAttempt, workerGeneration: binding.workerGeneration,
+        nativeTurnId: binding.nativeTurnId,
+        ...(binding.nativeSessionId ? { nativeSessionId: binding.nativeSessionId } : {}),
+      })) throw new Error('capacity_sideband_binding_conflict');
     },
     async onTurnTerminal(ds, terminal, context) {
       const originalFailedCaller = failedTurnCaller(ds, terminal.turnId);

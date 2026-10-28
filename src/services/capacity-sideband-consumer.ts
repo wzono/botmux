@@ -194,5 +194,11 @@ export function createCapacitySidebandDirectoryConsumer(deps: CapacitySidebandDi
         renameSync(join(directory, name), join(directory, name.slice(0, -'.pending'.length)));
       }
     },
+    start(intervalMs = 250) {
+      const timer = setInterval(() => { void poll().catch(() => undefined); }, intervalMs);
+      timer.unref?.();
+      void poll().catch(() => undefined);
+      return () => clearInterval(timer);
+    },
   };
 }
