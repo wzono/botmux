@@ -66,15 +66,16 @@
  * matching turn — identical to Codex/Grok. Non-steered turns stay strictly
  * interleaved (user → assistant_final → user → assistant_final).
  */
-import { existsSync, statSync, readdirSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { codexTaskFailureCode, safeFailureSummary, type CodexCotEntry } from './codex-transcript.js';
 import { boundSubjectForTransport, subjectFromInputObject } from './cot-subject.js';
 import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
 import { contentHasToolCall, messageContentText } from './pi-family-content.js';
 import { listProcessOpenFiles } from '../utils/process-open-files.js';
 import {
+  PI_INPUT_QUEUED_CUSTOM_TYPE,
   PI_TURN_BOUNDARY_CUSTOM_TYPE,
   PI_TURN_BOUNDARY_STOP_REASON_ERROR,
 } from '../adapters/cli/pi-turn-boundary-extension.js';
@@ -85,7 +86,10 @@ const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-
 export interface PiBridgeEvent {
   uuid: string;
   timestampMs: number;
-  kind: 'user' | 'assistant_final' | 'cot';
+  /** `input_queued` / `cli_settled` carry no text: Pi accepted an input it
+   *  will only persist after its current work, and Pi finished all queued
+   *  work. See CodexBridgeEvent for how the queue uses them. */
+  kind: 'user' | 'assistant_final' | 'cot' | 'input_queued' | 'cli_settled';
   text: string;
   cotEntries?: CodexCotEntry[];
   /** Best-effort terminal outcome carried by an `assistant_final` (attribution
@@ -106,6 +110,19 @@ export interface PiBridgeEvent {
  *  gate for stop/length — see drainPiTranscript). `toolUse` is never terminal. */
 type PiTerminalStopReason = 'stop' | 'length' | 'error' | 'aborted';
 
+/** Pi could not obtain the provider credential, so the request never left the
+ *  machine. A models.json `"apiKey": "!<command>"` is re-run before EVERY model
+ *  request, uncached, under a hard 10s timeout (pi-coding-agent
+ *  resolve-config-value.js); on a loaded box the token helper overruns and Pi
+ *  writes `API key auth failed for provider X: Failed to resolve API key …`.
+ *  Pi treats that as an auth error and does not retry, so the turn ends. The
+ *  shared classifier files it as a generic task failure (no 401/"invalid key"
+ *  token), whose notice reads like a hard fault; this code lets the notice say
+ *  what it is — a credential fetch that usually succeeds on resend. Pi-only on
+ *  purpose, like codexRolloutFailureCode: the shared taxonomy stays untouched. */
+export const PI_CREDENTIAL_ERROR_CODE = 'pi_credential_unavailable';
+const PI_CREDENTIAL_ERROR_RE = /\bAPI key auth failed\b|\bFailed to resolve API key\b/i;
+
 /** Map Pi's terminal stopReason to best-effort attribution metadata carried on
  *  the assistant_final. NOT a durable-delivery receipt (Pi has no
  *  reliableTurnTerminal — see pi.ts); the worker uses these only for
@@ -117,8 +134,9 @@ type PiTerminalStopReason = 'stop' | 'length' | 'error' | 'aborted';
  *    = Cancelled by backend" from the model gateway), classify it through the
  *    shared Codex-family classifier so the failure card names the real cause
  *    (gateway/connection/auth/…) and carries a redacted summary instead of
- *    the opaque "no error summary" fallback. Without an errorMessage the code
- *    stays `pi_turn_error`.
+ *    the opaque "no error summary" fallback. A credential that could not be
+ *    resolved gets its own `PI_CREDENTIAL_ERROR_CODE` first. Without an
+ *    errorMessage the code stays `pi_turn_error`.
  *  - `aborted` → `ambiguous` (`pi_turn_aborted`): a user Esc can land AFTER a
  *    tool's side effect already completed, so we don't assert it "did not
  *    happen" — same audit semantic as Codex/TraeX `turn_aborted`.
@@ -139,7 +157,9 @@ function piTerminalOutcome(
       const summary = safeFailureSummary(errorMessage);
       return {
         terminalStatus: 'failed',
-        terminalErrorCode: codexTaskFailureCode(errorMessage),
+        terminalErrorCode: PI_CREDENTIAL_ERROR_RE.test(errorMessage)
+          ? PI_CREDENTIAL_ERROR_CODE
+          : codexTaskFailureCode(errorMessage),
         ...(summary ? { terminalErrorSummary: summary } : {}),
       };
     }
@@ -154,9 +174,65 @@ export interface PiDrainResult {
   pendingTail: string;
 }
 
-function piSessionsDirForCwd(cwd: string): string {
-  const normalized = cwd === '/' ? '--root--' : cwd.replace(/\//g, '--');
-  return join(PI_SESSIONS_ROOT, normalized);
+/** Pi's own name for a cwd's session directory — a mirror of pi-coding-agent's
+ *  `getDefaultSessionDirPath` (core/session-manager.js, verified on 1.3.0 and
+ *  unchanged since 0.8x): `--` + the resolved path without its leading
+ *  separator, every `/`, `\` and `:` turned into `-`, + `--`. So `/root` is
+ *  `--root--` and `/root/iserver/x` is `--root-iserver-x--`.
+ *
+ *  It has to be Pi's exact rule, not a look-alike: Pi's `--session-id` lookup
+ *  (main.js findLocalSessionByExactId → SessionManager.findById) searches ONLY
+ *  this directory, and when it finds nothing there it creates a NEW session
+ *  file with the same id here instead of reopening the one under another cwd.
+ *  The bridge therefore has to follow the same directory, or it pins a file Pi
+ *  will never write again. */
+export function piSessionDirName(cwd: string): string {
+  return `--${resolve(cwd).replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`;
+}
+
+/** The spellings of `cwd` Pi may have used. Pi derives its directory from
+ *  `process.cwd()`, which the kernel reports with symlinks resolved, while the
+ *  configured working dir may go through a symlink — keep both. */
+function piCwdVariants(cwd: string): string[] {
+  const expanded = cwd === '~' ? homedir() : cwd.startsWith('~/') ? join(homedir(), cwd.slice(2)) : cwd;
+  const variants = [resolve(expanded)];
+  try {
+    const real = realpathSync(expanded);
+    if (!variants.includes(real)) variants.push(real);
+  } catch { /* the directory may already be gone */ }
+  return variants;
+}
+
+/** Pi's own cap on how far it scans for a session header (session-manager.js
+ *  MAX_SESSION_HEADER_SCAN_BYTES); beyond it Pi does not treat the file as a
+ *  session either. */
+const PI_SESSION_HEADER_SCAN_BYTES = 1024 * 1024;
+
+/** `cwd` recorded in a transcript's session header (its first line), or
+ *  undefined when the header is unreadable or predates the field. Reads up to
+ *  the first newline only: a long session's transcript runs to megabytes. */
+function piTranscriptHeaderCwd(path: string): string | undefined {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, 'r');
+    const buf = Buffer.alloc(64 * 1024);
+    const chunks: Buffer[] = [];
+    let scanned = 0;
+    while (scanned < PI_SESSION_HEADER_SCAN_BYTES) {
+      const n = readSync(fd, buf, 0, Math.min(buf.length, PI_SESSION_HEADER_SCAN_BYTES - scanned), scanned);
+      if (n === 0) break;
+      const newline = buf.subarray(0, n).indexOf(0x0a);
+      chunks.push(Buffer.from(buf.subarray(0, newline === -1 ? n : newline)));
+      scanned += n;
+      if (newline !== -1) break;
+    }
+    const header = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    return header?.type === 'session' && typeof header.cwd === 'string' ? header.cwd : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 }
 
 function piSessionIdFromPath(path: string): string | undefined {
@@ -226,26 +302,57 @@ function piCotEntries(message: Record<string, unknown>, includeText: boolean): C
   return entries;
 }
 
-export function findPiTranscriptBySessionId(cliSessionId: string, cwd?: string): string | undefined {
+/** Transcript Pi writes for `cliSessionId` when it runs in `cwd`.
+ *
+ *  With `cwd`, this answers the question Pi itself answers on `--session-id`:
+ *  the file in that cwd's session directory, or nothing yet. "Nothing" is a
+ *  real answer, not a miss to paper over — when a session is resumed in a
+ *  different cwd (its worktree was deleted, `/cd`, a recovery card), Pi starts
+ *  a fresh file with the same id in the new directory a moment after launch.
+ *  The bridge must wait for that file (the worker's late-attach poller reads it
+ *  from offset 0) rather than pin the old one: the old one is complete and Pi
+ *  never appends to it again, so every later turn would expire unread and its
+ *  final would never reach Lark.
+ *
+ *  The tree walk below stays as a safety net for layouts this mirror does not
+ *  reproduce, but with `cwd` it only accepts a file whose session header names
+ *  that same cwd. Without `cwd` (no working dir known) it keeps the historical
+ *  first-match behaviour.
+ *
+ *  `sessionsRoot` is injectable for tests only. */
+export function findPiTranscriptBySessionId(
+  cliSessionId: string,
+  cwd?: string,
+  sessionsRoot: string = PI_SESSIONS_ROOT,
+): string | undefined {
   if (!cliSessionId || !SESSION_UUID_RE.test(cliSessionId)) return undefined;
   const suffix = `_${cliSessionId}.jsonl`;
-  const roots = cwd ? [piSessionsDirForCwd(cwd), PI_SESSIONS_ROOT] : [PI_SESSIONS_ROOT];
-  for (const root of roots) {
-    if (!existsSync(root)) continue;
-    const stack: string[] = [root];
-    while (stack.length > 0) {
-      const dir = stack.pop()!;
-      let entries: string[];
-      try { entries = readdirSync(dir); } catch { continue; }
-      for (const name of entries) {
-        const full = join(dir, name);
-        let st: ReturnType<typeof statSync>;
-        try { st = statSync(full); } catch { continue; }
-        if (st.isDirectory()) {
-          stack.push(full);
-        } else if (st.isFile() && name.endsWith(suffix)) {
-          return full;
-        }
+  const cwds = cwd ? piCwdVariants(cwd) : [];
+  for (const variant of cwds) {
+    const dir = join(sessionsRoot, piSessionDirName(variant));
+    let names: string[];
+    try { names = readdirSync(dir); } catch { continue; }
+    const name = names.find(n => n.endsWith(suffix));
+    if (name) return join(dir, name);
+  }
+  if (!existsSync(sessionsRoot)) return undefined;
+  const stack: string[] = [sessionsRoot];
+  while (stack.length > 0) {
+    const dir = stack.pop()!;
+    let entries: string[];
+    try { entries = readdirSync(dir); } catch { continue; }
+    for (const name of entries) {
+      const full = join(dir, name);
+      let st: ReturnType<typeof statSync>;
+      try { st = statSync(full); } catch { continue; }
+      if (st.isDirectory()) {
+        stack.push(full);
+      } else if (st.isFile() && name.endsWith(suffix)) {
+        if (cwds.length === 0) return full;
+        const headerCwd = piTranscriptHeaderCwd(full);
+        // A header that names a different cwd is the stale transcript of an
+        // earlier run elsewhere. One without a cwd is unknown, not foreign.
+        if (headerCwd === undefined || cwds.includes(resolve(headerCwd))) return full;
       }
     }
   }
@@ -274,7 +381,13 @@ export function findPiTranscriptByPid(pid: number): { path: string; cliSessionId
  *  that was followed by the same turn continuing saw the next record within
  *  18.8s at p50, 90.3s at p95 and 165.6s at the maximum. 300s clears that
  *  maximum with room to spare, so a recovering turn is never reported early;
- *  a genuinely dead turn is reported late rather than never. */
+ *  a genuinely dead turn is reported late rather than never. The clock only
+ *  covers that gap: the first later assistant record of the turn drops the
+ *  hold (see drainPiTranscript), so a recovery that keeps working for an hour
+ *  is not mistaken for a turn that went quiet. The flip side: a turn that
+ *  recovers and is THEN killed without a marker gets no failure from this
+ *  reader — the same as a turn killed before any error record. The hold is
+ *  evidence about one failed request, not a liveness probe for the process. */
 export const PI_TURN_BOUNDARY_TIMEOUT_MS = 300_000;
 
 /** Per-transcript state that must survive across drain calls: a turn's records
@@ -321,6 +434,13 @@ function piPendingTurnState(path: string): PiPendingTurnState {
 export function resetPiPendingTurnState(path?: string): void {
   if (path === undefined) piPendingTurnCache.clear();
   else piPendingTurnCache.delete(path);
+}
+
+/** Record time of a session line, falling back to now when absent or bad. */
+function piRecordTimestampMs(obj: any): number {
+  const rawTs = obj?.timestamp ?? obj?.message?.timestamp;
+  const ts = typeof rawTs === 'number' ? rawTs : typeof rawTs === 'string' ? Date.parse(rawTs) : NaN;
+  return Number.isFinite(ts) ? ts : Date.now();
 }
 
 /** True when a session record is the turn-boundary marker appended by
@@ -408,8 +528,30 @@ export function drainPiTranscript(
     // closes. This is the ONLY place a held error becomes a user-visible
     // failure: `lastStopReason === 'error'` means the turn really ended that
     // way; anything else means Pi recovered and the held error is dropped.
+    // Input Pi accepted while busy: it is held in Pi's queue until the current
+    // work ends, so its user record can be minutes away (pi-turn-boundary-extension).
+    if (obj?.type === 'custom' && obj.customType === PI_INPUT_QUEUED_CUSTOM_TYPE) {
+      events.push({
+        uuid: `${path}:${lineStart}`,
+        timestampMs: piRecordTimestampMs(obj),
+        kind: 'input_queued',
+        text: '',
+        sourceSessionId: sessionId,
+      });
+      continue;
+    }
+
     const boundary = piTurnBoundaryStopReason(obj);
     if (boundary.present) {
+      // Pi drains queued input before settling, so anything still waiting on
+      // it at this marker was not taken up.
+      events.push({
+        uuid: `${path}:${lineStart}:settled`,
+        timestampMs: piRecordTimestampMs(obj),
+        kind: 'cli_settled',
+        text: '',
+        sourceSessionId: sessionId,
+      });
       // One marker proves the extension is live here; from now on the marker
       // (or the backstop) resolves holds, never a bare user record. Set before
       // the branch below so the session_start announcement counts too.
@@ -513,7 +655,8 @@ export function drainPiTranscript(
     //     posted a "gateway failure" card — and @mentioned a human — for turns
     //     that then succeeded. So an error record is HELD: it closes the turn
     //     only once the turn-boundary marker says the turn really settled that
-    //     way (see the `custom` branch above and `flushPiPendingError`).
+    //     way (see the `custom` branch above and `flushPiPendingError`), and
+    //     any later assistant record of the turn drops it.
     //   - `stop`/`length` end the turn ONLY when the message has NO tool calls.
     //     Both can carry tool calls mid-turn: agent-loop runs the batch and
     //     keeps looping unless it terminates (`length` → failToolCallsFrom-
@@ -544,8 +687,8 @@ export function drainPiTranscript(
           : undefined;
 
     if (stopReason === 'error') {
-      // Hold the newest error of this turn. If the turn recovers, the later
-      // `stop`/`length` terminal drops it; if the turn really failed, the
+      // Hold the newest error of this turn. If the turn recovers, its next
+      // assistant record drops it; if the turn really failed, the
       // boundary marker flushes exactly this one as the turn's failure. Any
       // partial text stays attached so a failed turn can still show what the
       // model managed to say.
@@ -558,6 +701,13 @@ export function drainPiTranscript(
       continue;
     }
 
+    // Any later assistant record — a tool step as much as a terminal — means
+    // Pi retried and the turn moved past the held error. Clearing only on
+    // stop/length left the hold armed through a long tool-driven recovery, and
+    // the backstop then reported a failure (card flipped to failed) for a turn
+    // that was still working.
+    pending.error = undefined;
+
     // Emit before the terminal so the queue attributes the activity while the
     // turn is still collecting. A distinct UUID prevents the cosmetic record
     // from consuming the final's dedup key when both come from the same line.
@@ -568,9 +718,6 @@ export function drainPiTranscript(
     });
 
     if (!isHardTerminal && !isTextTerminal) continue;
-
-    // A real terminal supersedes any held error: the turn moved past it.
-    pending.error = undefined;
 
     events.push({
       uuid: `${path}:${lineStart}`,

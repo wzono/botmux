@@ -244,6 +244,7 @@ import type { DaemonSession } from '../src/core/types.js';
 import { getDocSubscription, putDocSubscription, removeDocSubscription } from '../src/services/doc-subs-store.js';
 import { config } from '../src/config.js';
 
+import { recallProvenIdentityContent } from '../src/core/cli-identity.js';
 import { startIpcServer, setIpcAuthSecret } from '../src/core/dashboard-ipc-server.js';
 import { fetchDaemonIpc } from '../src/core/daemon-ipc-auth.js';
 import { setActiveSessionsRegistry } from '../src/core/worker-pool.js';
@@ -1101,10 +1102,16 @@ describe('/rename production routing — must not pre-create a session (review P
     bot.resolvedAllowedUsers = [OWNER];
     const ds = seedThreadSession(root, 'identity queue');
     ds.session.cliId = 'codex-app'; ds.workingDir = '/tmp'; ds.lastScreenStatus = state;
+    // F3: the proven content store is only fed when the live worker reported
+    // the proven model; the fixture stands in for that worker.
+    ds.reportedIdentityModel = {
+      model: 'proven', sandboxEngaged: false, loopbackShared: true,
+      workerPid: process.pid, workerGeneration: ds.workerGeneration ?? 1, reportedAt: 1,
+    };
     mkdirSync(`${mocks.dataDir}/fixture-lark-home`, { recursive: true });
     const send = vi.fn((message: any) => {
       if (message.type === 'message') {
-        const env = readFileSync(sessionIdentityPath(mocks.dataDir, ds.session.sessionId, 'lark-cli'), 'utf8');
+        const env = recallProvenIdentityContent(mocks.dataDir, ds.session.sessionId, 'om_queue_identity_reply', 'lark-cli');
         expect(env).toContain("BOTMUX_IDENTITY_TURN='om_queue_identity_reply'");
         expect(env).toContain('fixture-lark-home');
       }
@@ -3782,6 +3789,52 @@ describe('document comment canonical ownership and single-flight delivery', () =
     putDocSubscription(config.session.dataDir, APP, sub);
   }
 
+  it.each([
+    { name: 'author', authorOpenId: OWNER, adopt: false },
+    { name: 'unknown author', authorOpenId: undefined, adopt: false },
+    { name: 'adopted input', authorOpenId: OWNER, adopt: true },
+  ])('delivers the live comment execution identity through worker IPC: $name', async ({ authorOpenId, adopt }) => {
+    const sub = docSub(`doc-live-caller-${adopt}-${authorOpenId ?? 'unknown'}`);
+    const ds = seedThreadSession(sub.sessionAnchor, 'live comment identity');
+    const send = vi.fn();
+    ds.worker = { killed: false, send } as any;
+    if (adopt) ds.adoptedFrom = { session: 'legacy-native' } as any;
+    bindSubToSession(sub, ds);
+    try {
+      await expect(handleDocComment({ ...docCtx(sub, 'live-caller'), authorOpenId })).resolves.toBe(true);
+      const messages = send.mock.calls.map(call => call[0]).filter(message => message.type === 'message');
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toMatchObject({ turnId: 'reply-live-caller', content: expect.stringContaining('question live-caller') });
+      if (authorOpenId && !adopt) {
+        expect(messages[0].trustedCaller).toEqual({ requestLarkAppId: APP, requestUserOpenId: authorOpenId, senderType: 'user' });
+      } else {
+        expect(messages[0]).not.toHaveProperty('trustedCaller');
+      }
+    } finally {
+      removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
+    }
+  });
+
+  it('keeps each live comment IPC identity tied to its own author and turn', async () => {
+    const sub = docSub('doc-live-caller-switch');
+    const ds = seedThreadSession(sub.sessionAnchor, 'live comment author switch');
+    const send = vi.fn();
+    ds.worker = { killed: false, send } as any;
+    bindSubToSession(sub, ds);
+    try {
+      for (const [suffix, authorOpenId] of [['a', OWNER], ['b', 'ou_second_author']]) {
+        await expect(handleDocComment({ ...docCtx(sub, `caller-${suffix}`), authorOpenId })).resolves.toBe(true);
+      }
+      const messages = send.mock.calls.map(call => call[0]).filter(message => message.type === 'message');
+      expect(messages.map(message => ({ turnId: message.turnId, caller: message.trustedCaller }))).toEqual([
+        { turnId: 'reply-caller-a', caller: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' } },
+        { turnId: 'reply-caller-b', caller: { requestLarkAppId: APP, requestUserOpenId: 'ou_second_author', senderType: 'user' } },
+      ]);
+    } finally {
+      removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
+    }
+  });
+
   it('leaves the provider cursor retryable when a worker-null setup owner exists', async () => {
     const sub = docSub(`doc-protected-${Date.now()}`);
     const ds = seedThreadSession(sub.sessionAnchor, 'protected doc owner');
@@ -3938,6 +3991,29 @@ describe('document comment canonical ownership and single-flight delivery', () =
     removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
   });
 
+  it('drops a doc-watch prewarm whose session was closed during the owner lookup', async () => {
+    const sub = { ...docSub(`doc-prewarm-stale-${Date.now()}`), ownerOpenId: OWNER };
+    const ds = seedThreadSession(sub.sessionAnchor, 'prewarm stale');
+    const priorLastMessageAt = ds.lastMessageAt;
+    const gate = deferred();
+    mocks.resolveSender.mockImplementationOnce(async () => {
+      await gate.promise;
+      return { openId: OWNER, type: 'user' as const };
+    });
+    mocks.forkWorker.mockClear();
+
+    const prewarm = prewarmDocCommentSession(ds, sub);
+    await vi.waitFor(() => expect(mocks.resolveSender).toHaveBeenCalled());
+    ds.session.status = 'closed';
+    gate.resolve();
+
+    await expect(prewarm).rejects.toThrow('routing generation changed');
+    expect(ds.lastMessageAt).toBe(priorLastMessageAt);
+    expect(ds.currentTurnTitle).toBeUndefined();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
+  });
+
   it('durably queues live doc-watch prewarm behind activation without worker IPC', async () => {
     const sub = docSub(`doc-prewarm-live-${Date.now()}`);
     const ds = seedThreadSession(sub.sessionAnchor, 'prewarm live');
@@ -3960,6 +4036,22 @@ describe('document comment canonical ownership and single-flight delivery', () =
       }),
     ]);
     removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
+  });
+
+  it('hands concurrent replies on one new comment thread to a single auto-created session', async () => {
+    const fileToken = `doc-same-thread-${Date.now()}`;
+    const sub = docNativeSub(fileToken);
+
+    await expect(Promise.all([
+      handleDocComment({ ...docCtx(sub, 'first'), commentId: 'comment-shared' }),
+      handleDocComment({ ...docCtx(sub, 'second'), commentId: 'comment-shared' }),
+    ])).resolves.toEqual([true, true]);
+
+    const owner = activeSessions.get(sessionKey(`doc:${fileToken}:comment-shared`, APP))!;
+    expect(owner).toBeDefined();
+    expect([...activeSessions.values()].filter(ds => ds.chatId === `doc:${fileToken}:comment-shared`)).toEqual([owner]);
+    expect(Object.keys(owner.session.docCommentTargets ?? {}).sort()).toEqual(['reply-first', 'reply-second']);
+    removeDocSubscription(config.session.dataDir, APP, fileToken);
   });
 
   it('isolates concurrent document comment threads and reuses one thread after restart', async () => {
