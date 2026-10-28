@@ -195,9 +195,9 @@ async function repairOne(pluginId: string, dryRun: boolean): Promise<PluginRepai
       throw new Error(`plugin_repair_config_write_forbidden:${pluginId}`);
     }
     if (!definition) throw new Error(`plugin_service_definition_not_found:${pluginId}`);
-    const app = currentProcess;
-    if (!supervisorIdentityValid || app?.status !== 'online' || typeof app.pid !== 'number'
-      || typeof app.processStart !== 'string') {
+    const app = readPluginProcesses().find(proc => proc.name === pluginServiceName(pluginId));
+    if (app?.status !== 'online' || typeof app.pid !== 'number' || typeof app.processStart !== 'string'
+      || readDurableProcessIdentity(app.pid) !== app.processStart) {
       throw new Error(`plugin_repair_service_identity_invalid:${pluginId}`);
     }
     let urls;
@@ -216,6 +216,12 @@ async function repairOne(pluginId: string, dryRun: boolean): Promise<PluginRepai
     if (urlsMutated) {
       restoreAll(mutablePaths, beforeMutable, pluginId);
       throw new Error(`plugin_repair_config_write_forbidden:${pluginId}`);
+    }
+    const latestApp = readPluginProcesses().find(proc => proc.name === pluginServiceName(pluginId));
+    if (latestApp?.status !== 'online' || latestApp.pid !== app.pid
+      || latestApp.processStart !== app.processStart
+      || readDurableProcessIdentity(app.pid) !== app.processStart) {
+      throw new Error(`plugin_repair_service_identity_invalid:${pluginId}`);
     }
     nextState = {
       ...state,
