@@ -18,12 +18,11 @@ function reactionDiagnostic(record: PersistedTurnFeedback): boolean {
 
 function reminderDiagnostic(record: PersistedTurnFeedback): boolean {
   const reminder = record.reminder;
-  return reminder?.closed !== true && !reminder?.closeNextAttemptAt && (
-    reminder?.closeDiagnostic === 'card_mismatch'
-    || (reminder?.closeAttempts ?? 0) >= CAPACITY_REMINDER_CLOSE_MAX_ATTEMPTS
+  if (!reminder || reminder.closed === true || reminder.closeNextAttemptAt) return false;
+  return reminder.closeDiagnostic === 'card_mismatch'
+    || (reminder.closeAttempts ?? 0) >= CAPACITY_REMINDER_CLOSE_MAX_ATTEMPTS
       && (reminder.closeDiagnostic === 'unavailable'
-      || reminder.closeDiagnostic === 'transport_error')
-  );
+      || reminder.closeDiagnostic === 'transport_error');
 }
 
 function unresolved(
