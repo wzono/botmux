@@ -221,7 +221,7 @@ Run the installed release's TraeX focused fixtures. Verify all TraeX bots report
 
 - [ ] **Step 3: Observe an explicit native queue episode**
 
-Use the first naturally occurring authoritative TraeX queue in the approved observation window. Record external first-visible latency, position update, stale/clear/terminal, and exact app/session/turn ownership. If none occurs, keep the batch open and report “not observed”; do not synthesize a pass by injecting text into a live session.
+Use the first naturally occurring authoritative TraeX queue in the approved observation window. Record external first-visible latency, position update, stale/clear/terminal, and exact app/session/turn ownership. Also run the installed feedback-only fault test: a simulated first terminal SessionStore mutation failure must log and skip the reaction while the existing terminal lifecycle still completes, and must leave no replay record. If no natural queue occurs, keep the batch open and report “not observed”; do not synthesize a pass by injecting text into a live session.
 
 - [ ] **Step 4: Batch gate**
 
@@ -244,7 +244,7 @@ botmux capacity status --json
 
 - [ ] **Step 3: Run isolation tests on the installed release**
 
-Use signed synthetic v3 events bound to test SessionStore fixtures, not live user turns, to verify wrong owner/session/turn/attempt/generation, replay, sequence rollback, and key rotation never project.
+Use signed synthetic v3 events bound to test SessionStore fixtures, not live user turns, to verify wrong owner/session/turn/attempt/generation, replay, sequence rollback, and key rotation never project. Restart the candidate against a persisted reaction intent and verify LIST occurs before any DELETE/CREATE. Do not claim recovery for a fixture that crashes before its first SessionStore feedback commit.
 
 - [ ] **Step 4: Observe real Codex and Claude episodes**
 
