@@ -745,7 +745,6 @@ export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
         delete record.capacityClearedAt;
         delete record.capacityBinding;
         delete record.capacitySidebandCursor;
-        if (record.reminder) record.reminder.closed = true;
         refreshReactionIntent(target, record);
         changed.push(record.turnId);
       }
@@ -769,7 +768,6 @@ export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
       delete record.capacityBinding;
       delete record.capacitySidebandCursor;
       delete record.attention;
-      if (record.reminder) record.reminder.closed = true;
       refreshReactionIntent(target, record);
       changed = true;
       fresh.turnFeedback = pruneTurnFeedback(
