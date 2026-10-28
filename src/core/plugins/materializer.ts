@@ -46,8 +46,7 @@ function requireInstalledPlugin(pluginId: string): InstalledPluginRecord {
  * exposes. Skills and MCP remain in the plugin directory; session startup is
  * the only place that resolves and delivers them.
  */
-export function materializePlugin(pluginId: string): PluginMaterializedFile {
-  const record = requireInstalledPlugin(pluginId);
+export function projectMaterializedPlugin(record: InstalledPluginRecord): PluginMaterializedFile {
   const resolvedSkills = resolvePluginSkillPackages([record.id]);
   if (resolvedSkills.diagnostics.length > 0) {
     throw new Error(resolvedSkills.diagnostics.join(','));
@@ -76,6 +75,11 @@ export function materializePlugin(pluginId: string): PluginMaterializedFile {
   if (record.contributions?.cardActions) {
     materialized.cardActions = record.contributions.cardActions;
   }
+  return materialized;
+}
+
+export function materializePlugin(pluginId: string): PluginMaterializedFile {
+  const materialized = projectMaterializedPlugin(requireInstalledPlugin(pluginId));
   writeMaterialized(materialized);
   return materialized;
 }

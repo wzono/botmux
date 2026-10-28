@@ -224,6 +224,21 @@ export function getInstalledPlugin(id: string): InstalledPluginRecord | undefine
   return readPluginRegistry().plugins[assertValidPluginId(id)];
 }
 
+export function compareAndSwapInstalledPlugin(
+  id: string,
+  expected: InstalledPluginRecord,
+  next: InstalledPluginRecord,
+): void {
+  withFileLockSync(registryLockTarget(), () => {
+    const registry = readPluginRegistryUnlocked();
+    if (JSON.stringify(registry.plugins[id]) !== JSON.stringify(expected)) {
+      throw new Error(`plugin_repair_registry_changed:${id}`);
+    }
+    registry.plugins[id] = next;
+    writePluginRegistryUnlocked(registry);
+  }, { maxWaitMs: 30_000 });
+}
+
 export function upsertInstalledPlugin(record: InstalledPluginRecord): InstalledPluginRecord {
   assertValidPluginId(record.id);
   if (record.manifest.id !== record.id) throw new Error('plugin_manifest_id_mismatch');

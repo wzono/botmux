@@ -7,12 +7,12 @@ import { join, resolve } from 'node:path';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { readDurableProcessIdentity } from '../../utils/process-identity.js';
 import {
+  compareAndSwapInstalledPlugin,
   readPluginRegistry,
   readPluginRegistryWithoutMigration,
-  writePluginRegistry,
 } from '../../services/plugin-registry-store.js';
 import { scanPluginContributions } from './convention-scanner.js';
-import { materializePlugin } from './materializer.js';
+import { materializePlugin, projectMaterializedPlugin } from './materializer.js';
 import {
   pluginHome, pluginMaterializedPath, pluginRegistryPath, pluginRuntimeDir, pluginServiceStatePath,
 } from './paths.js';
@@ -83,26 +83,20 @@ function runtimeIdentity(runtime: string): string {
   return hash.digest('hex');
 }
 
-function materializedProjection(record: InstalledPluginRecord): Record<string, unknown> {
-  return {
-    schemaVersion: 1,
-    pluginId: record.id,
-    ...(record.contributions?.cli?.commands?.length
-      ? { cli: record.contributions.cli.commands.map(command => ({ name: command.name })) }
-      : {}),
-    ...(record.contributions?.dashboard?.length
-      ? { dashboard: record.contributions.dashboard.map(entry => ({ id: entry.id, entry: entry.entry })) }
-      : {}),
-    ...(record.contributions?.service ? { service: [{ name: record.id }] } : {}),
-    ...(record.contributions?.serviceHttp ? { serviceHttp: record.contributions.serviceHttp } : {}),
-    ...(record.contributions?.cardActions ? { cardActions: record.contributions.cardActions } : {}),
-  };
-}
+const PUBLIC_REPAIR_ERRORS = new Set([
+  'plugin_not_installed',
+  'plugin_repair_package_identity_mismatch',
+  'plugin_repair_package_identity_unavailable',
+  'plugin_repair_registry_changed',
+  'plugin_repair_rollback_failed',
+  'plugin_repair_runtime_identity_mismatch',
+  'plugin_repair_service_identity_invalid',
+]);
 
 function safeRepairWarning(error: unknown): string {
   if (!(error instanceof Error)) return 'plugin_repair_failed';
-  const match = error.message.match(/^(plugin_[a-z0-9_]+)/);
-  return match?.[1] ?? 'plugin_repair_failed';
+  const code = error.message.split(':', 1)[0];
+  return PUBLIC_REPAIR_ERRORS.has(code) ? code : 'plugin_repair_failed';
 }
 
 async function repairOne(pluginId: string, dryRun: boolean): Promise<PluginRepairReport> {
@@ -136,6 +130,16 @@ async function repairOne(pluginId: string, dryRun: boolean): Promise<PluginRepai
   };
 
   const state = readPluginServiceState(pluginId);
+  if (dryRun) {
+    const needsRepair = stable(record.contributions) !== stable(nextRecord.contributions)
+      || (record.manifest.service && (
+        state?.status !== 'online'
+        || typeof state.host !== 'string'
+        || typeof state.pid !== 'number'
+        || typeof state.processStart !== 'string'
+      ));
+    return { pluginId, action: needsRepair ? 'repaired' : 'unchanged' };
+  }
   let nextState = state;
   if (record.manifest.service) {
     const definition = await loadPluginServiceDefinition(nextRecord, { readOnlyConfig: true });
@@ -167,14 +171,15 @@ async function repairOne(pluginId: string, dryRun: boolean): Promise<PluginRepai
       ? JSON.parse(readFileSync(pluginMaterializedPath(pluginId), 'utf8'))
       : undefined;
   } catch { materialized = undefined; }
-  const expectedMaterialized = materializedProjection(nextRecord);
+  const expectedMaterialized = projectMaterializedPlugin(nextRecord);
   const currentMaterialized = materialized ? { ...materialized } : undefined;
   if (currentMaterialized) delete currentMaterialized.updatedAt;
-  const materializedCurrent = stable(currentMaterialized) === stable(expectedMaterialized);
+  const { updatedAt: _expectedUpdatedAt, ...comparableExpected } = expectedMaterialized;
+  const materializedCurrent = stable(currentMaterialized) === stable(comparableExpected);
   const unchanged = stable(record.contributions) === stable(nextRecord.contributions)
     && stable(state) === stable(nextState)
     && materializedCurrent;
-  if (unchanged || dryRun) return { pluginId, action: unchanged ? 'unchanged' : 'repaired' };
+  if (unchanged) return { pluginId, action: 'unchanged' };
 
   const paths = [
     pluginMaterializedPath(pluginId), pluginServiceStatePath(pluginId),
@@ -183,12 +188,7 @@ async function repairOne(pluginId: string, dryRun: boolean): Promise<PluginRepai
   const beforeFiles = paths.map(snapshot);
   let registryWritten = false;
   try {
-    const currentRegistry = readPluginRegistry();
-    if (stable(currentRegistry.plugins[pluginId]) !== stable(record)) {
-      throw new Error(`plugin_repair_registry_changed:${pluginId}`);
-    }
-    currentRegistry.plugins[pluginId] = nextRecord;
-    writePluginRegistry(currentRegistry);
+    compareAndSwapInstalledPlugin(pluginId, record, nextRecord);
     registryWritten = true;
     materializePlugin(pluginId);
     if (nextState) {
