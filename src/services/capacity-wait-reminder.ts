@@ -53,10 +53,11 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
     const messageId = row?.reminder?.messageId;
     if (!row || !messageId || row.reminder?.closed) return;
     if (row.phase === 'capacity_waiting' || row.phase === 'capacity_stale') return;
-    const attempts = row.reminder.closeAttempts ?? 0;
+    const reminder = row.reminder!;
+    const attempts = reminder.closeAttempts ?? 0;
     if (attempts >= MAX_CLOSE_ATTEMPTS) return;
-    const nextAttemptAt = row.reminder.closeNextAttemptAt
-      ? Date.parse(row.reminder.closeNextAttemptAt) : undefined;
+    const nextAttemptAt = reminder.closeNextAttemptAt
+      ? Date.parse(reminder.closeNextAttemptAt) : undefined;
     if (nextAttemptAt !== undefined && Number.isFinite(nextAttemptAt) && nextAttemptAt > deps.now()) {
       scheduleCloseRetry(target, turnId, nextAttemptAt - deps.now());
       return;
