@@ -221,6 +221,19 @@ describe('persisted reaction intent orchestration', () => {
     expect(h.remove).not.toHaveBeenCalled();
   });
 
+  it('clears a capacity episode monotonically and converges back to processing', async () => {
+    const h = reconcilerHarness(feedback({
+      phase: 'capacity_waiting', updatedAt: new Date(NOW - 10).toISOString(),
+      capacity: { state: 'waiting', source: 'pty', startedAtMs: NOW - 10, updatedAtMs: NOW - 10, position: 4 },
+    }));
+
+    expect(h.make().observeCapacity(h.target, 'turn-a', { state: 'clear', observedAtMs: NOW })).toBe(true);
+
+    expect(h.session.turnFeedback?.['turn-a']).toMatchObject({
+      phase: 'processing', capacity: { state: 'cleared', clearedAtMs: NOW },
+    });
+  });
+
   it('retries transient uncertainty at 1s, 5s, and 15s while keeping the intent durable', async () => {
     vi.useFakeTimers();
     try {

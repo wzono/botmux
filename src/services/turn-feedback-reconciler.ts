@@ -604,7 +604,7 @@ export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
             kind: 'waiting', source: 'pty', observedAtMs: observation.observedAtMs,
             ...(observation.position !== undefined ? { position: observation.position } : {}),
           } }
-        : { type: 'clear', observedAtMs: observation.observedAtMs });
+        : { type: 'cleared', observedAtMs: observation.observedAtMs });
       if (next.phase === record.phase && next.capacity === record.capacity) return;
       record.phase = next.phase;
       record.updatedAt = new Date(next.updatedAtMs).toISOString();
