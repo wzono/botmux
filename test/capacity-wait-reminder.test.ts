@@ -211,7 +211,8 @@ describe('capacity wait reminder', () => {
     await vi.waitFor(() => expect(h.patch).toHaveBeenCalledTimes(1));
     expect(h.row.reminder).toMatchObject({ closeStatus: 'ambiguous' });
 
-    await vi.advanceTimersByTimeAsync(1_000);
+    h.setNow(START + 1_001);
+    await vi.advanceTimersByTimeAsync(1_001);
     await vi.waitFor(() => expect(h.patch).toHaveBeenCalledTimes(2));
     expect(h.row.reminder).toMatchObject({ closed: true });
   });
@@ -231,5 +232,74 @@ describe('capacity wait reminder', () => {
 
     expect(h.row.reminder).toMatchObject({ closeStatus: 'ambiguous' });
     expect(h.row.reminder?.closed).toBeUndefined();
+  });
+
+  it('records card mismatch as a permanent diagnostic without retrying', async () => {
+    const h = harness();
+    h.row.phase = 'completed';
+    delete h.row.capacity;
+    h.row.reminder = {
+      episodeKey: String(START), uuid: 'capacity-terminal', status: 'sent',
+      messageId: 'om_old_work', sentAt: new Date(START).toISOString(),
+    };
+    h.patch.mockResolvedValue({ kind: 'card_mismatch' });
+
+    h.reminder.restore([h.target]);
+    let elapsed = 0;
+    for (const delay of [1_001, 2_001, 4_001, 8_001]) {
+      elapsed += delay; h.setNow(START + elapsed); await vi.advanceTimersByTimeAsync(delay);
+    }
+
+    expect(h.patch).toHaveBeenCalledTimes(1);
+    expect(h.row.reminder).toMatchObject({
+      closeStatus: 'ambiguous', closeDiagnostic: 'card_mismatch', closeAttempts: 1,
+    });
+    expect(h.row.reminder?.closeNextAttemptAt).toBeUndefined();
+    expect(h.row.reminder?.closed).toBeUndefined();
+  });
+
+  it('bounds unavailable retries with persisted exponential backoff', async () => {
+    const h = harness();
+    h.row.phase = 'completed';
+    delete h.row.capacity;
+    h.row.reminder = {
+      episodeKey: String(START), uuid: 'capacity-terminal', status: 'sent',
+      messageId: 'om_work_card', sentAt: new Date(START).toISOString(),
+    };
+    h.patch.mockResolvedValue({ kind: 'unavailable' });
+
+    h.reminder.restore([h.target]);
+    let elapsed = 0;
+    for (const delay of [1_001, 2_001, 4_001, 8_001, 16_001]) {
+      elapsed += delay; h.setNow(START + elapsed); await vi.advanceTimersByTimeAsync(delay);
+    }
+
+    expect(h.patch).toHaveBeenCalledTimes(5);
+    expect(h.row.reminder).toMatchObject({
+      closeStatus: 'ambiguous', closeDiagnostic: 'unavailable', closeAttempts: 5,
+    });
+    expect(h.row.reminder?.closeNextAttemptAt).toBeUndefined();
+    expect(h.row.reminder?.closed).toBeUndefined();
+  });
+
+  it('keeps zero provider calls and schedules recovery when close intent commit fails', async () => {
+    const h = harness();
+    h.row.phase = 'completed';
+    delete h.row.capacity;
+    h.row.reminder = {
+      episodeKey: String(START), uuid: 'capacity-terminal', status: 'sent',
+      messageId: 'om_work_card', sentAt: new Date(START).toISOString(),
+    };
+    h.commit.mockImplementationOnce(() => { throw new Error('intent commit failed'); });
+
+    h.reminder.restore([h.target]);
+
+    expect(h.patch).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+
+    h.setNow(START + 1_001);
+    await vi.advanceTimersByTimeAsync(1_001);
+    await vi.waitFor(() => expect(h.patch).toHaveBeenCalledTimes(1));
+    expect(h.row.reminder).toMatchObject({ closed: true });
   });
 });

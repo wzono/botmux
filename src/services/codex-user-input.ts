@@ -15,6 +15,7 @@ export interface CodexUserInputContext {
   /** Botmux reply identity, not the app-server's native turn id. */
   originTurnId?: string;
   originDispatchAttempt?: number;
+  originWorkerGeneration?: number;
   env?: NodeJS.ProcessEnv;
 }
 
@@ -119,6 +120,8 @@ export async function postCodexAsk(
   const dataDir = resolveBotmuxDataDir({ env });
   const claim = readManagedOriginCapability(dataDir, context.sessionId,
     env.BOTMUX_SEND_RELAY, env.BOTMUX_ORIGIN_CHANNEL_ID);
+  const originWorkerGeneration = context.originWorkerGeneration
+    ?? (Number(env.BOTMUX_WORKER_GENERATION) > 0 ? Number(env.BOTMUX_WORKER_GENERATION) : undefined);
   if (claim && context.originTurnId && claim.turnId !== context.originTurnId) {
     throw new Error('requestUserInput no longer belongs to the current Botmux turn');
   }
@@ -148,6 +151,7 @@ export async function postCodexAsk(
       ...((context.originTurnId ?? claim?.turnId) ? { originTurnId: context.originTurnId ?? claim?.turnId } : {}),
       ...((context.originDispatchAttempt ?? claim?.dispatchAttempt)
         ? { originDispatchAttempt: context.originDispatchAttempt ?? claim?.dispatchAttempt } : {}),
+      ...(originWorkerGeneration !== undefined ? { originWorkerGeneration } : {}),
     }),
   } satisfies RequestInit;
   const response = claim

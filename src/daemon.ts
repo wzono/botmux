@@ -9259,8 +9259,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // Invocation identity (from the hook; enables cross-restart re-attach).
     requestId: boundAsk.requestId,
     originKind: boundAsk.originKind,
-    originWorkerGeneration: boundAsk.originWorkerGeneration
-      ?? askSession?.workerGeneration ?? askSession?.session.workerGeneration,
+    originWorkerGeneration: boundAsk.originWorkerGeneration,
     ...((documentDelivery?.openId ?? asyncCaller)
       ? { answererOpenId: documentDelivery?.openId ?? asyncCaller } : {}),
     // Authoritative persistence gate (codex P1-4): derive resumability from the

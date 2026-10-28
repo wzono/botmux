@@ -14810,6 +14810,7 @@ export function forkWorker(
       BOTMUX: '1',  // Marker so user scripts/skills can detect a botmux-spawned CLI
       SESSION_DATA_DIR: config.session.dataDir,
       BOTMUX_SESSION_ID: ds.session.sessionId,
+      BOTMUX_WORKER_GENERATION: String(workerGeneration),
       LARK_APP_ID: botCfg.larkAppId,
       // Withhold the real secret from the worker's own CLI env for a no-transport
       // session (apiOnly bot or HTTP virtual chat). SEPARATE leak from the

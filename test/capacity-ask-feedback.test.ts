@@ -48,6 +48,13 @@ describe('capacity Ask feedback ownership', () => {
       claimedDispatchAttempt: 1,
     })).toBe(false);
   });
+
+  it('fails closed when a turn/attempt Ask omits worker generation', () => {
+    expect(ownsCapacityAskFeedback({
+      ...currentOrigin,
+      currentWorkerGeneration: undefined,
+    })).toBe(false);
+  });
 });
 
 describe('capacity Ask feedback lifecycle', () => {

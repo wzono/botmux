@@ -16369,7 +16369,7 @@ export async function runHook(
   /** 按 OpenCode 原生会话 id（payload.session_id，ses_*）反查所属 botmux 会话；
    *  缺省用真实实现（在线 daemon 并发查询 + budget 封顶）。测试注入 stub。 */
   resolveCliSessionRouteFn?: (cliSessionId: string) => Promise<import('./adapters/adopt-route.js').AdoptRoute | null>,
-  resolveTurnOriginFn: (sessionId: string) => { turnId?: string; dispatchAttempt?: number } | null | undefined =
+  resolveTurnOriginFn: (sessionId: string) => { turnId?: string; dispatchAttempt?: number; workerGeneration?: number } | null | undefined =
     sessionId => resolveSessionContext(resolveDataDir(), sessionId),
 ): Promise<{ stdout: string }> {
   const { getHookAdapter } = await import('./core/ask-hook/registry.js');
@@ -16524,6 +16524,9 @@ export async function runHook(
   // routing cannot borrow this process's ambient turn identity.
   const hookOrigin = !explicitRoute && routeSessionId === sessionId && ['claude-code', 'codex'].includes(cliId)
     ? resolveTurnOriginFn(routeSessionId!) : undefined;
+  const hookWorkerGeneration = hookOrigin?.workerGeneration ?? (routeSessionId
+    ? loadSessions().get(routeSessionId)?.workerGeneration
+    : undefined);
 
   const body: Record<string, unknown> = {
     sessionId: routeSessionId,
@@ -16536,6 +16539,7 @@ export async function runHook(
     originKind: 'hook',
     ...(hookOrigin?.turnId ? { originTurnId: hookOrigin.turnId } : {}),
     ...(hookOrigin?.dispatchAttempt !== undefined ? { originDispatchAttempt: hookOrigin.dispatchAttempt } : {}),
+    ...(hookWorkerGeneration !== undefined ? { originWorkerGeneration: hookWorkerGeneration } : {}),
   };
 
   // Post the ask, RETRYING across a daemon restart. The daemon holds pending

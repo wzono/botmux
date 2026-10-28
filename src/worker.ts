@@ -1549,6 +1549,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         sessionId: cfg.sessionId, larkAppId: cfg.larkAppId, chatId: cfg.chatId,
         rootMessageId: cfg.rootMessageId, originTurnId: identity?.turnId,
         originDispatchAttempt: identity?.dispatchAttempt,
+        originWorkerGeneration: Number(process.env.BOTMUX_WORKER_GENERATION) || undefined,
       }, params, signal),
       onTurnTerminal: (terminal) => {
         if (!engine) return;
@@ -5508,6 +5509,8 @@ function writeCliPidMarker(): void {
         const effectiveController = authority?.controller;
         atomicWriteFileSync(markerPath, JSON.stringify({
           sessionId,
+          ...(Number(process.env.BOTMUX_WORKER_GENERATION) > 0
+            ? { workerGeneration: Number(process.env.BOTMUX_WORKER_GENERATION) } : {}),
           turnId: currentBotmuxTurnId ?? null,
           dispatchAttempt: currentBotmuxDispatchAttempt ?? null,
           ...(currentBotmuxLinkRefMode ? { linkRefMode: currentBotmuxLinkRefMode } : {}),

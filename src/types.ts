@@ -541,6 +541,9 @@ export interface PersistedTurnFeedback {
     attemptedAt?: string;
     closeStatus?: 'pending' | 'ambiguous';
     closeAttemptedAt?: string;
+    closeAttempts?: number;
+    closeNextAttemptAt?: string;
+    closeDiagnostic?: 'card_mismatch' | 'unavailable' | 'transport_error' | 'intent_commit_failed';
     closed?: true;
   };
   /** Last daemon-committed signed v3 event for replay protection. */

@@ -14,6 +14,7 @@ export interface CapacityReminderDeps {
 }
 
 export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
+  const MAX_CLOSE_ATTEMPTS = 5;
   const timers = new Map<string, ReturnType<typeof setTimeout>>();
   const closeTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const inFlight = new Set<string>();
@@ -28,6 +29,22 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
     timers.delete(key);
   }
 
+  function closeRetryDelay(attempts: number): number {
+    return Math.min(30_000, 1_000 * 2 ** Math.max(0, attempts - 1));
+  }
+
+  function scheduleCloseRetry(target: TurnFeedbackTarget, turnId: string, delay: number): void {
+    const key = keyFor(target, turnId);
+    const prior = closeTimers.get(key);
+    if (prior) clearTimeout(prior);
+    const timer = setTimeout(() => {
+      closeTimers.delete(key);
+      void closePublished(target, turnId);
+    }, delay);
+    timer.unref?.();
+    closeTimers.set(key, timer);
+  }
+
   async function closePublished(target: TurnFeedbackTarget, turnId: string): Promise<void> {
     const key = keyFor(target, turnId);
     if (inFlight.has(key)) { rerunRequested.add(key); return; }
@@ -36,13 +53,30 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
     const messageId = row?.reminder?.messageId;
     if (!row || !messageId || row.reminder?.closed) return;
     if (row.phase === 'capacity_waiting' || row.phase === 'capacity_stale') return;
-    deps.commit(target, fresh => {
-      const current = fresh.turnFeedback?.[turnId];
-      if (current?.reminder?.messageId === messageId) {
-        current.reminder.closeStatus = 'pending';
-        current.reminder.closeAttemptedAt = new Date(deps.now()).toISOString();
-      }
-    });
+    const attempts = row.reminder.closeAttempts ?? 0;
+    if (attempts >= MAX_CLOSE_ATTEMPTS) return;
+    const nextAttemptAt = row.reminder.closeNextAttemptAt
+      ? Date.parse(row.reminder.closeNextAttemptAt) : undefined;
+    if (nextAttemptAt !== undefined && Number.isFinite(nextAttemptAt) && nextAttemptAt > deps.now()) {
+      scheduleCloseRetry(target, turnId, nextAttemptAt - deps.now());
+      return;
+    }
+    const currentAttempt = attempts + 1;
+    try {
+      deps.commit(target, fresh => {
+        const current = fresh.turnFeedback?.[turnId];
+        if (current?.reminder?.messageId === messageId) {
+          current.reminder.closeStatus = 'pending';
+          current.reminder.closeAttempts = currentAttempt;
+          current.reminder.closeAttemptedAt = new Date(deps.now()).toISOString();
+          delete current.reminder.closeNextAttemptAt;
+          delete current.reminder.closeDiagnostic;
+        }
+      });
+    } catch {
+      scheduleCloseRetry(target, turnId, closeRetryDelay(currentAttempt));
+      return;
+    }
     closing.add(key);
     try {
       const outcome = await deps.patch(target, row, messageId);
@@ -53,29 +87,44 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
             current.reminder.closed = true;
             delete current.reminder.closeStatus;
             delete current.reminder.closeAttemptedAt;
+            delete current.reminder.closeAttempts;
+            delete current.reminder.closeNextAttemptAt;
+            delete current.reminder.closeDiagnostic;
           }
         });
       } else {
-        throw new Error(`capacity reminder close ${outcome.kind}`);
+        throw Object.assign(new Error(`capacity reminder close ${outcome.kind}`), { diagnostic: outcome.kind });
       }
-    } catch {
+    } catch (error) {
+      const diagnostic = (error as { diagnostic?: unknown }).diagnostic === 'card_mismatch'
+        ? 'card_mismatch' as const
+        : (error as { diagnostic?: unknown }).diagnostic === 'unavailable'
+          ? 'unavailable' as const
+          : 'transport_error' as const;
+      const retryable = diagnostic !== 'card_mismatch' && currentAttempt < MAX_CLOSE_ATTEMPTS;
+      const retryAt = retryable ? deps.now() + closeRetryDelay(currentAttempt) : undefined;
       deps.commit(target, fresh => {
         const current = fresh.turnFeedback?.[turnId];
-        if (current?.reminder?.messageId === messageId) current.reminder.closeStatus = 'ambiguous';
+        if (current?.reminder?.messageId === messageId) {
+          current.reminder.closeStatus = 'ambiguous';
+          current.reminder.closeDiagnostic = diagnostic;
+          if (retryAt !== undefined) current.reminder.closeNextAttemptAt = new Date(retryAt).toISOString();
+          else delete current.reminder.closeNextAttemptAt;
+        }
       });
       const fresh = deps.read(target).turnFeedback?.[turnId];
       if (fresh?.reminder?.messageId === messageId && fresh.reminder.closed !== true
         && fresh.phase !== 'capacity_waiting' && fresh.phase !== 'capacity_stale'
-        && !closeTimers.has(key)) {
-        const timer = setTimeout(() => {
-          closeTimers.delete(key);
-          void closePublished(target, turnId);
-        }, 1_000);
-        timer.unref?.();
-        closeTimers.set(key, timer);
+        && retryAt !== undefined) {
+        scheduleCloseRetry(target, turnId, Math.max(0, retryAt - deps.now()));
       }
     } finally {
       closing.delete(key);
+      const fresh = deps.read(target).turnFeedback?.[turnId]?.reminder;
+      if (fresh?.closed !== true && fresh?.closeNextAttemptAt) {
+        const retryAt = Date.parse(fresh.closeNextAttemptAt);
+        if (Number.isFinite(retryAt)) scheduleCloseRetry(target, turnId, Math.max(0, retryAt - deps.now()));
+      }
     }
   }
 
@@ -99,6 +148,9 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
         if (!current) return;
         delete current.closeStatus;
         delete current.closeAttemptedAt;
+        delete current.closeAttempts;
+        delete current.closeNextAttemptAt;
+        delete current.closeDiagnostic;
       });
     }
     if (row.reminderSilent || row.requesterIsBot !== false || !row.requesterOpenId) return;

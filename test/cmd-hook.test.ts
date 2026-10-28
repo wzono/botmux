@@ -68,12 +68,12 @@ function makeThrowingStub(msg = 'boom', exitCode?: number): () => Promise<AskRes
 
 describe('runHook', () => {
   it('freezes the live turn and attempt across Ask reconnect retries', async () => {
-    const resolveOrigin = vi.fn(() => ({ turnId: 'om_current', dispatchAttempt: 3 }));
+    const resolveOrigin = vi.fn(() => ({ turnId: 'om_current', dispatchAttempt: 3, workerGeneration: 7 }));
     const requests: Record<string, unknown>[] = [];
     const post = async (body: Record<string, unknown>): Promise<AskResult> => {
       requests.push({ ...body });
       if (requests.length === 1) {
-        resolveOrigin.mockReturnValue({ turnId: 'om_next', dispatchAttempt: 4 });
+        resolveOrigin.mockReturnValue({ turnId: 'om_next', dispatchAttempt: 4, workerGeneration: 8 });
         throw Object.assign(new Error('restarting'), { retryable: true });
       }
       return makeAnsweredStub([['继续']])();
@@ -82,7 +82,9 @@ describe('runHook', () => {
     expect(resolveOrigin).toHaveBeenCalledExactlyOnceWith(FULL_ENV.BOTMUX_SESSION_ID);
     expect(requests).toHaveLength(2);
     expect(requests[0]).toEqual(requests[1]);
-    expect(requests[0]).toMatchObject({ originTurnId: 'om_current', originDispatchAttempt: 3 });
+    expect(requests[0]).toMatchObject({
+      originTurnId: 'om_current', originDispatchAttempt: 3, originWorkerGeneration: 7,
+    });
   });
 
   it('does not bind an Ask to the stale turn inherited in CLI environment', async () => {
