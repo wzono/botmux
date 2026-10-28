@@ -1,4 +1,8 @@
-import { traexCapacityQueuePosition, traexCapacityQueueVisible } from '../adapters/cli/traex.js';
+import {
+  traexCapacityQueuePosition,
+  traexCapacityQueueVisible,
+  traexModelProgressVisible,
+} from '../adapters/cli/traex.js';
 
 export interface CapacityCaptureIdentity {
   sessionId: string;
@@ -50,7 +54,7 @@ export function createCapacityWaitTracker() {
           ...(status.position !== undefined ? { position: status.position } : {}),
         };
       }
-      if (!screen || !/^[ \t]*[⋄✧◇✦❖◈◆][^\r\n]*\b(?:Working|Thinking|Generating|Reading|Running|Searching)\b/im.test(screen) || !current
+      if (!screen || !traexModelProgressVisible(screen) || !current
         || !sameIdentity(current.identity, captured)) return null;
       current = undefined;
       return { type: 'clear', identity: { ...captured }, observedAtMs };

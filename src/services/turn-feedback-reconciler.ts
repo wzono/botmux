@@ -11,6 +11,7 @@ import {
   type ReactionListReceipt,
 } from '../im/lark/reaction-provider.js';
 import {
+  desiredReaction,
   planReactionStep,
   reduceReactionReceipt,
   type ReactionPlanResult,
@@ -385,6 +386,8 @@ export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
   const createProvider = deps.createReactionOnce ?? createReactionOnce;
   const deleteProvider = deps.deleteReactionOnce ?? deleteReactionOnce;
   const inFlight = new Map<string, Promise<void>>();
+  const rerunRequested = new Set<string>();
+  const permanentProbes = new Set<string>();
   const repairs = new Map<string, {
     intentId: string;
     attempt: number;
@@ -405,19 +408,43 @@ export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
     return deps.policy?.(target) ?? {};
   }
 
+  function refreshReactionIntent(
+    target: TurnFeedbackTarget,
+    record: PersistedTurnFeedback,
+  ): void {
+    if (!record.messageId?.startsWith('om_') || record.reactionMessageGone) return;
+    const wanted = desiredReaction(record, policyFor(target));
+    if (record.reactionIntent?.desiredType === wanted) return;
+    if (record.reaction?.type === wanted && !record.reactionIntent) return;
+    record.reactionIntent = {
+      id: deps.randomId?.() ?? randomUUID(),
+      messageId: record.messageId,
+      ...(wanted ? { desiredType: wanted } : {}),
+      createdAt: new Date(deps.now()).toISOString(),
+      stage: 'observe',
+      deleteIds: [],
+    };
+  }
+
   function applyResult(
     target: TurnFeedbackTarget,
     turnId: string,
     intentId: string,
     result: ReactionPlanResult,
-  ): void {
+  ): boolean {
+    let applied = false;
     deps.commit(target, fresh => {
       const record = fresh.turnFeedback?.[turnId];
       if (!record || record.reactionIntent?.id !== intentId) return;
+      applied = true;
       if (result.messageGone) record.reactionMessageGone = true;
       if ('reaction' in result) record.reaction = result.reaction;
       if ('intent' in result) record.reactionIntent = result.intent;
+      fresh.turnFeedback = pruneTurnFeedback(
+        fresh.turnFeedback ?? {}, deps.now(), policyFor(target),
+      );
     });
+    return applied;
   }
 
   function cancelRepair(target: TurnFeedbackTarget, turnId: string): void {
@@ -496,18 +523,26 @@ export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
       }
       const current = readRow(target, turnId);
       if (!current?.reactionIntent || current.reactionIntent.id !== plan.intentId) continue;
+      const permanentProbeKey = `${keyFor(target, turnId)}:${plan.intentId}`;
+      if (current.reactionIntent.stage === 'permanent') {
+        if (permanentProbes.has(permanentProbeKey)) return;
+        permanentProbes.add(permanentProbeKey);
+      }
       const receipt = plan.action === 'list'
         ? await listProvider(target.larkAppId, plan.messageId)
         : plan.action === 'create'
           ? await createProvider(target.larkAppId, plan.messageId, plan.type)
           : await deleteProvider(target.larkAppId, plan.messageId, plan.reactionId);
+      const latest = readRow(target, turnId);
+      if (!latest?.reactionIntent || latest.reactionIntent.id !== plan.intentId) continue;
       const result = reduceReactionReceipt({
-        record: current, policy: policyFor(target), intentId: plan.intentId,
+        record: latest, policy: policyFor(target), intentId: plan.intentId,
         action: plan.action, receipt,
       });
-      applyResult(target, turnId, plan.intentId, result);
+      if (!applyResult(target, turnId, plan.intentId, result)) continue;
       const next = readRow(target, turnId)?.reactionIntent;
       if (!next) { cancelRepair(target, turnId); return; }
+      if (next.stage === 'permanent') return;
       if (next.retryClass) {
         scheduleNextRepair(target, turnId, next.id, next.retryClass);
         return;
@@ -522,8 +557,18 @@ export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
   ): Promise<void> {
     const key = keyFor(target, turnId);
     const existing = inFlight.get(key);
-    if (existing) return existing;
-    const promise = run(target, turnId, freshProcess).finally(() => {
+    if (existing) {
+      rerunRequested.add(key);
+      return existing;
+    }
+    const promise = (async () => {
+      let nextFreshProcess = freshProcess;
+      do {
+        rerunRequested.delete(key);
+        await run(target, turnId, nextFreshProcess);
+        nextFreshProcess = false;
+      } while (rerunRequested.has(key));
+    })().finally(() => {
       if (inFlight.get(key) === promise) inFlight.delete(key);
     });
     inFlight.set(key, promise);
@@ -612,12 +657,7 @@ export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
       record.phase = next.phase;
       record.updatedAt = new Date(next.updatedAtMs).toISOString();
       record.capacity = next.capacity;
-      const plan = planReactionStep({
-        record, policy: policyFor(target),
-        newIntentId: deps.randomId?.() ?? randomUUID(),
-        nowIso: new Date(deps.now()).toISOString(),
-      });
-      if (plan.action === 'persist_intent') record.reactionIntent = plan.intent;
+      refreshReactionIntent(target, record);
       changed = true;
     });
     return changed;
@@ -643,8 +683,62 @@ export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
     });
     return changed;
   }
-  function observeAttention(_target: TurnFeedbackTarget, _turnId: string, _observation: unknown): void {}
-  function disableCapacity(_target: TurnFeedbackTarget): void {}
+  function transition(
+    target: TurnFeedbackTarget,
+    turnId: string,
+    event: { type: 'progress' | 'resume' | 'user_resumed' | 'needs_user'; observedAtMs: number },
+  ): boolean {
+    let changed = false;
+    deps.commit(target, fresh => {
+      const record = fresh.turnFeedback?.[turnId];
+      if (!record) return;
+      const next = reduceTurnFeedback({
+        phase: record.phase, updatedAtMs: Date.parse(record.updatedAt), capacity: record.capacity,
+      }, event);
+      if (next.phase === record.phase && next.capacity === record.capacity) return;
+      record.phase = next.phase;
+      record.updatedAt = new Date(next.updatedAtMs).toISOString();
+      record.capacity = next.capacity;
+      if (event.type === 'needs_user') record.attention = {
+        state: 'needs_user', promptNonce: `attention-${turnId}`, dispatchAttempt: 0,
+        workerGeneration: target.session.workerGeneration ?? 0, openedAtMs: event.observedAtMs,
+      };
+      else delete record.attention;
+      refreshReactionIntent(target, record);
+      changed = true;
+    });
+    return changed;
+  }
+  const observeAttention = (target: TurnFeedbackTarget, turnId: string, observedAtMs = deps.now()) =>
+    transition(target, turnId, { type: 'needs_user', observedAtMs });
+  const observeProgress = (target: TurnFeedbackTarget, turnId: string, observedAtMs = deps.now()) =>
+    transition(target, turnId, { type: 'progress', observedAtMs });
+  const resumeAttention = (target: TurnFeedbackTarget, turnId: string, observedAtMs = deps.now()) =>
+    transition(target, turnId, { type: 'user_resumed', observedAtMs });
+  function disableCapacity(target: TurnFeedbackTarget, adapter?: 'traex' | 'codex' | 'claude-code'): string[] {
+    const changed: string[] = [];
+    deps.commit(target, fresh => {
+      for (const record of Object.values(fresh.turnFeedback ?? {})) {
+        const source = record.capacityBinding?.adapter
+          ?? (record.capacity?.state !== 'cleared' && record.capacity?.source === 'pty' ? 'traex' : undefined);
+        if (adapter && source !== adapter) continue;
+        if (!record.capacity && !record.capacityBinding && !record.capacitySidebandCursor) continue;
+        const next = reduceTurnFeedback({
+          phase: record.phase, updatedAtMs: Date.parse(record.updatedAt), capacity: record.capacity,
+        }, { type: 'progress', observedAtMs: deps.now() });
+        record.phase = next.phase;
+        record.updatedAt = new Date(next.updatedAtMs).toISOString();
+        delete record.capacity;
+        delete record.capacityClearedAt;
+        delete record.capacityBinding;
+        delete record.capacitySidebandCursor;
+        if (record.reminder) record.reminder.closed = true;
+        refreshReactionIntent(target, record);
+        changed.push(record.turnId);
+      }
+    });
+    return changed;
+  }
   function terminal(
     target: TurnFeedbackTarget,
     turnId: string,
@@ -657,12 +751,12 @@ export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
       if (!record || record.phase === 'completed' || record.phase === 'failed') return;
       record.phase = phase;
       record.updatedAt = new Date(Math.max(Date.parse(record.updatedAt), observedAtMs)).toISOString();
-      const desired = planReactionStep({
-        record, policy: policyFor(target),
-        newIntentId: deps.randomId?.() ?? randomUUID(),
-        nowIso: new Date(deps.now()).toISOString(),
-      });
-      if (desired.action === 'persist_intent') record.reactionIntent = desired.intent;
+      delete record.capacity;
+      delete record.capacityClearedAt;
+      delete record.capacityBinding;
+      delete record.capacitySidebandCursor;
+      if (record.reminder) record.reminder.closed = true;
+      refreshReactionIntent(target, record);
       changed = true;
       fresh.turnFeedback = pruneTurnFeedback(
         fresh.turnFeedback ?? {}, deps.now(), policyFor(target),
@@ -688,10 +782,17 @@ export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
       if (repair.timer) clearTimeout(repair.timer);
       repairs.delete(key);
     }
+    for (const key of permanentProbes) {
+      if (!prefix || key.startsWith(prefix)) permanentProbes.delete(key);
+    }
+    for (const key of rerunRequested) {
+      if (!prefix || key.startsWith(prefix)) rerunRequested.delete(key);
+    }
   }
 
   return {
-    admit, observeCapacity, markCapacityStale, observeAttention, terminal, disableCapacity, restore,
+    admit, observeCapacity, markCapacityStale, observeAttention, observeProgress, resumeAttention,
+    terminal, disableCapacity, restore,
     reconcile, scheduleReactionRepair, dispose,
   };
 }

@@ -49,6 +49,10 @@ export function createCapacitySidebandRuntime(
   function resolve(identity: CapacitySidebandIdentity): CapacitySidebandBinding | undefined {
     const key = keyOf(identity);
     const hit = key ? bindings.get(key) : undefined;
+    if (hit && !bindingIsActive(hit)) {
+      bindings.delete(key!);
+      return undefined;
+    }
     return hit ? { ...hit } : undefined;
   }
 

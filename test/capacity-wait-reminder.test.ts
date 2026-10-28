@@ -61,6 +61,20 @@ describe('capacity wait reminder', () => {
     expect(h.send).toHaveBeenCalledTimes(1);
   });
 
+  it('persists one stale-episode intent before sending and does not replay it', async () => {
+    const h = harness();
+    h.row.phase = 'capacity_stale';
+    h.row.capacity = { state: 'stale', startedAtMs: START, lastObservedAtMs: START, staleAtMs: START + 60_000 };
+    h.reminder.sync(h.target, 'turn-a'); h.setNow(START + 120_000);
+
+    await vi.advanceTimersByTimeAsync(120_000);
+    h.reminder.sync(h.target, 'turn-a');
+    await vi.advanceTimersByTimeAsync(120_000);
+
+    expect(h.send).toHaveBeenCalledTimes(1);
+    expect(h.row.reminder).toMatchObject({ status: 'sent', messageId: 'om_reminder' });
+  });
+
   it('patches the same work card and records closure when the episode clears', async () => {
     const h = harness();
     h.row.reminder = {

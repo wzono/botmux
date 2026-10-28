@@ -37,8 +37,17 @@ describe('authoritative TraeX capacity evidence', () => {
     });
     expect(tracker.observe(identity, identity, queued, 101)).toBeNull();
     expect(tracker.observe(identity, { ...identity, revision: 10 }, queued, 102)).toBeNull();
-    expect(tracker.observe(identity, identity, '◆ Working (2s • esc to interrupt)\nContext 99% left', 103))
+    expect(tracker.observe(identity, identity, '◆ Working… (2s • esc to interrupt)\nContext 99% left', 103))
       .toEqual({ type: 'clear', identity, observedAtMs: 103 });
     expect(tracker.observe(identity, identity, '', 104)).toBeNull();
+  });
+
+  it('does not clear a live wait from old progress far above the current footer', () => {
+    const tracker = createCapacityWaitTracker();
+    const identity = { sessionId: 'session-a', turnId: 'turn-a', dispatchAttempt: 2, revision: 9 };
+    expect(tracker.observe(identity, identity, queued, 100)?.type).toBe('waiting');
+    const oldProgress = `◆ Working… (2s • esc to interrupt)\n${Array(14).fill('old output').join('\n')}\n❯ Ready`;
+
+    expect(tracker.observe(identity, identity, oldProgress, 101)).toBeNull();
   });
 });

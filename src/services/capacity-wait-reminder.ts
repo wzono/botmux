@@ -55,17 +55,20 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
     if (row.reminderSilent || row.requesterIsBot !== false || !row.requesterOpenId) return;
     const episodeKey = String(row.capacity.startedAtMs);
     if (row.reminder?.episodeKey === episodeKey
-      && (row.reminder.messageId || row.reminder.status === 'ambiguous')) return;
+      && (row.reminder.messageId || row.reminder.status === 'pending'
+        || row.reminder.status === 'ambiguous')) return;
     const uuid = `capacity-${createHash('sha256').update(`${key}:${episodeKey}`).digest('hex').slice(0, 40)}`;
     deps.commit(target, fresh => {
       const current = fresh.turnFeedback?.[turnId];
-      if (current?.capacity?.state === 'waiting'
+      if ((current?.capacity?.state === 'waiting' || current?.capacity?.state === 'stale')
         && String(current.capacity.startedAtMs) === episodeKey) {
         current.reminder = {
           episodeKey, uuid, status: 'pending', attemptedAt: new Date(deps.now()).toISOString(),
         };
       }
     });
+    const persisted = deps.read(target).turnFeedback?.[turnId]?.reminder;
+    if (persisted?.uuid !== uuid || persisted.status !== 'pending') return;
     try {
       const messageId = await deps.send(target, row, uuid);
       deps.commit(target, fresh => {
@@ -98,7 +101,8 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
     if (row.reminderSilent || row.requesterIsBot !== false || !row.requesterOpenId) return;
     const episodeKey = String(row.capacity.startedAtMs);
     if (row.reminder?.episodeKey === episodeKey
-      && (row.reminder.messageId || row.reminder.status === 'ambiguous')) return;
+      && (row.reminder.messageId || row.reminder.status === 'pending'
+        || row.reminder.status === 'ambiguous')) return;
     const thresholds = deps.thresholds(target);
     const threshold = row.background ? thresholds.backgroundMs : thresholds.interactiveMs;
     const delay = Math.max(0, row.capacity.startedAtMs + threshold - deps.now());

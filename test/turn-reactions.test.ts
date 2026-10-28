@@ -171,6 +171,28 @@ describe('two-phase turn reactions', () => {
       ?.om_synthetic_same_id).toBeUndefined();
   });
 
+  it('does not reconcile an existing durable feedback row through a detached same-id session', async () => {
+    registerWith(true);
+    const durableOwner = makeDs();
+    durableOwner.session.turnFeedback = {
+      om_existing: {
+        version: 1, turnId: 'om_existing', messageId: 'om_existing',
+        phase: 'capacity_waiting', updatedAt: new Date().toISOString(),
+        reaction: { id: 'rid_existing', type: 'GoGoGo' },
+      },
+    };
+    sessionStore.updateSession(durableOwner.session);
+    const before = structuredClone(sessionStore.getSessionFresh(durableOwner.session.sessionId));
+    const detached = {
+      ...durableOwner,
+      session: structuredClone(durableOwner.session),
+    } as DaemonSession;
+
+    await noteTurnReceived(detached, 'om_existing');
+
+    expect(sessionStore.getSessionFresh(durableOwner.session.sessionId)).toEqual(before);
+  });
+
   it.each([true, false])('unified replies retain the independent status-card reaction gate (off=%s)', async statusOff => {
     registerWith(statusOff, { replyCardMode: 'unified' });
     const ds = makeDs();

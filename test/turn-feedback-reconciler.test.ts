@@ -173,4 +173,42 @@ describe('turn feedback admission', () => {
       disableCapacity: expect.any(Function),
     }));
   });
+
+  it('projects needs-user above capacity and resumes the still-valid wait after user input', () => {
+    const target = createTarget({ turnFeedback: { turn: {
+      version: 1, turnId: 'turn', messageId: 'om_turn', phase: 'capacity_waiting',
+      updatedAt: new Date(NOW - 10).toISOString(), capacity: {
+        state: 'waiting', source: 'pty', startedAtMs: NOW - 100, updatedAtMs: NOW - 10, position: 4,
+      },
+    } } });
+    const { reconciler } = createHarness();
+
+    expect(reconciler.observeAttention(target, 'turn', NOW)).toBe(true);
+    expect(target.session.turnFeedback?.turn.phase).toBe('needs_user');
+    expect(reconciler.resumeAttention(target, 'turn', NOW + 1)).toBe(true);
+    expect(target.session.turnFeedback?.turn.phase).toBe('capacity_waiting');
+  });
+
+  it('clears only the requested adapter capacity rows when disabled', () => {
+    const target = createTarget({ turnFeedback: {
+      codex: {
+        version: 1, turnId: 'codex', messageId: 'om_codex', phase: 'capacity_waiting',
+        updatedAt: new Date(NOW - 10).toISOString(), capacity: {
+          state: 'waiting', source: 'sideband', startedAtMs: NOW - 100, updatedAtMs: NOW - 10,
+        }, capacityBinding: { adapter: 'codex', nativeTurnId: 'native-c', dispatchAttempt: 1, workerGeneration: 1 },
+      },
+      claude: {
+        version: 1, turnId: 'claude', messageId: 'om_claude', phase: 'capacity_waiting',
+        updatedAt: new Date(NOW - 10).toISOString(), capacity: {
+          state: 'waiting', source: 'sideband', startedAtMs: NOW - 100, updatedAtMs: NOW - 10,
+        }, capacityBinding: { adapter: 'claude-code', nativeSessionId: 'sid', nativeTurnId: 'native-a', dispatchAttempt: 1, workerGeneration: 1 },
+      },
+    } });
+    const { reconciler } = createHarness();
+
+    expect(reconciler.disableCapacity(target, 'codex')).toEqual(['codex']);
+    expect(target.session.turnFeedback?.codex.phase).toBe('processing');
+    expect(target.session.turnFeedback?.codex.capacity).toBeUndefined();
+    expect(target.session.turnFeedback?.claude.phase).toBe('capacity_waiting');
+  });
 });

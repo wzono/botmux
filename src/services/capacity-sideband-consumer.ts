@@ -29,6 +29,8 @@ export interface CapacitySidebandKey {
 
 const MAX_BYTES = 16 * 1024;
 const MAX_CLOCK_SKEW_MS = 24 * 60 * 60_000;
+const MAX_PENDING_EVENTS = 512;
+const MAX_PENDING_AGE_MS = 24 * 60 * 60_000;
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
 const SIGNATURE = /^[A-Za-z0-9_-]{86}$/;
 const ALLOWED = new Set([
@@ -107,13 +109,43 @@ export interface CapacitySidebandDirectoryDeps {
     target: CapacitySidebandResolvedTarget,
     observation: { state: 'waiting' | 'clear'; position?: number; observedAtMs: number },
     event: CapacitySidebandEventV3,
-  ): void | Promise<void>;
+  ): void | boolean | Promise<void | boolean>;
+  quarantine?(event: { ownerAppId: string; reason: 'invalid' | 'untrusted' }): void | Promise<void>;
 }
 
 export function createCapacitySidebandDirectoryConsumer(deps: CapacitySidebandDirectoryDeps) {
   const directory = resolve(deps.root, 'owners', deps.ownerAppId, 'events');
   const checkpointPath = join(directory, '.checkpoint.json');
   let running = false;
+
+  function retryPending(): void {
+    if (!existsSync(directory)) return;
+    const now = deps.now?.() ?? Date.now();
+    const pending = readdirSync(directory)
+      .filter(name => name.endsWith('.json.pending'))
+      .map(name => {
+        const path = join(directory, name);
+        return { name, path, mtimeMs: statSync(path).mtimeMs };
+      })
+      .sort((left, right) => right.mtimeMs - left.mtimeMs || left.name.localeCompare(right.name));
+    for (const [index, entry] of pending.entries()) {
+      if (index >= MAX_PENDING_EVENTS || now - entry.mtimeMs > MAX_PENDING_AGE_MS) {
+        renameSync(entry.path, `${entry.path}.quarantine-expired`);
+        continue;
+      }
+      renameSync(entry.path, join(directory, entry.name.slice(0, -'.pending'.length)));
+    }
+    for (const name of readdirSync(directory).filter(name => /\.json\.claim-[0-9]+$/.test(name))) {
+      const match = /\.claim-([0-9]+)$/.exec(name);
+      const pid = Number(match?.[1]);
+      let live = false;
+      if (Number.isSafeInteger(pid) && pid > 1) {
+        try { process.kill(pid, 0); live = true; }
+        catch (error) { live = (error as NodeJS.ErrnoException).code === 'EPERM'; }
+      }
+      if (!live) renameSync(join(directory, name), join(directory, name.replace(/\.claim-[0-9]+$/, '')));
+    }
+  }
 
   function readCheckpoint(): Record<string, number> {
     if (!existsSync(checkpointPath)) return {};
@@ -148,6 +180,7 @@ export function createCapacitySidebandDirectoryConsumer(deps: CapacitySidebandDi
     }
     running = true;
     let accepted = 0;
+    let quarantined = false;
     try {
       const checkpoint = readCheckpoint();
       const names = readdirSync(directory)
@@ -170,7 +203,9 @@ export function createCapacitySidebandDirectoryConsumer(deps: CapacitySidebandDi
         } catch {
           if (fd !== undefined) closeSync(fd);
           renameSync(claimed, `${source}.quarantine-untrusted`);
-          continue;
+          quarantined = true;
+          await deps.quarantine?.({ ownerAppId: deps.ownerAppId, reason: 'untrusted' });
+          break;
         } finally {
           if (fd !== undefined) {
             try { closeSync(fd); } catch { /* already closed */ }
@@ -187,7 +222,9 @@ export function createCapacitySidebandDirectoryConsumer(deps: CapacitySidebandDi
             continue;
           }
           renameSync(claimed, `${source}.quarantine-invalid`);
-          continue;
+          quarantined = true;
+          await deps.quarantine?.({ ownerAppId: deps.ownerAppId, reason: 'invalid' });
+          break;
         }
         const cursorKey = JSON.stringify([
           event.signer_key_id, event.signer_epoch,
@@ -198,13 +235,14 @@ export function createCapacitySidebandDirectoryConsumer(deps: CapacitySidebandDi
         const observation = event.state === 'waiting'
           ? { state: 'waiting' as const, position: event.position, observedAtMs: Date.parse(event.observed_at) }
           : { state: 'clear' as const, observedAtMs: Date.parse(event.observed_at) };
-        await deps.observe(target, observation, event);
+        const observed = await deps.observe(target, observation, event);
+        if (observed === false) { renameSync(claimed, `${source}.pending`); continue; }
         checkpoint[cursorKey] = event.sequence;
         writeCheckpoint(checkpoint);
         unlinkSync(claimed);
         accepted += 1;
       }
-      return accepted;
+      return quarantined ? 0 : accepted;
     } finally {
       running = false;
     }
@@ -212,17 +250,9 @@ export function createCapacitySidebandDirectoryConsumer(deps: CapacitySidebandDi
 
   return {
     directory, checkpointPath, poll,
-    retryPending(): void {
-      if (!existsSync(directory)) return;
-      for (const name of readdirSync(directory).filter(name => name.endsWith('.json.pending'))) {
-        renameSync(join(directory, name), join(directory, name.slice(0, -'.pending'.length)));
-      }
-      for (const name of readdirSync(directory).filter(name => /\.json\.claim-[0-9]+$/.test(name))) {
-        renameSync(join(directory, name), join(directory, name.replace(/\.claim-[0-9]+$/, '')));
-      }
-    },
+    retryPending,
     start(intervalMs = 250) {
-      const timer = setInterval(() => { void poll().catch(() => undefined); }, intervalMs);
+      const timer = setInterval(() => { retryPending(); void poll().catch(() => undefined); }, intervalMs);
       timer.unref?.();
       void poll().catch(() => undefined);
       return () => clearInterval(timer);

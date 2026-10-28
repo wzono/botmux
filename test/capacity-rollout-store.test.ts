@@ -1,6 +1,7 @@
 import { chmodSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import { createCapacityRolloutStore } from '../src/services/capacity-rollout-store.js';
 
 describe('capacity fleet rollout policy', () => {
@@ -48,5 +49,25 @@ describe('capacity fleet rollout policy', () => {
     store.setPhase('shadow');
     store.setPhase('full');
     expect(store.evaluate('app-a', 'codex', true)).toBe('disabled');
+  });
+
+  it('serializes read-modify-write updates from independent processes', async () => {
+    const root = join(process.env.SESSION_DATA_DIR!, `capacity-rollout-rmw-${Math.random().toString(36).slice(2)}`);
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    const moduleUrl = new URL('../src/services/capacity-rollout-store.js', import.meta.url).href;
+    const children = Array.from({ length: 6 }, (_, index) => spawnTsEvalWithRepoImports(
+      `import { createCapacityRolloutStore } from ${JSON.stringify(moduleUrl)};`
+        + `createCapacityRolloutStore(${JSON.stringify(root)}).disable('app-${index}', 'codex', 'reason-${index}');`,
+      { stdio: ['ignore', 'ignore', 'pipe'] },
+    ));
+    const exits = await Promise.all(children.map(child => new Promise<number | null>(resolve => {
+      child.once('exit', code => resolve(code));
+    })));
+    expect(exits).toEqual(Array(children.length).fill(0));
+
+    const snapshot = createCapacityRolloutStore(root).snapshot();
+    for (let index = 0; index < children.length; index++) {
+      expect(snapshot.disabled).toHaveProperty(JSON.stringify([`app-${index}`, 'codex']));
+    }
   });
 });

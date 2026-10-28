@@ -1,6 +1,7 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { withFileLockSync } from '../utils/file-lock.js';
 
 export type CapacityRolloutPhase = 'shadow' | 'traex' | 'proxy' | 'full' | 'off';
 export type CapacityRolloutAdapter = 'traex' | 'codex' | 'claude-code';
@@ -41,23 +42,30 @@ export function createCapacityRolloutStore(dataDir: string) {
     });
   }
 
+  function mutate(change: (state: State) => void): void {
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    withFileLockSync(path, () => {
+      const state = read();
+      change(state);
+      write(state);
+    });
+  }
+
   return {
     path,
     phase: () => read().phase,
     snapshot: (): Readonly<State> => structuredClone(read()),
     setPhase(phase: CapacityRolloutPhase): void {
       if (!PHASES.has(phase)) throw new Error(`invalid capacity rollout phase: ${phase}`);
-      write({ ...read(), phase });
+      mutate(state => { state.phase = phase; });
     },
     disable(appId: string, adapter: CapacityRolloutAdapter, reason: string): void {
-      const state = read();
-      state.disabled[keyOf(appId, adapter)] = { reason, at: new Date().toISOString() };
-      write(state);
+      mutate(state => {
+        state.disabled[keyOf(appId, adapter)] = { reason, at: new Date().toISOString() };
+      });
     },
     enable(appId: string, adapter: CapacityRolloutAdapter): void {
-      const state = read();
-      delete state.disabled[keyOf(appId, adapter)];
-      write(state);
+      mutate(state => { delete state.disabled[keyOf(appId, adapter)]; });
     },
     evaluate(appId: string, adapter: CapacityRolloutAdapter, supported: boolean): CapacityRolloutDecision {
       const state = read();

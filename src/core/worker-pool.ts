@@ -1108,6 +1108,12 @@ export interface WorkerPoolCallbacks {
     ds: DaemonSession,
     binding: Extract<WorkerToDaemon, { type: 'capacity_sideband_binding' }> & { workerGeneration: number },
   ) => void;
+  /** Authoritative exact-turn model/tool progress clears stale capacity wait. */
+  onTurnProgress?: (
+    ds: DaemonSession,
+    progress: Extract<WorkerToDaemon, { type: 'turn_progress' }>,
+    context: { workerGeneration: number },
+  ) => void;
   /** Provider submission proof for one durable-primary Lark Inbox turn. */
   onTurnInputCommitted?: (
     ds: DaemonSession,
@@ -16093,6 +16099,7 @@ function setupWorkerHandlers(
       case 'turn_progress': {
         if (!ownsLifecycleMutation() || !['model_output', 'tool_started', 'tool_returned'].includes(msg.stage)) break;
         cliNotices.progress(msg.turnId, msg.dispatchAttempt, workerGeneration, msg.stage);
+        cb.onTurnProgress?.(ds, msg, { workerGeneration });
         break;
       }
       case 'turn_execution_started': {

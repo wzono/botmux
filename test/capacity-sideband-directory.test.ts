@@ -76,6 +76,46 @@ describe('owner directory capacity sideband consumer', () => {
     expect(readdirSync(ownerDirectory)).toContain('bad.json.quarantine-invalid');
   });
 
+  it('latches the owner adapters off after an untrusted event and stops the poll', async () => {
+    const { root, ownerDirectory } = fixture();
+    writeFileSync(join(ownerDirectory, '1-bad.json'), '{bad', { mode: 0o600 });
+    writeFileSync(join(ownerDirectory, '2-valid.json'), JSON.stringify(event()), { mode: 0o600 });
+    const quarantine = vi.fn();
+    const observe = vi.fn();
+    const consumer = createCapacitySidebandDirectoryConsumer({
+      root, ownerAppId: 'cli_test', keyring: [{ keyId: KEY_ID, publicKeyDer: PUBLIC, minEpoch: 1, maxEpoch: 1 }],
+      now: () => Date.parse(AT), quarantine,
+      resolve: () => ({ sessionId: 'session-a', turnId: 'turn-a', dispatchAttempt: 2, workerGeneration: 3 }),
+      observe,
+    });
+
+    await expect(consumer.poll()).resolves.toBe(0);
+    expect(quarantine).toHaveBeenCalledWith({ ownerAppId: 'cli_test', reason: 'invalid' });
+    expect(observe).not.toHaveBeenCalled();
+    expect(readdirSync(ownerDirectory)).toContain('2-valid.json');
+  });
+
+  it('retries pending events after a binding becomes available', async () => {
+    const { root, ownerDirectory } = fixture();
+    writeFileSync(join(ownerDirectory, 'pending.json'), JSON.stringify(event()), { mode: 0o600 });
+    let bound = false;
+    const observe = vi.fn();
+    const consumer = createCapacitySidebandDirectoryConsumer({
+      root, ownerAppId: 'cli_test', keyring: [{ keyId: KEY_ID, publicKeyDer: PUBLIC, minEpoch: 1, maxEpoch: 1 }],
+      now: () => Date.parse(AT),
+      resolve: () => bound
+        ? { sessionId: 'session-a', turnId: 'turn-a', dispatchAttempt: 2, workerGeneration: 3 }
+        : undefined,
+      observe,
+    });
+
+    await expect(consumer.poll()).resolves.toBe(0);
+    bound = true;
+    consumer.retryPending();
+    await expect(consumer.poll()).resolves.toBe(1);
+    expect(observe).toHaveBeenCalledTimes(1);
+  });
+
   it('rejects symlink and group-readable event files before parsing them', async () => {
     const { root, ownerDirectory } = fixture();
     const outside = join(root, 'outside.json');
@@ -93,7 +133,7 @@ describe('owner directory capacity sideband consumer', () => {
     await expect(consumer.poll()).resolves.toBe(0);
     expect(observe).not.toHaveBeenCalled();
     expect(readdirSync(ownerDirectory)).toEqual(expect.arrayContaining([
-      'link.json.quarantine-untrusted', 'wide.json.quarantine-untrusted',
+      'link.json.quarantine-untrusted', 'wide.json',
     ]));
   });
 
@@ -136,6 +176,23 @@ describe('owner directory capacity sideband consumer', () => {
     await expect(consumer.poll()).resolves.toBe(1);
     expect(observe).toHaveBeenCalledTimes(1);
     expect(readdirSync(ownerDirectory).some(name => name.includes('.claim-'))).toBe(false);
+  });
+
+  it('does not recover a claim owned by a live process', async () => {
+    const { root, ownerDirectory } = fixture();
+    writeFileSync(join(ownerDirectory, `live.json.claim-${process.pid}`), JSON.stringify(event()), { mode: 0o600 });
+    const observe = vi.fn();
+    const consumer = createCapacitySidebandDirectoryConsumer({
+      root, ownerAppId: 'cli_test', keyring: [{ keyId: KEY_ID, publicKeyDer: PUBLIC, minEpoch: 1, maxEpoch: 1 }],
+      now: () => Date.parse(AT),
+      resolve: () => ({ sessionId: 'session-a', turnId: 'turn-a', dispatchAttempt: 2, workerGeneration: 3 }),
+      observe,
+    });
+
+    consumer.retryPending();
+    await expect(consumer.poll()).resolves.toBe(0);
+    expect(observe).not.toHaveBeenCalled();
+    expect(readdirSync(ownerDirectory)).toContain(`live.json.claim-${process.pid}`);
   });
 
   it('ignores checkpoint metadata on subsequent empty polls', async () => {

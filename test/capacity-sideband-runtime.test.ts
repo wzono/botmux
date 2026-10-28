@@ -43,4 +43,14 @@ describe('owner-scoped sideband runtime', () => {
     runtime.retireWorker('session-a', 2);
     expect(runtime.resolve({ adapter: 'codex', nativeTurnId: 'native-a' })).toBeUndefined();
   });
+
+  it('does not resolve a binding that is no longer live', () => {
+    let active = true;
+    const runtime = createCapacitySidebandRuntime(() => active);
+    const first = binding();
+    expect(runtime.bind(first)).toBe(true);
+    active = false;
+
+    expect(runtime.resolve({ adapter: 'codex', nativeTurnId: 'native-a' })).toBeUndefined();
+  });
 });
