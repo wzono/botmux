@@ -715,6 +715,19 @@ export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
     transition(target, turnId, { type: 'progress', observedAtMs });
   const resumeAttention = (target: TurnFeedbackTarget, turnId: string, observedAtMs = deps.now()) =>
     transition(target, turnId, { type: 'user_resumed', observedAtMs });
+  function hasLiveAttempt(
+    target: TurnFeedbackTarget,
+    turnId: string,
+    dispatchAttempt: number | undefined,
+    workerGeneration: number,
+  ): boolean {
+    const record = readRow(target, turnId);
+    if (!record || target.session.workerGeneration !== workerGeneration) return false;
+    if (dispatchAttempt === undefined) return true;
+    const binding = record.capacityBinding;
+    return !binding || binding.workerGeneration === workerGeneration
+      && binding.dispatchAttempt === dispatchAttempt;
+  }
   function disableCapacity(target: TurnFeedbackTarget, adapter?: 'traex' | 'codex' | 'claude-code'): string[] {
     const changed: string[] = [];
     deps.commit(target, fresh => {
@@ -755,6 +768,7 @@ export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
       delete record.capacityClearedAt;
       delete record.capacityBinding;
       delete record.capacitySidebandCursor;
+      delete record.attention;
       if (record.reminder) record.reminder.closed = true;
       refreshReactionIntent(target, record);
       changed = true;
@@ -792,7 +806,7 @@ export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
 
   return {
     admit, observeCapacity, markCapacityStale, observeAttention, observeProgress, resumeAttention,
-    terminal, disableCapacity, restore,
+    hasLiveAttempt, terminal, disableCapacity, restore,
     reconcile, scheduleReactionRepair, dispose,
   };
 }

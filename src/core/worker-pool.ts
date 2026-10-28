@@ -1114,6 +1114,10 @@ export interface WorkerPoolCallbacks {
     progress: Extract<WorkerToDaemon, { type: 'turn_progress' }>,
     context: { workerGeneration: number },
   ) => void;
+  onTurnAttention?: (
+    ds: DaemonSession,
+    attention: { turnId: string; dispatchAttempt?: number; workerGeneration: number; state: 'needs_user' | 'resumed' },
+  ) => void;
   /** Provider submission proof for one durable-primary Lark Inbox turn. */
   onTurnInputCommitted?: (
     ds: DaemonSession,
@@ -17673,6 +17677,9 @@ function setupWorkerHandlers(
         }
         clearTuiPromptAuthority(ds);
         if (hadAuthority) publishAttentionPatch(ds);
+        if (msg.turnId) cb.onTurnAttention?.(ds, {
+          turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt, workerGeneration, state: 'resumed',
+        });
         break;
       }
 
@@ -17817,6 +17824,9 @@ function setupWorkerHandlers(
           }
           ds.stuckWarningCardId = cardMsgId;
           publishAttentionPatch(ds);
+          if (msg.turnId) cb.onTurnAttention?.(ds, {
+            turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt, workerGeneration, state: 'needs_user',
+          });
         } catch (err: any) {
           logger.warn(`[${t}] Failed to post stuck warning card: ${err}`);
           // Card send failed — clear markers ONLY if this nonce is still
@@ -17844,6 +17854,9 @@ function setupWorkerHandlers(
             logger.debug(`[${t}] Failed to update stuck-warning card on expired: ${err}`),
           );
           clearStuckWarningAuthority(ds);
+          if (msg.turnId) cb.onTurnAttention?.(ds, {
+            turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt, workerGeneration, state: 'resumed',
+          });
         }
         break;
       }
@@ -17862,6 +17875,9 @@ function setupWorkerHandlers(
             logger.debug(`[${t}] Failed to resolve stuck-warning card on delivered: ${err}`),
           );
           clearStuckWarningAuthority(ds);
+          if (msg.turnId) cb.onTurnAttention?.(ds, {
+            turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt, workerGeneration, state: 'resumed',
+          });
         }
         break;
       }

@@ -75,6 +75,22 @@ describe('capacity wait reminder', () => {
     expect(h.row.reminder).toMatchObject({ status: 'sent', messageId: 'om_reminder' });
   });
 
+  it('resumes a persisted pending reminder intent after restart', async () => {
+    const h = harness();
+    h.row.phase = 'capacity_stale';
+    h.row.capacity = { state: 'stale', startedAtMs: START, lastObservedAtMs: START, staleAtMs: START + 60_000 };
+    h.row.reminder = {
+      episodeKey: String(START), uuid: 'capacity-persisted', status: 'pending',
+      attemptedAt: new Date(START).toISOString(),
+    };
+    h.reminder.sync(h.target, 'turn-a'); h.setNow(START + 120_000);
+
+    await vi.advanceTimersByTimeAsync(120_000);
+
+    expect(h.send).toHaveBeenCalledTimes(1);
+    expect(h.row.reminder).toMatchObject({ status: 'sent', messageId: 'om_reminder' });
+  });
+
   it('patches the same work card and records closure when the episode clears', async () => {
     const h = harness();
     h.row.reminder = {

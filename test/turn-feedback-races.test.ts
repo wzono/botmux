@@ -59,6 +59,29 @@ describe('persisted terminal reaction convergence', () => {
     runtime.dispose();
   });
 
+  it('retires solved attention metadata at terminal settlement', async () => {
+    const now = Date.parse('2026-10-28T12:00:00Z');
+    const session = { sessionId: 'settled-attention', status: 'active', turnFeedback: { turn: {
+      version: 1, turnId: 'turn', messageId: 'om_r1', phase: 'needs_user',
+      updatedAt: new Date(now - 10).toISOString(), attention: {
+        state: 'needs_user', promptNonce: 'nonce', dispatchAttempt: 1, workerGeneration: 1, openedAtMs: now - 10,
+      },
+    } } } as Session;
+    const target = { session, larkAppId: 'cli_r1' };
+    const runtime = createTurnFeedbackReconciler({
+      now: () => now, read: () => session,
+      commit: (_target, mutate) => { mutate(session); return session; },
+      listOwnReactions: async () => ({ kind: 'listed', reactions: [] }),
+      createReactionOnce: async (_app, _message, type) => ({ kind: 'created', reaction: { id: `rid-${type}`, type } }),
+    });
+
+    expect(runtime.terminal(target, 'turn', 'completed')).toBe(true);
+    await runtime.reconcile(target, 'turn');
+
+    expect(session.turnFeedback!.turn).not.toHaveProperty('attention');
+    runtime.dispose();
+  });
+
   it('converges terminal after an earlier CREATE receipt arrives late', async () => {
     const now = Date.parse('2026-10-28T12:00:00Z');
     const session = { sessionId: 'race', status: 'active', turnFeedback: { turn: {

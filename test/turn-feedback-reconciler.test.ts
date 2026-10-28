@@ -211,4 +211,18 @@ describe('turn feedback admission', () => {
     expect(target.session.turnFeedback?.codex.capacity).toBeUndefined();
     expect(target.session.turnFeedback?.claude.phase).toBe('capacity_waiting');
   });
+
+  it('matches sideband progress to the persisted exact attempt and generation', () => {
+    const target = createTarget({ workerGeneration: 3, turnFeedback: { turn: {
+      version: 1, turnId: 'turn', messageId: 'om_turn', phase: 'capacity_waiting',
+      updatedAt: new Date(NOW - 10).toISOString(), capacity: {
+        state: 'waiting', source: 'sideband', startedAtMs: NOW - 100, updatedAtMs: NOW - 10,
+      }, capacityBinding: { adapter: 'codex', nativeTurnId: 'native', dispatchAttempt: 2, workerGeneration: 3 },
+    } } });
+    const { reconciler } = createHarness();
+
+    expect(reconciler.hasLiveAttempt(target, 'turn', 1, 3)).toBe(false);
+    expect(reconciler.hasLiveAttempt(target, 'turn', 2, 3)).toBe(true);
+    expect(reconciler.hasLiveAttempt(target, 'turn', 2, 2)).toBe(false);
+  });
 });

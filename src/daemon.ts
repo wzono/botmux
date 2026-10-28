@@ -4232,7 +4232,13 @@ export const __testOnly_applyLiveTurnFeedbackTerminal = applyLiveTurnFeedbackTer
 const capacitySidebandRuntime = createCapacitySidebandRuntime(binding => {
   const ds = findActiveBySessionId(binding.sessionId);
   const persisted = ds?.session.turnFeedback?.[binding.turnId]?.capacityBinding;
-  return !!ds && persisted?.adapter === binding.adapter
+  const liveAttempt = ds?.turnDispatchAttemptHighWater?.turnId === binding.turnId
+    ? ds.turnDispatchAttemptHighWater.dispatchAttempt
+    : ds?.managedTurnOrigin?.turnId === binding.turnId
+      ? ds.managedTurnOrigin.dispatchAttempt
+      : undefined;
+  return !!ds && (liveAttempt === undefined || liveAttempt === binding.dispatchAttempt)
+    && persisted?.adapter === binding.adapter
     && persisted.nativeTurnId === binding.nativeTurnId
     && persisted.nativeSessionId === binding.nativeSessionId
     && persisted.dispatchAttempt === binding.dispatchAttempt
@@ -4240,6 +4246,7 @@ const capacitySidebandRuntime = createCapacitySidebandRuntime(binding => {
 });
 let stopCapacitySidebandConsumer: (() => void) | undefined;
 let consumerCapacitySidebandRetry: (() => void) | undefined;
+let capacityRolloutPolicyTimer: ReturnType<typeof setInterval> | undefined;
 
 function capacityProjectionEnabled(
   appId: string,
@@ -4252,6 +4259,42 @@ function capacityProjectionEnabled(
     logger.warn(`[capacity] rollout policy unavailable; projection disabled: ${String(error)}`);
     return false;
   }
+}
+
+async function reconcileCapacityRolloutPolicy(ownerAppId: string): Promise<void> {
+  const rollout = createCapacityRolloutStore(config.session.dataDir);
+  for (const ds of activeSessions.values()) {
+    if (ds.larkAppId !== ownerAppId || !sessionStore.ownsSessionForMutation(ds.session)) continue;
+    for (const adapter of ['traex', 'codex', 'claude-code'] as const) {
+      if (rollout.evaluate(ownerAppId, adapter, true) === 'enabled') continue;
+      const changed = turnFeedbackReconciler.disableCapacity(
+        { session: ds.session, larkAppId: ds.larkAppId }, adapter,
+      );
+      for (const turnId of changed) {
+        capacityFeedbackProjection.sync(ds, turnId);
+        await turnFeedbackReconciler.reconcile(ds, turnId);
+      }
+    }
+  }
+}
+
+function startCapacityRolloutPolicyWatcher(ownerAppId: string): void {
+  if (capacityRolloutPolicyTimer) clearInterval(capacityRolloutPolicyTimer);
+  let previous = '';
+  const sweep = (): void => {
+    try {
+      const current = JSON.stringify(createCapacityRolloutStore(config.session.dataDir).snapshot());
+      if (current === previous) return;
+      previous = current;
+      void reconcileCapacityRolloutPolicy(ownerAppId).catch(error =>
+        logger.warn(`[capacity] rollout policy reconcile failed: ${String(error)}`));
+    } catch (error) {
+      logger.warn(`[capacity] rollout policy watcher failed: ${String(error)}`);
+    }
+  };
+  sweep();
+  capacityRolloutPolicyTimer = setInterval(sweep, 250);
+  capacityRolloutPolicyTimer.unref?.();
 }
 
 function recordCapacityAudit(
@@ -4324,7 +4367,10 @@ function startCapacitySidebandConsumer(ownerAppId: string): void {
         const changed = turnFeedbackReconciler.disableCapacity(
           { session: ds.session, larkAppId: ds.larkAppId },
         );
-        for (const turnId of changed) capacityFeedbackProjection.sync(ds, turnId);
+        for (const turnId of changed) {
+          capacityFeedbackProjection.sync(ds, turnId);
+          void turnFeedbackReconciler.reconcile(ds, turnId);
+        }
       }
     },
     resolve(event) {
@@ -4336,9 +4382,15 @@ function startCapacitySidebandConsumer(ownerAppId: string): void {
     async observe(binding, observation, event) {
       const ds = findActiveBySessionId(binding.sessionId);
       const persisted = ds?.session.turnFeedback?.[binding.turnId]?.capacityBinding;
+      const liveAttempt = ds?.turnDispatchAttemptHighWater?.turnId === binding.turnId
+        ? ds.turnDispatchAttemptHighWater.dispatchAttempt
+        : ds?.managedTurnOrigin?.turnId === binding.turnId
+          ? ds.managedTurnOrigin.dispatchAttempt
+          : undefined;
       if (!ds || ds.currentTurnId !== binding.turnId
         || ds.workerGeneration !== binding.workerGeneration
         || ds.session.workerGeneration !== binding.workerGeneration
+        || liveAttempt !== undefined && liveAttempt !== binding.dispatchAttempt
         || persisted?.dispatchAttempt !== binding.dispatchAttempt
         || persisted.workerGeneration !== binding.workerGeneration) return false;
       const enabled = capacityProjectionEnabled(ds.larkAppId, event.adapter);
@@ -4349,6 +4401,14 @@ function startCapacitySidebandConsumer(ownerAppId: string): void {
         if (changed) {
           await turnFeedbackReconciler.reconcile(ds, binding.turnId);
           capacityFeedbackProjection.sync(ds, binding.turnId);
+        }
+      } else {
+        const changed = turnFeedbackReconciler.disableCapacity(
+          { session: ds.session, larkAppId: ds.larkAppId }, event.adapter,
+        );
+        for (const turnId of changed) {
+          capacityFeedbackProjection.sync(ds, turnId);
+          await turnFeedbackReconciler.reconcile(ds, turnId);
         }
       }
       recordCapacityAudit(
@@ -9225,8 +9285,44 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   }
   const result = managedExplicit
     ? await explicitAskContinuation.wait(explicitInput)
-    : await registerAskForResponse(askInput, res);
+    : await (async () => {
+        const turnId = typeof body.originTurnId === 'string'
+          ? body.originTurnId
+          : askSession?.currentTurnId;
+        if (askSession && turnId && sessionStore.ownsSessionForMutation(askSession.session)) {
+          try {
+            const changed = turnFeedbackReconciler.observeAttention(
+              { session: askSession.session, larkAppId: askSession.larkAppId }, turnId, Date.now(),
+            );
+            if (changed) {
+              capacityFeedbackProjection.sync(askSession, turnId);
+              void turnFeedbackReconciler.reconcile(askSession, turnId);
+            }
+          } catch (error) {
+            logger.warn(`[capacity] ask attention projection failed: ${String(error)}`);
+          }
+        }
+        return registerAskForResponse(askInput, res);
+      })();
   if (res.destroyed) return;
+  {
+    const turnId = typeof body.originTurnId === 'string'
+      ? body.originTurnId
+      : askSession?.currentTurnId;
+    if (askSession && turnId && sessionStore.ownsSessionForMutation(askSession.session)) {
+      try {
+        const changed = turnFeedbackReconciler.resumeAttention(
+          { session: askSession.session, larkAppId: askSession.larkAppId }, turnId, Date.now(),
+        );
+        if (changed) {
+          capacityFeedbackProjection.sync(askSession, turnId);
+          void turnFeedbackReconciler.reconcile(askSession, turnId);
+        }
+      } catch (error) {
+        logger.warn(`[capacity] ask resume projection failed: ${String(error)}`);
+      }
+    }
+  }
 
   if (asyncInput && askSession && result.kind === 'answered') {
     const isCurrent = () => findActiveBySessionId(boundAsk.sessionId) === askSession
@@ -31298,7 +31394,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           const changed = turnFeedbackReconciler.disableCapacity(
             { session: ds.session, larkAppId: ds.larkAppId }, 'traex',
           );
-          for (const turnId of changed) capacityFeedbackProjection.sync(ds, turnId);
+          for (const turnId of changed) {
+            capacityFeedbackProjection.sync(ds, turnId);
+            void turnFeedbackReconciler.reconcile(ds, turnId);
+          }
           recordCapacityAudit(
             ds, observation.turnId, 'traex', 'traex-viewport.v1', observation.state,
             observation.observedAtMs, observation.position !== undefined, 'disabled',
@@ -31332,7 +31431,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     onTurnProgress(ds, progress, context) {
       if (ds.workerGeneration !== context.workerGeneration
-        || ds.currentTurnId !== progress.turnId) return;
+        || ds.currentTurnId !== progress.turnId
+        || progress.dispatchAttempt !== undefined
+          && ds.turnDispatchAttemptHighWater?.turnId === progress.turnId
+          && ds.turnDispatchAttemptHighWater.dispatchAttempt !== progress.dispatchAttempt) return;
       try {
         const changed = turnFeedbackReconciler.observeProgress(
           { session: ds.session, larkAppId: ds.larkAppId },
@@ -31345,6 +31447,28 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         }
       } catch (error) {
         logger.warn(`[capacity] progress clear failed: ${String(error)}`);
+      }
+    },
+    onTurnAttention(ds, attention) {
+      if (ds.workerGeneration !== attention.workerGeneration
+        || ds.currentTurnId !== attention.turnId
+        || attention.dispatchAttempt !== undefined
+          && ds.turnDispatchAttemptHighWater?.turnId === attention.turnId
+          && ds.turnDispatchAttemptHighWater.dispatchAttempt !== attention.dispatchAttempt) return;
+      try {
+        const changed = attention.state === 'needs_user'
+          ? turnFeedbackReconciler.observeAttention(
+              { session: ds.session, larkAppId: ds.larkAppId }, attention.turnId, Date.now(),
+            )
+          : turnFeedbackReconciler.resumeAttention(
+              { session: ds.session, larkAppId: ds.larkAppId }, attention.turnId, Date.now(),
+            );
+        if (changed) {
+          capacityFeedbackProjection.sync(ds, attention.turnId);
+          void turnFeedbackReconciler.reconcile(ds, attention.turnId);
+        }
+      } catch (error) {
+        logger.warn(`[capacity] TUI attention projection failed: ${String(error)}`);
       }
     },
     onCapacitySidebandBinding(ds, binding) {
@@ -32692,6 +32816,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     driveRestoredPrincipalLane: ds => { driveNextPrincipalLaneTurn(ds); },
   });
   startCapacitySidebandConsumer(cfg.larkAppId);
+  startCapacityRolloutPolicyWatcher(cfg.larkAppId);
   capacityFeedbackProjection.restore(activeSessions.values());
   // Completion Proposal may resume an accepted pending decision immediately.
   // Schedule it only after restore populated activeSessions; doing this before
@@ -33624,6 +33749,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     stopCapacitySidebandConsumer?.();
     stopCapacitySidebandConsumer = undefined;
     consumerCapacitySidebandRetry = undefined;
+    if (capacityRolloutPolicyTimer) clearInterval(capacityRolloutPolicyTimer);
+    capacityRolloutPolicyTimer = undefined;
     capacityFeedbackProjection.dispose();
     capacityWaitReminder.dispose();
     turnFeedbackReconciler.dispose();
