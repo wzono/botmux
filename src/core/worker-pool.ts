@@ -1731,6 +1731,23 @@ export function idleCardLabel(ds: DaemonSession): IdleCardLabel | undefined {
  *  但仍有后台子任务在跑时为「后台子任务运行中（N）」，盖过 idle 标签；否则同
  *  {@link idleCardLabel}。冻结卡不用它——后台计数只描述当下。 */
 export function streamCardLabel(ds: DaemonSession): StreamCardLabel | undefined {
+  const feedback = ds.currentTurnId
+    ? ds.session.turnFeedback?.[ds.currentTurnId]
+    : undefined;
+  const capacity = feedback?.phase === 'capacity_waiting' || feedback?.phase === 'capacity_stale'
+    ? feedback.capacity
+    : undefined;
+  if (capacity?.state === 'waiting' || capacity?.state === 'stale') {
+    return {
+      capacityWait: {
+        state: capacity.state,
+        ...(capacity.state === 'waiting' && capacity.position !== undefined
+          ? { position: capacity.position }
+          : {}),
+        ageMs: Math.max(0, Date.now() - capacity.updatedAtMs),
+      },
+    };
+  }
   if (ds.backgroundTaskCount && (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'idle')) {
     return { backgroundTasks: ds.backgroundTaskCount };
   }
@@ -3540,7 +3557,9 @@ export function cachedStreamingCardStatus(ds: DaemonSession): StreamStatus {
  *  subtasks ran under the worker too, so a stale count is dropped with it;
  *  the turn's own outcome labels still apply. */
 export function cachedStreamCardLabel(ds: DaemonSession): StreamCardLabel | undefined {
-  return hasNoCliUnderDaemon(ds) ? idleCardLabel(ds) : streamCardLabel(ds);
+  const live = streamCardLabel(ds);
+  if (live && typeof live === 'object' && 'capacityWait' in live) return live;
+  return hasNoCliUnderDaemon(ds) ? idleCardLabel(ds) : live;
 }
 
 function hasNoCliUnderDaemon(ds: DaemonSession): boolean {

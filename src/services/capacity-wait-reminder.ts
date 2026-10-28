@@ -4,14 +4,16 @@ import type { TurnFeedbackTarget } from './turn-feedback-reconciler.js';
 
 export interface CapacityReminderDeps {
   read(target: TurnFeedbackTarget): Session;
-  commit(mutate: (session: Session) => void): void;
+  commit(target: TurnFeedbackTarget, mutate: (session: Session) => void): void;
   send(target: TurnFeedbackTarget, row: PersistedTurnFeedback, uuid: string): Promise<string>;
+  patch(target: TurnFeedbackTarget, row: PersistedTurnFeedback, messageId: string): Promise<void>;
   now(): number;
   thresholds: { interactiveMs: number; backgroundMs: number };
 }
 
 export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
   const timers = new Map<string, ReturnType<typeof setTimeout>>();
+  const closing = new Set<string>();
   const keyFor = (target: TurnFeedbackTarget, turnId: string) =>
     JSON.stringify([target.larkAppId, target.session.sessionId, turnId]);
 
@@ -21,18 +23,41 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
     timers.delete(key);
   }
 
+  async function closePublished(target: TurnFeedbackTarget, turnId: string): Promise<void> {
+    const key = keyFor(target, turnId);
+    if (closing.has(key)) return;
+    const row = deps.read(target).turnFeedback?.[turnId];
+    const messageId = row?.reminder?.messageId;
+    if (!row || !messageId || row.reminder?.closed) return;
+    closing.add(key);
+    try {
+      await deps.patch(target, row, messageId);
+      deps.commit(target, fresh => {
+        const current = fresh.turnFeedback?.[turnId];
+        if (current?.reminder?.messageId === messageId) current.reminder.closed = true;
+      });
+    } finally {
+      closing.delete(key);
+    }
+  }
+
   async function fire(target: TurnFeedbackTarget, turnId: string): Promise<void> {
     const key = keyFor(target, turnId);
     timers.delete(key);
     const session = deps.read(target);
     const row = session.turnFeedback?.[turnId];
-    if (!row || row.silent || row.requesterIsBot !== false || !row.requesterOpenId
-      || row.phase !== 'capacity_waiting' || row.capacity?.state !== 'waiting') return;
+    if (!row
+      || (row.phase !== 'capacity_waiting' && row.phase !== 'capacity_stale')
+      || (row.capacity?.state !== 'waiting' && row.capacity?.state !== 'stale')) {
+      void closePublished(target, turnId);
+      return;
+    }
+    if (row.reminderSilent || row.requesterIsBot !== false || !row.requesterOpenId) return;
     const episodeKey = String(row.capacity.startedAtMs);
     if (row.reminder?.episodeKey === episodeKey
       && (row.reminder.messageId || row.reminder.status === 'ambiguous')) return;
     const uuid = `capacity-${createHash('sha256').update(`${key}:${episodeKey}`).digest('hex').slice(0, 40)}`;
-    deps.commit(fresh => {
+    deps.commit(target, fresh => {
       const current = fresh.turnFeedback?.[turnId];
       if (current?.capacity?.state === 'waiting'
         && String(current.capacity.startedAtMs) === episodeKey) {
@@ -43,7 +68,7 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
     });
     try {
       const messageId = await deps.send(target, row, uuid);
-      deps.commit(fresh => {
+      deps.commit(target, fresh => {
         const current = fresh.turnFeedback?.[turnId];
         if (current?.reminder?.uuid === uuid) {
           current.reminder = {
@@ -52,7 +77,7 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
         }
       });
     } catch {
-      deps.commit(fresh => {
+      deps.commit(target, fresh => {
         const current = fresh.turnFeedback?.[turnId];
         if (current?.reminder?.uuid === uuid) current.reminder.status = 'ambiguous';
       });
@@ -64,8 +89,13 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
     cancel(key);
     const session = deps.read(target);
     const row = session.turnFeedback?.[turnId];
-    if (!row || row.silent || row.requesterIsBot !== false || !row.requesterOpenId
-      || row.phase !== 'capacity_waiting' || row.capacity?.state !== 'waiting') return;
+    if (!row
+      || (row.phase !== 'capacity_waiting' && row.phase !== 'capacity_stale')
+      || (row.capacity?.state !== 'waiting' && row.capacity?.state !== 'stale')) {
+      void closePublished(target, turnId);
+      return;
+    }
+    if (row.reminderSilent || row.requesterIsBot !== false || !row.requesterOpenId) return;
     const episodeKey = String(row.capacity.startedAtMs);
     if (row.reminder?.episodeKey === episodeKey
       && (row.reminder.messageId || row.reminder.status === 'ambiguous')) return;

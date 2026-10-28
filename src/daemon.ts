@@ -130,6 +130,8 @@ import * as sessionStore from './services/session-store.js';
 import { createTurnFeedbackReconciler } from './services/turn-feedback-reconciler.js';
 import { createCapacitySidebandDirectoryConsumer, type CapacitySidebandKey } from './services/capacity-sideband-consumer.js';
 import { createCapacitySidebandRuntime } from './services/capacity-sideband-runtime.js';
+import { createCapacityWaitReminder } from './services/capacity-wait-reminder.js';
+import { createCapacityFeedbackProjection } from './services/capacity-feedback-projection.js';
 import { initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
 import { closeLinkRefRuntime, initializeLinkRefRuntime } from './services/link-ref-runtime.js';
 import { startDurableInboxShadowConsumer } from './services/durable-inbox-shadow-consumer.js';
@@ -4128,6 +4130,67 @@ const turnFeedbackReconciler = createTurnFeedbackReconciler({
 });
 export const __testOnly_turnFeedbackReconciler = turnFeedbackReconciler;
 
+const capacityWaitReminder = createCapacityWaitReminder({
+  read: target => sessionStore.getSessionFresh(target.session.sessionId) ?? target.session,
+  commit(target, mutate) {
+    const sessionId = target.session.sessionId;
+    sessionStore.mutateOwnedSessionsAtomically([sessionId], fresh => mutate(fresh.get(sessionId)!));
+  },
+  async send(target, row, uuid) {
+    const ds = findActiveBySessionId(target.session.sessionId);
+    if (!ds) throw new Error('capacity reminder session is not active');
+    void uuid;
+    if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL) {
+      throw new Error('capacity reminder has no patchable work card');
+    }
+    const messageId = ds.streamCardId;
+    await updateMessage(target.larkAppId, messageId, buildStreamingCardJson(ds), {
+      beforeWrite: () => {
+        const current = findActiveBySessionId(target.session.sessionId);
+        if (current !== ds || current.streamCardId !== messageId
+          || current.currentTurnId !== row.turnId) {
+          throw new Error('capacity reminder no longer owns the work card');
+        }
+      },
+    });
+    return messageId;
+  },
+  patch: async (target, _row, messageId) => {
+    const ds = findActiveBySessionId(target.session.sessionId);
+    if (!ds || ds.streamCardId !== messageId) return;
+    await updateMessage(target.larkAppId, messageId, buildStreamingCardJson(ds), {
+      beforeWrite: () => {
+        const current = findActiveBySessionId(target.session.sessionId);
+        if (current !== ds || current.streamCardId !== messageId
+          || current.currentTurnId !== _row.turnId) {
+          throw new Error('capacity reminder close no longer owns the work card');
+        }
+      },
+    });
+  },
+  now: () => Date.now(),
+  thresholds: { interactiveMs: 120_000, backgroundMs: 600_000 },
+});
+
+const capacityFeedbackProjection = createCapacityFeedbackProjection({
+  read: (target, turnId) => {
+    const row = (sessionStore.getSessionFresh(target.session.sessionId) ?? target.session)
+      .turnFeedback?.[turnId];
+    return row?.phase === 'capacity_waiting' || row?.phase === 'capacity_stale'
+      ? row.capacity
+      : undefined;
+  },
+  markStale: (target, turnId, observedAtMs, nowMs) =>
+    turnFeedbackReconciler.markCapacityStale(target, turnId, observedAtMs, nowMs),
+  patch(ds, turnId) {
+    scheduleCardPatch(ds, buildStreamingCardJson(ds), turnId);
+  },
+  reminderSync: (target, turnId) => capacityWaitReminder.sync(target, turnId),
+  now: () => Date.now(),
+  trailingMs: 15_000,
+  staleMs: 60_000,
+});
+
 function applyLiveTurnFeedbackTerminal(
   ds: DaemonSession,
   terminal: Pick<Extract<WorkerToDaemon, { type: 'turn_terminal' }>,
@@ -4141,6 +4204,7 @@ function applyLiveTurnFeedbackTerminal(
       terminal.completedAtMs,
     );
     if (changed) {
+      capacityFeedbackProjection.sync(ds, terminal.turnId);
       void turnFeedbackReconciler.reconcile(
         { session: ds.session, larkAppId: ds.larkAppId },
         terminal.turnId,
@@ -4213,7 +4277,10 @@ function startCapacitySidebandConsumer(ownerAppId: string): void {
       const changed = turnFeedbackReconciler.observeCapacity(
         { session: ds.session, larkAppId: ds.larkAppId }, binding.turnId, observation,
       );
-      if (changed) await turnFeedbackReconciler.reconcile(ds, binding.turnId);
+      if (changed) {
+        await turnFeedbackReconciler.reconcile(ds, binding.turnId);
+        capacityFeedbackProjection.sync(ds, binding.turnId);
+      }
       sessionStore.mutateOwnedSessionsAtomically([ds.session.sessionId], fresh => {
         const row = fresh.get(ds.session.sessionId)?.turnFeedback?.[binding.turnId];
         if (row) row.capacitySidebandCursor = {
@@ -4238,10 +4305,14 @@ export async function noteTurnReceived(
   ownedReplyAliasRoots?: readonly string[],
 ): Promise<void> {
   const turnId = _turnId ?? triggerMessageId;
-  const silent = !streamingCardDisabledFor(ds, turnId)
+  const reactionSilent = !streamingCardDisabledFor(ds, turnId)
     || silentTurnReactionsFor(ds)
     || (ds.session.vcMeetingReceiver
       && resolveVcMeetingImTurnOrigin(ds.session, triggerMessageId) !== undefined);
+  const background = turnId.startsWith('schedule:') || ds.chatId.startsWith('http_async_')
+    || ds.chatId.startsWith('http_wait_') || ds.chatId.startsWith('headless_');
+  const reminderSilent = isSilentScheduledTurn(ds, turnId)
+    || ds.session.vcMeetingReceiver !== undefined;
   // Durable admission is the synchronous linearization point. It must complete
   // before identity publication or any other await lets a second live-only turn
   // stage routing beside this one.
@@ -4256,7 +4327,9 @@ export async function noteTurnReceived(
       { session: ds.session, larkAppId: ds.larkAppId },
       {
         turnId, messageId: triggerMessageId, receivedReactionEmoji,
-        ...(silent ? { silent: true } : {}),
+        ...(reactionSilent ? { reactionSilent: true } : {}),
+        ...(reminderSilent ? { reminderSilent: true } : {}),
+        ...(background ? { background: true } : {}),
         ownedReplyAliasRoots,
       },
     );
@@ -31096,6 +31169,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           },
         );
         if (changed) {
+          capacityFeedbackProjection.sync(ds, observation.turnId);
           void turnFeedbackReconciler.reconcile(
             { session: ds.session, larkAppId: ds.larkAppId },
             observation.turnId,
@@ -32450,6 +32524,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     driveRestoredXpiGroup: groupId => { void driveNextXpiSharedCwdTurn(groupId); },
     driveRestoredPrincipalLane: ds => { driveNextPrincipalLaneTurn(ds); },
   });
+  capacityFeedbackProjection.restore(activeSessions.values());
   // Completion Proposal may resume an accepted pending decision immediately.
   // Schedule it only after restore populated activeSessions; doing this before
   // the awaited startup I/O deterministically marks every pending record failed.

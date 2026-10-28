@@ -1318,6 +1318,24 @@ describe('buildStreamingCard', () => {
   // ── Header / status / template color ───────────────────────────────────
 
   describe('header status and color', () => {
+    it('renders one stable capacity wait status element without replacing the process header', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'working', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, {
+          capacityWait: { state: 'waiting', position: 3, ageMs: 125_000 },
+        } as any,
+      ));
+      const status = card.elements.filter(
+        (element: any) => element.element_id === 'capacity_wait_status',
+      );
+      expect(status).toHaveLength(1);
+      expect(status[0].content).toContain('等待模型容量');
+      expect(status[0].content).toContain('3');
+      expect(status[0].content).toContain('2 分钟');
+      expect(card.header.title.content).toContain('工作中');
+    });
+
     it('should show yellow template and "启动中..." for starting status', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'starting'));
       expect(card.header.template).toBe('yellow');

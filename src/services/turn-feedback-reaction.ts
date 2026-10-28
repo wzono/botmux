@@ -23,7 +23,7 @@ export function desiredReaction(
   record: PersistedTurnFeedback,
   policy: TurnReactionPolicy,
 ): string | undefined {
-  if (policy.silent || record.silent || record.reactionMessageGone) return undefined;
+  if (policy.silent || record.reactionSilent || record.reactionMessageGone) return undefined;
   if (record.phase === 'processing' && record.receivedReactionEmoji) {
     return record.receivedReactionEmoji;
   }

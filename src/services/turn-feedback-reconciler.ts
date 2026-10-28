@@ -40,7 +40,8 @@ export interface TurnFeedbackAdmission {
   turnId: string;
   messageId?: string;
   receivedReactionEmoji?: string;
-  silent?: boolean;
+  reactionSilent?: boolean;
+  reminderSilent?: boolean;
   background?: boolean;
   /** Daemon-derived folded roots created for this exact turn immediately before admission. */
   ownedReplyAliasRoots?: readonly string[];
@@ -557,7 +558,8 @@ export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
           ...(input.receivedReactionEmoji === undefined
             ? {}
             : { receivedReactionEmoji: input.receivedReactionEmoji }),
-          ...(input.silent === undefined ? {} : { silent: input.silent }),
+          ...(input.reactionSilent === undefined ? {} : { reactionSilent: input.reactionSilent }),
+          ...(input.reminderSilent === undefined ? {} : { reminderSilent: input.reminderSilent }),
           ...(input.background === undefined ? {} : { background: input.background }),
         };
         return;
@@ -583,7 +585,8 @@ export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
         existing.requesterIsBot = requester.requesterIsBot;
       }
       existing.receivedReactionEmoji ??= input.receivedReactionEmoji;
-      existing.silent ??= input.silent;
+      existing.reactionSilent ??= input.reactionSilent;
+      existing.reminderSilent ??= input.reminderSilent;
       existing.background ??= input.background;
     });
   }
@@ -615,6 +618,27 @@ export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
         nowIso: new Date(deps.now()).toISOString(),
       });
       if (plan.action === 'persist_intent') record.reactionIntent = plan.intent;
+      changed = true;
+    });
+    return changed;
+  }
+  function markCapacityStale(
+    target: TurnFeedbackTarget,
+    turnId: string,
+    observedAtMs: number,
+    nowMs: number,
+  ): boolean {
+    let changed = false;
+    deps.commit(target, fresh => {
+      const record = fresh.turnFeedback?.[turnId];
+      if (!record) return;
+      const next = reduceTurnFeedback({
+        phase: record.phase, updatedAtMs: Date.parse(record.updatedAt), capacity: record.capacity,
+      }, { type: 'stale', observedAtMs, nowMs });
+      if (next.phase === record.phase && next.capacity === record.capacity) return;
+      record.phase = next.phase;
+      record.updatedAt = new Date(next.updatedAtMs).toISOString();
+      record.capacity = next.capacity;
       changed = true;
     });
     return changed;
@@ -667,7 +691,7 @@ export function createTurnFeedbackReconciler(deps: TurnFeedbackDeps) {
   }
 
   return {
-    admit, observeCapacity, observeAttention, terminal, disableCapacity, restore,
+    admit, observeCapacity, markCapacityStale, observeAttention, terminal, disableCapacity, restore,
     reconcile, scheduleReactionRepair, dispose,
   };
 }

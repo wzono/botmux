@@ -558,7 +558,8 @@ export interface PersistedTurnFeedback {
     dispatchAttempt: number;
     workerGeneration: number;
   };
-  silent?: boolean;
+  reactionSilent?: boolean;
+  reminderSilent?: boolean;
   background?: boolean;
 }
 

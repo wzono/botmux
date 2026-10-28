@@ -28,7 +28,7 @@ describe('pure turn reaction convergence', () => {
   it('maps feedback phase through policy and respects silent turns', () => {
     expect(desiredReaction(row({ phase: 'capacity_waiting' }), policy)).toBe('Coffee');
     expect(desiredReaction(row({ phase: 'processing', receivedReactionEmoji: 'Get' }), policy)).toBe('Get');
-    expect(desiredReaction(row({ silent: true }), policy)).toBeUndefined();
+    expect(desiredReaction(row({ reactionSilent: true }), policy)).toBeUndefined();
   });
 
   it('persists an immutable observe intent before any provider action', () => {
