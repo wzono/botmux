@@ -20,6 +20,7 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
   const inFlight = new Set<string>();
   const rerunRequested = new Set<string>();
   const closing = new Set<string>();
+  const intentFailures = new Map<string, number>();
   const keyFor = (target: TurnFeedbackTarget, turnId: string) =>
     JSON.stringify([target.larkAppId, target.session.sessionId, turnId]);
 
@@ -75,9 +76,12 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
         }
       });
     } catch {
-      scheduleCloseRetry(target, turnId, closeRetryDelay(currentAttempt));
+      const failures = (intentFailures.get(key) ?? 0) + 1;
+      intentFailures.set(key, failures);
+      if (failures < MAX_CLOSE_ATTEMPTS) scheduleCloseRetry(target, turnId, closeRetryDelay(failures));
       return;
     }
+    intentFailures.delete(key);
     closing.add(key);
     try {
       const outcome = await deps.patch(target, row, messageId);
@@ -222,6 +226,7 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
     for (const timer of closeTimers.values()) clearTimeout(timer);
     timers.clear();
     closeTimers.clear();
+    intentFailures.clear();
   }
 
   function restore(targets: Iterable<TurnFeedbackTarget>): void {
