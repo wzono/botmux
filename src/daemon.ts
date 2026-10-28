@@ -134,6 +134,10 @@ import { createCapacityRolloutStore, type CapacityRolloutAdapter } from './servi
 import { createCapacityRolloutWatcher } from './services/capacity-rollout-watcher.js';
 import { appendCapacityAuditRecord, capacityEpisodeId } from './services/capacity-wait-audit.js';
 import { createCapacityWaitReminder } from './services/capacity-wait-reminder.js';
+import {
+  createCapacityAskFeedbackLifecycle,
+  ownsCapacityAskFeedback,
+} from './services/capacity-ask-feedback.js';
 import { createCapacityFeedbackProjection } from './services/capacity-feedback-projection.js';
 import { initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
 import { closeLinkRefRuntime, initializeLinkRefRuntime } from './services/link-ref-runtime.js';
@@ -9256,11 +9260,6 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
   };
   const managedExplicit = askInput.originKind === 'explicit' && !!askInput.requestId && !!askSession;
   const explicitInput = { ...askInput, originKind: 'host_explicit', requestId: askInput.requestId! };
-  if (body.acknowledge === true) {
-    if (!managedExplicit) return jsonRes(res, 400, { error: 'invalid_acknowledgement' });
-    const result = explicitAskContinuation.acknowledge(explicitInput);
-    return result ? jsonRes(res, 200, result) : jsonRes(res, 409, { error: 'ask_result_not_ready' });
-  }
   const askTurnId = typeof body.originTurnId === 'string'
     ? body.originTurnId
     : askSession?.currentTurnId;
@@ -9268,93 +9267,58 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     && Number.isSafeInteger(body.originDispatchAttempt)
     ? body.originDispatchAttempt
     : undefined;
-  const liveAttempt = askSession && askTurnId
-    && askSession.turnDispatchAttemptHighWater?.turnId === askTurnId
-      ? askSession.turnDispatchAttemptHighWater.dispatchAttempt
-      : askSession?.managedTurnOrigin?.turnId === askTurnId
-        ? askSession?.managedTurnOrigin?.dispatchAttempt
-        : undefined;
-  const askFeedbackOwned = !!askSession && !!askTurnId
-    && sessionStore.ownsSessionForMutation(askSession.session)
-    && askSession.currentTurnId === askTurnId
-    && (claimedAttempt === undefined || liveAttempt !== undefined && claimedAttempt === liveAttempt);
-  if (askFeedbackOwned) {
-    try {
-      const changed = turnFeedbackReconciler.observeAttention(
-        { session: askSession.session, larkAppId: askSession.larkAppId }, askTurnId!, Date.now(),
-      );
-      if (changed) {
-        capacityFeedbackProjection.sync(askSession, askTurnId!);
-        void turnFeedbackReconciler.reconcile(askSession, askTurnId!);
-      }
-    } catch (error) {
-      logger.warn(`[capacity] ask attention projection failed: ${String(error)}`);
+  let ownsAskSession = false;
+  if (askSession && askTurnId) {
+    try { ownsAskSession = sessionStore.ownsSessionForMutation(askSession.session); }
+    catch (error) { logger.warn(`[capacity] ask ownership check failed: ${String(error)}`); }
+  }
+  const askFeedbackOwned = !!askSession && !!askTurnId && ownsCapacityAskFeedback({
+    ownsSession: ownsAskSession,
+    currentTurnId: askSession.currentTurnId,
+    claimedTurnId: askTurnId,
+    claimedDispatchAttempt: claimedAttempt,
+    dispatchHighWater: askSession.turnDispatchAttemptHighWater,
+    managedTurnOrigin: askSession.managedTurnOrigin,
+  });
+  const transitionAskFeedback = (transition: 'observeAttention' | 'resumeAttention') => {
+    if (!askFeedbackOwned) return;
+    const changed = turnFeedbackReconciler[transition](
+      { session: askSession!.session, larkAppId: askSession!.larkAppId }, askTurnId!, Date.now(),
+    );
+    if (changed) {
+      capacityFeedbackProjection.sync(askSession!, askTurnId!);
+      void turnFeedbackReconciler.reconcile(askSession!, askTurnId!);
     }
+  };
+  const askFeedback = createCapacityAskFeedbackLifecycle({
+    owned: askFeedbackOwned,
+    observe: () => transitionAskFeedback('observeAttention'),
+    resume: () => transitionAskFeedback('resumeAttention'),
+    onTransitionError: error => logger.warn(`[capacity] ask feedback projection failed: ${String(error)}`),
+  });
+  if (body.acknowledge === true) {
+    if (!managedExplicit) return jsonRes(res, 400, { error: 'invalid_acknowledgement' });
+    const result = askFeedback.acknowledge(() => explicitAskContinuation.acknowledge(explicitInput));
+    return result ? jsonRes(res, 200, result) : jsonRes(res, 409, { error: 'ask_result_not_ready' });
   }
   if (managedExplicit && explicitInput.timeoutMs === null) {
     void explicitAskContinuation.wait(explicitInput).catch(error => {
       logger.warn(`[ask-continuation] ${error instanceof Error ? error.message : String(error)}`);
     });
     try {
-      const delivery = await waitForAskDelivery(explicitInput);
+      const delivery = await askFeedback.pending(() => waitForAskDelivery(explicitInput));
       return jsonRes(res, 200, {
         kind: 'pending', requestId: explicitInput.requestId,
         askId: delivery.askId, messageId: delivery.messageId, pending: true,
       });
     } catch (error) {
-      if (askFeedbackOwned) {
-        try {
-          const changed = turnFeedbackReconciler.resumeAttention(
-            { session: askSession!.session, larkAppId: askSession!.larkAppId }, askTurnId!, Date.now(),
-          );
-          if (changed) {
-            capacityFeedbackProjection.sync(askSession!, askTurnId!);
-            void turnFeedbackReconciler.reconcile(askSession!, askTurnId!);
-          }
-        } catch (resumeError) {
-          logger.warn(`[capacity] ask delivery failure resume failed: ${String(resumeError)}`);
-        }
-      }
       return jsonRes(res, 500, { error: error instanceof Error ? error.message : String(error) });
     }
   }
-  let result: Awaited<ReturnType<typeof registerAskForResponse>>;
-  try {
-    result = managedExplicit
-      ? await explicitAskContinuation.wait(explicitInput)
-      : await registerAskForResponse(askInput, res);
-  } catch (error) {
-    if (askFeedbackOwned) {
-      try {
-        const changed = turnFeedbackReconciler.resumeAttention(
-          { session: askSession!.session, larkAppId: askSession!.larkAppId }, askTurnId!, Date.now(),
-        );
-        if (changed) {
-          capacityFeedbackProjection.sync(askSession!, askTurnId!);
-          void turnFeedbackReconciler.reconcile(askSession!, askTurnId!);
-        }
-      } catch (resumeError) {
-        logger.warn(`[capacity] ask failure resume projection failed: ${String(resumeError)}`);
-      }
-    }
-    throw error;
-  }
+  const result = await askFeedback.settled(() => managedExplicit
+    ? explicitAskContinuation.wait(explicitInput)
+    : registerAskForResponse(askInput, res));
   if (res.destroyed) return;
-  {
-    if (askFeedbackOwned) {
-      try {
-        const changed = turnFeedbackReconciler.resumeAttention(
-          { session: askSession!.session, larkAppId: askSession!.larkAppId }, askTurnId!, Date.now(),
-        );
-        if (changed) {
-          capacityFeedbackProjection.sync(askSession!, askTurnId!);
-          void turnFeedbackReconciler.reconcile(askSession!, askTurnId!);
-        }
-      } catch (error) {
-        logger.warn(`[capacity] ask resume projection failed: ${String(error)}`);
-      }
-    }
-  }
 
   if (asyncInput && askSession && result.kind === 'answered') {
     const isCurrent = () => findActiveBySessionId(boundAsk.sessionId) === askSession

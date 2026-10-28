@@ -137,6 +137,33 @@ describe('capacity wait reminder', () => {
     expect(h.row.reminder).toMatchObject({ episodeKey: String(START + 1), messageId: 'om_new' });
   });
 
+  it('closes a late work card after the turn becomes terminal during send', async () => {
+    const h = harness();
+    let release!: () => void;
+    let entered!: () => void;
+    const sendEntered = new Promise<void>(resolve => { entered = resolve; });
+    h.send.mockImplementation(async () => {
+      entered();
+      await new Promise<void>(resolve => { release = resolve; });
+      return 'om_late_work_card';
+    });
+    h.reminder.sync(h.target, 'turn-a');
+    h.setNow(START + 120_000);
+    await vi.advanceTimersByTimeAsync(120_000);
+    await sendEntered;
+
+    h.row.phase = 'completed';
+    delete h.row.capacity;
+    h.reminder.sync(h.target, 'turn-a');
+    release();
+    await vi.runAllTimersAsync();
+
+    expect(h.send).toHaveBeenCalledTimes(1);
+    expect(h.patch).toHaveBeenCalledTimes(1);
+    expect(h.patch).toHaveBeenCalledWith(h.target, h.row, 'om_late_work_card');
+    expect(h.row.reminder).toMatchObject({ messageId: 'om_late_work_card', closed: true });
+  });
+
   it('patches the same work card and records closure when the episode clears', async () => {
     const h = harness();
     h.row.reminder = {
