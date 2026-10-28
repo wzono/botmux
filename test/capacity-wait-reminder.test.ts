@@ -113,6 +113,31 @@ describe('capacity wait reminder', () => {
     await vi.runAllTimersAsync();
   });
 
+  it('allows a newer episode to proceed while an older episode receipt is in flight', async () => {
+    const h = harness();
+    let release!: () => void;
+    let entered!: () => void;
+    const firstEntered = new Promise<void>(resolve => { entered = resolve; });
+    h.send.mockImplementationOnce(async () => {
+      entered();
+      await new Promise<void>(resolve => { release = resolve; });
+      return 'om_old';
+    }).mockResolvedValueOnce('om_new');
+    h.reminder.sync(h.target, 'turn-a'); h.setNow(START + 120_000);
+    await vi.advanceTimersByTimeAsync(120_000);
+    await firstEntered;
+    h.row.capacity = { state: 'waiting', source: 'pty', startedAtMs: START + 1, updatedAtMs: START + 1 };
+    h.setNow(START + 120_001);
+
+    h.reminder.sync(h.target, 'turn-a');
+    await vi.advanceTimersByTimeAsync(120_000);
+
+    expect(h.send).toHaveBeenCalledTimes(2);
+    release();
+    await vi.runAllTimersAsync();
+    expect(h.row.reminder).toMatchObject({ episodeKey: String(START + 1), messageId: 'om_new' });
+  });
+
   it('patches the same work card and records closure when the episode clears', async () => {
     const h = harness();
     h.row.reminder = {

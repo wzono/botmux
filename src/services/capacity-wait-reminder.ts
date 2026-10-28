@@ -13,7 +13,7 @@ export interface CapacityReminderDeps {
 
 export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
   const timers = new Map<string, ReturnType<typeof setTimeout>>();
-  const inFlight = new Set<string>();
+  const inFlight = new Map<string, Set<string>>();
   const closing = new Set<string>();
   const keyFor = (target: TurnFeedbackTarget, turnId: string) =>
     JSON.stringify([target.larkAppId, target.session.sessionId, turnId]);
@@ -26,7 +26,7 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
 
   async function closePublished(target: TurnFeedbackTarget, turnId: string): Promise<void> {
     const key = keyFor(target, turnId);
-    if (inFlight.has(key)) return;
+    if ((inFlight.get(key)?.size ?? 0) > 0) return;
     if (closing.has(key)) return;
     const row = deps.read(target).turnFeedback?.[turnId];
     const messageId = row?.reminder?.messageId;
@@ -46,7 +46,6 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
   async function fire(target: TurnFeedbackTarget, turnId: string): Promise<void> {
     const key = keyFor(target, turnId);
     timers.delete(key);
-    if (inFlight.has(key)) return;
     const session = deps.read(target);
     const row = session.turnFeedback?.[turnId];
     if (!row
@@ -57,6 +56,7 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
     }
     if (row.reminderSilent || row.requesterIsBot !== false || !row.requesterOpenId) return;
     const episodeKey = String(row.capacity.startedAtMs);
+    if (inFlight.get(key)?.has(episodeKey)) return;
     if (row.reminder?.episodeKey === episodeKey
       && (row.reminder.messageId || row.reminder.status === 'ambiguous')) return;
     const uuid = `capacity-${createHash('sha256').update(`${key}:${episodeKey}`).digest('hex').slice(0, 40)}`;
@@ -71,7 +71,9 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
     });
     const persisted = deps.read(target).turnFeedback?.[turnId]?.reminder;
     if (persisted?.uuid !== uuid || persisted.status !== 'pending') return;
-    inFlight.add(key);
+    const episodes = inFlight.get(key) ?? new Set<string>();
+    episodes.add(episodeKey);
+    inFlight.set(key, episodes);
     try {
       const messageId = await deps.send(target, row, uuid);
       deps.commit(target, fresh => {
@@ -88,14 +90,14 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
         if (current?.reminder?.uuid === uuid) current.reminder.status = 'ambiguous';
       });
     } finally {
-      inFlight.delete(key);
+      episodes.delete(episodeKey);
+      if (episodes.size === 0) inFlight.delete(key);
     }
   }
 
   function sync(target: TurnFeedbackTarget, turnId: string): void {
     const key = keyFor(target, turnId);
     cancel(key);
-    if (inFlight.has(key)) return;
     const session = deps.read(target);
     const row = session.turnFeedback?.[turnId];
     if (!row
@@ -106,6 +108,7 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
     }
     if (row.reminderSilent || row.requesterIsBot !== false || !row.requesterOpenId) return;
     const episodeKey = String(row.capacity.startedAtMs);
+    if (inFlight.get(key)?.has(episodeKey)) return;
     if (row.reminder?.episodeKey === episodeKey
       && (row.reminder.messageId || row.reminder.status === 'ambiguous')) return;
     const thresholds = deps.thresholds(target);

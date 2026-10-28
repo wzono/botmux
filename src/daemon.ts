@@ -9261,20 +9261,6 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     const result = explicitAskContinuation.acknowledge(explicitInput);
     return result ? jsonRes(res, 200, result) : jsonRes(res, 409, { error: 'ask_result_not_ready' });
   }
-  if (managedExplicit && explicitInput.timeoutMs === null) {
-    void explicitAskContinuation.wait(explicitInput).catch(error => {
-      logger.warn(`[ask-continuation] ${error instanceof Error ? error.message : String(error)}`);
-    });
-    try {
-      const delivery = await waitForAskDelivery(explicitInput);
-      return jsonRes(res, 200, {
-        kind: 'pending', requestId: explicitInput.requestId,
-        askId: delivery.askId, messageId: delivery.messageId, pending: true,
-      });
-    } catch (error) {
-      return jsonRes(res, 500, { error: error instanceof Error ? error.message : String(error) });
-    }
-  }
   const askTurnId = typeof body.originTurnId === 'string'
     ? body.originTurnId
     : askSession?.currentTurnId;
@@ -9302,6 +9288,20 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
       }
     } catch (error) {
       logger.warn(`[capacity] ask attention projection failed: ${String(error)}`);
+    }
+  }
+  if (managedExplicit && explicitInput.timeoutMs === null) {
+    void explicitAskContinuation.wait(explicitInput).catch(error => {
+      logger.warn(`[ask-continuation] ${error instanceof Error ? error.message : String(error)}`);
+    });
+    try {
+      const delivery = await waitForAskDelivery(explicitInput);
+      return jsonRes(res, 200, {
+        kind: 'pending', requestId: explicitInput.requestId,
+        askId: delivery.askId, messageId: delivery.messageId, pending: true,
+      });
+    } catch (error) {
+      return jsonRes(res, 500, { error: error instanceof Error ? error.message : String(error) });
     }
   }
   const result = managedExplicit
