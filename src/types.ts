@@ -539,6 +539,8 @@ export interface PersistedTurnFeedback {
     episodeKey?: string;
     status?: 'pending' | 'sent' | 'ambiguous';
     attemptedAt?: string;
+    closeStatus?: 'pending' | 'ambiguous';
+    closeAttemptedAt?: string;
     closed?: true;
   };
   /** Last daemon-committed signed v3 event for replay protection. */

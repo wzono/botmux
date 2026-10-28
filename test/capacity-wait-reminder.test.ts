@@ -181,4 +181,38 @@ describe('capacity wait reminder', () => {
     expect(h.send).not.toHaveBeenCalled();
     expect(h.row.reminder).toMatchObject({ messageId: 'om_work_card', closed: true });
   });
+
+  it('restores a terminal reminder close obligation after restart', async () => {
+    const h = harness();
+    h.row.phase = 'completed';
+    delete h.row.capacity;
+    h.row.reminder = {
+      episodeKey: String(START), uuid: 'capacity-terminal', status: 'sent',
+      messageId: 'om_work_card', sentAt: new Date(START).toISOString(),
+    };
+
+    h.reminder.restore([h.target]);
+    await vi.waitFor(() => expect(h.patch).toHaveBeenCalledTimes(1));
+
+    expect(h.row.reminder).toMatchObject({ messageId: 'om_work_card', closed: true });
+  });
+
+  it('persists and retries a failed terminal reminder close', async () => {
+    const h = harness();
+    h.row.phase = 'completed';
+    delete h.row.capacity;
+    h.row.reminder = {
+      episodeKey: String(START), uuid: 'capacity-terminal', status: 'sent',
+      messageId: 'om_work_card', sentAt: new Date(START).toISOString(),
+    };
+    h.patch.mockRejectedValueOnce(new Error('transient patch failure'));
+
+    h.reminder.restore([h.target]);
+    await vi.waitFor(() => expect(h.patch).toHaveBeenCalledTimes(1));
+    expect(h.row.reminder).toMatchObject({ closeStatus: 'ambiguous' });
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.waitFor(() => expect(h.patch).toHaveBeenCalledTimes(2));
+    expect(h.row.reminder).toMatchObject({ closed: true });
+  });
 });

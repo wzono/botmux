@@ -6,6 +6,8 @@ import {
 
 const currentOrigin = {
   ownsSession: true,
+  currentWorkerGeneration: 3,
+  liveWorkerGeneration: 3,
   currentTurnId: 'turn-new',
   claimedTurnId: 'turn-new',
   claimedDispatchAttempt: 2,
@@ -18,7 +20,7 @@ function harness(origin = currentOrigin) {
   const resume = vi.fn();
   const onTransitionError = vi.fn();
   const lifecycle = createCapacityAskFeedbackLifecycle({
-    owned: ownsCapacityAskFeedback(origin),
+    owns: () => ownsCapacityAskFeedback(origin),
     observe,
     resume,
     onTransitionError,
@@ -81,6 +83,28 @@ describe('capacity Ask feedback lifecycle', () => {
       .toEqual({ kind: 'answered' });
 
     expect(h.resume).not.toHaveBeenCalled();
+  });
+
+  it('does not resume when worker generation changes while the Ask is waiting', async () => {
+    let live = { ...currentOrigin, currentWorkerGeneration: 3, liveWorkerGeneration: 3 };
+    let release!: () => void;
+    const resume = vi.fn();
+    const lifecycle = createCapacityAskFeedbackLifecycle({
+      owns: () => ownsCapacityAskFeedback(live),
+      observe: vi.fn(),
+      resume,
+      onTransitionError: vi.fn(),
+    });
+
+    const waiting = lifecycle.settled(async () => {
+      await new Promise<void>(resolve => { release = resolve; });
+      return { kind: 'answered' as const };
+    });
+    live = { ...live, liveWorkerGeneration: 4 };
+    release();
+    await waiting;
+
+    expect(resume).not.toHaveBeenCalled();
   });
 
   it('retains needs_user when an acknowledgement has no settled result', () => {

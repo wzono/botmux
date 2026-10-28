@@ -9267,21 +9267,26 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     && Number.isSafeInteger(body.originDispatchAttempt)
     ? body.originDispatchAttempt
     : undefined;
-  let ownsAskSession = false;
-  if (askSession && askTurnId) {
-    try { ownsAskSession = sessionStore.ownsSessionForMutation(askSession.session); }
+  const askWorkerGeneration = askSession?.workerGeneration ?? askSession?.session.workerGeneration;
+  const ownsAskFeedback = () => {
+    if (!askSession || !askTurnId) return false;
+    let ownsSession = false;
+    try { ownsSession = sessionStore.ownsSessionForMutation(askSession.session); }
     catch (error) { logger.warn(`[capacity] ask ownership check failed: ${String(error)}`); }
-  }
-  const askFeedbackOwned = !!askSession && !!askTurnId && ownsCapacityAskFeedback({
-    ownsSession: ownsAskSession,
-    currentTurnId: askSession.currentTurnId,
-    claimedTurnId: askTurnId,
-    claimedDispatchAttempt: claimedAttempt,
-    dispatchHighWater: askSession.turnDispatchAttemptHighWater,
-    managedTurnOrigin: askSession.managedTurnOrigin,
-  });
+    return findActiveBySessionId(askSession.session.sessionId) === askSession
+      && ownsCapacityAskFeedback({
+        ownsSession,
+        currentTurnId: askSession.currentTurnId,
+        claimedTurnId: askTurnId,
+        claimedDispatchAttempt: claimedAttempt,
+        currentWorkerGeneration: askWorkerGeneration,
+        liveWorkerGeneration: askSession.workerGeneration ?? askSession.session.workerGeneration,
+        dispatchHighWater: askSession.turnDispatchAttemptHighWater,
+        managedTurnOrigin: askSession.managedTurnOrigin,
+      });
+  };
   const transitionAskFeedback = (transition: 'observeAttention' | 'resumeAttention') => {
-    if (!askFeedbackOwned) return;
+    if (!ownsAskFeedback()) return;
     const changed = turnFeedbackReconciler[transition](
       { session: askSession!.session, larkAppId: askSession!.larkAppId }, askTurnId!, Date.now(),
     );
@@ -9291,7 +9296,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     }
   };
   const askFeedback = createCapacityAskFeedbackLifecycle({
-    owned: askFeedbackOwned,
+    owns: ownsAskFeedback,
     observe: () => transitionAskFeedback('observeAttention'),
     resume: () => transitionAskFeedback('resumeAttention'),
     onTransitionError: error => logger.warn(`[capacity] ask feedback projection failed: ${String(error)}`),
@@ -32814,6 +32819,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   startCapacitySidebandConsumer(cfg.larkAppId);
   startCapacityRolloutPolicyWatcher(cfg.larkAppId);
   capacityFeedbackProjection.restore(activeSessions.values());
+  capacityWaitReminder.restore([...activeSessions.values()].map(ds => ({
+    session: ds.session, larkAppId: ds.larkAppId,
+  })));
   // Completion Proposal may resume an accepted pending decision immediately.
   // Schedule it only after restore populated activeSessions; doing this before
   // the awaited startup I/O deterministically marks every pending record failed.

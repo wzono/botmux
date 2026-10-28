@@ -1,5 +1,7 @@
 export interface CapacityAskFeedbackOrigin {
   ownsSession: boolean;
+  currentWorkerGeneration?: number;
+  liveWorkerGeneration?: number;
   currentTurnId?: string;
   claimedTurnId?: string;
   claimedDispatchAttempt?: number;
@@ -9,7 +11,9 @@ export interface CapacityAskFeedbackOrigin {
 
 export function ownsCapacityAskFeedback(origin: CapacityAskFeedbackOrigin): boolean {
   if (!origin.ownsSession || !origin.claimedTurnId
-    || origin.currentTurnId !== origin.claimedTurnId) return false;
+    || origin.currentTurnId !== origin.claimedTurnId
+    || origin.currentWorkerGeneration === undefined
+    || origin.liveWorkerGeneration !== origin.currentWorkerGeneration) return false;
   const liveAttempt = origin.dispatchHighWater?.turnId === origin.claimedTurnId
     ? origin.dispatchHighWater.dispatchAttempt
     : origin.managedTurnOrigin?.turnId === origin.claimedTurnId
@@ -20,17 +24,17 @@ export function ownsCapacityAskFeedback(origin: CapacityAskFeedbackOrigin): bool
 }
 
 export function createCapacityAskFeedbackLifecycle(deps: {
-  owned: boolean;
+  owns(): boolean;
   observe(): void;
   resume(): void;
   onTransitionError(error: unknown): void;
 }) {
   const observe = () => {
-    if (!deps.owned) return;
+    if (!deps.owns()) return;
     try { deps.observe(); } catch (error) { deps.onTransitionError(error); }
   };
   const resume = () => {
-    if (!deps.owned) return;
+    if (!deps.owns()) return;
     try { deps.resume(); } catch (error) { deps.onTransitionError(error); }
   };
 
