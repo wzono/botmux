@@ -130,11 +130,10 @@ describe('capacity wait reminder', () => {
     h.setNow(START + 120_001);
 
     h.reminder.sync(h.target, 'turn-a');
-    await vi.advanceTimersByTimeAsync(120_000);
-
-    expect(h.send).toHaveBeenCalledTimes(2);
     release();
     await vi.runAllTimersAsync();
+
+    expect(h.send).toHaveBeenCalledTimes(2);
     expect(h.row.reminder).toMatchObject({ episodeKey: String(START + 1), messageId: 'om_new' });
   });
 

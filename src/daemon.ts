@@ -9276,7 +9276,8 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
         : undefined;
   const askFeedbackOwned = !!askSession && !!askTurnId
     && sessionStore.ownsSessionForMutation(askSession.session)
-    && (claimedAttempt === undefined || liveAttempt === undefined || claimedAttempt === liveAttempt);
+    && askSession.currentTurnId === askTurnId
+    && (claimedAttempt === undefined || liveAttempt !== undefined && claimedAttempt === liveAttempt);
   if (askFeedbackOwned) {
     try {
       const changed = turnFeedbackReconciler.observeAttention(
@@ -9301,12 +9302,43 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
         askId: delivery.askId, messageId: delivery.messageId, pending: true,
       });
     } catch (error) {
+      if (askFeedbackOwned) {
+        try {
+          const changed = turnFeedbackReconciler.resumeAttention(
+            { session: askSession!.session, larkAppId: askSession!.larkAppId }, askTurnId!, Date.now(),
+          );
+          if (changed) {
+            capacityFeedbackProjection.sync(askSession!, askTurnId!);
+            void turnFeedbackReconciler.reconcile(askSession!, askTurnId!);
+          }
+        } catch (resumeError) {
+          logger.warn(`[capacity] ask delivery failure resume failed: ${String(resumeError)}`);
+        }
+      }
       return jsonRes(res, 500, { error: error instanceof Error ? error.message : String(error) });
     }
   }
-  const result = managedExplicit
-    ? await explicitAskContinuation.wait(explicitInput)
-    : await registerAskForResponse(askInput, res);
+  let result: Awaited<ReturnType<typeof registerAskForResponse>>;
+  try {
+    result = managedExplicit
+      ? await explicitAskContinuation.wait(explicitInput)
+      : await registerAskForResponse(askInput, res);
+  } catch (error) {
+    if (askFeedbackOwned) {
+      try {
+        const changed = turnFeedbackReconciler.resumeAttention(
+          { session: askSession!.session, larkAppId: askSession!.larkAppId }, askTurnId!, Date.now(),
+        );
+        if (changed) {
+          capacityFeedbackProjection.sync(askSession!, askTurnId!);
+          void turnFeedbackReconciler.reconcile(askSession!, askTurnId!);
+        }
+      } catch (resumeError) {
+        logger.warn(`[capacity] ask failure resume projection failed: ${String(resumeError)}`);
+      }
+    }
+    throw error;
+  }
   if (res.destroyed) return;
   {
     if (askFeedbackOwned) {
