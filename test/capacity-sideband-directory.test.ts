@@ -1,11 +1,13 @@
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { chmodSync, mkdirSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { spawn } from 'node:child_process';
 import { describe, expect, it, vi } from 'vitest';
 import {
   createCapacitySidebandDirectoryConsumer,
   type CapacitySidebandEventV3,
 } from '../src/services/capacity-sideband-consumer.js';
+import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 
 const KEYS = generateKeyPairSync('ed25519');
 const PUBLIC = KEYS.publicKey.export({ format: 'der', type: 'spki' });
@@ -193,6 +195,32 @@ describe('owner directory capacity sideband consumer', () => {
     await expect(consumer.poll()).resolves.toBe(0);
     expect(observe).not.toHaveBeenCalled();
     expect(readdirSync(ownerDirectory)).toContain(`live.json.claim-${process.pid}`);
+  });
+
+  it('recovers a generation-scoped claim after its owner process exits', async () => {
+    const { root, ownerDirectory } = fixture();
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' });
+    let generation: string | undefined;
+    for (let index = 0; index < 100 && !generation; index++) {
+      generation = readProcessStartIdentity(child.pid!);
+      if (!generation) await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    expect(generation).toBeTruthy();
+    const claim = `dead.json.claim-${child.pid}-${generation}`;
+    writeFileSync(join(ownerDirectory, claim), JSON.stringify(event()), { mode: 0o600 });
+    child.kill();
+    await new Promise(resolve => child.once('exit', resolve));
+    const observe = vi.fn();
+    const consumer = createCapacitySidebandDirectoryConsumer({
+      root, ownerAppId: 'cli_test', keyring: [{ keyId: KEY_ID, publicKeyDer: PUBLIC, minEpoch: 1, maxEpoch: 1 }],
+      now: () => Date.parse(AT),
+      resolve: () => ({ sessionId: 'session-a', turnId: 'turn-a', dispatchAttempt: 2, workerGeneration: 3 }),
+      observe,
+    });
+
+    consumer.retryPending();
+    await expect(consumer.poll()).resolves.toBe(1);
+    expect(observe).toHaveBeenCalledTimes(1);
   });
 
   it('ignores checkpoint metadata on subsequent empty polls', async () => {

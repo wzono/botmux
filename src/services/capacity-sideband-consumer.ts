@@ -148,7 +148,12 @@ export function createCapacitySidebandDirectoryConsumer(deps: CapacitySidebandDi
       if (Number.isSafeInteger(pid) && pid > 1) {
         if (generation && generation !== 'unknown') {
           const current = readProcessStartIdentity(pid);
-          live = current === undefined || current.replace(/[^A-Za-z0-9._-]/g, '_') === generation;
+          if (current !== undefined) {
+            live = current.replace(/[^A-Za-z0-9._-]/g, '_') === generation;
+          } else {
+            try { process.kill(pid, 0); live = true; }
+            catch (error) { live = (error as NodeJS.ErrnoException).code === 'EPERM'; }
+          }
         } else {
           try { process.kill(pid, 0); live = true; }
           catch (error) { live = (error as NodeJS.ErrnoException).code === 'EPERM'; }
