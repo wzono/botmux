@@ -131,6 +131,7 @@ import { createTurnFeedbackReconciler } from './services/turn-feedback-reconcile
 import { createCapacitySidebandDirectoryConsumer, type CapacitySidebandKey } from './services/capacity-sideband-consumer.js';
 import { createCapacitySidebandRuntime } from './services/capacity-sideband-runtime.js';
 import { createCapacityRolloutStore, type CapacityRolloutAdapter } from './services/capacity-rollout-store.js';
+import { appendCapacityAuditRecord, capacityEpisodeId } from './services/capacity-wait-audit.js';
 import { createCapacityWaitReminder } from './services/capacity-wait-reminder.js';
 import { createCapacityFeedbackProjection } from './services/capacity-feedback-projection.js';
 import { initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
@@ -4170,7 +4171,13 @@ const capacityWaitReminder = createCapacityWaitReminder({
     });
   },
   now: () => Date.now(),
-  thresholds: { interactiveMs: 120_000, backgroundMs: 600_000 },
+  thresholds(target) {
+    const cfg = getBot(target.larkAppId).config;
+    return {
+      interactiveMs: (cfg.capacityInteractiveReminderMinutes ?? 2) * 60_000,
+      backgroundMs: (cfg.capacityBackgroundReminderMinutes ?? 10) * 60_000,
+    };
+  },
 });
 
 const capacityFeedbackProjection = createCapacityFeedbackProjection({
@@ -4246,6 +4253,34 @@ function capacityProjectionEnabled(
   }
 }
 
+function recordCapacityAudit(
+  ds: DaemonSession,
+  turnId: string,
+  adapter: CapacityRolloutAdapter,
+  schemaVersion: 'traex-viewport.v1' | 'capacity-wait.v3',
+  event: 'waiting' | 'position' | 'clear' | 'terminal' | 'stale',
+  observedAtMs: number,
+  positionKnown: boolean,
+  verdict: 'accepted' | 'rejected' | 'unsupported' | 'disabled',
+  signer?: { keyId: string; epoch: number },
+): void {
+  try {
+    const row = ds.session.turnFeedback?.[turnId];
+    const episodeStart = row?.capacity && row.capacity.state !== 'cleared'
+      ? row.capacity.startedAtMs
+      : observedAtMs;
+    appendCapacityAuditRecord(config.session.dataDir, {
+      episodeId: capacityEpisodeId([ds.larkAppId, ds.session.sessionId, turnId, String(episodeStart)]),
+      adapter, schemaVersion, event, observedAt: new Date(observedAtMs).toISOString(),
+      positionKnown, visibility: verdict === 'accepted' ? 'work-card' : 'none',
+      latencyMs: Math.max(0, Date.now() - observedAtMs), verdict,
+      ...(signer ? { signerKeyId: signer.keyId, signerEpoch: signer.epoch } : {}),
+    });
+  } catch (error) {
+    logger.warn(`[capacity] audit append failed: ${String(error)}`);
+  }
+}
+
 function decodeCapacitySidebandKeyring(raw: string | undefined): CapacitySidebandKey[] {
   if (!raw) return [];
   const parsed = JSON.parse(raw) as Array<{
@@ -4288,7 +4323,8 @@ function startCapacitySidebandConsumer(ownerAppId: string): void {
       const persisted = ds?.session.turnFeedback?.[binding.turnId]?.capacityBinding;
       if (!ds || persisted?.dispatchAttempt !== binding.dispatchAttempt
         || persisted.workerGeneration !== binding.workerGeneration) return;
-      if (capacityProjectionEnabled(ds.larkAppId, event.adapter)) {
+      const enabled = capacityProjectionEnabled(ds.larkAppId, event.adapter);
+      if (enabled) {
         const changed = turnFeedbackReconciler.observeCapacity(
           { session: ds.session, larkAppId: ds.larkAppId }, binding.turnId, observation,
         );
@@ -4297,6 +4333,12 @@ function startCapacitySidebandConsumer(ownerAppId: string): void {
           capacityFeedbackProjection.sync(ds, binding.turnId);
         }
       }
+      recordCapacityAudit(
+        ds, binding.turnId, event.adapter, 'capacity-wait.v3',
+        event.state === 'waiting' ? 'waiting' : event.state, Date.parse(event.observed_at),
+        event.position !== undefined, enabled ? 'accepted' : 'disabled',
+        { keyId: event.signer_key_id, epoch: event.signer_epoch },
+      );
       sessionStore.mutateOwnedSessionsAtomically([ds.session.sessionId], fresh => {
         const row = fresh.get(ds.session.sessionId)?.turnFeedback?.[binding.turnId];
         if (row) row.capacitySidebandCursor = {
@@ -31176,7 +31218,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     onCapacityWait(ds, observation) {
       try {
-        if (!capacityProjectionEnabled(ds.larkAppId, 'traex')) return;
+        const enabled = capacityProjectionEnabled(ds.larkAppId, 'traex');
+        if (!enabled) {
+          recordCapacityAudit(
+            ds, observation.turnId, 'traex', 'traex-viewport.v1', observation.state,
+            observation.observedAtMs, observation.position !== undefined, 'disabled',
+          );
+          return;
+        }
         const changed = turnFeedbackReconciler.observeCapacity(
           { session: ds.session, larkAppId: ds.larkAppId },
           observation.turnId,
@@ -31194,6 +31243,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             `[reaction] capacity reconcile failed turn=${observation.turnId.slice(0, 12)}: ${String(error)}`,
           ));
         }
+        recordCapacityAudit(
+          ds, observation.turnId, 'traex', 'traex-viewport.v1', observation.state,
+          observation.observedAtMs, observation.position !== undefined, 'accepted',
+        );
       } catch (error) {
         logger.warn(`[capacity] feedback observation commit failed: ${String(error)}`);
       }

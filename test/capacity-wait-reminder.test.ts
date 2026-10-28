@@ -18,7 +18,7 @@ function harness(background = false) {
   const commit = vi.fn((_target: unknown, mutate: (session: Session) => void) => mutate(session));
   const reminder = createCapacityWaitReminder({
     read: () => session, commit, send, patch, now: () => now,
-    thresholds: { interactiveMs: 120_000, backgroundMs: 600_000 },
+    thresholds: () => ({ interactiveMs: 120_000, backgroundMs: 600_000 }),
   });
   return { target, row, session, send, patch, commit, reminder, setNow: (value: number) => { now = value; } };
 }

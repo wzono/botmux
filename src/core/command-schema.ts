@@ -80,6 +80,7 @@ export const COMMANDS: readonly CommandSpec[] = [
   },
   { name: '/restart', sessionPolicy: 'default', help: ['help.restart'] },
   { name: '/status', sessionPolicy: 'default', help: ['help.status'] },
+  { name: '/capacity', sessionPolicy: 'sessionless', permission: 'talk', help: ['help.capacity'] },
   { name: '/retry', sessionPolicy: 'default', help: ['help.retry'] },
   { name: '/queue', sessionPolicy: 'existingOnly', multiline: true, literalBody: true, help: ['help.queue'],
     notes: 'Codex App 活会话中的文字消息按原生 FIFO 新轮次执行；其它 CLI 明确拒绝，不创建会话' },

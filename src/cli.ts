@@ -19158,6 +19158,20 @@ switch (command) {
     await runCodexInstancesCommand(process.argv.slice(3));
     break;
   }
+  case 'capacity': {
+    try {
+      const { parseCapacityCommand, runCapacityCommand } = await import('./cli/capacity-command.js');
+      const { createCapacityRolloutStore } = await import('./services/capacity-rollout-store.js');
+      const command = parseCapacityCommand(process.argv.slice(3));
+      const result = runCapacityCommand(command, createCapacityRolloutStore(resolveDataDir()));
+      if (command.json) console.log(JSON.stringify(result));
+      else console.log(`capacity phase=${result.phase} disabled=${Object.keys(result.disabled).length}`);
+    } catch (error) {
+      console.error(`botmux capacity: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 2;
+    }
+    break;
+  }
   case 'upgrade':
   case 'update':  await cmdUpgrade(process.argv.slice(3)); break;
   case 'sandbox-network-policy': {

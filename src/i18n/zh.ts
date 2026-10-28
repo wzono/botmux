@@ -991,6 +991,7 @@ export const messages: Record<string, string> = {
   'help.rename': '/rename <标题> - 重命名当前 Botmux 会话，并同步运行中的 Codex/Claude 原生会话名',
   'help.tabs': '/tabs - 查看与管理当前飞书群的标签页',
   'help.status': '/status     - 查看当前会话状态（含终端链接）',
+  'help.capacity': '/capacity status - 查看容量反馈分批阶段和已禁用的机器人 × adapter',
   'help.retry': '/retry      - 重试最近一个失败或被中断的 turn（10s 冷却）',
   'cmd.retry.no_session': '当前话题没有活跃的会话，无法重试。',
   'cmd.retry.no_failed_turn': '最近没有失败或被中断的 turn，无需重试。',

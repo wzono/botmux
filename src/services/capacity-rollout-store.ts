@@ -44,6 +44,7 @@ export function createCapacityRolloutStore(dataDir: string) {
   return {
     path,
     phase: () => read().phase,
+    snapshot: (): Readonly<State> => structuredClone(read()),
     setPhase(phase: CapacityRolloutPhase): void {
       if (!PHASES.has(phase)) throw new Error(`invalid capacity rollout phase: ${phase}`);
       write({ ...read(), phase });

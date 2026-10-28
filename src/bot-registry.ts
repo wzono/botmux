@@ -1628,6 +1628,10 @@ export interface BotConfig {
   /** Opt-in Codex model-capacity continuation. Missing/false is off. Each
    * admitted task may inject up to two recovery inputs into native history. */
   codexCapacityRecovery?: boolean;
+  /** Capacity wait work-card reminder threshold for interactive turns. Default 2 minutes. */
+  capacityInteractiveReminderMinutes?: number;
+  /** Capacity wait work-card reminder threshold for scheduled/headless turns. Default 10 minutes. */
+  capacityBackgroundReminderMinutes?: number;
   /** Experimental, off by default. When true, a structured-bridge failure
    * notice is not posted if this exact turn/attempt already delivered an
    * acknowledged explicit final. It trusts that final and does not compare it
@@ -4206,6 +4210,18 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       idleSuspendMinutes: typeof entry.idleSuspendMinutes === 'number'
         && Number.isInteger(entry.idleSuspendMinutes) && entry.idleSuspendMinutes > 0
         ? entry.idleSuspendMinutes
+        : undefined,
+      capacityInteractiveReminderMinutes: typeof entry.capacityInteractiveReminderMinutes === 'number'
+        && Number.isInteger(entry.capacityInteractiveReminderMinutes)
+        && entry.capacityInteractiveReminderMinutes >= 1
+        && entry.capacityInteractiveReminderMinutes <= 60
+        ? entry.capacityInteractiveReminderMinutes
+        : undefined,
+      capacityBackgroundReminderMinutes: typeof entry.capacityBackgroundReminderMinutes === 'number'
+        && Number.isInteger(entry.capacityBackgroundReminderMinutes)
+        && entry.capacityBackgroundReminderMinutes >= 1
+        && entry.capacityBackgroundReminderMinutes <= 240
+        ? entry.capacityBackgroundReminderMinutes
         : undefined,
       sessionOwnerReminder: normalizeSessionOwnerReminderConfig(entry.sessionOwnerReminder),
       quotaFallbackBot: normalizedQuotaFallback.config,

@@ -994,6 +994,7 @@ export const messages: Record<string, string> = {
   'help.rename': '/rename <title> - Rename this Botmux session and sync the running Codex/Claude session name',
   'help.tabs': '/tabs - List and manage tabs in the current Lark chat',
   'help.status': '/status     - Show current session status (incl. terminal URL)',
+  'help.capacity': '/capacity status - Show capacity-feedback rollout phase and disabled bot × adapter cells',
   'help.retry': '/retry      - Retry the most recent failed or interrupted turn (10s cooldown)',
   'cmd.retry.no_session': 'No active session in this topic to retry.',
   'cmd.retry.no_failed_turn': 'No recent failed or interrupted turn to retry.',

@@ -8,7 +8,7 @@ export interface CapacityReminderDeps {
   send(target: TurnFeedbackTarget, row: PersistedTurnFeedback, uuid: string): Promise<string>;
   patch(target: TurnFeedbackTarget, row: PersistedTurnFeedback, messageId: string): Promise<void>;
   now(): number;
-  thresholds: { interactiveMs: number; backgroundMs: number };
+  thresholds(target: TurnFeedbackTarget): { interactiveMs: number; backgroundMs: number };
 }
 
 export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
@@ -99,7 +99,8 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
     const episodeKey = String(row.capacity.startedAtMs);
     if (row.reminder?.episodeKey === episodeKey
       && (row.reminder.messageId || row.reminder.status === 'ambiguous')) return;
-    const threshold = row.background ? deps.thresholds.backgroundMs : deps.thresholds.interactiveMs;
+    const thresholds = deps.thresholds(target);
+    const threshold = row.background ? thresholds.backgroundMs : thresholds.interactiveMs;
     const delay = Math.max(0, row.capacity.startedAtMs + threshold - deps.now());
     const timer = setTimeout(() => { void fire(target, turnId); }, delay);
     timer.unref?.();
