@@ -16527,7 +16527,7 @@ export async function runHook(
   // routing cannot borrow this process's ambient turn identity.
   const hookOrigin = !explicitRoute && routeSessionId === sessionId && ['claude-code', 'codex'].includes(cliId)
     ? resolveTurnOriginFn(routeSessionId!) : undefined;
-  const hookWorkerGeneration = explicitRoute?.workerGeneration ?? hookOrigin?.workerGeneration
+  const hookWorkerGeneration = hookOrigin?.workerGeneration
     ?? (Number(env.BOTMUX_WORKER_GENERATION) > 0 ? Number(env.BOTMUX_WORKER_GENERATION) : undefined);
 
   const body: Record<string, unknown> = {

@@ -1,5 +1,6 @@
 import type { PersistedTurnFeedback } from '../types.js';
 import { desiredReaction, type TurnReactionPolicy } from './turn-feedback-reaction.js';
+import { CAPACITY_REMINDER_CLOSE_MAX_ATTEMPTS } from './capacity-wait-reminder.js';
 
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 const SETTLED_MAX = 512;
@@ -19,7 +20,8 @@ function reminderDiagnostic(record: PersistedTurnFeedback): boolean {
   const reminder = record.reminder;
   return reminder?.closed !== true && !reminder?.closeNextAttemptAt && (
     reminder?.closeDiagnostic === 'card_mismatch'
-    || reminder?.closeAttempts === 5 && (reminder.closeDiagnostic === 'unavailable'
+    || (reminder?.closeAttempts ?? 0) >= CAPACITY_REMINDER_CLOSE_MAX_ATTEMPTS
+      && (reminder.closeDiagnostic === 'unavailable'
       || reminder.closeDiagnostic === 'transport_error')
   );
 }

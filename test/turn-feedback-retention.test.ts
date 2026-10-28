@@ -149,4 +149,15 @@ describe('turn feedback retention', () => {
       expect(result.exhausted_128).toBeUndefined();
     },
   );
+
+  it.each(['unavailable', 'transport_error'] as const)(
+    'treats migrated %s rows above the attempt threshold as bounded diagnostics', closeDiagnostic => {
+      const migrated = row('migrated', {
+        reaction: undefined, updatedAt: new Date(NOW - 8 * DAY).toISOString(),
+        reminder: { messageId: 'om_migrated', status: 'sent', closeStatus: 'ambiguous',
+          closeAttempts: 6, closeDiagnostic },
+      });
+      expect(pruneTurnFeedback({ migrated }, NOW, policy).migrated).toBeUndefined();
+    },
+  );
 });

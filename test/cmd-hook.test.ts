@@ -221,7 +221,6 @@ describe('runHook', () => {
       chatId: 'oc_real_chat',
       larkAppId: 'cli_real_app',
       rootMessageId: 'oc_real_root',
-      workerGeneration: 9,
     };
     // env 指向首个启动 service 的会话（错投目标），必须被显式反查覆盖。
     const STALE_ENV = {
@@ -250,7 +249,7 @@ describe('runHook', () => {
       expect(posted?.chatId).toBe('oc_real_chat');
       expect(posted?.larkAppId).toBe('cli_real_app');
       expect(posted?.rootMessageId).toBe('oc_real_root');
-      expect(posted?.originWorkerGeneration).toBe(9);
+      expect(posted?.originWorkerGeneration).toBeUndefined();
     });
 
     it('opencode2 反查未命中（独立终端会话 + 陈旧完整 env）→ fail closed，postAsk 未调用且 stdout 为空', async () => {
@@ -390,7 +389,6 @@ describe('runHook', () => {
       chatId: 'c-adopt',
       larkAppId: 'a-adopt',
       rootMessageId: 'om_x',
-      workerGeneration: 7,
     };
 
     it('adopt 命中 → postAskFn 收到 adopt 会话的 body', async () => {
@@ -408,7 +406,7 @@ describe('runHook', () => {
       expect(capturedBody?.larkAppId).toBe('a-adopt');
       expect(capturedBody?.chatId).toBe('c-adopt');
       expect(capturedBody?.rootMessageId).toBe('om_x');
-      expect(capturedBody?.originWorkerGeneration).toBe(7);
+      expect(capturedBody?.originWorkerGeneration).toBeUndefined();
       // 应输出答案 directive（非空）
       expect(result.stdout).toBeTruthy();
       const directive = JSON.parse(result.stdout);

@@ -13,8 +13,9 @@ export interface CapacityReminderDeps {
   thresholds(target: TurnFeedbackTarget): { interactiveMs: number; backgroundMs: number };
 }
 
+export const CAPACITY_REMINDER_CLOSE_MAX_ATTEMPTS = 5;
+
 export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
-  const MAX_CLOSE_ATTEMPTS = 5;
   const timers = new Map<string, ReturnType<typeof setTimeout>>();
   const closeTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const inFlight = new Set<string>();
@@ -57,7 +58,7 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
     const reminder = row.reminder!;
     const attempts = reminder.closeAttempts ?? 0;
     if (reminder.closeDiagnostic === 'card_mismatch' && !reminder.closeNextAttemptAt) return;
-    if (attempts >= MAX_CLOSE_ATTEMPTS) return;
+    if (attempts >= CAPACITY_REMINDER_CLOSE_MAX_ATTEMPTS) return;
     const nextAttemptAt = reminder.closeNextAttemptAt
       ? Date.parse(reminder.closeNextAttemptAt) : undefined;
     if (nextAttemptAt !== undefined && Number.isFinite(nextAttemptAt) && nextAttemptAt > deps.now()) {
@@ -79,7 +80,7 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
     } catch {
       const failures = (intentFailures.get(key) ?? 0) + 1;
       intentFailures.set(key, failures);
-      if (failures < MAX_CLOSE_ATTEMPTS) scheduleCloseRetry(target, turnId, closeRetryDelay(failures));
+      if (failures < CAPACITY_REMINDER_CLOSE_MAX_ATTEMPTS) scheduleCloseRetry(target, turnId, closeRetryDelay(failures));
       return;
     }
     intentFailures.delete(key);
@@ -107,7 +108,8 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
         : (error as { diagnostic?: unknown }).diagnostic === 'unavailable'
           ? 'unavailable' as const
           : 'transport_error' as const;
-      const retryable = diagnostic !== 'card_mismatch' && currentAttempt < MAX_CLOSE_ATTEMPTS;
+      const retryable = diagnostic !== 'card_mismatch'
+        && currentAttempt < CAPACITY_REMINDER_CLOSE_MAX_ATTEMPTS;
       const retryAt = retryable ? deps.now() + closeRetryDelay(currentAttempt) : undefined;
       deps.commit(target, fresh => {
         const current = fresh.turnFeedback?.[turnId];
