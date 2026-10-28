@@ -360,3 +360,9 @@ See [Workflow](/en/workflow) for details.
 ## ⏰ Scheduling & ❓ Help
 
 `/schedule ...` (see [Scheduled Tasks](/en/schedule)) · `/help` (shows the full list inside the topic)
+
+### Capacity feedback
+
+- `/capacity status`: show the capacity-feedback rollout phase and persisted bot × adapter disables.
+- Host CLI: `botmux capacity status --json`, `phase <shadow|traex|proxy|full|off>`, `disable <appId> <adapter> --reason <reason>`, and `enable <appId> <adapter>`.
+- Waiting is driven only by the current TraeX viewport or signed `capacity-wait.v3` events; silence, prose, and quoted text never synthesize it.

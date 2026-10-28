@@ -137,4 +137,33 @@ describe('owner directory capacity sideband consumer', () => {
     expect(observe).toHaveBeenCalledTimes(1);
     expect(readdirSync(ownerDirectory).some(name => name.includes('.claim-'))).toBe(false);
   });
+
+  it('ignores checkpoint metadata on subsequent empty polls', async () => {
+    const { root, ownerDirectory } = fixture();
+    writeFileSync(join(ownerDirectory, '1.json'), JSON.stringify(event()), { mode: 0o600 });
+    const consumer = createCapacitySidebandDirectoryConsumer({
+      root, ownerAppId: 'cli_test', keyring: [{ keyId: KEY_ID, publicKeyDer: PUBLIC, minEpoch: 1, maxEpoch: 1 }],
+      now: () => Date.parse(AT),
+      resolve: () => ({ sessionId: 'session-a', turnId: 'turn-a', dispatchAttempt: 2, workerGeneration: 3 }),
+      observe: vi.fn(),
+    });
+    await expect(consumer.poll()).resolves.toBe(1);
+    await expect(consumer.poll()).resolves.toBe(0);
+    expect(readdirSync(ownerDirectory)).toEqual(['.checkpoint.json']);
+  });
+
+  it('atomically claims an event so two consumers deliver it once', async () => {
+    const { root, ownerDirectory } = fixture();
+    writeFileSync(join(ownerDirectory, 'race.json'), JSON.stringify(event()), { mode: 0o600 });
+    const observe = vi.fn(async () => { await new Promise(resolve => setTimeout(resolve, 10)); });
+    const make = () => createCapacitySidebandDirectoryConsumer({
+      root, ownerAppId: 'cli_test', keyring: [{ keyId: KEY_ID, publicKeyDer: PUBLIC, minEpoch: 1, maxEpoch: 1 }],
+      now: () => Date.parse(AT),
+      resolve: () => ({ sessionId: 'session-a', turnId: 'turn-a', dispatchAttempt: 2, workerGeneration: 3 }),
+      observe,
+    });
+
+    await Promise.allSettled([make().poll(), make().poll()]);
+    expect(observe).toHaveBeenCalledTimes(1);
+  });
 });

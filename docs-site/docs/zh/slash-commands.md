@@ -360,3 +360,9 @@ Dashboard 的「Bot 默认设置 → 安全 → Slash 命令」还有一个可�
 ## ⏰ 定时 & ❓帮助
 
 `/schedule ...`（见 [定时任务](/schedule)）· `/help`（话题内显示完整清单）
+
+### 容量反馈
+
+- `/capacity status`：查看容量反馈分批阶段，以及已持久禁用的机器人 × adapter。
+- 宿主 CLI：`botmux capacity status --json`、`phase <shadow|traex|proxy|full|off>`、`disable <appId> <adapter> --reason <原因>`、`enable <appId> <adapter>`。
+- 等待只由 TraeX 当前视口或签名 `capacity-wait.v3` 触发；不从静默、普通文本或引用内容猜测。

@@ -150,13 +150,17 @@ export function createCapacitySidebandDirectoryConsumer(deps: CapacitySidebandDi
     let accepted = 0;
     try {
       const checkpoint = readCheckpoint();
-      const names = readdirSync(directory).filter(name => name.endsWith('.json')).sort();
+      const names = readdirSync(directory)
+        .filter(name => name.endsWith('.json') && name !== '.checkpoint.json')
+        .sort();
       for (const name of names) {
         const source = join(directory, name);
+        const claimed = `${source}.claim-${process.pid}`;
+        try { renameSync(source, claimed); } catch { continue; }
         let fd: number | undefined;
         let raw: string;
         try {
-          fd = openSync(source, constants.O_RDONLY | constants.O_NOFOLLOW);
+          fd = openSync(claimed, constants.O_RDONLY | constants.O_NOFOLLOW);
           const info = fstatSync(fd);
           if (!info.isFile() || info.nlink !== 1 || (info.mode & 0o077) !== 0
             || typeof process.getuid === 'function' && info.uid !== process.getuid()) {
@@ -165,7 +169,7 @@ export function createCapacitySidebandDirectoryConsumer(deps: CapacitySidebandDi
           raw = readFileSync(fd, 'utf8');
         } catch {
           if (fd !== undefined) closeSync(fd);
-          renameSync(source, `${source}.quarantine-untrusted`);
+          renameSync(claimed, `${source}.quarantine-untrusted`);
           continue;
         } finally {
           if (fd !== undefined) {
@@ -178,23 +182,26 @@ export function createCapacitySidebandDirectoryConsumer(deps: CapacitySidebandDi
         if (!event) {
           let parsedOwner: unknown;
           try { parsedOwner = (JSON.parse(raw) as Record<string, unknown>).owner_app_id; } catch {}
-          if (parsedOwner !== undefined && parsedOwner !== deps.ownerAppId) continue;
-          renameSync(source, `${source}.quarantine-invalid`);
+          if (parsedOwner !== undefined && parsedOwner !== deps.ownerAppId) {
+            renameSync(claimed, source);
+            continue;
+          }
+          renameSync(claimed, `${source}.quarantine-invalid`);
           continue;
         }
         const cursorKey = JSON.stringify([
           event.signer_key_id, event.signer_epoch,
         ]);
-        if ((checkpoint[cursorKey] ?? 0) >= event.sequence) { unlinkSync(source); continue; }
+        if ((checkpoint[cursorKey] ?? 0) >= event.sequence) { unlinkSync(claimed); continue; }
         const target = deps.resolve(event);
-        if (!target) { renameSync(source, `${source}.pending`); continue; }
+        if (!target) { renameSync(claimed, `${source}.pending`); continue; }
         const observation = event.state === 'waiting'
           ? { state: 'waiting' as const, position: event.position, observedAtMs: Date.parse(event.observed_at) }
           : { state: 'clear' as const, observedAtMs: Date.parse(event.observed_at) };
         await deps.observe(target, observation, event);
         checkpoint[cursorKey] = event.sequence;
         writeCheckpoint(checkpoint);
-        unlinkSync(source);
+        unlinkSync(claimed);
         accepted += 1;
       }
       return accepted;
