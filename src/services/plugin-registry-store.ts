@@ -193,6 +193,10 @@ function isUnwritableMigrationError(error: unknown): boolean {
   return code === 'EBUSY' || code === 'EPERM' || code === 'EACCES' || code === 'EROFS';
 }
 
+export function readPluginRegistryWithoutMigration(): PluginRegistryFile {
+  return readPluginRegistryReadOnly();
+}
+
 export function readPluginRegistry(): PluginRegistryFile {
   try {
     return withFileLockSync(registryLockTarget(), () => readPluginRegistryUnlocked(), { maxWaitMs: 30_000 });

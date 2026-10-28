@@ -33,6 +33,10 @@ afterEach(() => {
 function legacyFixture() {
   const runtime = pluginRuntimeDir('demo');
   mkdirSync(join(runtime, 'service'), { recursive: true });
+  writeFileSync(join(home, '.botmux', 'plugins', 'demo', 'package.json'), JSON.stringify({
+    name: '@botmux/plugin-demo', version: '1.0.0', keywords: ['botmux-plugin'],
+    botmux: { schemaVersion: 1, id: 'demo', service: { mode: 'auto' } },
+  }));
   mkdirSync(join(runtime, 'service-http'), { recursive: true });
   mkdirSync(join(runtime, 'dashboard'), { recursive: true });
   writeFileSync(join(runtime, 'dashboard', 'index.js'), 'export default {}');

@@ -7,6 +7,7 @@ import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { readDurableProcessIdentity } from '../../utils/process-identity.js';
 import {
   readPluginRegistry,
+  readPluginRegistryWithoutMigration,
   writePluginRegistry,
 } from '../../services/plugin-registry-store.js';
 import { scanPluginContributions } from './convention-scanner.js';
@@ -66,19 +67,16 @@ function stable(value: unknown): string {
 }
 
 async function repairOne(pluginId: string, dryRun: boolean): Promise<PluginRepairReport> {
-  const registry = readPluginRegistry();
+  const registry = dryRun ? readPluginRegistryWithoutMigration() : readPluginRegistry();
   const record = registry.plugins[pluginId];
   if (!record) throw new Error(`plugin_not_installed:${pluginId}`);
   const runtime = assertRuntimeIdentity(record);
   const packageFile = record.source.link
     ? join(resolve(record.source.spec), 'package.json')
     : join(pluginHome(record.id), 'package.json');
-  if (existsSync(packageFile)) {
-    const pkg = parsePluginPackageManifest(JSON.parse(readFileSync(packageFile, 'utf8')));
-    if (pkg.name !== record.packageName || pkg.version !== record.version || pkg.botmux.id !== record.id) {
-      throw new Error(`plugin_repair_package_identity_mismatch:${record.id}`);
-    }
-  } else if (record.source.link) {
+  if (!existsSync(packageFile)) throw new Error(`plugin_repair_package_identity_mismatch:${record.id}`);
+  const pkg = parsePluginPackageManifest(JSON.parse(readFileSync(packageFile, 'utf8')));
+  if (pkg.name !== record.packageName || pkg.version !== record.version || pkg.botmux.id !== record.id) {
     throw new Error(`plugin_repair_package_identity_mismatch:${record.id}`);
   }
   const scanned = scanPluginContributions(runtime, record.manifest);
@@ -134,8 +132,12 @@ async function repairOne(pluginId: string, dryRun: boolean): Promise<PluginRepai
   const beforeRegistry = snapshot(pluginRegistryPath());
   const beforeFiles = paths.map(snapshot);
   try {
-    registry.plugins[pluginId] = nextRecord;
-    writePluginRegistry(registry);
+    const currentRegistry = readPluginRegistry();
+    if (stable(currentRegistry.plugins[pluginId]) !== stable(record)) {
+      throw new Error(`plugin_repair_registry_changed:${pluginId}`);
+    }
+    currentRegistry.plugins[pluginId] = nextRecord;
+    writePluginRegistry(currentRegistry);
     materializePlugin(pluginId);
     if (nextState) {
       atomicWriteFileSync(pluginServiceStatePath(pluginId), `${JSON.stringify(nextState, null, 2)}\n`, { mode: 0o600 });
@@ -169,7 +171,7 @@ export async function repairPlugins(
           pluginId: id,
           action: 'failed',
           warning: error instanceof Error
-            ? error.message.split(':').slice(0, 2).join(':').replace(/https?:\/\/\S+/g, '<redacted>')
+            ? error.message.split(':', 1)[0].replace(/https?:\/\/\S+/g, '<redacted>')
             : 'plugin_repair_failed',
         });
       }
