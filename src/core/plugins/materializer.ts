@@ -47,7 +47,9 @@ function requireInstalledPlugin(pluginId: string): InstalledPluginRecord {
  * the only place that resolves and delivers them.
  */
 export function projectMaterializedPlugin(record: InstalledPluginRecord): PluginMaterializedFile {
-  const resolvedSkills = resolvePluginSkillPackages([record.id]);
+  const resolvedSkills = resolvePluginSkillPackages([record.id], {
+    schemaVersion: 1, plugins: { [record.id]: record },
+  });
   if (resolvedSkills.diagnostics.length > 0) {
     throw new Error(resolvedSkills.diagnostics.join(','));
   }

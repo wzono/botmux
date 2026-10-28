@@ -228,13 +228,29 @@ export function compareAndSwapInstalledPlugin(
   id: string,
   expected: InstalledPluginRecord,
   next: InstalledPluginRecord,
-): void {
-  withFileLockSync(registryLockTarget(), () => {
+): PluginRegistryFile {
+  return withFileLockSync(registryLockTarget(), () => {
     const registry = readPluginRegistryUnlocked();
     if (JSON.stringify(registry.plugins[id]) !== JSON.stringify(expected)) {
       throw new Error(`plugin_repair_registry_changed:${id}`);
     }
     registry.plugins[id] = next;
+    writePluginRegistryUnlocked(registry);
+    return registry;
+  }, { maxWaitMs: 30_000 });
+}
+
+export function restoreInstalledPluginAfterFailedRepair(
+  id: string,
+  written: InstalledPluginRecord,
+  previous: InstalledPluginRecord,
+): void {
+  withFileLockSync(registryLockTarget(), () => {
+    const registry = readPluginRegistryUnlocked();
+    if (JSON.stringify(registry.plugins[id]) !== JSON.stringify(written)) {
+      throw new Error(`plugin_repair_registry_changed:${id}`);
+    }
+    registry.plugins[id] = previous;
     writePluginRegistryUnlocked(registry);
   }, { maxWaitMs: 30_000 });
 }
