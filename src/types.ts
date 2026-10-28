@@ -513,25 +513,24 @@ export interface PersistedTurnFeedback {
     openedAtMs: number;
   };
   reaction?: { id: string; type: string };
-  reactionReconcilePending?: true;
   reactionMessageGone?: true;
-  reactionOperation?: {
-    opId: string;
+  reactionIntent?: {
+    id: string;
     messageId: string;
     desiredType?: string;
     createdAt: string;
-    phase: 'remove_pending' | 'add_pending' | 'cleanup_pending' | 'failed' | 'blocked';
-    failureReason?:
-      | 'invalid-emoji'
-      | 'permission-denied'
-      | 'invalid-request'
-      | 'unsupported-message'
-      | 'chat-unavailable'
-      | 'operator-unavailable';
-    retryExhausted?: true;
-    old?: { id: string; type: string };
+    stage: 'observe' | 'delete' | 'create' | 'cleanup' | 'blocked' | 'permanent';
     adopted?: { id: string; type: string };
-    duplicateIds?: string[];
+    deleteIds: string[];
+    retryClass?: 'transient' | 'blocked';
+    diagnostic?:
+      | 'invalid_request'
+      | 'unsupported_message'
+      | 'invalid_response'
+      | 'permission_denied'
+      | 'chat_unavailable'
+      | 'operator_unavailable';
+    retryExhausted?: true;
   };
   reminder?: {
     messageId?: string;
