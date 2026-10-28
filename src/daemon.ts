@@ -84,7 +84,7 @@ import { botmuxVersion } from './utils/install-info.js';
 import { SESSION_STORE_PROTOCOL } from './utils/daemon-version-display.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
-import { deleteMessage, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { addReaction, deleteMessage, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -4392,6 +4392,20 @@ export async function noteTurnReceived(
       },
     );
     syncReplyTargetState(ds, committed);
+  } else if (!reactionSilent && triggerMessageId.startsWith('om_')) {
+    // Compatibility-only synthetic sessions have no durable owner row. Keep
+    // their historical best-effort receipt (and its await boundary) without
+    // pretending it is restart-recoverable. Real daemon sessions always take
+    // the owned SessionStore branch above.
+    try {
+      await addReaction(
+        ds.larkAppId, triggerMessageId,
+        receivedReactionEmoji ?? getBot(ds.larkAppId).config.receivedReactionEmoji
+          ?? RECEIVED_REACTION_EMOJI_TYPE,
+      );
+    } catch (error) {
+      logger.debug(`[reaction] legacy receipt failed for ${triggerMessageId}: ${String(error)}`);
+    }
   }
   if (getBot(ds.larkAppId).config.showReplyTiming === true) {
     const received = ds.turnReceivedAtMs ??= new Map();
@@ -29926,7 +29940,18 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
       ensureCurrentRoutingGeneration(generation, 'comment:refork-note');
       sub = currentDocSubscriptionForDelivery(larkAppId, sub);
       if (ds.worker && !ds.worker.killed) {
-        throw new Error('worker became active during comment:refork-note');
+        // A sibling reply in the same newly-created comment thread may finish
+        // the one canonical fork while this turn was awaiting admission-side
+        // feedback/identity work. That worker is the expected successor, not a
+        // foreign generation: deliver this exact frozen input to it instead of
+        // attempting a second fork or rejecting the provider event.
+        if (!sendWorkerInput(ds, wrappedInput, turnId,
+          wrappedInput.trustedCaller ? { trustedCaller: wrappedInput.trustedCaller } : {})) {
+          throw new Error('worker became unavailable during comment:refork-handoff');
+        }
+        acceptDocCommentSession(ds);
+        markDocCommentActivityAfterAdmission(ds, turnId);
+        return;
       }
       sessionStore.updateSession(ds.session);
       if (ds.adoptedFrom) {

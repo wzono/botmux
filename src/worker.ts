@@ -2946,10 +2946,14 @@ function notifyNativeTranscriptConsumedLarkTurn(
   const nativeSessionId = base.endsWith('.jsonl') && /^[A-Za-z0-9-]{8,128}\.jsonl$/.test(base)
     ? base.slice(0, -'.jsonl'.length)
     : undefined;
-  acknowledgeNativeInputConsumed(
-    turn.turnId, 'claude_transcript_user_record',
-    nativeSessionId ?? lastInitConfig?.cliSessionId, evidence.nativeTurnId,
-  );
+  const session = nativeSessionId ?? lastInitConfig?.cliSessionId;
+  if (evidence.nativeTurnId) {
+    acknowledgeNativeInputConsumed(
+      turn.turnId, 'claude_transcript_user_record', session, evidence.nativeTurnId,
+    );
+  } else {
+    acknowledgeNativeInputConsumed(turn.turnId, 'claude_transcript_user_record', session);
+  }
 }
 
 function notifyTerminalTurnStarted(turn: { turnId: string; markTimeMs?: number; replyContextTurnId?: string }): void {
