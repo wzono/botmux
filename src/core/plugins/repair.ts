@@ -45,6 +45,14 @@ function restore(path: string, value: Snapshot): void {
   atomicWriteFileSync(path, value.bytes!, { mode: 0o600 });
 }
 
+function restoreAll(paths: readonly string[], values: readonly Snapshot[], pluginId: string): void {
+  const errors: unknown[] = [];
+  paths.forEach((path, index) => {
+    try { restore(path, values[index]); } catch (error) { errors.push(error); }
+  });
+  if (errors.length > 0) throw new Error(`plugin_repair_rollback_failed:${pluginId}`);
+}
+
 function assertRuntimeIdentity(record: InstalledPluginRecord): string {
   const runtime = pluginRuntimeDir(record.id);
   const stat = lstatSync(runtime);
@@ -173,7 +181,7 @@ async function repairOne(pluginId: string, dryRun: boolean): Promise<PluginRepai
     try {
       definition = await loadPluginServiceDefinition(nextRecord, { readOnlyConfig: true });
     } catch (error) {
-      mutablePaths.forEach((path, index) => restore(path, beforeMutable[index]));
+      restoreAll(mutablePaths, beforeMutable, pluginId);
       throw error;
     }
     const mutated = mutablePaths.some((path, index) => {
@@ -183,7 +191,7 @@ async function repairOne(pluginId: string, dryRun: boolean): Promise<PluginRepai
         || (current.exists && !current.bytes!.equals(before.bytes!));
     });
     if (mutated) {
-      mutablePaths.forEach((path, index) => restore(path, beforeMutable[index]));
+      restoreAll(mutablePaths, beforeMutable, pluginId);
       throw new Error(`plugin_repair_config_write_forbidden:${pluginId}`);
     }
     if (!definition) throw new Error(`plugin_service_definition_not_found:${pluginId}`);
@@ -191,6 +199,23 @@ async function repairOne(pluginId: string, dryRun: boolean): Promise<PluginRepai
     if (!supervisorIdentityValid || app?.status !== 'online' || typeof app.pid !== 'number'
       || typeof app.processStart !== 'string') {
       throw new Error(`plugin_repair_service_identity_invalid:${pluginId}`);
+    }
+    let urls;
+    try {
+      urls = serviceUrls(nextRecord, definition);
+    } catch (error) {
+      restoreAll(mutablePaths, beforeMutable, pluginId);
+      throw error;
+    }
+    const urlsMutated = mutablePaths.some((path, index) => {
+      const current = snapshot(path);
+      const before = beforeMutable[index];
+      return current.exists !== before.exists
+        || (current.exists && !current.bytes!.equals(before.bytes!));
+    });
+    if (urlsMutated) {
+      restoreAll(mutablePaths, beforeMutable, pluginId);
+      throw new Error(`plugin_repair_config_write_forbidden:${pluginId}`);
     }
     nextState = {
       ...state,
@@ -202,7 +227,7 @@ async function repairOne(pluginId: string, dryRun: boolean): Promise<PluginRepai
       status: app.status,
       pid: app.pid,
       processStart: app.processStart,
-      ...serviceUrls(nextRecord, definition),
+      ...urls,
       processName: app.name,
       supervisor: 'builtin',
     };
