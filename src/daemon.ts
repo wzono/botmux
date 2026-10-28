@@ -4380,7 +4380,7 @@ export async function noteTurnReceived(
   // working without inventing recoverability for a row we do not own. Once an
   // owned row exists, admission remains fail-closed so routing and feedback
   // cannot diverge after a real persistence failure.
-  if (sessionStore.getOwnedSession(ds.session.sessionId)) {
+  if (sessionStore.ownsSessionForMutation(ds.session)) {
     const committed = turnFeedbackReconciler.admit(
       { session: ds.session, larkAppId: ds.larkAppId },
       {

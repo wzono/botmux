@@ -156,6 +156,21 @@ describe('two-phase turn reactions', () => {
     expect(ds.turnReceivedAtMs?.has('om_b')).toBe(false);
   });
 
+  it('does not persist feedback through an unrelated store row with the same session id', async () => {
+    registerWith(true);
+    const durableOwner = makeDs();
+    const synthetic = {
+      ...durableOwner,
+      session: structuredClone(durableOwner.session),
+    } as DaemonSession;
+
+    await noteTurnReceived(synthetic, 'om_synthetic_same_id');
+
+    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_synthetic_same_id', 'GoGoGo');
+    expect(sessionStore.getOwnedSession(durableOwner.session.sessionId)?.turnFeedback
+      ?.om_synthetic_same_id).toBeUndefined();
+  });
+
   it.each([true, false])('unified replies retain the independent status-card reaction gate (off=%s)', async statusOff => {
     registerWith(statusOff, { replyCardMode: 'unified' });
     const ds = makeDs();

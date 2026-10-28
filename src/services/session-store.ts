@@ -2316,6 +2316,17 @@ export function getOwnedSession(sessionId: string): Session | undefined {
   return sessions.get(sessionId);
 }
 
+/**
+ * Return whether this exact live object is backed by the currently attached
+ * writable store. A matching id alone is insufficient: compatibility ingress
+ * and test harnesses can carry detached snapshots with the same id, and a
+ * read-only/synthetic process can expose a row without an owned SQLite handle.
+ */
+export function ownsSessionForMutation(session: Session): boolean {
+  load();
+  return ownStore !== undefined && sessions.get(session.sessionId) === session;
+}
+
 /** Cross-process fresh read. SQLite: a point SELECT observes the last committed
  *  write (WAL orders the daemon against offline CLI writers). */
 export function getSessionFresh(sessionId: string): Session | undefined {
