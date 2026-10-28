@@ -91,6 +91,28 @@ describe('capacity wait reminder', () => {
     expect(h.row.reminder).toMatchObject({ status: 'sent', messageId: 'om_reminder' });
   });
 
+  it('keeps one provider send in flight for an episode', async () => {
+    const h = harness();
+    let release!: () => void;
+    let entered!: () => void;
+    const sendEntered = new Promise<void>(resolve => { entered = resolve; });
+    h.send.mockImplementation(async () => {
+      entered();
+      await new Promise<void>(resolve => { release = resolve; });
+      return 'om_reminder';
+    });
+    h.reminder.sync(h.target, 'turn-a'); h.setNow(START + 120_000);
+    await vi.advanceTimersByTimeAsync(120_000);
+    await sendEntered;
+
+    h.reminder.sync(h.target, 'turn-a');
+    await vi.advanceTimersByTimeAsync(120_000);
+
+    expect(h.send).toHaveBeenCalledTimes(1);
+    release();
+    await vi.runAllTimersAsync();
+  });
+
   it('patches the same work card and records closure when the episode clears', async () => {
     const h = harness();
     h.row.reminder = {

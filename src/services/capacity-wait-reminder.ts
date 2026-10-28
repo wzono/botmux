@@ -46,6 +46,7 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
   async function fire(target: TurnFeedbackTarget, turnId: string): Promise<void> {
     const key = keyFor(target, turnId);
     timers.delete(key);
+    if (inFlight.has(key)) return;
     const session = deps.read(target);
     const row = session.turnFeedback?.[turnId];
     if (!row
@@ -94,6 +95,7 @@ export function createCapacityWaitReminder(deps: CapacityReminderDeps) {
   function sync(target: TurnFeedbackTarget, turnId: string): void {
     const key = keyFor(target, turnId);
     cancel(key);
+    if (inFlight.has(key)) return;
     const session = deps.read(target);
     const row = session.turnFeedback?.[turnId];
     if (!row

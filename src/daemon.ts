@@ -131,6 +131,7 @@ import { createTurnFeedbackReconciler } from './services/turn-feedback-reconcile
 import { createCapacitySidebandDirectoryConsumer, type CapacitySidebandKey } from './services/capacity-sideband-consumer.js';
 import { createCapacitySidebandRuntime } from './services/capacity-sideband-runtime.js';
 import { createCapacityRolloutStore, type CapacityRolloutAdapter } from './services/capacity-rollout-store.js';
+import { createCapacityRolloutWatcher } from './services/capacity-rollout-watcher.js';
 import { appendCapacityAuditRecord, capacityEpisodeId } from './services/capacity-wait-audit.js';
 import { createCapacityWaitReminder } from './services/capacity-wait-reminder.js';
 import { createCapacityFeedbackProjection } from './services/capacity-feedback-projection.js';
@@ -4246,7 +4247,7 @@ const capacitySidebandRuntime = createCapacitySidebandRuntime(binding => {
 });
 let stopCapacitySidebandConsumer: (() => void) | undefined;
 let consumerCapacitySidebandRetry: (() => void) | undefined;
-let capacityRolloutPolicyTimer: ReturnType<typeof setInterval> | undefined;
+let stopCapacityRolloutPolicyWatcher: (() => void) | undefined;
 
 function capacityProjectionEnabled(
   appId: string,
@@ -4279,22 +4280,13 @@ async function reconcileCapacityRolloutPolicy(ownerAppId: string): Promise<void>
 }
 
 function startCapacityRolloutPolicyWatcher(ownerAppId: string): void {
-  if (capacityRolloutPolicyTimer) clearInterval(capacityRolloutPolicyTimer);
-  let previous = '';
-  const sweep = (): void => {
-    try {
-      const current = JSON.stringify(createCapacityRolloutStore(config.session.dataDir).snapshot());
-      if (current === previous) return;
-      previous = current;
-      void reconcileCapacityRolloutPolicy(ownerAppId).catch(error =>
-        logger.warn(`[capacity] rollout policy reconcile failed: ${String(error)}`));
-    } catch (error) {
-      logger.warn(`[capacity] rollout policy watcher failed: ${String(error)}`);
-    }
-  };
-  sweep();
-  capacityRolloutPolicyTimer = setInterval(sweep, 250);
-  capacityRolloutPolicyTimer.unref?.();
+  stopCapacityRolloutPolicyWatcher?.();
+  const watcher = createCapacityRolloutWatcher({
+    snapshot: () => JSON.stringify(createCapacityRolloutStore(config.session.dataDir).snapshot()),
+    reconcile: () => reconcileCapacityRolloutPolicy(ownerAppId),
+    warn: error => logger.warn(`[capacity] rollout policy reconcile failed: ${String(error)}`),
+  });
+  stopCapacityRolloutPolicyWatcher = watcher.start(250);
 }
 
 function recordCapacityAudit(
@@ -9283,40 +9275,48 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
       return jsonRes(res, 500, { error: error instanceof Error ? error.message : String(error) });
     }
   }
+  const askTurnId = typeof body.originTurnId === 'string'
+    ? body.originTurnId
+    : askSession?.currentTurnId;
+  const claimedAttempt = typeof body.originDispatchAttempt === 'number'
+    && Number.isSafeInteger(body.originDispatchAttempt)
+    ? body.originDispatchAttempt
+    : undefined;
+  const liveAttempt = askSession && askTurnId
+    && askSession.turnDispatchAttemptHighWater?.turnId === askTurnId
+      ? askSession.turnDispatchAttemptHighWater.dispatchAttempt
+      : askSession?.managedTurnOrigin?.turnId === askTurnId
+        ? askSession?.managedTurnOrigin?.dispatchAttempt
+        : undefined;
+  const askFeedbackOwned = !!askSession && !!askTurnId
+    && sessionStore.ownsSessionForMutation(askSession.session)
+    && (claimedAttempt === undefined || liveAttempt === undefined || claimedAttempt === liveAttempt);
+  if (askFeedbackOwned) {
+    try {
+      const changed = turnFeedbackReconciler.observeAttention(
+        { session: askSession.session, larkAppId: askSession.larkAppId }, askTurnId!, Date.now(),
+      );
+      if (changed) {
+        capacityFeedbackProjection.sync(askSession, askTurnId!);
+        void turnFeedbackReconciler.reconcile(askSession, askTurnId!);
+      }
+    } catch (error) {
+      logger.warn(`[capacity] ask attention projection failed: ${String(error)}`);
+    }
+  }
   const result = managedExplicit
     ? await explicitAskContinuation.wait(explicitInput)
-    : await (async () => {
-        const turnId = typeof body.originTurnId === 'string'
-          ? body.originTurnId
-          : askSession?.currentTurnId;
-        if (askSession && turnId && sessionStore.ownsSessionForMutation(askSession.session)) {
-          try {
-            const changed = turnFeedbackReconciler.observeAttention(
-              { session: askSession.session, larkAppId: askSession.larkAppId }, turnId, Date.now(),
-            );
-            if (changed) {
-              capacityFeedbackProjection.sync(askSession, turnId);
-              void turnFeedbackReconciler.reconcile(askSession, turnId);
-            }
-          } catch (error) {
-            logger.warn(`[capacity] ask attention projection failed: ${String(error)}`);
-          }
-        }
-        return registerAskForResponse(askInput, res);
-      })();
+    : await registerAskForResponse(askInput, res);
   if (res.destroyed) return;
   {
-    const turnId = typeof body.originTurnId === 'string'
-      ? body.originTurnId
-      : askSession?.currentTurnId;
-    if (askSession && turnId && sessionStore.ownsSessionForMutation(askSession.session)) {
+    if (askFeedbackOwned) {
       try {
         const changed = turnFeedbackReconciler.resumeAttention(
-          { session: askSession.session, larkAppId: askSession.larkAppId }, turnId, Date.now(),
+          { session: askSession!.session, larkAppId: askSession!.larkAppId }, askTurnId!, Date.now(),
         );
         if (changed) {
-          capacityFeedbackProjection.sync(askSession, turnId);
-          void turnFeedbackReconciler.reconcile(askSession, turnId);
+          capacityFeedbackProjection.sync(askSession!, askTurnId!);
+          void turnFeedbackReconciler.reconcile(askSession!, askTurnId!);
         }
       } catch (error) {
         logger.warn(`[capacity] ask resume projection failed: ${String(error)}`);
@@ -33749,8 +33749,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     stopCapacitySidebandConsumer?.();
     stopCapacitySidebandConsumer = undefined;
     consumerCapacitySidebandRetry = undefined;
-    if (capacityRolloutPolicyTimer) clearInterval(capacityRolloutPolicyTimer);
-    capacityRolloutPolicyTimer = undefined;
+    stopCapacityRolloutPolicyWatcher?.();
+    stopCapacityRolloutPolicyWatcher = undefined;
     capacityFeedbackProjection.dispose();
     capacityWaitReminder.dispose();
     turnFeedbackReconciler.dispose();
