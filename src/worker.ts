@@ -622,7 +622,10 @@ import {
   type TraexAutoModelAction,
 } from './services/traex-auto-model.js';
 import { readTraexModelLoads } from './services/traex-model-load.js';
-import { createCapacityWaitTracker } from './services/worker-capacity-wait.js';
+import {
+  createCapacityWaitTracker,
+  type CapacityCaptureIdentity,
+} from './services/worker-capacity-wait.js';
 import { parseDaemonIpcPort } from './utils/daemon-discovery.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
@@ -12344,6 +12347,43 @@ let renderer: TerminalRenderer | null = null;
  *  call. (Historically also fed the AI ScreenAnalyzer, now removed.) */
 let lastAnalyzerSnapshot = '';
 const capacityWaitTracker = createCapacityWaitTracker();
+
+function currentCapacityCaptureIdentity(): CapacityCaptureIdentity | undefined {
+  if (lastInitConfig?.cliId !== 'traex' || !currentBotmuxTurnId) return undefined;
+  return {
+    sessionId,
+    turnId: currentBotmuxTurnId,
+    ...(currentBotmuxDispatchAttempt !== undefined
+      ? { dispatchAttempt: currentBotmuxDispatchAttempt }
+      : {}),
+    revision: captureRevision,
+  };
+}
+
+function publishTraexCapacityObservation(
+  captured: CapacityCaptureIdentity | undefined,
+  screen: string,
+  observedAtMs: number,
+): void {
+  if (!captured) return;
+  const current = currentCapacityCaptureIdentity();
+  if (!current) return;
+  const observation = capacityWaitTracker.observe(captured, current, screen, observedAtMs);
+  if (!observation) return;
+  send({
+    type: 'capacity_wait',
+    sessionId,
+    turnId: observation.identity.turnId,
+    ...(observation.identity.dispatchAttempt !== undefined
+      ? { dispatchAttempt: observation.identity.dispatchAttempt }
+      : {}),
+    source: 'traex-viewport',
+    state: observation.type,
+    ...(observation.position !== undefined ? { position: observation.position } : {}),
+    observedAtMs: observation.observedAtMs,
+    revision: observation.identity.revision,
+  });
+}
 let screenUpdateTimer: ReturnType<typeof setInterval> | null = null;
 const SCREEN_UPDATE_INTERVAL_MS = 2_000;
 
@@ -19051,6 +19091,7 @@ function startScreenUpdates(): void {
   screenUpdateTimer = setInterval(() => {
     const capacityBackend = backend;
     const capacityGeneration = cliSpawnGeneration;
+    const capacityIdentity = currentCapacityCaptureIdentity();
     if (awaitingFirstPrompt) {
       inspectAidenCodexUpdateDialogOnScreen();
       if (renderer) observeTraexAutoModelCapacity(renderer.rawSnapshot());
@@ -19151,29 +19192,7 @@ function startScreenUpdates(): void {
       if (backend === capacityBackend && cliSpawnGeneration === capacityGeneration) {
         const evidenceScreen = lastAnalyzerSnapshot || renderer?.rawSnapshot() || snapshot.content;
         observeTraexAutoModelCapacity(evidenceScreen);
-        if (lastInitConfig?.cliId === 'traex' && currentBotmuxTurnId) {
-          const identity = {
-            sessionId, turnId: currentBotmuxTurnId,
-            ...(currentBotmuxDispatchAttempt !== undefined
-              ? { dispatchAttempt: currentBotmuxDispatchAttempt }
-              : {}),
-            revision: backendScreenRevision,
-          };
-          const observation = capacityWaitTracker.observe(
-            identity, identity, evidenceScreen, Date.now(),
-          );
-          if (observation) {
-            send({
-              type: 'capacity_wait', sessionId, turnId: observation.identity.turnId,
-              ...(observation.identity.dispatchAttempt !== undefined
-                ? { dispatchAttempt: observation.identity.dispatchAttempt }
-                : {}),
-              source: 'traex-viewport', state: observation.type,
-              ...(observation.position !== undefined ? { position: observation.position } : {}),
-              observedAtMs: observation.observedAtMs, revision: observation.identity.revision,
-            });
-          }
-        }
+        publishTraexCapacityObservation(capacityIdentity, evidenceScreen, Date.now());
       }
       const usageAware = usageLimitTracker.classify(snapshot.content, status);
       // Claude Code's permission dialogs — including one raised by a

@@ -1,14 +1,15 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   createCapacityWaitTracker,
   extractTraexLiveCapacityStatus,
 } from '../src/services/worker-capacity-wait.js';
 
-const queued = [
-  '◆ Queued for capacity (51s • esc to interrupt)',
-  "  └ Too many requests right now. You're in the queue at position 1590.",
-  'Context 100% left',
-].join('\n');
+const queued = readFileSync(
+  join(process.cwd(), 'test/fixtures/capacity-wait/traex-current.txt'),
+  'utf8',
+);
 
 describe('authoritative TraeX capacity evidence', () => {
   it('extracts only a live current-footer queue and its optional position', () => {
