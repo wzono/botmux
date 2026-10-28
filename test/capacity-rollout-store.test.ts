@@ -34,4 +34,19 @@ describe('capacity fleet rollout policy', () => {
     expect(store.evaluate('app-a', 'claude-code', true)).toBe('disabled');
     expect(readFileSync(store.path, 'utf8')).not.toMatch(/secret|token|prompt/i);
   });
+
+  it('keeps one app-adapter kill switch isolated across phase changes', () => {
+    const root = join(process.env.SESSION_DATA_DIR!, `capacity-rollout-isolation-${Math.random().toString(36).slice(2)}`);
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    const store = createCapacityRolloutStore(root);
+    store.setPhase('full');
+    store.disable('app-a', 'codex', 'confirmed false positive');
+
+    expect(store.evaluate('app-a', 'codex', true)).toBe('disabled');
+    expect(store.evaluate('app-a', 'claude-code', true)).toBe('enabled');
+    expect(store.evaluate('app-b', 'codex', true)).toBe('enabled');
+    store.setPhase('shadow');
+    store.setPhase('full');
+    expect(store.evaluate('app-a', 'codex', true)).toBe('disabled');
+  });
 });
