@@ -156,6 +156,34 @@ export interface SessionRow extends SessionMessagePreview {
   quoteTargetId?: string;
   quoteTargetSenderOpenId?: string;
   codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
+  capacityFeedback?: {
+    state: 'waiting' | 'stale' | 'unsupported';
+    position?: number;
+    observedAtMs?: number;
+    ageMs?: number;
+  };
+}
+
+export function projectCapacityFeedback(
+  session: Session,
+  turnId: string | undefined,
+  nowMs = Date.now(),
+): SessionRow['capacityFeedback'] {
+  if (!turnId) return undefined;
+  const record = session.turnFeedback?.[turnId];
+  if (!record || (record.phase !== 'capacity_waiting' && record.phase !== 'capacity_stale')) {
+    return undefined;
+  }
+  const capacity = record.capacity;
+  if (!capacity || (capacity.state !== 'waiting' && capacity.state !== 'stale')) return undefined;
+  return {
+    state: capacity.state,
+    ...(capacity.state === 'waiting' && capacity.position !== undefined
+      ? { position: capacity.position }
+      : {}),
+    observedAtMs: capacity.updatedAtMs,
+    ageMs: Math.max(0, nowMs - capacity.updatedAtMs),
+  };
 }
 
 function composeSendRoutingFields(
@@ -399,6 +427,9 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     ...(ds.adoptedFrom?.originalCliPid !== undefined ? { adoptCliPid: ds.adoptedFrom.originalCliPid } : {}),
     ...buildSessionMessagePreview(ds.session),
     ...composeSendRoutingFields(ds.session, ds.currentReplyTarget),
+    ...(projectCapacityFeedback(ds.session, ds.currentTurnId)
+      ? { capacityFeedback: projectCapacityFeedback(ds.session, ds.currentTurnId) }
+      : {}),
   };
 }
 
