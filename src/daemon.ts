@@ -10012,6 +10012,7 @@ ipcRoute('GET', '/api/adopt-session/:pid', (_req, res, params) => {
         chatId: ds.chatId,
         larkAppId: ds.larkAppId,
         rootMessageId: sessionAnchorId(ds),
+        workerGeneration: ds.workerGeneration ?? ds.session.workerGeneration,
       });
     }
   }
@@ -10072,6 +10073,7 @@ ipcRoute('GET', '/api/session-by-cli/:cliId/:cliSessionId', (_req, res, params) 
     chatId: ds.chatId,
     larkAppId: ds.larkAppId,
     rootMessageId: sessionAnchorId(ds),
+    workerGeneration: ds.workerGeneration ?? ds.session.workerGeneration,
   });
 });
 

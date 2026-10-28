@@ -118,4 +118,35 @@ describe('turn feedback retention', () => {
     expect(result.reminder_128).toBeUndefined();
     expect(result.old).toBeUndefined();
   });
+
+  it('retains a live reaction obligation even when the same row has a permanent reminder diagnostic', () => {
+    const mixed = row('mixed', {
+      updatedAt: new Date(NOW - 8 * DAY).toISOString(), reaction: undefined,
+      reactionIntent: { id: 'live', messageId: 'om_live', desiredType: 'DONE',
+        createdAt: new Date(NOW).toISOString(), stage: 'observe', deleteIds: [] },
+      reminder: { messageId: 'om_old', status: 'sent', closeStatus: 'ambiguous',
+        closeAttempts: 1, closeDiagnostic: 'card_mismatch' },
+    });
+
+    expect(pruneTurnFeedback({ mixed }, NOW, policy).mixed).toBeDefined();
+  });
+
+  it.each(['unavailable', 'transport_error'] as const)(
+    'bounds exhausted %s reminder diagnostics to the newest 128', closeDiagnostic => {
+      const records: Record<string, PersistedTurnFeedback> = {};
+      for (let index = 0; index < 10_000; index += 1) {
+        records[`exhausted_${index}`] = row(`exhausted_${index}`, {
+          reaction: undefined, updatedAt: new Date(NOW - index).toISOString(),
+          reminder: { messageId: `om_${index}`, status: 'sent', closeStatus: 'ambiguous',
+            closeAttempts: 5, closeDiagnostic },
+        });
+      }
+
+      const result = pruneTurnFeedback(records, NOW, policy);
+      expect(Object.keys(result)).toHaveLength(128);
+      expect(result.exhausted_0).toBeDefined();
+      expect(result.exhausted_127).toBeDefined();
+      expect(result.exhausted_128).toBeUndefined();
+    },
+  );
 });

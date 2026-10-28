@@ -23,6 +23,7 @@ export interface AdoptRoute {
   chatId: string;
   larkAppId: string;
   rootMessageId: string;
+  workerGeneration?: number;
 }
 
 // ── 祖先 PID 收集 ──────────────────────────────────────────────────────────────
@@ -139,6 +140,8 @@ export async function queryAdoptSession(
       chatId: b.chatId,
       larkAppId: b.larkAppId,
       rootMessageId: b.rootMessageId,
+      ...(typeof b.workerGeneration === 'number' && Number.isSafeInteger(b.workerGeneration)
+        && b.workerGeneration > 0 ? { workerGeneration: b.workerGeneration } : {}),
     };
   } catch {
     // 超时、网络错误、JSON 解析失败等 → null
@@ -301,6 +304,8 @@ export async function queryCliSession(
         chatId: b.chatId,
         larkAppId: b.larkAppId,
         rootMessageId: b.rootMessageId,
+        ...(typeof b.workerGeneration === 'number' && Number.isSafeInteger(b.workerGeneration)
+          && b.workerGeneration > 0 ? { workerGeneration: b.workerGeneration } : {}),
       },
     };
   } catch {

@@ -16475,6 +16475,7 @@ export async function runHook(
       return { stdout: adapter.passthrough(payload) };
     }
     // adopt 命中 → 使用 adopt 路由信息
+    explicitRoute = adopt;
     routeSessionId = adopt.sessionId;
     routeChatId = adopt.chatId;
     routeLarkAppId = adopt.larkAppId;
@@ -16526,7 +16527,7 @@ export async function runHook(
   // routing cannot borrow this process's ambient turn identity.
   const hookOrigin = !explicitRoute && routeSessionId === sessionId && ['claude-code', 'codex'].includes(cliId)
     ? resolveTurnOriginFn(routeSessionId!) : undefined;
-  const hookWorkerGeneration = hookOrigin?.workerGeneration
+  const hookWorkerGeneration = explicitRoute?.workerGeneration ?? hookOrigin?.workerGeneration
     ?? (Number(env.BOTMUX_WORKER_GENERATION) > 0 ? Number(env.BOTMUX_WORKER_GENERATION) : undefined);
 
   const body: Record<string, unknown> = {

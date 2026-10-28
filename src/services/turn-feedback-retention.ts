@@ -9,23 +9,29 @@ function terminal(record: PersistedTurnFeedback): boolean {
   return record.phase === 'completed' || record.phase === 'failed';
 }
 
-function durableDiagnostic(record: PersistedTurnFeedback): boolean {
+function reactionDiagnostic(record: PersistedTurnFeedback): boolean {
   const intent = record.reactionIntent;
-  return record.reminder?.closed !== true
-    && record.reminder?.closeDiagnostic === 'card_mismatch'
-    && !record.reminder.closeNextAttemptAt
-    || intent?.stage === 'permanent' && intent.diagnostic !== undefined
+  return intent?.stage === 'permanent' && intent.diagnostic !== undefined
     || intent?.stage === 'blocked' && intent.retryExhausted === true;
+}
+
+function reminderDiagnostic(record: PersistedTurnFeedback): boolean {
+  const reminder = record.reminder;
+  return reminder?.closed !== true && !reminder?.closeNextAttemptAt && (
+    reminder?.closeDiagnostic === 'card_mismatch'
+    || reminder?.closeAttempts === 5 && (reminder.closeDiagnostic === 'unavailable'
+      || reminder.closeDiagnostic === 'transport_error')
+  );
 }
 
 function unresolved(
   record: PersistedTurnFeedback,
   policy: TurnReactionPolicy,
 ): boolean {
-  if (record.reactionIntent) return !durableDiagnostic(record);
+  if (record.reactionIntent) return !reactionDiagnostic(record);
   if (record.attention || record.capacity || record.capacityClearedAt
     || record.capacitySidebandCursor || record.capacityBinding) return true;
-  if (record.reminder && record.reminder.closed !== true) return true;
+  if (record.reminder && record.reminder.closed !== true && !reminderDiagnostic(record)) return true;
   return record.reaction !== undefined
     && record.reaction.type !== desiredReaction(record, policy);
 }
@@ -51,12 +57,12 @@ export function pruneTurnFeedback(
       kept.set(turnId, record);
       continue;
     }
-    if (durableDiagnostic(record)) {
-      diagnostics.push([turnId, record, updatedAtMs]);
-      continue;
-    }
     if (unresolved(record, policy)) {
       kept.set(turnId, record);
+      continue;
+    }
+    if (reactionDiagnostic(record) || reminderDiagnostic(record)) {
+      diagnostics.push([turnId, record, updatedAtMs]);
       continue;
     }
     settled.push([turnId, record, updatedAtMs]);
