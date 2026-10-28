@@ -6,6 +6,7 @@ import {
   proxyPluginDashboardServiceRequest,
 } from '../src/core/plugins/dashboard-service-bridge.js';
 import type { InstalledPluginRecord, PluginServiceState } from '../src/core/plugins/types.js';
+import { assessPluginServiceIdentity } from '../src/core/plugins/supervisor-client.js';
 import { pluginDashboardApi } from '../src/dashboard/web/plugin-page.js';
 
 const servers: Server[] = [];
@@ -112,23 +113,46 @@ function record(): InstalledPluginRecord {
 function state(port: number, patch: Partial<PluginServiceState> = {}): PluginServiceState {
   return {
     pluginId: 'sample', updatedAt: '2026-10-26T00:00:00.000Z',
-    status: 'online', host: '127.0.0.1', port, ...patch,
+    status: 'online', pid: 4101, processStart: 'boot-a:100', host: '127.0.0.1', port, ...patch,
   };
 }
 
 describe('Dashboard plugin service bridge', () => {
+  it('accepts only the current supervisor process generation across stop and restart', () => {
+    const name = 'botmux-plugin-sample';
+    const cached = { pid: 4101, processStart: 'boot-a:100', port: 43210 };
+    expect(assessPluginServiceIdentity(name, cached, [
+      { name, status: 'online', pid: 4101, processStart: 'boot-a:100' },
+    ], () => 'boot-a:100', () => true)).toBe('online');
+    expect(assessPluginServiceIdentity(name, cached, [
+      { name, status: 'stopped' },
+    ], () => undefined)).toBe('offline');
+    expect(assessPluginServiceIdentity(name, cached, [
+      { name, status: 'online', pid: 4102, processStart: 'boot-a:200' },
+    ], () => 'boot-a:200', () => true)).toBe('identity_mismatch');
+    expect(assessPluginServiceIdentity(name, cached, [
+      { name, status: 'online', pid: 4101, processStart: 'boot-a:100' },
+    ], () => 'boot-a:999', () => true)).toBe('identity_mismatch');
+    expect(assessPluginServiceIdentity(name, { pid: 4102, processStart: 'boot-a:200', port: 43210 }, [
+      { name, status: 'online', pid: 4102, processStart: 'boot-a:200' },
+    ], () => 'boot-a:200', () => true)).toBe('online');
+    expect(assessPluginServiceIdentity(name, cached, [
+      { name, status: 'online', pid: 4101, processStart: 'boot-a:100' },
+    ], () => 'boot-a:100', () => false)).toBe('identity_mismatch');
+  });
+
   it('forwards allowlisted GET and POST JSON requests without browser credentials', async () => {
     const local = await fixture();
     const getResult = await proxyPluginDashboardServiceRequest(
       { pluginId: 'sample', method: 'GET', path: '/api/snapshot' },
-      { record: record(), state: state(local.port) },
+      { record: record(), state: state(local.port), verifyServiceIdentity: () => 'online' },
     );
     const postResult = await proxyPluginDashboardServiceRequest(
       {
         pluginId: 'sample', method: 'POST', path: '/api/refresh', body: { refresh: true },
         headers: { cookie: 'browser=secret', authorization: 'Bearer secret', 'x-forwarded-for': 'remote' },
       } as any,
-      { record: record(), state: state(local.port) },
+      { record: record(), state: state(local.port), verifyServiceIdentity: () => 'online' },
     );
 
     expect(getResult).toEqual({ ok: true, method: 'GET', body: null });
@@ -152,10 +176,48 @@ describe('Dashboard plugin service bridge', () => {
     ]) {
       await expect(proxyPluginDashboardServiceRequest(
         { pluginId: 'sample', method: 'GET', path },
-        { record: record(), state: state(43210), fetchImpl: fetchImpl as typeof fetch },
+        {
+          record: record(), state: state(43210), fetchImpl: fetchImpl as typeof fetch,
+          verifyServiceIdentity: () => 'online',
+        },
       )).rejects.toThrow('route_not_allowed');
     }
     expect(calls).toBe(0);
+  });
+
+  it('requires the current supervisor to attest the cached process identity before connecting', async () => {
+    const local = await fixture();
+    const input = { pluginId: 'sample', method: 'GET' as const, path: '/api/snapshot' };
+    const fetchImpl = vi.fn(async () => new Response('{"ok":true}', {
+      status: 200, headers: { 'content-type': 'application/json' },
+    }));
+
+    await expect(proxyPluginDashboardServiceRequest(input, {
+      record: record(), state: state(local.port), fetchImpl: fetchImpl as typeof fetch,
+      verifyServiceIdentity: () => 'online',
+    })).resolves.toEqual({ ok: true });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+
+    for (const verifyServiceIdentity of [
+      () => 'offline' as const,
+      () => 'identity_mismatch' as const,
+      () => { throw new Error('supervisor unavailable'); },
+    ]) {
+      fetchImpl.mockClear();
+      await expect(proxyPluginDashboardServiceRequest(input, {
+        record: record(), state: state(local.port), fetchImpl: fetchImpl as typeof fetch,
+        verifyServiceIdentity,
+      })).rejects.toThrow('service_offline');
+      expect(fetchImpl).not.toHaveBeenCalled();
+    }
+
+    await expect(proxyPluginDashboardServiceRequest(input, {
+      record: record(), state: state(local.port, { pid: 4102, processStart: 'boot-a:200' }),
+      fetchImpl: fetchImpl as typeof fetch,
+      verifyServiceIdentity: identity => identity.pid === 4102 && identity.processStart === 'boot-a:200'
+        ? 'online'
+        : 'identity_mismatch',
+    })).resolves.toEqual({ ok: true });
   });
 
   it('fails closed for invalid service identity, host, port, and offline state', async () => {
@@ -169,9 +231,11 @@ describe('Dashboard plugin service bridge', () => {
     })).rejects.toThrow('service_offline');
     await expect(proxyPluginDashboardServiceRequest(input, {
       record: record(), state: state(local.port, { host: '10.0.0.1' }),
+      verifyServiceIdentity: () => 'online',
     })).rejects.toThrow('service_host_invalid');
     await expect(proxyPluginDashboardServiceRequest(input, {
       record: record(), state: state(local.port, { port: 0 }),
+      verifyServiceIdentity: () => 'online',
     })).rejects.toThrow('service_port_invalid');
   });
 
@@ -180,7 +244,7 @@ describe('Dashboard plugin service bridge', () => {
     const call = (path: string, extra: { timeoutMs?: number; maxBytes?: number } = {}) => (
       proxyPluginDashboardServiceRequest(
         { pluginId: 'sample', method: 'GET', path },
-        { record: record(), state: state(local.port), ...extra },
+        { record: record(), state: state(local.port), verifyServiceIdentity: () => 'online', ...extra },
       )
     );
     await expect(call('/redirect')).rejects.toThrow('upstream_redirect');
@@ -201,7 +265,7 @@ describe('Dashboard plugin service bridge', () => {
     const local = await fixture();
     const call = (path: string) => proxyPluginDashboardServiceRequest(
       { pluginId: 'sample', method: 'GET', path },
-      { record: record(), state: state(local.port) },
+      { record: record(), state: state(local.port), verifyServiceIdentity: () => 'online' },
     );
     await expect(call('/plain-stream')).rejects.toThrow('upstream_non_json');
     await expect(local.didStreamClose('/plain-stream')).resolves.toBe(true);
@@ -218,7 +282,10 @@ describe('Dashboard plugin service bridge', () => {
     for (const host of ['localhost', '127.0.0.1', '::1', '[::1]']) {
       await proxyPluginDashboardServiceRequest(
         { pluginId: 'sample', method: 'GET', path: '/api/snapshot' },
-        { record: record(), state: state(43210, { host }), fetchImpl: fetchImpl as typeof fetch },
+        {
+          record: record(), state: state(43210, { host }), fetchImpl: fetchImpl as typeof fetch,
+          verifyServiceIdentity: () => 'online',
+        },
       );
     }
     expect(targets).toEqual([
@@ -233,7 +300,10 @@ describe('Dashboard plugin service bridge', () => {
     const ipv4 = await fixture('127.0.0.1');
     await expect(proxyPluginDashboardServiceRequest(
       { pluginId: 'sample', method: 'GET', path: '/api/snapshot' },
-      { record: record(), state: state(ipv4.port, { host: '127.0.0.1' }) },
+      {
+        record: record(), state: state(ipv4.port, { host: '127.0.0.1' }),
+        verifyServiceIdentity: () => 'online',
+      },
     )).resolves.toMatchObject({ ok: true });
   });
 
@@ -251,7 +321,10 @@ describe('Dashboard plugin service bridge', () => {
     }
     await expect(proxyPluginDashboardServiceRequest(
       { pluginId: 'sample', method: 'GET', path: '/api/snapshot' },
-      { record: record(), state: state(ipv6.port, { host: '[::1]' }) },
+      {
+        record: record(), state: state(ipv6.port, { host: '[::1]' }),
+        verifyServiceIdentity: () => 'online',
+      },
     )).resolves.toMatchObject({ ok: true });
   });
 });
@@ -270,6 +343,7 @@ async function bridgeHttpFixture(options: {
     void handlePluginDashboardServiceHttpRequest(req, res, 'sample', {
       resolveRecord: () => options.installed === false ? undefined : record(),
       readState: () => options.serviceState ?? state(43210),
+      verifyServiceIdentity: () => 'online',
       proxy: options.proxy ?? (async () => ({ ok: true })),
       readBody: async request => {
         let raw = '';

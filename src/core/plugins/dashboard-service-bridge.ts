@@ -12,6 +12,8 @@ export interface PluginDashboardServiceRequest {
   body?: unknown;
 }
 
+export type PluginDashboardServiceIdentityStatus = 'online' | 'offline' | 'identity_mismatch';
+
 export type PluginDashboardServiceErrorCode =
   | 'invalid_request'
   | 'route_not_allowed'
@@ -83,6 +85,7 @@ export async function proxyPluginDashboardServiceRequest(
   deps: {
     record: InstalledPluginRecord;
     state: PluginServiceState | undefined;
+    verifyServiceIdentity(state: PluginServiceState): PluginDashboardServiceIdentityStatus;
     fetchImpl?: typeof fetch;
     timeoutMs?: number;
     maxBytes?: number;
@@ -96,6 +99,12 @@ export async function proxyPluginDashboardServiceRequest(
     .some(route => route.method === input.method && route.path === input.path);
   if (!allowed) fail('route_not_allowed');
   if (deps.state?.pluginId !== deps.record.id || deps.state.status !== 'online') fail('service_offline');
+  try {
+    if (deps.verifyServiceIdentity(deps.state) !== 'online') fail('service_offline');
+  } catch (error) {
+    if (error instanceof PluginDashboardServiceError) throw error;
+    fail('service_offline');
+  }
   const targetHost = loopbackUrlHost(deps.state.host);
   if (!targetHost) fail('service_host_invalid');
   if (!Number.isInteger(deps.state.port) || deps.state.port! < 1 || deps.state.port! > 65_535) {
@@ -186,6 +195,7 @@ export async function handlePluginDashboardServiceHttpRequest(
     resolveRecord(id: string): InstalledPluginRecord | undefined;
     readState(id: string): PluginServiceState | undefined;
     readBody(req: IncomingMessage): Promise<unknown>;
+    verifyServiceIdentity(state: PluginServiceState): PluginDashboardServiceIdentityStatus;
     proxy?: typeof proxyPluginDashboardServiceRequest;
     log?: (event: { pluginId: string; path: string; status: string; durationMs: number }) => void;
     now?: () => number;
@@ -221,7 +231,7 @@ export async function handlePluginDashboardServiceHttpRequest(
   try {
     const result = await (deps.proxy ?? proxyPluginDashboardServiceRequest)(
       { pluginId, ...parsed },
-      { record, state },
+      { record, state, verifyServiceIdentity: deps.verifyServiceIdentity },
     );
     return respond(200, result, 'ok');
   } catch (error) {

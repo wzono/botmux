@@ -385,6 +385,7 @@ import { pluginRuntimeDir, resolvePluginPath } from './core/plugins/paths.js';
 import { isValidPluginId, normalizePluginIdList } from './core/plugins/ids.js';
 import { listPluginServiceStatus, readPluginServiceState, startPluginServices, stopPluginServices } from './core/plugins/service-manager.js';
 import { handlePluginDashboardServiceHttpRequest } from './core/plugins/dashboard-service-bridge.js';
+import { verifyPluginServiceIdentity } from './core/plugins/supervisor-client.js';
 import { materializePlugin } from './core/plugins/materializer.js';
 import { resolveEffectivePluginIds, updateBotPluginOverride } from './core/plugins/effective.js';
 import { assertPluginBindingTransition, describePluginDependencyError } from './core/plugins/dependencies.js';
@@ -2855,6 +2856,7 @@ async function handlePluginManagementApi(
       resolveRecord: id => requireInstalledPlugin(id) ?? undefined,
       readState: readPluginServiceState,
       readBody: readJsonBody,
+      verifyServiceIdentity: state => verifyPluginServiceIdentity(pluginId, state),
     });
   }
 

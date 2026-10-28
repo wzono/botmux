@@ -65,7 +65,7 @@ function assertPublicPluginRegistry(registry: PluginRegistryFile): void {
   }
 }
 
-function writePluginRegistryUnlocked(registry: PluginRegistryFile): void {
+export function writePluginRegistryUnlocked(registry: PluginRegistryFile): void {
   assertPublicPluginRegistry(registry);
   mkdirSync(dirname(pluginRegistryPath()), { recursive: true });
   atomicWriteFileSync(pluginRegistryPath(), JSON.stringify(registry, null, 2) + '\n', { mode: 0o600 });

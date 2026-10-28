@@ -281,7 +281,7 @@ export function readPluginServiceState(pluginId: string): PluginServiceState | u
   }
 }
 
-function writeServiceState(record: InstalledPluginRecord, definition: PluginServiceDefinition, app: PluginProcessInfo | undefined): PluginServiceState {
+export function writePluginServiceState(record: InstalledPluginRecord, definition: PluginServiceDefinition, app: PluginProcessInfo | undefined): PluginServiceState {
   const runtimeDir = pluginRuntimeDir(record.id);
   const runtimeRealpath = existsSync(runtimeDir) ? realpathSync(runtimeDir) : undefined;
   const state: PluginServiceState = {
@@ -292,6 +292,7 @@ function writeServiceState(record: InstalledPluginRecord, definition: PluginServ
     updatedAt: new Date().toISOString(),
     status: app?.status ?? 'stopped',
     ...(typeof app?.pid === 'number' ? { pid: app.pid } : {}),
+    ...(typeof app?.processStart === 'string' ? { processStart: app.processStart } : {}),
     ...serviceUrls(record, definition),
     processName: pluginServiceName(record.id),
     supervisor: 'builtin',
@@ -382,7 +383,7 @@ export async function startPluginServices(
         if (!definition) continue;
         const action = await startService(record, definition);
         const app = findService(pluginServiceName(record.id));
-        const state = writeServiceState(record, definition, app);
+        const state = writePluginServiceState(record, definition, app);
         reports.push(reportFromState(record, action, state));
       } catch (err: any) {
         reports.push(reportFromState(record, 'failed', readPluginServiceState(record.id), err?.message ?? String(err)));
@@ -405,13 +406,13 @@ export async function stopPluginServices(
         const name = pluginServiceName(record.id);
         const before = findService(name);
         if (!before) {
-          const state = writeServiceState(record, definition, before);
+          const state = writePluginServiceState(record, definition, before);
           reports.push(reportFromState(record, 'not-running', state));
           continue;
         }
         await changePluginService(record.id, 'stop');
         const app = findService(name);
-        const state = writeServiceState(record, definition, app);
+        const state = writePluginServiceState(record, definition, app);
         reports.push(reportFromState(record, isStoppedService(before) ? 'not-running' : 'stopped', state));
       } catch (err: any) {
         reports.push(reportFromState(record, 'failed', readPluginServiceState(record.id), err?.message ?? String(err)));
@@ -468,7 +469,7 @@ export async function listPluginServiceStatus(): Promise<PluginServiceReport[]> 
         const definition = await loadPluginServiceDefinition(record);
         if (!definition) continue;
         const app = findService(pluginServiceName(record.id));
-        const state = writeServiceState(record, definition, app);
+        const state = writePluginServiceState(record, definition, app);
         reports.push(reportFromState(record, 'status', state));
       } catch (err: any) {
         reports.push(reportFromState(record, 'failed', readPluginServiceState(record.id), err?.message ?? String(err)));

@@ -18680,6 +18680,7 @@ function printPluginUsage(): void {
   botmux plugin init <plugin-id|botmux-plugin-id|@botmux-ai/plugin-id>
   botmux plugin install <npm-package|local-dir> [--link]
   botmux plugin uninstall <plugin-id> [--force]
+  botmux plugin repair [plugin-id|--all] [--dry-run]
   botmux plugin enable <plugin-id> [--bot <name|index|all>]
   botmux plugin disable <plugin-id> [--bot <name|index|all>]
   botmux plugin emit <plugin-id> --bot <process-name|app-id>  # JSON 从 stdin 读取
@@ -18856,6 +18857,20 @@ async function cmdPlugin(args: string[]): Promise<void> {
     if (globalPlugins === undefined) {
       console.log(`（enabled? = 未知：本会话没有 ${globalConfigPath()} 的读权限，启用状态无法观测）`);
     }
+    return;
+  }
+
+  if (sub === 'repair') {
+    const rawId = args[1];
+    const pluginIds = !rawId || rawId === '--all' || rawId === '--dry-run'
+      ? undefined
+      : [requirePluginId(rawId)];
+    const { repairPlugins } = await import('./core/plugins/repair.js');
+    const reports = await repairPlugins(pluginIds, { dryRun: args.includes('--dry-run') });
+    for (const report of reports) {
+      console.log(`${report.pluginId}\t${report.action}${report.warning ? `\t${report.warning}` : ''}`);
+    }
+    if (reports.some(report => report.action === 'failed')) process.exitCode = 1;
     return;
   }
 

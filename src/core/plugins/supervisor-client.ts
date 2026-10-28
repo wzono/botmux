@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { readlinkSync, readdirSync, readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { closeSync, mkdirSync, openSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -22,6 +23,7 @@ export interface PluginProcessInfo {
   pid?: number;
   status?: string;
   configHash?: string;
+  processStart?: string;
 }
 
 export function assertNoLegacyPluginPm2(): void {
@@ -48,6 +50,7 @@ export function readPluginProcesses(): PluginProcessInfo[] {
       ...(alive ? { pid: proc.pid } : {}),
       status: !alive && proc.status === 'online' ? 'stopped' : proc.status,
       configHash: proc?.configHash,
+      processStart: proc?.processStart,
     });
   }
   for (const [id, item] of Object.entries(desired.services)) {
@@ -70,6 +73,56 @@ export function readPluginProcesses(): PluginProcessInfo[] {
     processes.set(name, proc);
   }
   return [...processes.values()];
+}
+
+export function processOwnsListeningPort(pid: number, port: number): boolean {
+  if (process.platform !== 'linux' || !Number.isInteger(port) || port < 1 || port > 65_535) return false;
+  try {
+    const listening = new Set<string>();
+    for (const table of ['tcp', 'tcp6']) {
+      const rows = readFileSync(`/proc/${pid}/net/${table}`, 'utf8').trim().split('\n').slice(1);
+      for (const row of rows) {
+        const columns = row.trim().split(/\s+/);
+        const localPort = Number.parseInt(columns[1]?.split(':').at(-1) ?? '', 16);
+        if (columns[3] === '0A' && localPort === port && columns[9]) listening.add(columns[9]);
+      }
+    }
+    return readdirSync(`/proc/${pid}/fd`).some(fd => {
+      try {
+        const match = readlinkSync(`/proc/${pid}/fd/${fd}`).match(/^socket:\[(\d+)\]$/);
+        return !!match && listening.has(match[1]);
+      } catch { return false; }
+    });
+  } catch { return false; }
+}
+
+export function assessPluginServiceIdentity(
+  serviceName: string,
+  expected: { pid?: number; processStart?: string; port?: number },
+  processes: readonly PluginProcessInfo[],
+  readIdentity: (pid: number) => string | undefined = readDurableProcessIdentity,
+  ownsPort: (pid: number, port: number) => boolean = processOwnsListeningPort,
+): 'online' | 'offline' | 'identity_mismatch' {
+  const current = processes.find(proc => proc.name === serviceName);
+  if (current?.status !== 'online' || typeof current.pid !== 'number') return 'offline';
+  if (typeof expected.pid !== 'number' || typeof expected.processStart !== 'string'
+    || current.pid !== expected.pid || current.processStart !== expected.processStart) {
+    return 'identity_mismatch';
+  }
+  if (readIdentity(current.pid) !== expected.processStart) return 'identity_mismatch';
+  return typeof expected.port === 'number' && ownsPort(current.pid, expected.port)
+    ? 'online'
+    : 'identity_mismatch';
+}
+
+export function verifyPluginServiceIdentity(pluginId: string, expected: {
+  pid?: number;
+  processStart?: string;
+  port?: number;
+}): 'online' | 'offline' | 'identity_mismatch' {
+  return assessPluginServiceIdentity(
+    pluginServiceName(pluginId), expected, readPluginProcesses(), readDurableProcessIdentity,
+  );
 }
 
 function supervisorAlive(): boolean {
