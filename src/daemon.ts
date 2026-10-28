@@ -33621,6 +33621,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     await (await import('./services/constrained-invocation/daemon.js')).closeConstrainedInvocations();
     await waitAllWithin([stopInputCaptureRuntimes()], shutdownDeadlineMs);
     stopMaintenance();
+    stopCapacitySidebandConsumer?.();
+    stopCapacitySidebandConsumer = undefined;
+    consumerCapacitySidebandRetry = undefined;
+    capacityFeedbackProjection.dispose();
+    capacityWaitReminder.dispose();
+    turnFeedbackReconciler.dispose();
     vcMeetingTerminalReconciler?.stop();
     clearInterval(vcMeetingDeliveryLeaseTimer);
     for (const timer of vcMeetingReceiverRecoveryTimers.values()) clearTimeout(timer);
