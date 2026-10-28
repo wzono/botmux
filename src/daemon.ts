@@ -4245,7 +4245,13 @@ export async function noteTurnReceived(
   // Durable admission is the synchronous linearization point. It must complete
   // before identity publication or any other await lets a second live-only turn
   // stage routing beside this one.
-  if (typeof turnFeedbackReconciler !== 'undefined') {
+  // Feedback admission is durable state owned by this daemon's SessionStore.
+  // Some compatibility/test ingress paths intentionally use synthetic sessions
+  // that are not attached to the owned store; keep those historical paths
+  // working without inventing recoverability for a row we do not own. Once an
+  // owned row exists, admission remains fail-closed so routing and feedback
+  // cannot diverge after a real persistence failure.
+  if (sessionStore.getOwnedSession(ds.session.sessionId)) {
     const committed = turnFeedbackReconciler.admit(
       { session: ds.session, larkAppId: ds.larkAppId },
       {
