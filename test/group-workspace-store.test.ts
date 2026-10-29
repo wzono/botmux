@@ -11,6 +11,7 @@ import {
   canonicalGroupOperationPayloadDigest,
   canonicalTextSourceEventId,
   groupWorkspaceOperationKey,
+  type GroupWorkspaceStoreOptions,
 } from '../src/services/group-workspace-store.js';
 
 const U: TenantHumanId = { tenantKey: 'tenant-a', unionId: 'on_user_u' };
@@ -19,6 +20,18 @@ const CHAT = 'oc_group';
 
 function dataDir(): string {
   return mkdtempSync(join(tmpdir(), 'botmux-group-workspace-'));
+}
+
+const STORE_TEST_OPTIONS: GroupWorkspaceStoreOptions = {
+  pathProbe: path => ({
+    ok: true,
+    normalizedPath: resolve(path),
+    identity: { dev: '1', ino: '2' },
+  }),
+};
+
+function createStore(dataDirectory: string, options: GroupWorkspaceStoreOptions = {}): GroupWorkspaceStore {
+  return new GroupWorkspaceStore(dataDirectory, { ...STORE_TEST_OPTIONS, ...options });
 }
 
 function textSource(messageId: string): string {
@@ -55,13 +68,13 @@ function setInput(options: {
 
 describe('GroupWorkspaceStore', () => {
   it('treats a missing store as an empty available store', async () => {
-    const result = await new GroupWorkspaceStore(dataDir()).read(CHAT);
+    const result = await createStore(dataDir()).read(CHAT);
     expect(result).toEqual({ status: 'available', record: undefined });
   });
 
   it('round-trips a bound canonical path and durable receipt', async () => {
     const dir = dataDir();
-    const store = new GroupWorkspaceStore(dir);
+    const store = createStore(dir);
     const sourceEventId = textSource('om_set_x');
     const outcome = await store.mutate(setInput({
       sourceEventId,
@@ -77,7 +90,7 @@ describe('GroupWorkspaceStore', () => {
         resultingDirectory: { kind: 'bound', workingDir: resolve('/tmp/canonical-repo') },
       },
     });
-    await expect(new GroupWorkspaceStore(dir).read(CHAT)).resolves.toEqual({
+    await expect(createStore(dir).read(CHAT)).resolves.toEqual({
       status: 'available',
       record: expect.objectContaining({
         chatId: CHAT,
@@ -91,7 +104,7 @@ describe('GroupWorkspaceStore', () => {
   it('fails closed on a malformed store', async () => {
     const dir = dataDir();
     writeFileSync(join(dir, 'group-workspaces.json'), '{broken');
-    const store = new GroupWorkspaceStore(dir);
+    const store = createStore(dir);
     expect(await store.read(CHAT)).toEqual({ status: 'store_unavailable' });
     expect((await store.mutate(setInput({
       sourceEventId: textSource('om_malformed'),
@@ -121,7 +134,7 @@ describe('GroupWorkspaceStore', () => {
         },
       },
     }));
-    expect(await new GroupWorkspaceStore(dir).read(CHAT)).toEqual({ status: 'store_unavailable' });
+    expect(await createStore(dir).read(CHAT)).toEqual({ status: 'store_unavailable' });
   });
 
   it.each(['__proto__', 'constructor', 'prototype'])(
@@ -134,9 +147,9 @@ describe('GroupWorkspaceStore', () => {
         ...setInput({ sourceEventId: source.sourceEventId, workingDir: `/tmp/${chatId}`, expectedRevision: 0 }),
         chatId,
       };
-      const committed = await new GroupWorkspaceStore(dir).mutate(input);
+      const committed = await createStore(dir).mutate(input);
       expect(committed).toMatchObject({ outcome: 'committed', receipt: { chatId, resultingRevision: 1 } });
-      await expect(new GroupWorkspaceStore(dir).read(chatId)).resolves.toMatchObject({
+      await expect(createStore(dir).read(chatId)).resolves.toMatchObject({
         status: 'available', record: { chatId, revision: 1, directory: { workingDir: `/tmp/${chatId}` } },
       });
     },
@@ -167,7 +180,7 @@ describe('GroupWorkspaceStore', () => {
       },
     }));
 
-    expect(await new GroupWorkspaceStore(dir).read(CHAT)).toEqual({ status: 'store_unavailable' });
+    expect(await createStore(dir).read(CHAT)).toEqual({ status: 'store_unavailable' });
   });
 
   it.each([
@@ -200,27 +213,27 @@ describe('GroupWorkspaceStore', () => {
   ])('fails closed on whole-file history corruption: %s', async (_name, corrupt) => {
     const dir = dataDir();
     const path = join(dir, 'group-workspaces.json');
-    const store = new GroupWorkspaceStore(dir);
+    const store = createStore(dir);
     await store.mutate(setInput({ sourceEventId: textSource('om_history_1'), workingDir: '/tmp/one', expectedRevision: 0 }));
     await store.mutate(setInput({ sourceEventId: textSource('om_history_2'), workingDir: '/tmp/two', expectedRevision: 1 }));
     const registry = JSON.parse(readFileSync(path, 'utf8'));
     corrupt(registry);
     writeFileSync(path, JSON.stringify(registry));
-    expect(await new GroupWorkspaceStore(dir).read(CHAT)).toEqual({ status: 'store_unavailable' });
+    expect(await createStore(dir).read(CHAT)).toEqual({ status: 'store_unavailable' });
   });
 
   it('accepts noncommitted receipts alongside an exact committed revision history', async () => {
     const dir = dataDir();
-    const store = new GroupWorkspaceStore(dir);
+    const store = createStore(dir);
     await store.mutate(setInput({ sourceEventId: textSource('om_history_commit'), workingDir: '/tmp/one', expectedRevision: 0 }));
     await store.mutate(setInput({ sourceEventId: textSource('om_history_conflict'), workingDir: '/tmp/two', expectedRevision: 0 }));
-    expect(await new GroupWorkspaceStore(dir).read(CHAT)).toMatchObject({ status: 'available', record: { revision: 1 } });
+    expect(await createStore(dir).read(CHAT)).toMatchObject({ status: 'available', record: { revision: 1 } });
   });
 
   it.each([
     ['blank originMessageId', { originMessageId: ' ' }],
   ])('rejects invalid optional receipt input: %s', async (_name, patch) => {
-    const result = await new GroupWorkspaceStore(dataDir()).mutate({
+    const result = await createStore(dataDir()).mutate({
       ...setInput({ sourceEventId: textSource('om_invalid_optional'), workingDir: '/tmp/x', expectedRevision: 0 }),
       ...patch,
     });
@@ -234,22 +247,22 @@ describe('GroupWorkspaceStore', () => {
   ])('fails closed on receipt outcome invariant: %s', async (_name, corrupt) => {
     const dir = dataDir();
     const path = join(dir, 'group-workspaces.json');
-    await new GroupWorkspaceStore(dir).mutate(setInput({
+    await createStore(dir).mutate(setInput({
       sourceEventId: textSource(`om_receipt_invariant_${_name}`), workingDir: '/tmp/x', expectedRevision: 0,
     }));
     const registry = JSON.parse(readFileSync(path, 'utf8'));
     corrupt(Object.values(registry.receipts)[0]);
     writeFileSync(path, JSON.stringify(registry));
-    expect(await new GroupWorkspaceStore(dir).read(CHAT)).toEqual({ status: 'store_unavailable' });
+    expect(await createStore(dir).read(CHAT)).toEqual({ status: 'store_unavailable' });
   });
 
   it('ignores an interrupted atomic replacement and preserves the last complete store', async () => {
     const dir = dataDir();
-    const store = new GroupWorkspaceStore(dir);
+    const store = createStore(dir);
     await store.mutate(setInput({ sourceEventId: textSource('om_complete'), workingDir: '/tmp/x', expectedRevision: 0 }));
     writeFileSync(join(dir, 'group-workspaces.json.999.deadbeef.tmp'), '{partial');
 
-    expect(await new GroupWorkspaceStore(dir).read(CHAT)).toMatchObject({
+    expect(await createStore(dir).read(CHAT)).toMatchObject({
       status: 'available',
       record: { revision: 1, directory: { kind: 'bound', workingDir: '/tmp/x' } },
     });
@@ -273,7 +286,7 @@ describe('GroupWorkspaceStore', () => {
     const path = join(dir, 'group-workspaces.json');
     writeFileSync(path, JSON.stringify({ schemaVersion: 1, records: {}, receipts: {} }));
     let writes = 0;
-    const store = new GroupWorkspaceStore(dir, {
+    const store = createStore(dir, {
       writer: (...args) => {
         writes += 1;
         atomicWriteFileSync(...args);
@@ -291,7 +304,7 @@ describe('GroupWorkspaceStore', () => {
   it('leaves a readable store byte-for-byte unchanged for malformed mutation input', async () => {
     const dir = dataDir();
     const path = join(dir, 'group-workspaces.json');
-    const store = new GroupWorkspaceStore(dir);
+    const store = createStore(dir);
     await store.mutate(setInput({
       sourceEventId: textSource('om_valid_seed'), workingDir: '/tmp/seed', expectedRevision: 0,
     }));
@@ -302,14 +315,14 @@ describe('GroupWorkspaceStore', () => {
     });
     expect(result).toEqual({ outcome: 'store_unavailable' });
     expect(readFileSync(path, 'utf8')).toBe(before);
-    expect(await new GroupWorkspaceStore(dir).read(CHAT)).toMatchObject({
+    expect(await createStore(dir).read(CHAT)).toMatchObject({
       status: 'available', record: { revision: 1, directory: { workingDir: '/tmp/seed' } },
     });
   });
 
   it('returns store_unavailable when an injected write fails before rename and leaves no receipt', async () => {
     const dir = dataDir();
-    const store = new GroupWorkspaceStore(dir, {
+    const store = createStore(dir, {
       writer: () => { throw new Error('before rename'); },
     });
     const result = await store.mutate(setInput({
@@ -318,14 +331,14 @@ describe('GroupWorkspaceStore', () => {
       expectedRevision: 0,
     }));
     expect(result).toEqual({ outcome: 'store_unavailable' });
-    expect(await new GroupWorkspaceStore(dir).read(CHAT)).toEqual({ status: 'available', record: undefined });
+    expect(await createStore(dir).read(CHAT)).toEqual({ status: 'available', record: undefined });
   });
 
   it('re-establishes file and directory durability after a true directory-fsync failure without retrying', async () => {
     const dir = dataDir();
     let writes = 0;
     let durabilityProofs = 0;
-    const store = new GroupWorkspaceStore(dir, {
+    const store = createStore(dir, {
       writer: (path, data) => {
         writes += 1;
         const replacement = `${path}.replacement`;
@@ -344,7 +357,7 @@ describe('GroupWorkspaceStore', () => {
     expect(result).toMatchObject({ outcome: 'committed', receipt: { resultingRevision: 1 } });
     expect(writes).toBe(1);
     expect(durabilityProofs).toBe(1);
-    expect(await new GroupWorkspaceStore(dir).read(CHAT)).toMatchObject({
+    expect(await createStore(dir).read(CHAT)).toMatchObject({
       status: 'available', record: { revision: 1, directory: { workingDir: '/tmp/X' } },
     });
   });
@@ -354,7 +367,7 @@ describe('GroupWorkspaceStore', () => {
     const path = join(dir, 'group-workspaces.json');
     let writes = 0;
     let durabilityAttempts = 0;
-    const store = new GroupWorkspaceStore(dir, {
+    const store = createStore(dir, {
       writer: (target, data) => {
         writes += 1;
         writeFileSync(target, data);
@@ -378,7 +391,7 @@ describe('GroupWorkspaceStore', () => {
 
   it('returns unknown when a caught write cannot be reconciled from the durable store', async () => {
     const dir = dataDir();
-    const store = new GroupWorkspaceStore(dir, {
+    const store = createStore(dir, {
       writer: (path) => {
         writeFileSync(path, '{ambiguous unreadable replacement');
         throw new Error('directory fsync result lost');
@@ -395,7 +408,7 @@ describe('GroupWorkspaceStore', () => {
   it('returns store_unavailable when the cross-process lock cannot be acquired', async () => {
     const dir = dataDir();
     writeFileSync(join(dir, 'group-workspaces.json.lock'), String(process.pid));
-    const store = new GroupWorkspaceStore(dir, { lockTimeoutMs: 0 });
+    const store = createStore(dir, { lockTimeoutMs: 0 });
     const result = await store.mutate(setInput({
       sourceEventId: textSource('om_locked'),
       workingDir: '/tmp/x',
@@ -407,11 +420,11 @@ describe('GroupWorkspaceStore', () => {
   it('serializes parallel writers so exactly one CAS commits', async () => {
     const dir = dataDir();
     const [left, right] = await Promise.all([
-      new GroupWorkspaceStore(dir).mutate(setInput({ sourceEventId: textSource('om_left'), workingDir: '/tmp/left', expectedRevision: 0 })),
-      new GroupWorkspaceStore(dir).mutate(setInput({ sourceEventId: textSource('om_right'), workingDir: '/tmp/right', expectedRevision: 0 })),
+      createStore(dir).mutate(setInput({ sourceEventId: textSource('om_left'), workingDir: '/tmp/left', expectedRevision: 0 })),
+      createStore(dir).mutate(setInput({ sourceEventId: textSource('om_right'), workingDir: '/tmp/right', expectedRevision: 0 })),
     ]);
     expect([left.outcome, right.outcome].sort()).toEqual(['committed', 'conflict']);
-    expect((await new GroupWorkspaceStore(dir).read(CHAT))).toMatchObject({
+    expect((await createStore(dir).read(CHAT))).toMatchObject({
       status: 'available',
       record: { revision: 1 },
     });
@@ -443,7 +456,7 @@ describe('GroupWorkspaceStore', () => {
 
   it('shares text identity across Bots and replays historical M1 after recovery without writing current revision or target', async () => {
     const dir = dataDir();
-    const botA = new GroupWorkspaceStore(dir);
+    const botA = createStore(dir);
     const m1FromBotA = canonicalTextSourceEventId({
       tenantKey: 'tenant-a', chatId: CHAT, messageId: 'om_m1', deliveryAttemptId: 'bot-a-live-attempt',
     });
@@ -459,7 +472,7 @@ describe('GroupWorkspaceStore', () => {
 
     const beforeReplayBytes = readFileSync(join(dir, 'group-workspaces.json'), 'utf8');
     let botBWrites = 0;
-    const botBReloaded = new GroupWorkspaceStore(dir, {
+    const botBReloaded = createStore(dir, {
       writer: (...args) => {
         botBWrites += 1;
         atomicWriteFileSync(...args);
@@ -483,7 +496,7 @@ describe('GroupWorkspaceStore', () => {
         canonicalTargetWorkingDir: '/tmp/X',
       },
     });
-    expect(await new GroupWorkspaceStore(dir).read(CHAT)).toMatchObject({
+    expect(await createStore(dir).read(CHAT)).toMatchObject({
       status: 'available',
       record: { revision: 2, directory: { kind: 'bound', workingDir: '/tmp/Y' } },
     });
@@ -492,7 +505,7 @@ describe('GroupWorkspaceStore', () => {
 
   it('rejects reuse of one source with different semantic intent or operation kind', async () => {
     const dir = dataDir();
-    const store = new GroupWorkspaceStore(dir);
+    const store = createStore(dir);
     const sourceEventId = textSource('om_protocol');
     await store.mutate(setInput({ sourceEventId, workingDir: '/tmp/X', expectedRevision: 0 }));
     const conflict = await store.mutate(setInput({ sourceEventId, workingDir: '/tmp/Z', expectedRevision: 1 }));
@@ -512,7 +525,7 @@ describe('GroupWorkspaceStore', () => {
 
   it('keeps revisions monotonic across tombstones and rejects an old CAS', async () => {
     const dir = dataDir();
-    const store = new GroupWorkspaceStore(dir);
+    const store = createStore(dir);
     await store.mutate(setInput({ sourceEventId: textSource('om_set_x'), workingDir: '/tmp/X', expectedRevision: 0 }));
     const unbindInput = {
       kind: 'unbind' as const,
@@ -525,7 +538,7 @@ describe('GroupWorkspaceStore', () => {
     };
     const unbound = await store.mutate(unbindInput);
     expect(unbound).toMatchObject({ outcome: 'committed', receipt: { resultingRevision: 2, resultingDirectory: { kind: 'unbound' } } });
-    expect(await new GroupWorkspaceStore(dir).mutate({ ...unbindInput, expectedRevision: 99 })).toEqual(unbound);
+    expect(await createStore(dir).mutate({ ...unbindInput, expectedRevision: 99 })).toEqual(unbound);
     await store.mutate(setInput({ sourceEventId: textSource('om_set_y'), workingDir: '/tmp/Y', expectedRevision: 2 }));
     expect((await store.mutate(setInput({ sourceEventId: textSource('om_delayed_z'), workingDir: '/tmp/Z', expectedRevision: 1 }))).outcome).toBe('conflict');
     expect(await store.read(CHAT)).toMatchObject({ record: { revision: 3, directory: { kind: 'bound', workingDir: '/tmp/Y' } } });
@@ -570,25 +583,25 @@ describe('GroupWorkspaceStore', () => {
         },
       },
     }));
-    const store = new GroupWorkspaceStore(dir);
+    const store = createStore(dir);
     await store.mutate({ kind: 'unbind', chatId: CHAT, sourceEventId: textSource('om_acl_unbind'), expectedRevision: 1, actor: U, authorized: true, now: 200 });
-    expect(await new GroupWorkspaceStore(dir).read(CHAT)).toMatchObject({ record: { revision: 2, workspaceManagers: [U], directory: { kind: 'unbound' } } });
-    const denied = await new GroupWorkspaceStore(dir).mutate(setInput({ sourceEventId: textSource('om_v_set'), workingDir: '/tmp/V', expectedRevision: 2, actor: V }));
+    expect(await createStore(dir).read(CHAT)).toMatchObject({ record: { revision: 2, workspaceManagers: [U], directory: { kind: 'unbound' } } });
+    const denied = await createStore(dir).mutate(setInput({ sourceEventId: textSource('om_v_set'), workingDir: '/tmp/V', expectedRevision: 2, actor: V }));
     expect(denied.outcome).toBe('unauthorized');
   });
 
   it('does not allow an ordinary directory set to establish workspaceManagers', async () => {
     const dir = dataDir();
-    const result = await new GroupWorkspaceStore(dir).mutate({
+    const result = await createStore(dir).mutate({
       ...setInput({ sourceEventId: textSource('om_acl_injection'), workingDir: '/tmp/X', expectedRevision: 0, actor: V }),
       workspaceManagers: [U],
     });
     expect(result.outcome).toBe('committed');
-    expect(await new GroupWorkspaceStore(dir).read(CHAT)).toMatchObject({
+    expect(await createStore(dir).read(CHAT)).toMatchObject({
       status: 'available',
       record: { revision: 1, directory: { workingDir: '/tmp/X' } },
     });
-    expect((await new GroupWorkspaceStore(dir).read(CHAT) as { status: 'available'; record?: { workspaceManagers?: TenantHumanId[] } }).record?.workspaceManagers).toBeUndefined();
+    expect((await createStore(dir).read(CHAT) as { status: 'available'; record?: { workspaceManagers?: TenantHumanId[] } }).record?.workspaceManagers).toBeUndefined();
   });
 
   it('fails closed instead of overflowing the revision counter', async () => {
@@ -606,18 +619,18 @@ describe('GroupWorkspaceStore', () => {
       },
       receipts: {},
     }));
-    const outcome = await new GroupWorkspaceStore(dir).mutate(setInput({
+    const outcome = await createStore(dir).mutate(setInput({
       sourceEventId: textSource('om_exhausted'),
       workingDir: '/tmp/X',
       expectedRevision: Number.MAX_SAFE_INTEGER,
     }));
     expect(outcome.outcome).toBe('store_unavailable');
-    expect(await new GroupWorkspaceStore(dir).read(CHAT)).toEqual({ status: 'store_unavailable' });
+    expect(await createStore(dir).read(CHAT)).toEqual({ status: 'store_unavailable' });
   });
 
   it('returns invalid_dir and unauthorized terminal outcomes without changing revision', async () => {
     const dir = dataDir();
-    const store = new GroupWorkspaceStore(dir);
+    const store = createStore(dir);
     expect((await store.mutate({ ...setInput({ sourceEventId: textSource('om_invalid'), workingDir: 'relative', expectedRevision: 0 }), directoryValid: false })).outcome).toBe('invalid_dir');
     expect((await store.mutate({ ...setInput({ sourceEventId: textSource('om_unauthorized'), workingDir: '/tmp/X', expectedRevision: 0 }), authorized: false })).outcome).toBe('unauthorized');
     expect(await store.read(CHAT)).toEqual({ status: 'available', record: undefined });

@@ -2,6 +2,12 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import type { TenantHumanId } from './bot-admin-unions-store.js';
+import {
+  probePathUsability,
+  type PathIdentity,
+  type PathUsabilityProbeOptions,
+  type PathUsabilityResult,
+} from '../core/path-usability.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { fsyncFilesAndDirectorySync } from '../utils/fs-durability.js';
 import { withFileLock } from '../utils/file-lock.js';
@@ -20,6 +26,7 @@ export interface GroupWorkspaceRecord {
   chatId: string;
   revision: number;
   directory: GroupDirectoryState;
+  directoryIdentity?: PathIdentity;
   workspaceManagers?: TenantHumanId[];
   updatedAt: number;
   updatedBy: TenantHumanId;
@@ -124,11 +131,23 @@ export type GroupWorkspaceReadResult =
 
 type GroupWorkspaceWriter = typeof atomicWriteFileSync;
 type DurabilityReestablisher = (filePath: string) => void;
+export type GroupWorkspacePathProbe = (
+  path: string,
+  options?: PathUsabilityProbeOptions,
+) => PathUsabilityResult;
+
+export type GroupWorkspaceConsumptionResult =
+  | { status: 'available'; record: undefined }
+  | { status: 'unbound'; record: GroupWorkspaceRecord }
+  | { status: 'usable'; record: GroupWorkspaceRecord; usability: Extract<PathUsabilityResult, { ok: true }> }
+  | { status: 'unusable'; record: GroupWorkspaceRecord; usability: Extract<PathUsabilityResult, { ok: false }> }
+  | { status: 'store_unavailable' };
 
 export interface GroupWorkspaceStoreOptions {
   lockTimeoutMs?: number;
   writer?: GroupWorkspaceWriter;
   durabilityReestablisher?: DurabilityReestablisher;
+  pathProbe?: GroupWorkspacePathProbe;
 }
 
 function digest(domain: string, value: unknown): string {
@@ -228,11 +247,20 @@ function validManagers(value: unknown): value is TenantHumanId[] | undefined {
   return value === undefined || (Array.isArray(value) && value.every(isTenantHumanId));
 }
 
+function isPathIdentity(value: unknown): value is PathIdentity {
+  return isObject(value)
+    && typeof value.dev === 'string' && /^\d+$/.test(value.dev)
+    && typeof value.ino === 'string' && /^\d+$/.test(value.ino);
+}
+
 function validateRecord(value: unknown, key: string): asserts value is GroupWorkspaceRecord {
   if (!isObject(value)
     || value.chatId !== key
     || !Number.isSafeInteger(value.revision) || (value.revision as number) < 1
     || !isDirectoryState(value.directory)
+    || (value.directory.kind === 'bound'
+      && value.directoryIdentity !== undefined && !isPathIdentity(value.directoryIdentity))
+    || (value.directory.kind === 'unbound' && value.directoryIdentity !== undefined)
     || !validManagers(value.workspaceManagers)
     || !Number.isFinite(value.updatedAt)
     || !isTenantHumanId(value.updatedBy)) {
@@ -400,6 +428,7 @@ export class GroupWorkspaceStore {
   private readonly lockTimeoutMs: number | undefined;
   private readonly writer: GroupWorkspaceWriter;
   private readonly durabilityReestablisher: DurabilityReestablisher;
+  private readonly pathProbe: GroupWorkspacePathProbe;
 
   constructor(dataDir: string, options: GroupWorkspaceStoreOptions = {}) {
     this.path = join(dataDir, GROUP_WORKSPACE_STORE_FILE);
@@ -407,6 +436,7 @@ export class GroupWorkspaceStore {
     this.writer = options.writer ?? atomicWriteFileSync;
     this.durabilityReestablisher = options.durabilityReestablisher
       ?? (filePath => fsyncFilesAndDirectorySync(dirname(filePath), [filePath]));
+    this.pathProbe = options.pathProbe ?? probePathUsability;
   }
 
   async read(chatId: string): Promise<GroupWorkspaceReadResult> {
@@ -419,6 +449,20 @@ export class GroupWorkspaceStore {
     } catch {
       return { status: 'store_unavailable' };
     }
+  }
+
+  async probeBoundDirectoryForConsumption(chatId: string): Promise<GroupWorkspaceConsumptionResult> {
+    const readResult = await this.read(chatId);
+    if (readResult.status === 'store_unavailable') return readResult;
+    const { record } = readResult;
+    if (!record) return { status: 'available', record: undefined };
+    if (record.directory.kind === 'unbound') return { status: 'unbound', record };
+    const usability = this.pathProbe(record.directory.workingDir, record.directoryIdentity
+      ? { expectedIdentity: record.directoryIdentity }
+      : undefined);
+    return usability.ok
+      ? { status: 'usable', record, usability }
+      : { status: 'unusable', record, usability };
   }
 
   async mutate(input: GroupWorkspaceMutation): Promise<GroupWorkspaceMutationResult> {
@@ -456,12 +500,23 @@ export class GroupWorkspaceStore {
         let outcome: Exclude<GroupOperationTerminalOutcome, 'store_unavailable'>;
         let resultingRevision: number | undefined;
         let resultingDirectory: GroupDirectoryState | undefined;
+        let validatedIdentity: PathIdentity | undefined;
 
         if (!actorAllowed(input, current)) outcome = 'unauthorized';
-        else if (input.kind === 'set' && (!input.directoryValid || !isAbsolute(input.requestedWorkingDir))) {
-          outcome = 'invalid_dir';
-        } else if ((current?.revision ?? 0) !== input.expectedRevision) outcome = 'conflict';
-        else {
+        else if (input.kind === 'set') {
+          if (!input.directoryValid || !isAbsolute(input.requestedWorkingDir)) {
+            outcome = 'invalid_dir';
+          } else {
+            const usability = this.pathProbe(input.requestedWorkingDir);
+            if (!usability.ok) outcome = 'invalid_dir';
+            else {
+              validatedIdentity = usability.identity;
+              outcome = (current?.revision ?? 0) !== input.expectedRevision ? 'conflict' : 'committed';
+            }
+          }
+        } else outcome = (current?.revision ?? 0) !== input.expectedRevision ? 'conflict' : 'committed';
+
+        if (outcome === 'committed') {
           const previousRevision = current?.revision ?? 0;
           if (previousRevision >= Number.MAX_SAFE_INTEGER) {
             throw new Error('group workspace revision exhausted');
@@ -475,6 +530,7 @@ export class GroupWorkspaceStore {
             chatId: input.chatId,
             revision: resultingRevision,
             directory: resultingDirectory,
+            ...(validatedIdentity ? { directoryIdentity: validatedIdentity } : {}),
             ...(current?.workspaceManagers?.length
               ? { workspaceManagers: current.workspaceManagers.map(manager => ({ ...manager })) }
               : {}),
