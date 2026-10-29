@@ -1,11 +1,23 @@
 import { describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   formatGroupWorkspaceRepoShow,
   runGroupWorkspaceRepoEntrypoint,
   type GroupWorkspaceRepoEntrypointDeps,
   type GroupWorkspaceRepoEntrypointRequest,
 } from '../src/core/command-handler.js';
-import { canonicalCardSourceEventId, canonicalTextSourceEventId } from '../src/services/group-workspace-store.js';
+import {
+  canonicalCardSourceEventId,
+  canonicalTextSourceEventId,
+  canonicalGroupWorkspaceRequestIntentDigest,
+  GroupWorkspaceStore,
+  groupWorkspaceOperationKey,
+} from '../src/services/group-workspace-store.js';
+import { GroupWorkspaceOperationStore } from '../src/services/group-workspace-operation-store.js';
+import { GroupWorkspaceOperationCoordinator, type GroupCommitReceipt } from '../src/core/group-workspace-operation.js';
+import { resolveGroupWorkspaceRepoSelection } from '../src/core/repo-selection.js';
 
 const actor = { tenantKey: 'tenant-a', unionId: 'on_user' };
 const base: GroupWorkspaceRepoEntrypointRequest = {
@@ -24,6 +36,73 @@ function harness(result: Awaited<ReturnType<GroupWorkspaceRepoEntrypointDeps['ex
 }
 
 describe('group workspace /repo entrypoints', () => {
+  it.each([['name', 'repo-a'], ['index', '1']] as const)(
+    'replays /repo %s from frozen raw intent and canonical target without re-resolution', async (_case, selection) => {
+      const dataDir = mkdtempSync(join(tmpdir(), 'botmux-repo-entrypoint-'));
+      const scanRoot = join(dataDir, 'scan');
+      const target = join(scanRoot, 'repo-a');
+      mkdirSync(target, { recursive: true });
+      const groupStore = new GroupWorkspaceStore(dataDir);
+      let mapping = [{ path: target, name: 'repo-a', branch: 'main' }];
+      let resolutions = 0, switches = 0, writes = 0;
+      const execute = async (request: Parameters<GroupWorkspaceRepoEntrypointDeps['executeSet']>[0]) => {
+        const coordinator = new GroupWorkspaceOperationCoordinator({
+          journalStore: new GroupWorkspaceOperationStore(dataDir), now: () => 10,
+          lookupGroupReceipt: async key => {
+            const found = await groupStore.readReceipt(key);
+            if (found.status !== 'found') return found;
+            return { status: 'found' as const, receipt: {
+              operationKey: key, payloadDigest: found.receipt.payloadDigest, chatId: found.receipt.chatId,
+              targetWorkingDir: found.receipt.canonicalTargetWorkingDir!, status: 'committed' as const,
+              resultingRevision: found.receipt.resultingRevision!,
+            } satisfies GroupCommitReceipt };
+          },
+          reconcileUnknownGroupReceipt: async () => ({ status: 'missing' as const }),
+          readCurrentGroupRevision: async () => ({ status: 'available' as const, revision: 0 }),
+          resolveCanonicalTarget: async () => {
+            resolutions += 1;
+            const resolved = resolveGroupWorkspaceRepoSelection(request.selection!, [scanRoot], mapping);
+            return resolved ? { status: 'resolved' as const, workingDir: resolved.path } : { status: 'store_unavailable' as const };
+          },
+          readSession: async () => ({ status: 'available' as const, generation: 0, workingDir: '/old' }),
+          switchSession: async () => { switches += 1; return { status: 'committed' as const, generation: 1 }; },
+          commitGroup: async journal => {
+            writes += 1;
+            const result = await groupStore.mutate({
+              kind: 'set', chatId: journal.chatId, sourceEventId: journal.sourceEventId,
+              requestedWorkingDir: journal.targetWorkingDir, expectedRevision: journal.expectedGroupRevision,
+              actor: journal.actor, authorized: true, directoryValid: true, now: 10,
+            });
+            return result.outcome === 'committed'
+              ? { status: 'committed' as const, resultingRevision: result.receipt.resultingRevision! }
+              : { status: 'unknown' as const };
+          },
+          convergeSession: async () => undefined,
+        });
+        const result = await coordinator.execute({
+          operationKey: groupWorkspaceOperationKey(request.sourceEventId, 'set'), sourceEventId: request.sourceEventId,
+          kind: 'set', requestIntentDigest: canonicalGroupWorkspaceRequestIntentDigest({
+            kind: 'set', chatId: request.chatId, selection: request.selection!,
+          }), chatId: request.chatId, sessionId: 'session-1', actor: request.actor,
+        });
+        return result.status === 'group_committed'
+          ? { status: 'group_committed' as const, groupRevision: result.groupRevision }
+          : { status: result.status };
+      };
+      const request = { ...base, selection };
+      const replies: string[] = [];
+      await runGroupWorkspaceRepoEntrypoint(request, { executeSet: execute, executeUnbind: vi.fn(), reply: async m => { replies.push(m); } });
+      const receipt = await groupStore.readReceipt(groupWorkspaceOperationKey(canonicalTextSourceEventId({
+        tenantKey: actor.tenantKey, chatId: base.chatId, messageId: base.messageId!,
+      }).ok ? (canonicalTextSourceEventId({ tenantKey: actor.tenantKey, chatId: base.chatId, messageId: base.messageId! }) as any).sourceEventId : '', 'set'));
+      mapping = [{ path: join(scanRoot, 'changed'), name: 'repo-a', branch: 'next' }];
+      await runGroupWorkspaceRepoEntrypoint(request, { executeSet: execute, executeUnbind: vi.fn(), reply: async m => { replies.push(m); } });
+      expect({ resolutions, switches, writes }).toEqual({ resolutions: 1, switches: 1, writes: 1 });
+      expect(await groupStore.readReceipt((receipt as any).receipt.operationKey)).toEqual(receipt);
+      await expect(execute({ ...request, sourceEventId: (receipt as any).receipt.sourceEventId, selection: `${selection}-other` }))
+        .resolves.toMatchObject({ status: 'protocol_conflict' });
+    },
+  );
   it('gives text and card the same terminal response boundary with distinct canonical sources', async () => {
     const text = harness();
     await runGroupWorkspaceRepoEntrypoint(base, text.deps);

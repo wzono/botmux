@@ -35,7 +35,8 @@ export interface GroupWorkspaceOperationRequest {
   sourceEventId: string;
   /** Task 5 coordinates the session-to-group set saga; unbind is wired separately in Task 6. */
   kind: Extract<GroupOperationKind, 'set'>;
-  payloadDigest: string;
+  /** Normalized raw selection, before name/index target resolution. */
+  requestIntentDigest: string;
   chatId: string;
   sessionId: string;
   actor: TenantHumanId;
@@ -94,11 +95,17 @@ function sameIntent(journal: RepoGroupOperationJournal, request: GroupWorkspaceO
   return journal.operationKey === request.operationKey
     && journal.sourceEventId === request.sourceEventId
     && journal.kind === request.kind
-    && journal.payloadDigest === request.payloadDigest
+    && journal.requestIntentDigest === request.requestIntentDigest
     && journal.chatId === request.chatId
-    && journal.sessionId === request.sessionId
     && journal.actor.tenantKey === request.actor.tenantKey
     && journal.actor.unionId === request.actor.unionId;
+}
+
+function receiptMatchesJournal(receipt: GroupCommitReceipt, journal: RepoGroupOperationJournal): boolean {
+  return receipt.operationKey === journal.operationKey
+    && receipt.payloadDigest === journal.payloadDigest
+    && receipt.chatId === journal.chatId
+    && receipt.targetWorkingDir === journal.targetWorkingDir;
 }
 
 export type GroupWorkspaceUnbindResult =
@@ -144,6 +151,9 @@ export async function executeGroupWorkspaceUnbind(
     if (current.status === 'store_unavailable') return { status: 'store_unavailable' };
     const prepared = await dependencies.journalStore.prepare({
       operationKey, sourceEventId: request.sourceEventId, kind: 'unbind',
+      requestIntentDigest: canonicalGroupOperationPayloadDigest({
+        ...intent, expectedRevision: 0, authorized: true, now: 0,
+      }),
       payloadDigest: canonicalGroupOperationPayloadDigest({
         ...intent, expectedRevision: current.revision, authorized: true, now: 0,
       }), chatId: request.chatId, sessionId: GROUP_WORKSPACE_UNBIND_NO_SESSION_ID, expectedSessionGeneration: 0,
@@ -217,25 +227,19 @@ export class GroupWorkspaceOperationCoordinator {
     const receiptLookup = await this.dependencies.lookupGroupReceipt(canonicalOperationKey);
     if (receiptLookup.status === 'store_unavailable') return { status: 'unknown' };
     if (receiptLookup.status === 'found') {
-      if (receiptLookup.receipt.payloadDigest !== canonicalRequest.payloadDigest
-        || receiptLookup.receipt.chatId !== canonicalRequest.chatId) {
+      if (existing.status !== 'found' || !sameIntent(existing.journal, canonicalRequest)
+        || receiptLookup.receipt.payloadDigest !== existing.journal.payloadDigest
+        || receiptLookup.receipt.chatId !== existing.journal.chatId
+        || receiptLookup.receipt.targetWorkingDir !== existing.journal.targetWorkingDir) {
         return { status: 'protocol_conflict', journal: existing.status === 'found' ? existing.journal : undefined };
-      }
-      // A canonical receipt is host-wide authority. Historical recovery may arrive
-      // through another Bot and therefore have a different receiver-local session.
-      if (existing.status !== 'found' || !sameIntent(existing.journal, canonicalRequest)) {
-        return receiptLookup.receipt.status === 'committed'
-          ? { status: 'group_committed', journal: existing.status === 'found' ? existing.journal : undefined,
-            groupRevision: receiptLookup.receipt.resultingRevision }
-          : receiptLookup.receipt.status === 'conflict'
-            ? { status: 'conflict', journal: existing.status === 'found' ? existing.journal : undefined,
-              currentRevision: receiptLookup.receipt.currentRevision }
-            : { status: 'store_unavailable', journal: existing.status === 'found' ? existing.journal : undefined };
       }
       return this.convergeReceipt(existing.journal, receiptLookup.receipt);
     }
     if (existing.status === 'found' && !sameIntent(existing.journal, canonicalRequest)) {
       return { status: 'protocol_conflict', journal: existing.journal };
+    }
+    if (existing.status === 'found' && existing.journal.sessionId !== request.sessionId) {
+      return { status: 'unknown', journal: existing.journal };
     }
 
     let journal: RepoGroupOperationJournal;
@@ -247,8 +251,13 @@ export class GroupWorkspaceOperationCoordinator {
       if (target.status === 'store_unavailable') return { status: 'store_unavailable' };
       const session = await this.dependencies.readSession(request.sessionId);
       if (session.status === 'store_unavailable') return { status: 'store_unavailable' };
+      const payloadDigest = canonicalGroupOperationPayloadDigest({
+        kind: 'set', chatId: canonicalRequest.chatId, sourceEventId: canonicalRequest.sourceEventId,
+        requestedWorkingDir: target.workingDir, expectedRevision: revision.revision,
+        actor: canonicalRequest.actor, authorized: true, directoryValid: true, now: 0,
+      });
       journal = {
-        ...canonicalRequest,
+        ...canonicalRequest, payloadDigest,
         expectedSessionGeneration: session.generation,
         expectedGroupRevision: revision.revision,
         targetWorkingDir: target.workingDir,
@@ -317,6 +326,7 @@ export class GroupWorkspaceOperationCoordinator {
     if (groupResult.status === 'committed') {
       const receiptReadback = await this.dependencies.lookupGroupReceipt(journal.operationKey);
       if (receiptReadback.status !== 'found'
+        || !receiptMatchesJournal(receiptReadback.receipt, journal)
         || receiptReadback.receipt.status !== 'committed'
         || receiptReadback.receipt.resultingRevision !== groupResult.resultingRevision) {
         return this.markUnknown(journal);
@@ -357,10 +367,7 @@ export class GroupWorkspaceOperationCoordinator {
     receipt: GroupCommitReceipt,
   ): Promise<GroupWorkspaceOperationResult> {
     if (!journal) return { status: 'store_unavailable' };
-    if (receipt.operationKey !== journal.operationKey
-      || receipt.payloadDigest !== journal.payloadDigest
-      || receipt.chatId !== journal.chatId
-      || receipt.targetWorkingDir !== journal.targetWorkingDir) {
+    if (!receiptMatchesJournal(receipt, journal)) {
       return { status: 'unknown', journal };
     }
     if (journal.phase === 'group_committed' && (receipt.status !== 'committed'

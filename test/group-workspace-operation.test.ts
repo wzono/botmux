@@ -26,7 +26,10 @@ const ACTOR: TenantHumanId = { tenantKey: 'tenant-a', unionId: 'on_user' };
 const SOURCE_EVENT_ID = 'group-workspace-text-source-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const BASE = {
   operationKey: groupWorkspaceOperationKey(SOURCE_EVENT_ID, 'set'), sourceEventId: SOURCE_EVENT_ID, kind: 'set' as const,
-  payloadDigest: 'intent-X', chatId: 'chat-1', sessionId: 'session-1',
+  requestIntentDigest: 'request-intent-X', payloadDigest: canonicalGroupOperationPayloadDigest({
+    kind: 'set', chatId: 'chat-1', sourceEventId: SOURCE_EVENT_ID, requestedWorkingDir: '/repo/X',
+    expectedRevision: 2, actor: ACTOR, authorized: true, directoryValid: true, now: 0,
+  }), chatId: 'chat-1', sessionId: 'session-1',
   expectedSessionGeneration: 4, expectedGroupRevision: 2,
   targetWorkingDir: '/repo/X', actor: ACTOR,
 };
@@ -80,13 +83,14 @@ describe('GroupWorkspaceOperationStore', () => {
     await expect(lockStore.prepare(journal())).resolves.toEqual({ status: 'store_unavailable' });
   });
 
-  it('loads a legacy schema-v1 journal without an index and derives its canonical intent index', async () => {
+  it('fails closed on a legacy journal that cannot prove the frozen request intent', async () => {
     const dataDir = dir();
     const path = join(dataDir, 'group-workspace-operations.json');
-    writeFileSync(path, JSON.stringify({ schemaVersion: 1, operations: { [BASE.operationKey]: journal() } }));
-    await expect(new GroupWorkspaceOperationStore(dataDir).getByIntent(BASE.sourceEventId, BASE.kind)).resolves.toMatchObject({
-      status: 'found', journal: { operationKey: BASE.operationKey },
-    });
+    const legacy = journal() as Partial<RepoGroupOperationJournal>;
+    delete legacy.requestIntentDigest;
+    writeFileSync(path, JSON.stringify({ schemaVersion: 1, operations: { [BASE.operationKey]: legacy } }));
+    await expect(new GroupWorkspaceOperationStore(dataDir).getByIntent(BASE.sourceEventId, BASE.kind))
+      .resolves.toEqual({ status: 'store_unavailable' });
   });
 
   it('looks up the canonical source/kind index and rejects a corrupt index', async () => {
@@ -185,7 +189,7 @@ function harness(options: {
 
 const REQUEST = {
   operationKey: BASE.operationKey, sourceEventId: BASE.sourceEventId, kind: BASE.kind,
-  payloadDigest: BASE.payloadDigest, chatId: BASE.chatId, sessionId: BASE.sessionId, actor: ACTOR,
+  requestIntentDigest: BASE.requestIntentDigest, chatId: BASE.chatId, sessionId: BASE.sessionId, actor: ACTOR,
 };
 
 describe('executeGroupWorkspaceUnbind', () => {
@@ -242,6 +246,9 @@ describe('executeGroupWorkspaceUnbind', () => {
     const intent = { kind: 'unbind' as const, chatId: BASE.chatId, sourceEventId, actor: ACTOR };
     expect(await journalStore.prepare({
       operationKey, sourceEventId, kind: 'unbind',
+      requestIntentDigest: canonicalGroupOperationPayloadDigest({
+        ...intent, expectedRevision: 0, authorized: true, now: 0,
+      }),
       payloadDigest: canonicalGroupOperationPayloadDigest({
         ...intent, expectedRevision: 0, authorized: true, now: 0,
       }),
@@ -302,6 +309,9 @@ describe('executeGroupWorkspaceUnbind', () => {
     const seed = new GroupWorkspaceOperationStore(dataDir);
     await seed.prepare({
       operationKey, sourceEventId, kind: 'unbind',
+      requestIntentDigest: canonicalGroupOperationPayloadDigest({
+        ...intent, expectedRevision: 0, authorized: true, now: 0,
+      }),
       payloadDigest: canonicalGroupOperationPayloadDigest({
         ...intent, expectedRevision: 0, authorized: true, now: 0,
       }),
@@ -363,20 +373,35 @@ describe('GroupWorkspaceOperationCoordinator', () => {
     await expect(first.coordinator.execute(REQUEST)).rejects.toThrow();
     const replay = harness({ dataDir });
     await expect(replay.coordinator.execute({
-      ...REQUEST, operationKey: 'caller-controlled', payloadDigest: 'different-intent',
+      ...REQUEST, operationKey: 'caller-controlled', requestIntentDigest: 'different-intent',
     })).resolves.toMatchObject({ status: 'protocol_conflict' });
     expect(replay.calls).toEqual(['receipt']);
   });
 
-  it('replays a host-wide committed receipt through a different receiver-local session', async () => {
-    const first = harness();
+  it('replays a committed receipt through a different receiver-local session using the frozen journal', async () => {
+    const dataDir = dir();
+    const first = harness({ dataDir });
     await expect(first.coordinator.execute(REQUEST)).resolves.toMatchObject({ status: 'group_committed' });
-    const replay = harness({ dataDir: dir() });
+    const replay = harness({ dataDir });
     for (const [key, value] of first.receipts) replay.receipts.set(key, value);
     await expect(replay.coordinator.execute({ ...REQUEST, sessionId: 'bot-b-session' }))
       .resolves.toMatchObject({ status: 'group_committed', groupRevision: 3 });
     expect(replay.switches).toBe(0);
     expect(replay.commits).toBe(0);
+  });
+
+  it('does not let a foreign receiver advance or poison a prepared journal before a receipt exists', async () => {
+    const dataDir = dir();
+    const first = harness({ dataDir, crashAt: 'prepared_before_switch' });
+    await expect(first.coordinator.execute(REQUEST)).rejects.toThrow();
+    const foreign = harness({ dataDir });
+    await expect(foreign.coordinator.execute({ ...REQUEST, sessionId: 'bot-b-session' }))
+      .resolves.toMatchObject({ status: 'unknown' });
+    expect(foreign.switches).toBe(0);
+    expect(foreign.commits).toBe(0);
+    await expect(foreign.store.get(BASE.operationKey)).resolves.toMatchObject({
+      status: 'found', journal: { phase: 'prepared', sessionId: BASE.sessionId },
+    });
   });
 
   it('looks up prior intent before target/revision and reuses frozen values after intervening change', async () => {
@@ -388,8 +413,12 @@ describe('GroupWorkspaceOperationCoordinator', () => {
     expect(replay.calls).not.toContain('target');
     expect(replay.calls).not.toContain('revision');
     expect(replay.calls).toContain('group-commit');
-    expect(await replay.store.get(BASE.operationKey)).toMatchObject({ journal: { targetWorkingDir: '/repo/X', expectedGroupRevision: 2, expectedSessionGeneration: 4, payloadDigest: 'intent-X' } });
-    await expect(replay.coordinator.execute({ ...REQUEST, payloadDigest: 'different-intent' })).resolves.toMatchObject({ status: 'protocol_conflict' });
+    expect(await replay.store.get(BASE.operationKey)).toMatchObject({ journal: {
+      targetWorkingDir: '/repo/X', expectedGroupRevision: 2, expectedSessionGeneration: 4,
+      requestIntentDigest: 'request-intent-X', payloadDigest: BASE.payloadDigest,
+    } });
+    await expect(replay.coordinator.execute({ ...REQUEST, requestIntentDigest: 'different-intent' }))
+      .resolves.toMatchObject({ status: 'protocol_conflict' });
   });
 
   it.each([
@@ -420,6 +449,23 @@ describe('GroupWorkspaceOperationCoordinator', () => {
     await expect(h.coordinator.execute(REQUEST)).resolves.toMatchObject({ status: phase });
     expect(h.calls).toContain('converge:explicit:none');
     await expect(h.store.get(BASE.operationKey)).resolves.toMatchObject({ journal: { phase } });
+  });
+
+  it('rejects a post-commit receipt whose digest or target differs from the frozen operation', async () => {
+    const h = harness();
+    const dependencies = (h.coordinator as any).dependencies;
+    dependencies.afterBoundary = async (boundary: string) => {
+      if (boundary === 'group_committed_before_convergence') {
+        h.receipts.set(BASE.operationKey, receipt({ status: 'committed', resultingRevision: 3 }, {
+          payloadDigest: 'other-operation', targetWorkingDir: '/repo/Y',
+        }));
+      }
+    };
+    await expect(h.coordinator.execute(REQUEST)).resolves.toMatchObject({ status: 'unknown' });
+    await expect(h.store.get(BASE.operationKey)).resolves.toMatchObject({
+      status: 'found', journal: { phase: 'unknown' },
+    });
+    expect(h.calls.some(call => call.startsWith('converge:'))).toBe(false);
   });
 
   it('keeps a restored group_committed journal unknown when its authoritative receipt was lost', async () => {

@@ -22,6 +22,7 @@ export interface RepoGroupOperationJournal {
   operationKey: string;
   sourceEventId: string;
   kind: GroupOperationKind;
+  requestIntentDigest: string;
   payloadDigest: string;
   chatId: string;
   sessionId: string;
@@ -99,6 +100,7 @@ function validateJournal(value: unknown, key: string): asserts value is RepoGrou
     || typeof value.sourceEventId !== 'string' || !value.sourceEventId
     || (value.kind !== 'set' && value.kind !== 'unbind')
     || value.operationKey !== groupWorkspaceOperationKey(value.sourceEventId as string, value.kind as GroupOperationKind)
+    || typeof value.requestIntentDigest !== 'string' || !value.requestIntentDigest
     || typeof value.payloadDigest !== 'string' || !value.payloadDigest
     || typeof value.chatId !== 'string' || !value.chatId
     || typeof value.sessionId !== 'string' || !value.sessionId
@@ -157,6 +159,7 @@ function sameFrozenIntent(left: RepoGroupOperationJournal, right: RepoGroupOpera
   return left.operationKey === right.operationKey
     && left.sourceEventId === right.sourceEventId
     && left.kind === right.kind
+    && left.requestIntentDigest === right.requestIntentDigest
     && left.payloadDigest === right.payloadDigest
     && left.chatId === right.chatId
     && left.sessionId === right.sessionId

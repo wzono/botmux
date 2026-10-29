@@ -203,6 +203,15 @@ export function canonicalGroupOperationPayloadDigest(input: GroupWorkspaceMutati
     : [PAYLOAD_VERSION, input.chatId, input.kind, 'tombstone']);
 }
 
+/** Stable semantic request identity before a repo name/index is resolved to a path. */
+export function canonicalGroupWorkspaceRequestIntentDigest(input: {
+  chatId: string;
+  kind: 'set';
+  selection: string;
+}): string {
+  return digest('group-workspace-request-intent-v1', [PAYLOAD_VERSION, input.chatId, input.kind, input.selection.trim()]);
+}
+
 export function groupWorkspaceOperationKey(sourceEventId: string, kind: GroupOperationKind): string {
   return digest('group-workspace-operation-v1', [OPERATION_KEY_VERSION, sourceEventId, kind]);
 }

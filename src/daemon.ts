@@ -5,7 +5,7 @@ import { isCurrentBotInChat, resolveUnionIdFromOpenIdStrict } from './im/lark/cl
 import { createBotAdminUnionsPublisher, readBotAdminUnions, type BotAdminIdentityConfig } from './services/bot-admin-unions-store.js';
 import {
   GroupWorkspaceStore,
-  canonicalGroupOperationPayloadDigest,
+  canonicalGroupWorkspaceRequestIntentDigest,
   groupWorkspaceOperationKey,
 } from './services/group-workspace-store.js';
 import { GroupWorkspaceOperationStore } from './services/group-workspace-operation-store.js';
@@ -537,7 +537,8 @@ import {
   readGroupCollaborationMode,
 } from './services/group-collaboration-mode-store.js';
 import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.js';
-import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, resolveRepoSelection, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, runGroupWorkspaceRepoEntrypoint } from './core/command-handler.js';
+import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, runGroupWorkspaceRepoEntrypoint } from './core/command-handler.js';
+import { resolveGroupWorkspaceRepoSelection } from './core/repo-selection.js';
 import { createGroupWorkspaceRouteRuntime } from './core/group-workspace-route-runtime.js';
 import { classifySlash, isCommandDecision, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
 import { deriveSessionPhase } from './core/session-phase.js';
@@ -32658,10 +32659,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           reply,
           executeSet: async request => {
             if (!ds || !request.selection) return { status: 'aborted' };
-            const payloadDigest = canonicalGroupOperationPayloadDigest({
-              kind: 'set', chatId: request.chatId, sourceEventId: request.sourceEventId,
-              requestedWorkingDir: request.selection, expectedRevision: 0, actor: request.actor,
-              authorized: true, directoryValid: true, now: 0,
+            const requestIntentDigest = canonicalGroupWorkspaceRequestIntentDigest({
+              kind: 'set', chatId: request.chatId, selection: request.selection,
             });
             const coordinator = new GroupWorkspaceOperationCoordinator({
               journalStore: groupWorkspaceOperationStore,
@@ -32709,7 +32708,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                   : current;
               },
               resolveCanonicalTarget: async () => {
-                const resolved = resolveRepoSelection(request.selection!, getProjectScanDirs(ds));
+                const resolved = resolveGroupWorkspaceRepoSelection(
+                  request.selection!, getProjectScanDirs(ds), lastRepoScan.get(ds.chatId),
+                );
                 return resolved ? { status: 'resolved', workingDir: resolved.path } : { status: 'store_unavailable' };
               },
               readSession: async sessionId => {
@@ -32760,7 +32761,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             });
             const result = await coordinator.execute({
               operationKey: groupWorkspaceOperationKey(request.sourceEventId, 'set'),
-              sourceEventId: request.sourceEventId, kind: 'set', payloadDigest,
+              sourceEventId: request.sourceEventId, kind: 'set', requestIntentDigest,
               chatId: request.chatId, sessionId: sessionKey(request.chatId, cfg.larkAppId), actor: request.actor,
             });
             return result.status === 'group_committed'
