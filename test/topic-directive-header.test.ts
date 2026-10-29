@@ -35,7 +35,10 @@ const mocks = vi.hoisted(() => {
     resolveSender: vi.fn(async (_appId: string, openId?: string) => (
       openId ? { openId, type: 'user' as const } : undefined
     )),
-    forkWorker: vi.fn((..._args: any[]) => undefined),
+    forkWorker: vi.fn((ds: any, ..._args: any[]) => {
+      ds.worker = { killed: false, send: vi.fn() };
+      return true;
+    }),
     sendWorkerInput: vi.fn((..._args: any[]) => true),
     downloadResources: vi.fn(async (..._args: any[]) => ({ attachments: [] as unknown[], needLogin: false })),
     createdSessions: [] as any[],
@@ -211,6 +214,10 @@ beforeEach(() => {
   mocks.getChatMode.mockResolvedValue('group');
   mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
   mocks.sendWorkerInput.mockReturnValue(true);
+  mocks.forkWorker.mockImplementation((ds: any) => {
+    ds.worker = { killed: false, send: vi.fn() };
+    return true;
+  });
   registerAppBot();
 });
 
@@ -436,6 +443,63 @@ describe('指令头：向后兼容（D9）', () => {
     expect(mocks.forkWorker.mock.calls[0][1]).toBe('');
     expect(ds.session.initialUserTurnPending).toBe(true);
     expect(sentContents().join('\n')).toContain('话题已就绪');
+  });
+
+  it('pinned raw route retains its command after guarded fork rejection', async () => {
+    registerAppBot({ defaultWorkingDir: botmuxRepo });
+    mocks.forkWorker.mockReturnValueOnce(false);
+    const firstCtx = groupCtx('om_raw_pinned_rejected');
+
+    await handleNewTopic(groupEvent('/t /goal ship the fix', firstCtx.messageId), firstCtx);
+
+    const ds = mocks.forkWorker.mock.calls[0][0];
+    expect(ds.worker).toBeNull();
+    expect(ds.pendingRawInput).toBe('/goal ship the fix');
+    expect(ds.initialStartPending).toBe(true);
+    expect(firstCtx.ingressAdmission?.admitted).not.toBe(true);
+  });
+
+  it('no-project raw route retains its command after guarded fork rejection', async () => {
+    registerAppBot({ workingDirs: [] });
+    mocks.forkWorker.mockReturnValueOnce(false);
+    const firstCtx = groupCtx('om_raw_picker_rejected');
+
+    await handleNewTopic(groupEvent('/t /goal ship the fix', firstCtx.messageId), firstCtx);
+
+    const ds = mocks.forkWorker.mock.calls[0][0];
+    expect(ds.worker).toBeNull();
+    expect(ds.pendingRawInput).toBe('/goal ship the fix');
+    expect(ds.initialStartPending).toBe(true);
+  });
+
+  it('pinned idle route keeps opening state unadmitted and sends no ready when guarded fork rejects', async () => {
+    registerAppBot({ defaultWorkingDir: botmuxRepo });
+    mocks.forkWorker.mockReturnValueOnce(false);
+    const ctx = groupCtx('om_idle_pinned_rejected');
+
+    await handleNewTopic(groupEvent('/t /repo botmux', ctx.messageId), ctx);
+
+    const ds = mocks.forkWorker.mock.calls[0][0];
+    expect(ds.worker).toBeNull();
+    expect(ds.initialStartPending).toBe(true);
+    expect(ds.session.initialUserTurnPending).toBeUndefined();
+    expect(ctx.ingressAdmission?.admitted).not.toBe(true);
+    expect(sentContents().join('\n')).not.toContain('话题已就绪');
+  });
+
+  it('no-project idle route keeps opening state unadmitted and sends no ready when guarded fork rejects', async () => {
+    registerAppBot({ workingDirs: [] });
+    const ctx = groupCtx('om_idle_picker_rejected');
+    mocks.forkWorker.mockReturnValueOnce(false);
+
+    await handleNewTopic(groupEvent('标题 /t /model sonnet', ctx.messageId), ctx);
+
+    const ds = mocks.forkWorker.mock.calls[0][0];
+    expect(ds.worker).toBeNull();
+    expect(ds.initialStartPending).toBe(true);
+    expect(ds.session.initialUserTurnPending).toBeUndefined();
+    expect(ctx.ingressAdmission?.admitted).not.toBe(true);
+    expect(sentContents().join('\n')).not.toContain('话题已就绪');
   });
 
   it('/t /goal … 这类既有冷启动用法不被解析器提前拒掉', async () => {

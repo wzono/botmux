@@ -24408,8 +24408,8 @@ async function startInitialPassthroughSession(args: {
       messageId,
     });
     const availableBots = await getAvailableBots(larkAppId, chatId);
-    forkReservedInitialRawSession(ds, availableBots);
-    // fork 成功即开场已交给 CLI；fork 抛错则本轮只存在于内存，保持重发提示。
+    if (!forkReservedInitialRawSession(ds, availableBots)) return;
+    // fork 成功即开场已交给 CLI；fork 拒绝/抛错则保留 opening，保持可修复后重试。
     onDurablyAdmitted?.();
     const reason = oncallEntry
       ? `oncall-bound chat ${chatId}`
@@ -24472,7 +24472,7 @@ async function startInitialPassthroughSession(args: {
     messageId,
   });
   const availableBots = await getAvailableBots(larkAppId, chatId);
-  forkReservedInitialRawSession(ds, availableBots);
+  if (!forkReservedInitialRawSession(ds, availableBots)) return;
   logger.info(`[${tag(ds)}] ${repoCardDegraded ? 'Repo card unavailable' : 'No projects to select'}, queued initial raw passthrough ${commandContent.substring(0, 40)}`);
 }
 
@@ -25774,7 +25774,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // 指令头只交代规格、没写任务：空跑 CLI 等下一条（详见 forkReservedIdleSession）。
     // 这条路径不产生 AI 回合、也没有流式卡片，所以用一句确认回显真正钉下去的东西。
     if (topicHeaderIdleStart && !hasBufferedOpeningInput(ds)) {
-      forkReservedIdleSession(ds);
+      if (!forkReservedIdleSession(ds)) return;
       // 与下面常规 pinned 分支同序，刻意不提前打标：这条路没有 pendingRepo 那种 durable
       // staging，fork 抛错时 forkWorker 的 pre-init 补偿已经杀掉子进程并回滚，本轮既没进
       // worker 也没有兜底，应当保持「请重发」。空跑成功之后 ready 回复失败才是「已接收，
@@ -25859,15 +25859,17 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // selection, spawn directly.
     // 已 durable staging（picker）且通过放弃闸：即使下面 fork 失败，opening 仍由
     // 会话 durable 持有（pre-init 回滚恢复 queued journal，重启复活），重发会
-    // 重复执行——先打接纳标。
-    markIngressAdmitted(ctx);
+    // 重复执行——业务 opening 在 fork 前打接纳标；纯 setup 没有业务输入，只有 guarded
+    // fork 真正成功后才接纳并发送 ready。
     ds.pendingRepo = false;
     if (topicHeaderIdleStart && !hasBufferedOpeningInput(ds)) {
-      forkReservedIdleSession(ds);
+      if (!forkReservedIdleSession(ds)) return;
+      markIngressAdmitted(ctx);
       await sessionReply(anchor, topicHeaderReadyText(topicSpec!, localeForBot(larkAppId), ds.workingDir), 'text', larkAppId);
       logger.info(`[${tag(ds)}] topic header → idle start (no projects to select), waiting for the first task`);
       return;
     }
+    markIngressAdmitted(ctx);
     ensureSessionWhiteboard(ds);
     await maybeSeedCardlessForceTopicTurn({
       ds,
