@@ -2,123 +2,202 @@
 
 ## 目标 / Goal
 
-为普通飞书群增加一份独立于单个 Bot 配置的宿主机本地工作目录绑定，使同一宿主机上的所有 Bot 在创建群顶层会话或通过 `/th` 新开话题时得到一致、持久且可追踪的目录；同时保持话题会话的任务隔离、现有 per-Bot `oncallChats` 的授权语义和显式会话选仓能力。
+为普通飞书群增加一份独立于单个 Bot 配置的宿主机本地工作目录绑定，使同一宿主机上的所有 Bot 在创建群顶层会话或通过 `/th` 新开话题时得到一致、持久且可追踪的目录；同时保持话题会话任务隔离、现有 per-Bot `oncallChats` 授权语义和显式会话选仓能力。
 
 ## 背景 / Context
 
-当前 `oncallChats` 存在于每个 Bot 的 `bots.json` 配置项中，实际语义是 “Bot × 群 → workingDir”，不是群内所有 Bot 共享的绑定。普通群 chat-scope 会话可被其他 Bot 临时继承，但依赖 active 会话存在。`/th` 的 “here” 生命周期找不到当前 Bot 的 oncall 绑定或 active chat-scope peer 时会拒绝启动。编队/profile 重写还可能覆盖 `bots.json` 中的运行态 `oncallChats`，因此用户观察到群目录“经常丢失”。
+当前 `oncallChats` 位于每个 Bot 的 `bots.json`，实际语义是 “Bot × 群 → workingDir”，不是群内所有 Bot 共享的绑定。普通群 chat-scope 会话可临时继承其他 Bot 的 active 会话，但会随会话关闭而消失；`/th` 找不到当前 Bot 的 oncall 绑定或 active peer 时会拒绝启动。编队/profile 重写还可能覆盖 `bots.json` 中的运行态 `oncallChats`。
 
-工作目录是宿主机绝对路径。同一飞书群可能连接多台机器，不能把一台机器上的路径复制到其他机器。
+工作目录是宿主机绝对路径。同一飞书群可能连接多台机器，不能把一台机器的路径复制到其他机器。
 
 ## 已确认决策 / Confirmed decisions
 
-### 状态边界与优先级
+### 状态边界与目录优先级
 
-新增宿主机本地、跨 Bot 共享的群绑定，逻辑键为 `chatId`；物理存储天然位于当前 Botmux 宿主机，因此不跨机器同步绝对路径。平台 `machineId` 只用于展示；未绑定平台时功能仍可用。
+新增宿主机本地、跨 Bot 共享的群状态，逻辑键为 `chatId`；物理存储天然位于当前 Botmux 宿主机，不跨机器同步。平台 `machineId` 只用于展示，未绑定平台时功能仍可用。
 
 新会话解析目录的优先级为：
 
 1. 当前会话或指令显式指定的目录；
-2. 当前 Bot 对该群的 `oncallChats` 专用覆盖；
-3. 当前宿主机的群级目录；
+2. 当前 Bot 对该群的**显式/人工** `oncallChats` 专用覆盖；
+3. 当前宿主机的有效群级目录；
 4. 当前 Bot 的 `defaultWorkingDir` / `defaultOncall.workingDir`；
 5. 仓库选择卡。
 
-`oncallChats` 继续同时承担 per-Bot 工作目录覆盖和对话授权，不自动迁移、不改义。
+`oncallChats` 继续承担 per-Bot 对话授权，不自动迁移、不改义。为避免 `defaultOncall` 的自动绑定遮蔽已存在的群目录，cwd 来源必须区分：
+
+- `oncall-explicit`：人工配置或明确选定的专用覆盖，优先于群目录；
+- `oncall-default-auto`：`ensureDefaultOncallBound` 为授权/兼容自动生成的记录；它保留 oncall 授权效果，但在 cwd resolver 中不作为显式覆盖。存在有效群目录时取群目录，不存在群目录时才使用其 `defaultOncall` 目录。
+
+新写入记录必须带来源；历史 `oncallChats` 没有来源时不猜测、不批量迁移，按既有显式覆盖处理，避免改变已运行部署。授权判定仍看原有 oncall 绑定，不因 cwd resolver 跳过 `oncall-default-auto` 而缩小权限。
 
 ### `/repo` 与会话范围对齐
 
-- 普通群顶层（`scope='chat'`）执行 `/repo <path|name|index>` 或在 repo 卡片中选择目录：切换当前 chat-scope 会话，并在会话切换成功后更新群级目录。
-- 话题内（`scope='thread'`）执行相同操作：只切换当前话题，不写群级目录。
-- `/repo wt ...` 创建任务 worktree，属于显式会话目录，不写群级目录，避免把短生命周期 worktree 设为全群默认。
-- `/repo here` 复用当前目录但不制造新的群级写入；若顶层当前目录已经来自有效群绑定，其状态不变。
-- `/repo show` 只读展示当前会话目录、群级目录、当前 Bot 的专用覆盖、最终来源、revision 和最后更新时间。
-- `/repo unbind` 只允许在普通群顶层解除当前宿主机群绑定；不修改当前已运行会话或 `oncallChats`。
+- 普通群顶层（`scope='chat'`）执行 `/repo <path|name|index>` 或选择 repo 卡：执行下述两阶段操作；会话切换成功后才尝试提交群目录。
+- 话题内相同操作只切当前话题，不写群状态。
+- `/repo wt ...` 属于显式会话 worktree，不写群状态。
+- `/repo here` 复用当前目录，不制造群写入；若当前目录来自群绑定，状态不变。
+- `/repo show` 只读展示 session、显式 per-Bot oncall、自动 defaultOncall、group、bot default、最终来源、群 revision/状态和更新时间。
+- `/repo unbind` 只允许普通群顶层执行：提交 tombstone，不修改当前会话、ACL 或 `oncallChats`。
 
-顺序写入以后一次成功提交为准。真正并发写入使用 revision/CAS；先提交者成功，后提交者收到冲突和当前值，不静默覆盖。相同 `sourceMessageId` 重放幂等返回既有结果。
+不同事件的并发写入使用 group revision/CAS；先提交者成功，后提交者返回冲突和当前值，不自动 rebase 或覆盖。重放由持久 operation receipt 判定，而不是只比较当前 binding 的 message id。
 
-### 运行中会话
+### 稳定人类身份与权限入口
 
-群级目录更新不强切正在执行的会话：
+群管理主体统一为 `TenantHumanId = { tenantKey, unionId }`。`open_id (ou_*)` 只在签发 app 内用于事件解析，禁止跨 app 直接比较；`union_id (on_*)` 只有在同租户边界内才稳定。无法取得 tenant 或 union_id、来源为 Bot、身份转换不确定时，群状态写入 fail closed。
 
-- 发起 `/repo` 的 chat-scope 会话按现有安全切仓流程立即切换，切换成功后提交群绑定。
-- 之后创建的新会话和 `/th` 读取新绑定。
-- 既有 thread-scope 会话保持自己的目录。
-- 其他 Bot 的既有 chat-scope 会话不被跨进程主动关闭；下一次空闲回合开始前若其目录来源是旧群绑定且没有显式/per-Bot 覆盖，则安全恢复到新群目录并给出一次提示。
+默认管理者集合来自宿主机的管理员 union 快照：对所有已注册 Bot 的 `resolvedAllowedUsers`，通过各自 app 将真人归一化为 `TenantHumanId`，去重后持久化/缓存。每次授权必须同时校验快照的 `configFingerprint` 与当前参与计算的 Bot 配置指纹一致；配置变化、快照过期、转换失败或租户不一致时先刷新，无法得到 fresh snapshot 则拒绝，不使用旧管理员资格。`workspaceManagers` 也存同一 `TenantHumanId` 类型；非空时完全替代默认并集。
 
-### 权限
+文本命令和卡片动作在接收 Bot 的通用 `canRunDaemonCommand` / repo-card gate **之前**增加窄路由：仅当事件已经解析为普通群的 `/repo <selection>` 或 `/repo unbind`（卡片则为该群原始 repo 请求对应的 selection/unbind action），且 `canManageGroupWorkspace(chatId, TenantHumanId, freshSnapshot)` 通过时，允许到达 group-workspace 操作路径。该例外：
 
-群绑定修改权限不取决于命令发给哪个 Bot：
+- 不授予普通对话、其他 daemon 命令、thread `/repo`、`/repo wt`、`/repo here` 或跨群卡片权限；
+- 不绕过目标路径校验、operation journal、CAS 或 session switch 的原有安全检查；
+- 对仅有群管理权、没有接收 Bot 权限的人，只允许这次群操作。若会话切换需要接收 Bot 的额外能力而不具备，则不得降级为普通 switch；应明确拒绝且不写群状态。
 
-- 默认管理者是当前宿主机所有已注册 Bot 的 `resolvedAllowedUsers` 并集。
-- 群级记录可带 `workspaceManagers`；非空时只允许该名单中的人修改，默认并集不再生效。
-- 飞书群主/群管理员不自动获得本地文件系统控制权。
-- Bot 事件不能以 Bot 自身身份修改群绑定。受信任 Bot 代办时必须携带并验证原始人类操作者；首版没有可靠人类来源时拒绝群级写入，但仍可按既有规则切当前会话。
-- 所有成功写入记录 `updatedBy`、`sourceMessageId`、旧值、新值和 revision。
+飞书群主/群管理员不自动获得本地文件系统控制权。受信任 Bot 代办必须携带并验证原始真人的 `TenantHumanId`；首版无法验证时拒绝群写入。所有终态收据记录稳定 `actor`、源事件、旧/新值和 revision。
 
-### 持久化与失效
+### 持久状态模型：单调群版本、ACL 与历史收据
 
-新增共享 store，位于 `SESSION_DATA_DIR` 下，不进入 `bots.json`。建议文件为 `group-workspaces.json`，以现有跨进程文件锁和原子写模式更新。记录结构：
+共享 store 位于 `SESSION_DATA_DIR/group-workspaces.json`，使用现有跨进程锁和原子写模式。目录状态、ACL 和版本生命周期分离：
 
 ```ts
-interface GroupWorkspaceBinding {
+type TenantHumanId = { tenantKey: string; unionId: string };
+
+type GroupDirectoryState =
+  | { kind: 'bound'; workingDir: string }
+  | { kind: 'unbound' }; // tombstone
+
+interface GroupWorkspaceRecord {
   chatId: string;
-  workingDir: string;
-  revision: number;
+  revision: number;              // set/unbind 均严格递增，永不因重绑归零
+  directory: GroupDirectoryState;
+  workspaceManagers?: TenantHumanId[]; // unbind 后保留
   updatedAt: number;
-  updatedBy: string;
-  sourceMessageId: string;
-  workspaceManagers?: string[];
+  updatedBy: TenantHumanId;
+}
+
+type GroupOperationKind = 'set' | 'unbind';
+interface GroupOperationReceipt {
+  operationKey: string;          // digest(sourceEventId, kind, payloadDigest)
+  sourceEventId: string;         // 文本消息事件；卡片为 action event id
+  originMessageId?: string;      // 卡片原始请求/卡片消息，仅审计，不作幂等键
+  kind: GroupOperationKind;
+  payloadDigest: string;         // canonical chatId + target/tombstone + expectedRevision
+  chatId: string;
+  outcome: 'committed' | 'conflict' | 'invalid_dir' | 'unauthorized' | 'store_unavailable';
+  resultingRevision?: number;
+  resultingDirectory?: GroupDirectoryState;
+  actor: TenantHumanId;
+  completedAt: number;
 }
 ```
 
-设置时必须验证目录存在且为目录。绑定建立后目录失效时 fail closed：新会话、`/th` 和需要恢复的会话明确报“群级目录已失效”，不得回退到 `~`、Bot 默认目录或选仓卡。记录保留，管理员通过新的顶层 `/repo` 修复或 `/repo unbind` 解除。
+收据跨重启持久保留（首版不做自动清理）；同 `sourceEventId + kind + payloadDigest` 返回原收据，不再切会话或写群。相同 source event 携带不同 payload/kind 视为协议冲突并拒绝。卡片 action event id 是真实源事件；原请求/card message id 只用于关联，因此同一张卡的两个独立 action 不会被误合并。解绑自身也有 receipt，并提交 `revision + 1` 的 tombstone；后续重绑继续递增。解绑不删除 `workspaceManagers`，因此不会扩大 ACL。
 
-## 备选方案与否决理由
+共享 store 损坏、lock/read/write/fsync/rename 失败均 fail closed；不能解释成“没有绑定”。
 
-1. **复制到每个 Bot 的 `oncallChats`**：改动小，但继续与授权耦合，新增 Bot 和编队重写仍会产生漂移，否决。
-2. **只复用 active chat-scope 会话**：无需新存储，但会话关闭/回收后失效，不能解释和修复“绑定丢失”，否决。
-3. **新增 `/workspace` 命令**：边界清楚，但增加第二套工作目录心智模型；用户明确要求与 `/repo` 运行时范围对齐，否决。
+### 两阶段操作 journal 与成功响应边界
+
+顶层 `/repo` 是跨 session store 与 group store 的持久 saga，不宣称文件级原子。副作用前先持久化 journal：
+
+```ts
+type RepoGroupOperationPhase =
+  | 'prepared'
+  | 'session_committed'
+  | 'group_committed'
+  | 'conflict'
+  | 'store_unavailable'
+  | 'unknown';
+
+interface RepoGroupOperationJournal {
+  operationKey: string;
+  sourceEventId: string;
+  chatId: string;
+  sessionId: string;
+  expectedSessionGeneration: number;
+  expectedGroupRevision: number;
+  targetWorkingDir: string;
+  actor: TenantHumanId;
+  phase: RepoGroupOperationPhase;
+  sessionGenerationAfter?: number;
+  groupRevisionAfter?: number;
+}
+```
+
+状态转移：
+
+1. 授权、路径可用性与当前 revision 校验后，在任何 session/worker 副作用前写 `prepared`。
+2. 重放/恢复先读 journal/receipt：终态直接返回；`prepared` 先读回 session generation/cwd，只有能证明未提交时才执行一次 switch，能证明已提交则推进，无法证明则置 `unknown` 并停止人工可见操作。
+3. session 安全切换及持久化完成后写 `session_committed`，记录新 generation。此时会话目标目录的 provenance 是 `explicit`，直到 group CAS 成功；这样群提交失败时不会被后续 auto-follow 覆盖。
+4. 以 journal 的 expected revision 做 group CAS。成功时在同一 group-store 锁/原子写中写 record 与 operation receipt；receipt 是群提交的权威证明。释放 group 锁后再将 journal 标记 `group_committed`，并把该 session provenance 收敛为 `group` + 新 revision；任一后续写入结果未知时，恢复均以 receipt + session generation 读回收敛，不重复 group CAS。
+5. CAS 冲突写 `conflict` receipt；store 明确失败写 `store_unavailable` receipt（若底层提交结果不确定则 journal 为 `unknown`，不得伪造失败 receipt）。两者都保留已切换会话为 `explicit`，明确提示“会话已切换，群目录未更新”及当前群值/修复方式，不自动重基。
+6. `unknown` 恢复先在锁内按 operation key 读 receipt 和 group record：有 receipt 即收敛；无 receipt 且 record 精确证明该 operation 已提交时补 receipt；否则保持 unknown、拒绝再次切 session 或覆盖群值，提示管理员重试新的事件或检查状态。
+
+“群目录更新成功”的最终回复只能在 `group_committed` receipt 可读回后发送。现有 session-switch 成功文案必须延迟/改为中间结果，不能在 group CAS 前让用户误认整体成功。若进程在提交后、回复前退出，重放直接使用 receipt 发相同终态回复，不重启 worker、不增加 revision。`/repo unbind` 没有 session 阶段，但也先 journal、CAS 后 receipt，再发送成功。
+
+### 路径可用性与 TOCTOU
+
+set 写入前以及每次消费（新会话、`/th`、恢复、auto-follow、worker spawn 前）均以 daemon 的实际 uid/gid 执行：规范化绝对路径、`stat` 确认为目录，并通过独立 fd 或受控子进程实际 `chdir`/打开目录探测搜索权限。只 `stat` 成功不算可用。不要求目录可写。
+
+校验与 worker 启动之间仍有 TOCTOU：worker 必须以目标 cwd 启动并回报实际 cwd/ready，任一 chdir、挂载、权限或 realpath 变化失败都终止本 turn，不能回退到 `~`、Bot 默认目录或 picker。绑定记录保留，管理员用新的顶层 `/repo` 修复或 `/repo unbind` 解除。
+
+### 运行中会话、provenance 与安全跟随
+
+群更新不强切正在执行的会话。所有 cwd mutation 入口必须原子更新 `{workingDir, workingDirSource, groupWorkspaceRevision}`：
+
+- 顶层 group 解析/成功收敛：`source='group'` 并记录 revision；
+- `/repo`、`/cd`、worktree、人工 IPC repin 等显式操作：`source='explicit'`，清除 group revision；
+- 显式 oncall：`source='oncall-explicit'`；自动 defaultOncall：`source='oncall-default-auto'`；Bot 默认：`source='bot-default'`；
+- resume/recovery/session restore 必须恢复已持久化来源，不得仅恢复 path；跨进程 IPC 必须传递并校验 source/revision；
+- 历史无 provenance 的 session 标为 `legacy-unknown`，即使路径恰好等于群目录也不猜为 group，不自动跟随。
+
+其他 Bot 的既有 chat-scope session 仅在 `source='group'`、revision 落后且进入**下一业务 turn 之前**跟随。安全切换契约是：保持 turn admission/FIFO 锁，确认 idle 且非 busy/streaming/needs_user；真实 suspend 当前 CLI（若适配器要求）、kill 并等待旧 worker/PTY 退出，持久化新 cwd/provenance/generation，重新 spawn worker，以目标 cwd 到达 ready 并回报一致后，才把尚未投递的业务消息交给新 worker。任何一步失败都不投递该 turn，并给出一次可恢复提示；不得只 repin session 记录。
+
+thread、`explicit`、两种 oncall、bot-default、legacy-unknown 都不自动跟随。remote/adopt 或不支持可靠 suspend/kill/restart/ready 确认的 backend fail closed，保持原 session 并阻止该业务 turn，不能假装已迁移。崩溃恢复根据 generation 和 journal 读回，确保最多一个 worker；旧 worker 未确认退出时不得启动新 worker。
 
 ## 非目标 / Non-goals
 
 - 不跨宿主机同步或映射绝对路径。
-- 不自动迁移、合并或删除现有 `oncallChats`。
-- 不改变 oncall 对话授权、defaultOncall 或 Bot 默认目录语义。
+- 不自动迁移、合并或删除现有 `oncallChats`；只给新自动绑定写来源，历史值保守兼容。
+- 不改变 oncall 对话授权语义。
 - 不让 `/repo wt` 自动成为群默认目录。
-- 首个 PR 不要求 Dashboard 编辑界面；只读展示可后续增加，命令行为和 store 是本 PR 范围。
+- 首个 PR 不要求 Dashboard 编辑界面。
 - 不清理历史 worktree，不改变 worktree 生命周期。
 
 ## 验收标准 / Acceptance criteria
 
-1. Bot A 在普通群顶层成功执行 `/repo X` 后，同机 Bot B 新开的 chat-scope 会话和 `/th` 使用 X；daemon 重启后仍成立。
-2. 在话题内执行 `/repo Y` 只影响该话题；群绑定仍为 X，其他 Bot 新会话仍使用 X。
-3. 当前 Bot 存在 `oncallChats[chatId]=Z` 时，该 Bot 使用 Z；无专用覆盖的 Bot 使用 X。
-4. 编队/profile 重写 `bots.json` 不改变共享群绑定。
-5. 两个不同 source message 基于同 revision 并发写入时仅一个成功；另一个返回冲突和当前值。相同 source message 重放不增加 revision。
-6. 未授权真人、无可验证真人来源的 Bot 不能写或解绑群绑定；配置 `workspaceManagers` 后默认管理员并集不再越权。
-7. X 被删除后，新会话、`/th` 和需要跟随的旧 chat-scope 会话均停止并显示修复方法，不静默回退。
-8. `/repo show` 能区分 session / per-Bot oncall / group / bot default 的值和最终来源；`/repo unbind` 不改变已运行会话或 oncall 配置。
-9. 现有 thread `/repo`、pending repo 卡、mid-session switch、`/repo wt`、remote backend fail-closed 和 oncall 测试无回归。
+1. Bot A 顶层 `/repo X` 后，Bot B 新 chat session 和 `/th` 使用 X；daemon 重启后仍成立。
+2. thread `/repo Y` 只影响该 thread；`/repo wt`、`/repo here` 不写群。
+3. 显式 oncall Z 优先于 group X；defaultOncall 自动目录 Z 不遮蔽 X，但 oncall 授权不变；历史无来源 oncall 保守保持旧行为。
+4. 同一真人在 A/B app 下不同 open_id 均归一到同租户 union_id，文本和卡片可管理；普通成员、Bot、租户不符、旧配置指纹快照、收紧名单均拒绝。窄 bypass 不放行任何其他命令/范围。
+5. `M1 set X → M2 set Y → replay M1` 返回 M1 收据且 Y 不变；同 source 不同 payload 拒绝；跨 Bot/重启同样成立。
+6. `set → unbind → set → 旧 CAS` 中 revision 单调且旧 CAS 失败；unbind 重放幂等，ACL 在 tombstone 上保留。
+7. 在 switch 前、session committed 后、group commit 结果未知、group committed 后回复前分别崩溃，恢复/重放不重复 switch/worker，不误报成功；CAS/ENOSPC/锁失败明确区分，最终回复只在 receipt 可证明后发出。
+8. group→`/cd`/显式 IPC→群更新不自动跟随；restart/resume 保留 provenance；legacy unknown 不误跟随。
+9. 支持的本地 PTY CLI 在安全边界确实 suspend/kill/restart，下一消息实际 cwd 为新目录且只有一个 worker；busy/FIFO/needs_user 延后；remote/adopt fail closed。
+10. 目录存在但不可进入、校验后撤权/卸载、消费时失效均停止，不回退；`/repo show` 给出修复信息。
+11. profile 重写 `bots.json` 不改变共享群状态；store 损坏/锁失败 fail closed。
+12. 现有 thread `/repo`、pending repo card、mid-session switch、worktree、oncall 授权和 command router 无回归。
 
 ## 风险与 Gate / Risks and gates
 
-- 这是跨进程持久状态语义变更，必须覆盖人工中途干预、部分写入失败、并发重入，并按仓库规则做独立对抗复核和变异复验。
-- 群绑定只能在会话切换成功后提交；先写绑定后切会话会留下“记录已变、实际会话未变”的半完成状态。
-- 共享 store 损坏或锁失败必须 fail closed，不得当作“无绑定”。
+- 这是跨进程持久状态语义变更，必须覆盖人工中途干预、两阶段半写入、长等待与并发重入，并按仓库规则做独立对抗复核和变异复验。
+- operation journal、group record/receipt 与 session generation 的锁顺序必须固定，避免跨 store 死锁；不得持 group 文件锁等待 worker。
+- store 损坏或结果未知必须 fail closed，不得当作无绑定或自动重试覆盖。
 - Draft PR 可在规格和计划提交后创建；实现、自测、独立审查完成前不得合并或部署。
-- 部署/重启由 Botmux 维护者在用户另行授权后执行，本 PR 创建不包含生产切换。
+- 部署/重启由维护者另行授权，本 PR 不包含生产切换。
 
 ## AI Agent 执行指引 / Implementation guidance
 
-优先新增聚焦的 `src/services/group-workspace-store.ts`，不要把共享状态塞入 `bot-registry.ts` 或 `oncall-store.ts`。在 `src/daemon.ts` 的新会话目录解析中加入群绑定层，并在失效时返回可区分的错误而不是 `undefined`。文本 `/repo` 与卡片选择必须通过同一个“会话提交成功后更新群绑定”的 helper，避免入口漂移。
+优先新增聚焦的 group workspace store、operation journal 和纯策略模块，不把共享状态塞入 `bot-registry.ts` 或 `oncall-store.ts`。文本与卡片必须复用同一 saga；目录解析返回 discriminated result，失效/不可访问/store unavailable 不得折成 `undefined`。
 
 关键调用链：
 
-- `src/daemon.ts`：`resolvePinnedWorkingDir`、`resolveForceTopicCurrentWorkingDir`。
-- `src/core/command-handler.ts`：`case '/repo'`、文本选仓提交与 show/unbind。
-- `src/im/lark/card-handler.ts`：模块级 `commitRepoSelection` 和 repo 卡权限。
-- `src/im/lark/event-dispatcher.ts`：`canOperate` / `canRunDaemonCommand` 与原始人类来源。
-- `src/services/session-store.ts`：跨 Bot chat-scope 会话枚举。
+- `src/daemon.ts`：新会话、`/th`、turn admission、resume/recovery 与 worker 生命周期。
+- `src/core/command-handler.ts`：`/repo`、`/cd`、show/unbind、成功响应边界。
+- `src/im/lark/card-handler.ts`：repo card action 来源事件与窄权限入口。
+- `src/im/lark/event-dispatcher.ts`：接收 Bot gate、defaultOncall 自动来源、真人身份解析。
+- `src/core/session-cwd.ts` / session IPC：所有 cwd mutation 的 provenance。
+- `src/services/bot-admin-unions-store.ts`：fresh config fingerprint 管理员 union snapshot。
 
-测试先写失败用例，再做最小实现；至少运行定向 Vitest、`bun run build` 和受影响命令/路由测试。PR 描述记录 before/after 证据、影响面、回退方式和独立复核结果。
+测试先写失败行为，再做最小实现；至少运行定向 Vitest、build 和受影响命令/路由测试。PR 描述记录故障注入序列、影响面、回退方式和独立复核结果。
