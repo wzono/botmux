@@ -798,6 +798,16 @@ export interface Session {
   groupWorkspaceRevision?: number;
   /** Directory identity captured from the authoritative group binding. */
   groupWorkspaceDirectoryIdentity?: { dev: string; ino: string };
+  /** Durable replacement journal for a group-following local worker. */
+  groupWorkspaceFollow?: {
+    targetWorkingDir: string;
+    targetRevision: number;
+    targetDirectoryIdentity?: { dev: string; ino: string };
+    previousRevision: number;
+    previousGeneration: number;
+    nextGeneration: number;
+    phase: 'prepared' | 'old_exited' | 'persisted' | 'spawned';
+  };
   webPort?: number;
   /** Agent-registered local Web preview for this session. The daemon accepts
    * only a reachable literal loopback target through the session-scoped CLI
@@ -2023,6 +2033,7 @@ type DaemonToWorkerBase =
    * backends and Riff keep their owned CLI/task alive for the replacement
   * worker to reattach; PTY keeps its historical cold-resume behavior. */
   | { type: 'detach_for_transfer'; requestId: string }
+  | { type: 'retire_for_replacement'; requestId: string }
   | { type: 'suspend' }
   | { type: 'prompt_submitted' }
   /** Kill the CLI and respawn it with --resume. `updateWorkingDir`（可选）
@@ -2282,6 +2293,7 @@ export type WorkerToDaemon =
    * its backend observer and disarmed sandbox teardown, immediately before it
    * exits. The daemon also waits for that child exit before forking replacement. */
   | { type: 'transfer_detached'; requestId: string }
+  | { type: 'replacement_retired'; requestId: string }
   /** Trusted worker observation used only by the host activation transaction.
    * PID markers are child-writable diagnostics and are never security proof. */
   | {

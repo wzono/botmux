@@ -12,17 +12,9 @@ export type SessionWorkingDirMutation =
   | { workingDir: string; source: 'group'; groupWorkspaceRevision: number; groupWorkspaceDirectoryIdentity?: { dev: string; ino: string } }
   | { workingDir: string; source: Exclude<SessionWorkingDirSource, 'group'>; groupWorkspaceRevision?: never; groupWorkspaceDirectoryIdentity?: never };
 
-export type GroupWorkspaceFollowJournal = {
-  targetWorkingDir: string;
-  targetRevision: number;
-  targetDirectoryIdentity?: { dev: string; ino: string };
-  previousRevision: number;
-  previousGeneration: number;
-  nextGeneration: number;
-  phase: 'prepared' | 'old_exited' | 'persisted' | 'spawned';
-};
+export type GroupWorkspaceFollowJournal = NonNullable<Session['groupWorkspaceFollow']>;
 
-type FollowSession = Session & { groupWorkspaceFollow?: GroupWorkspaceFollowJournal };
+type FollowSession = Session;
 
 export interface GroupWorkspaceFollowDeps {
   isIdle(ds: DaemonSession): boolean;
@@ -30,10 +22,9 @@ export interface GroupWorkspaceFollowDeps {
   isWorkerLive(ds: DaemonSession): boolean;
   persist(input: ({ journal?: GroupWorkspaceFollowJournal; phase?: 'complete' | GroupWorkspaceFollowJournal['phase'] }
     & Partial<SessionWorkingDirMutation> & { workerGeneration?: number })): void;
-  suspend(ds: DaemonSession): boolean;
-  kill(ds: DaemonSession): void;
-  awaitExit(ds: DaemonSession): Promise<boolean>;
-  spawn(ds: DaemonSession): boolean;
+  /** Retire the exact old local worker and its PTY/persistent backing, then prove exit. */
+  retire(ds: DaemonSession): Promise<boolean>;
+  spawn(ds: DaemonSession, onGenerationReserved: (generation: number) => void): boolean;
   awaitReady(ds: DaemonSession): Promise<{ ready: boolean; workingDir?: string }>;
   notice(kind: 'migrated' | 'failed'): void;
 }
@@ -74,12 +65,10 @@ export async function runGroupWorkspaceSessionFollow(
   try {
     if (!session.groupWorkspaceFollow) deps.persist({ journal, phase: journal.phase });
     if (journal.phase === 'prepared') {
-      if (!deps.suspend(ds)) return fail('worker suspend refused');
-      deps.kill(ds);
-      if (!await deps.awaitExit(ds)) return fail('old worker exit timeout');
+      if (!await deps.retire(ds)) return fail('old worker retirement unverified');
       if (session.workingDirSource !== 'group'
           || session.groupWorkspaceRevision !== journal.previousRevision
-          || session.workerGeneration !== journal.previousGeneration) {
+          || (session.workerGeneration ?? 0) !== journal.previousGeneration) {
         return fail('session changed during worker replacement');
       }
       journal.phase = 'old_exited';
@@ -96,12 +85,31 @@ export async function runGroupWorkspaceSessionFollow(
       ds.workingDir = target.workingDir;
       journal.phase = 'persisted';
     }
-    if (journal.phase === 'persisted') {
-      if (!deps.spawn(ds)) return fail('replacement worker spawn refused');
+    // A crash may happen after forkWorker durably reserves the generation but
+    // before this journal reaches `spawned`. Reconcile that exact reservation
+    // before any new spawn; otherwise forkWorker would reserve N+1 and start it
+    // before the mismatch became visible.
+    if (journal.phase === 'persisted'
+        && (session.workerGeneration ?? 0) === journal.nextGeneration) {
       journal.phase = 'spawned';
       deps.persist({ journal, phase: journal.phase });
-    } else if (journal.phase === 'spawned' && !deps.isWorkerLive(ds)) {
-      return fail('replacement worker generation missing during recovery');
+    }
+    if (journal.phase === 'spawned' && !deps.isWorkerLive(ds)) {
+      // The replacement was durably spawned by the prior daemon, but no process
+      // survived this boot. Rebase the reservation onto one fresh generation;
+      // persisting `persisted` first makes a second crash repeat this exact step,
+      // never overlap the vanished generation.
+      journal.previousGeneration = Math.max(session.workerGeneration ?? 0, journal.nextGeneration);
+      journal.nextGeneration = journal.previousGeneration + 1;
+      journal.phase = 'persisted';
+      deps.persist({ journal, phase: journal.phase });
+    }
+    if (journal.phase === 'persisted') {
+      let reservedGeneration: number | undefined;
+      if (!deps.spawn(ds, generation => { reservedGeneration = generation; })) return fail('replacement worker spawn refused');
+      if (reservedGeneration !== journal.nextGeneration) return fail('replacement worker generation mismatch');
+      journal.phase = 'spawned';
+      deps.persist({ journal, phase: journal.phase });
     }
     const ready = await deps.awaitReady(ds);
     if (!ready.ready) return fail('replacement worker not ready');

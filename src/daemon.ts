@@ -433,7 +433,7 @@ import {
   sendPromptCacheKeepalive,
   sendWorkerSessionInput,
   killWorker,
-  suspendWorker,
+  retireWorkerForReplacement,
   retireWorkerProcessOnly,
   retiringWorkersForSession,
   reapOrphanWorkers,
@@ -542,7 +542,7 @@ import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.j
 import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, runGroupWorkspaceRepoEntrypoint } from './core/command-handler.js';
 import { resolveGroupWorkspaceRepoSelection } from './core/repo-selection.js';
 import { resolveGroupWorkspaceCwd } from './core/group-workspace-policy.js';
-import { applySessionWorkingDir, runGroupWorkspaceSessionFollow, setSessionWorkingDirMetadata, type GroupWorkspaceFollowJournal, type SessionWorkingDirMutation } from './core/session-cwd.js';
+import { applySessionWorkingDir, runGroupWorkspaceSessionFollow, setSessionWorkingDirMetadata, type SessionWorkingDirMutation } from './core/session-cwd.js';
 import { createGroupWorkspaceRouteRuntime } from './core/group-workspace-route-runtime.js';
 import { classifySlash, isCommandDecision, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
 import { deriveSessionPhase } from './core/session-phase.js';
@@ -1243,6 +1243,14 @@ async function restoreSessionsAndScheduleStartupRecovery(opts: {
   driveRestoredPrincipalLane: (ds: DaemonSession) => void;
 }): Promise<Array<XpiSharedCwdStartupNotice | PrincipalLaneStartupNotice>> {
   const restoredQuarantineNotices = await opts.restoreSessions();
+  // Reconcile every persisted follow journal while ingress is still fenced. This
+  // includes workerless PTY rows and rows restored after the replacement spawn.
+  for (const ds of activeSessions.values()) {
+    if (ds.larkAppId !== opts.larkAppId || !ds.session.groupWorkspaceFollow) continue;
+    if (await followGroupWorkspaceBeforeBusinessTurn(ds, { recoverPersistedJournal: true }) === 'stop') {
+      throw new Error(`workspace follow startup reconciliation failed for ${ds.session.sessionId}`);
+    }
+  }
   const restoredAt = Date.now();
   const quarantineNotices = restoredQuarantineNotices ?? [];
   scheduleRestoredStreamingCardPinRecovery(opts.larkAppId);
@@ -6350,21 +6358,9 @@ async function submitQueuedMessage(
   return true;
 }
 
-const GROUP_WORKSPACE_FOLLOW_EXIT_TIMEOUT_MS = 7_000;
 const GROUP_WORKSPACE_FOLLOW_READY_TIMEOUT_MS = 30_000;
 
-type FollowPersistedSession = Session & { groupWorkspaceFollow?: GroupWorkspaceFollowJournal };
-
-function waitForWorkerExit(worker: NonNullable<DaemonSession['worker']>): Promise<boolean> {
-  if (worker.exitCode !== null || worker.signalCode !== null) return Promise.resolve(true);
-  return new Promise(resolve => {
-    const timer = setTimeout(() => { cleanup(); resolve(false); }, GROUP_WORKSPACE_FOLLOW_EXIT_TIMEOUT_MS);
-    timer.unref?.();
-    const onExit = () => { cleanup(); resolve(true); };
-    const cleanup = () => { clearTimeout(timer); worker.off('exit', onExit); };
-    worker.once('exit', onExit);
-  });
-}
+type FollowPersistedSession = Session;
 
 async function waitForFollowWorkerReady(ds: DaemonSession, generation: number): Promise<{ ready: boolean; workingDir?: string }> {
   const deadline = Date.now() + GROUP_WORKSPACE_FOLLOW_READY_TIMEOUT_MS;
@@ -6379,8 +6375,12 @@ async function waitForFollowWorkerReady(ds: DaemonSession, generation: number): 
 }
 
 /** Called only while the ordinary same-anchor FIFO/admission lock is held. */
-async function followGroupWorkspaceBeforeBusinessTurn(ds: DaemonSession): Promise<'continue' | 'stop'> {
+async function followGroupWorkspaceBeforeBusinessTurn(
+  ds: DaemonSession,
+  opts: { recoverPersistedJournal?: boolean } = {},
+): Promise<'continue' | 'stop'> {
   if (ds.scope !== 'chat' || ds.session.workingDirSource !== 'group') return 'continue';
+  const journalAtStartup = opts.recoverPersistedJournal ? ds.session.groupWorkspaceFollow : undefined;
   const group = await groupWorkspaceStore.read(ds.chatId);
   if (group.status === 'store_unavailable') {
     await sessionReply(ds.session.rootMessageId, '群目录状态暂不可用，本条消息未投递；请稍后重试。', 'text', ds.larkAppId);
@@ -6389,24 +6389,34 @@ async function followGroupWorkspaceBeforeBusinessTurn(ds: DaemonSession): Promis
   const followJournal = (ds.session as FollowPersistedSession).groupWorkspaceFollow;
   if (!group.record || group.record.directory.kind !== 'bound'
       || (!followJournal && group.record.revision <= (ds.session.groupWorkspaceRevision ?? -1))) return 'continue';
-  if (followJournal
+  if (followJournal && !journalAtStartup
       && (followJournal.targetRevision !== group.record.revision
         || followJournal.targetWorkingDir !== group.record.directory.workingDir)) {
     await sessionReply(sessionAnchorId(ds), '群目录在会话迁移期间再次变化，本条消息未投递；请重试。', 'text', ds.larkAppId);
     return 'stop';
   }
-  const target = group.record.directory;
-  const health = await groupWorkspaceStore.probeBoundDirectoryForConsumption(ds.chatId);
+  const target = journalAtStartup
+    ? { kind: 'bound' as const, workingDir: journalAtStartup.targetWorkingDir }
+    : group.record.directory;
+  const targetRevision = journalAtStartup?.targetRevision ?? group.record.revision;
+  const startupUsability = journalAtStartup
+    ? probePathUsability(target.workingDir, journalAtStartup.targetDirectoryIdentity
+      ? { expectedIdentity: journalAtStartup.targetDirectoryIdentity }
+      : {})
+    : undefined;
+  const health = startupUsability
+    ? (startupUsability.ok ? { status: 'usable' as const, usability: startupUsability } : { status: 'unusable' as const })
+    : await groupWorkspaceStore.probeBoundDirectoryForConsumption(ds.chatId);
   if (health.status !== 'usable') {
     await sessionReply(ds.session.rootMessageId, '群目录当前不可进入，本条消息未投递；请管理员修复绑定。', 'text', ds.larkAppId);
     return 'stop';
   }
-  const oldWorker = ds.worker;
-  let reservedGeneration = (ds.session.workerGeneration ?? 0) + 1;
+  const journalGeneration = ds.session.groupWorkspaceFollow?.nextGeneration;
+  let reservedGeneration = journalGeneration ?? (ds.session.workerGeneration ?? 0) + 1;
   let admission: WorkerForkAdmission | undefined;
   const outcome = await runGroupWorkspaceSessionFollow(ds, {
     workingDir: target.workingDir,
-    revision: group.record.revision,
+    revision: targetRevision,
     directoryIdentity: health.usability.identity,
   }, {
     isIdle: current => !!current.worker && !current.worker.killed
@@ -6429,12 +6439,13 @@ async function followGroupWorkspaceBeforeBusinessTurn(ds: DaemonSession): Promis
       Object.assign(ds.session, next);
       if (input.workingDir) ds.workingDir = input.workingDir;
     },
-    suspend: current => suspendWorker(current, 'group_workspace_follow'),
-    kill: current => killWorker(current),
-    awaitExit: async () => !!oldWorker && await waitForWorkerExit(oldWorker),
-    spawn: current => forkWorker(current, '', {
+    retire: current => retireWorkerForReplacement(current),
+    spawn: (current, onGenerationReserved) => forkWorker(current, '', {
       resume: current.hasHistory,
-      onWorkerGenerationReserved: generation => { reservedGeneration = generation; },
+      onWorkerGenerationReserved: generation => {
+        reservedGeneration = generation;
+        onGenerationReserved(generation);
+      },
     }, { onAdmission: value => { admission = value; } }) && admission !== 'rejected' && admission !== 'deferred',
     awaitReady: current => waitForFollowWorkerReady(current, reservedGeneration),
     notice: kind => {
@@ -22915,6 +22926,13 @@ async function dispatchApprovedCrossPrincipalSuggestion(
   record: CrossPrincipalInterruption,
 ): Promise<boolean> {
   if (ds.activeInteractiveTurn) return false;
+  // XPI admission intentionally happens while the old owner is busy. The
+  // approved record becomes executable only here, so enforce group follow at
+  // this execution boundary and retain the FIFO head on defer/failure.
+  if (await followGroupWorkspaceBeforeBusinessTurn(ds) === 'stop') {
+    scheduleCrossPrincipalOwnerWait(ds, Date.now() + 5_000);
+    return false;
+  }
   const ownerId = record.owner.requestUserOpenId;
   if (!ownerId) return false;
   const loc = localeForBot(ds.larkAppId);
@@ -28910,7 +28928,10 @@ async function handleThreadReplyAdmitted(
   // Auto-follow is part of the admitted same-anchor FIFO and runs before any
   // queue append, turn mutation, or worker delivery. A deferred/failed follow
   // leaves this business message unadmitted so the ingress retry can preserve it.
-  if (await followGroupWorkspaceBeforeBusinessTurn(ds) === 'stop') return;
+  if (await followGroupWorkspaceBeforeBusinessTurn(ds) === 'stop') {
+    retryDurablePrimaryIngress(ctx, 'group workspace follow is waiting for a safe worker boundary');
+    return;
+  }
 
   // Existing-owner route: append once after all pending-repo early returns.
   // 接纳标记不打在这里：append 仅供 dashboard 预览，真正的接纳在下方 live worker

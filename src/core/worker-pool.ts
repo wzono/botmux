@@ -6610,6 +6610,68 @@ function clearTransferWorkerState(
  * session is already detached, so unlike killWorker() this path must never
  * destroy its orphaned backing resource.
  */
+export async function retireWorkerForReplacement(
+  ds: DaemonSession,
+  opts: { timeoutMs?: number } = {},
+): Promise<boolean> {
+  const w = ds.worker;
+  const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+  if (!backendType || isRemoteBackendType(backendType) || ds.adoptedFrom) return false;
+  if (!w) {
+    // Restore has no ChildProcess handle, but a persistent pane may have survived
+    // the daemon. Positive backing teardown is the old-generation exit proof.
+    return isSuspendableBackendType(backendType) ? destroySuspendBackingVerified(ds) : true;
+  }
+  if (w.killed && (w.exitCode !== null || w.signalCode !== null)) {
+    clearTransferWorkerState(ds, w, 'retireWorkerForReplacement:already_exited');
+    return true;
+  }
+  if (isSuspendableBackendType(backendType) && !destroySuspendBackingVerified(ds)) return false;
+
+  const requestId = randomUUID();
+  trackLifecycleRetirement(ds, w);
+  let acked = false;
+  let exited = w.exitCode !== null || w.signalCode !== null;
+  let finish!: (ok: boolean) => void;
+  const completion = new Promise<boolean>(resolve => { finish = resolve; });
+  const maybeFinish = (): void => { if (acked && exited) finish(true); };
+  const onMessage = (raw: unknown): void => {
+    const msg = raw as Partial<WorkerToDaemon>;
+    if (msg.type !== 'replacement_retired' || msg.requestId !== requestId) return;
+    acked = true;
+    maybeFinish();
+  };
+  const onExit = (): void => { exited = true; maybeFinish(); };
+  w.on('message', onMessage);
+  w.on('exit', onExit);
+  const timeout = setTimeout(() => finish(false), opts.timeoutMs ?? TRANSFER_DETACH_FENCE_MS);
+  timeout.unref?.();
+  void sendWorkerIpc(w, { type: 'retire_for_replacement', requestId }).catch(() => finish(false));
+  let completed = await completion;
+  if (!completed && !exited) {
+    const forcedExit = new Promise<boolean>(resolve => {
+      const forcedTimeout = setTimeout(() => resolve(false), TRANSFER_FORCE_EXIT_MS);
+      forcedTimeout.unref?.();
+      w.once('exit', () => { clearTimeout(forcedTimeout); resolve(true); });
+    });
+    try { w.kill('SIGKILL'); } catch { /* already gone */ }
+    exited = await forcedExit || exited;
+    // A hard-retired local worker is a verified terminal generation even when its
+    // graceful ACK was lost; persistent backing was already positively removed.
+    completed = exited;
+  }
+  clearTimeout(timeout);
+  w.off('message', onMessage);
+  w.off('exit', onExit);
+  if (!completed || !exited || (ds.worker !== w && ds.worker !== null)) {
+    clearLifecycleRetirement(ds, w);
+    return false;
+  }
+  clearTransferWorkerState(ds, w, 'retireWorkerForReplacement');
+  sessionStore.updateSessionPid(ds.session.sessionId, null);
+  return true;
+}
+
 export async function detachWorkerForTransfer(
   ds: DaemonSession,
   opts: { timeoutMs?: number } = {},

@@ -2092,6 +2092,25 @@ export function normalizeSessionWorkingDirProvenance<T extends Session>(session:
   } else if (session.groupWorkspaceRevision !== undefined) {
     throw new Error('non-group cwd provenance must not carry a group revision');
   }
+  const follow = session.groupWorkspaceFollow;
+  if (follow !== undefined) {
+    const validIdentity = follow.targetDirectoryIdentity === undefined
+      || (typeof follow.targetDirectoryIdentity.dev === 'string'
+        && !!follow.targetDirectoryIdentity.dev
+        && typeof follow.targetDirectoryIdentity.ino === 'string'
+        && !!follow.targetDirectoryIdentity.ino);
+    const valid = session.workingDirSource === 'group'
+      && typeof follow.targetWorkingDir === 'string'
+      && follow.targetWorkingDir.startsWith('/')
+      && Number.isSafeInteger(follow.targetRevision) && follow.targetRevision >= 0
+      && Number.isSafeInteger(follow.previousRevision) && follow.previousRevision >= -1
+      && Number.isSafeInteger(follow.previousGeneration) && follow.previousGeneration >= 0
+      && Number.isSafeInteger(follow.nextGeneration)
+      && follow.nextGeneration === follow.previousGeneration + 1
+      && ['prepared', 'old_exited', 'persisted', 'spawned'].includes(follow.phase)
+      && validIdentity;
+    if (!valid) throw new Error('invalid groupWorkspaceFollow journal');
+  }
   return session;
 }
 

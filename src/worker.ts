@@ -780,6 +780,7 @@ scrubClaudeSessionMarkerEnv(process.env);
 let cliAdapter: CliAdapter | null = null;
 let codexCleanupLaunchTarget: { codexBin: string; codexHome: string } | undefined;
 let backend: SessionBackend | null = null;
+let replacementRetirementExitResolve: (() => void) | undefined;
 let backendScreenRevision = 0;
 let idleScreenSettleTask: {
   backend: SessionBackend;
@@ -25822,6 +25823,10 @@ async function spawnCli(
     restoreHerdrWebBindings();
   }
   backend.onExit((code, signal) => {
+    if (replacementRetirementExitResolve && backend === observedBackend) {
+      replacementRetirementExitResolve();
+      replacementRetirementExitResolve = undefined;
+    }
     const intentionalRestart = intentionalRestartBackend === observedBackend;
     if (intentionalRestart) intentionalRestartBackend = null;
     // destroySession()/kill() may report exit after the 500ms replacement spawn
@@ -29189,11 +29194,14 @@ const TRANSFER_DETACH_ACK_FLUSH_MS = 250;
  * so a wedged process.send callback must not keep this old worker alive and
  * strand the daemon behind its detach fence indefinitely.
  */
-async function flushTransferDetachAck(requestId: string): Promise<void> {
+async function flushRetirementAck(
+  requestId: string,
+  type: 'transfer_detached' | 'replacement_retired' = 'transfer_detached',
+): Promise<void> {
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
     await Promise.race([
-      sendAndFlush({ type: 'transfer_detached', requestId }),
+      sendAndFlush({ type, requestId }),
       new Promise<void>((resolve) => {
         timeout = setTimeout(resolve, TRANSFER_DETACH_ACK_FLUSH_MS);
         timeout.unref?.();
@@ -31044,7 +31052,7 @@ process.on('message', async (raw: unknown) => {
       // gate would need preserveCliPidMarker here too.
       killCli({ preserveSandbox: true });
       cleanup();
-      await flushTransferDetachAck(msg.requestId);
+      await flushRetirementAck(msg.requestId);
       // NOTE: process.exit(0) can wedge in node-pty's native teardown when a
       // web-terminal client PTY was attached (the reader-thread join blocks and
       // the JS event loop is already stopped, so this process cannot self-kill
@@ -31262,6 +31270,33 @@ process.on('message', async (raw: unknown) => {
         ...(abortError ? { error: abortError } : {}),
       });
       break;
+    }
+
+    case 'retire_for_replacement': {
+      if (isRemoteBackendType(effectiveBackendType)) {
+        log(`Refused unsafe ${effectiveBackendType} replacement retirement`);
+        break;
+      }
+      log('Replacement retirement requested');
+      stopScreenshotLoop();
+      stopBridgeWatcher();
+      destroyCrashDiagnosticTerminal('replacement retirement');
+      revokeManagedTurnOriginForRestart();
+      const retiringBackend = backend;
+      const exited = retiringBackend
+        ? new Promise<void>(resolve => { replacementRetirementExitResolve = resolve; })
+        : Promise.resolve();
+      try { (retiringBackend?.destroySession ?? retiringBackend?.kill)?.call(retiringBackend); } catch { /* daemon timeout stays authoritative */ }
+      if (retiringBackend) await exited;
+      stopOwnedSessionScope('replacement retirement');
+      backend = null;
+      isPromptReady = false;
+      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } sandboxStopWatcher = null; }
+      sandboxCleanup = null;
+      sandboxTeardownDone = true;
+      await flushRetirementAck(msg.requestId, 'replacement_retired');
+      cleanup();
+      process.exit(0);
     }
 
     case 'suspend': {
