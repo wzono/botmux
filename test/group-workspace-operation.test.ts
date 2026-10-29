@@ -10,6 +10,7 @@ import {
 } from '../src/services/group-workspace-operation-store.js';
 import {
   GroupWorkspaceOperationCoordinator,
+  type GroupCommitReceipt,
   type GroupCommitResult,
   type GroupWorkspaceOperationDependencies,
 } from '../src/core/group-workspace-operation.js';
@@ -103,7 +104,18 @@ interface Harness {
   readonly switches: number;
   readonly workers: number;
   readonly commits: number;
-  receipts: Map<string, GroupCommitResult>;
+  receipts: Map<string, GroupCommitReceipt>;
+}
+
+function receipt(result: Exclude<GroupCommitResult, { status: 'unknown' }>, patch: Partial<GroupCommitReceipt> = {}): GroupCommitReceipt {
+  return {
+    ...result,
+    operationKey: BASE.operationKey,
+    payloadDigest: BASE.payloadDigest,
+    chatId: BASE.chatId,
+    targetWorkingDir: BASE.targetWorkingDir,
+    ...patch,
+  };
 }
 
 function harness(options: {
@@ -147,7 +159,7 @@ function harness(options: {
     commitGroup: async input => {
       calls.push('group-commit'); commits += 1;
       const result = options.commitResult ?? { status: 'committed', resultingRevision: input.expectedGroupRevision + 1 };
-      if (result.status !== 'unknown') receipts.set(input.operationKey, result);
+      if (result.status !== 'unknown') receipts.set(input.operationKey, receipt(result));
       if (result.status === 'committed') revision = result.resultingRevision;
       return result;
     },
@@ -238,13 +250,75 @@ describe('GroupWorkspaceOperationCoordinator', () => {
     await expect(h.store.get(BASE.operationKey)).resolves.toMatchObject({ journal: { phase } });
   });
 
+  it('keeps a restored group_committed journal unknown when its authoritative receipt was lost', async () => {
+    const dataDir = dir();
+    const store = new GroupWorkspaceOperationStore(dataDir);
+    await store.prepare(journal());
+    await store.transition(BASE.operationKey, 'session_committed', { sessionGenerationAfter: 5, updatedAt: 2 });
+    const committed = await store.transition(BASE.operationKey, 'group_committed', { groupRevisionAfter: 3, updatedAt: 3 });
+    expect(committed).toMatchObject({ status: 'updated' });
+    if (committed.status !== 'updated') throw new Error('expected committed journal');
+
+    const replay = harness({ dataDir });
+    await expect(replay.coordinator.recover(committed.journal)).resolves.toMatchObject({ status: 'unknown' });
+    expect(replay.calls).not.toContain('converge:group:3');
+  });
+
+  it('keeps group_committed recovery unknown when the exact receipt revision mismatches the journal', async () => {
+    const dataDir = dir();
+    const store = new GroupWorkspaceOperationStore(dataDir);
+    await store.prepare(journal());
+    await store.transition(BASE.operationKey, 'session_committed', { sessionGenerationAfter: 5, updatedAt: 2 });
+    const committed = await store.transition(BASE.operationKey, 'group_committed', { groupRevisionAfter: 3, updatedAt: 3 });
+    expect(committed).toMatchObject({ status: 'updated' });
+    if (committed.status !== 'updated') throw new Error('expected committed journal');
+
+    const replay = harness({ dataDir });
+    replay.receipts.set(BASE.operationKey, receipt({ status: 'committed', resultingRevision: 4 }));
+    await expect(replay.coordinator.recover(committed.journal)).resolves.toMatchObject({ status: 'unknown' });
+    expect(replay.calls).not.toContain('converge:group:4');
+  });
+
+  it.each([
+    ['operation', { operationKey: `${BASE.operationKey}-other` }],
+    ['target', { targetWorkingDir: '/repo/Y' }],
+  ] as const)('keeps group_committed recovery unknown when receipt %s mismatches', async (_field, patch) => {
+    const dataDir = dir();
+    const store = new GroupWorkspaceOperationStore(dataDir);
+    await store.prepare(journal());
+    await store.transition(BASE.operationKey, 'session_committed', { sessionGenerationAfter: 5, updatedAt: 2 });
+    const committed = await store.transition(BASE.operationKey, 'group_committed', { groupRevisionAfter: 3, updatedAt: 3 });
+    expect(committed).toMatchObject({ status: 'updated' });
+    if (committed.status !== 'updated') throw new Error('expected committed journal');
+
+    const replay = harness({ dataDir });
+    replay.receipts.set(BASE.operationKey, receipt({ status: 'committed', resultingRevision: 3 }, patch));
+    await expect(replay.coordinator.recover(committed.journal)).resolves.toMatchObject({ status: 'unknown' });
+    expect(replay.calls.some(call => call.startsWith('converge:'))).toBe(false);
+  });
+
+  it('keeps group_committed recovery unknown when receipt contradicts the committed outcome', async () => {
+    const dataDir = dir();
+    const store = new GroupWorkspaceOperationStore(dataDir);
+    await store.prepare(journal());
+    await store.transition(BASE.operationKey, 'session_committed', { sessionGenerationAfter: 5, updatedAt: 2 });
+    const committed = await store.transition(BASE.operationKey, 'group_committed', { groupRevisionAfter: 3, updatedAt: 3 });
+    expect(committed).toMatchObject({ status: 'updated' });
+    if (committed.status !== 'updated') throw new Error('expected committed journal');
+
+    const replay = harness({ dataDir });
+    replay.receipts.set(BASE.operationKey, receipt({ status: 'conflict', currentRevision: 3 }));
+    await expect(replay.coordinator.recover(committed.journal)).resolves.toMatchObject({ status: 'unknown' });
+    expect(replay.calls.some(call => call.startsWith('converge:'))).toBe(false);
+  });
+
   it('durably converges an unknown exact proof through journal then provenance, and replays after callback failure', async () => {
     const dataDir = dir();
     const first = harness({ dataDir, commitResult: { status: 'unknown' } });
     await expect(first.coordinator.execute(REQUEST)).resolves.toMatchObject({ status: 'unknown' });
     const replay = harness({ dataDir });
     replay.session.generation = 5; replay.session.workingDir = '/repo/X';
-    replay.receipts.set(BASE.operationKey, { status: 'committed', resultingRevision: 3 });
+    replay.receipts.set(BASE.operationKey, receipt({ status: 'committed', resultingRevision: 3 }));
     const originalConverge = (replay.coordinator as any).dependencies.convergeSession;
     (replay.coordinator as any).dependencies.convergeSession = async () => { throw new Error('provenance callback failed'); };
     await expect(replay.coordinator.execute(REQUEST)).rejects.toThrow('provenance callback failed');

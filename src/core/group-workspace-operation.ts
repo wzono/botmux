@@ -11,8 +11,15 @@ export type GroupCommitResult =
   | { status: 'store_unavailable' }
   | { status: 'unknown' };
 
+export type GroupCommitReceipt = Exclude<GroupCommitResult, { status: 'unknown' }> & {
+  operationKey: string;
+  payloadDigest: string;
+  chatId: string;
+  targetWorkingDir: string;
+};
+
 export type GroupReceiptLookupResult =
-  | { status: 'found'; receipt: Exclude<GroupCommitResult, { status: 'unknown' }> }
+  | { status: 'found'; receipt: GroupCommitReceipt }
   | { status: 'missing' }
   | { status: 'store_unavailable' };
 
@@ -147,15 +154,7 @@ export class GroupWorkspaceOperationCoordinator {
       if (readback.status === 'store_unavailable') return { status: 'store_unavailable', journal };
       return this.convergeReceipt(journal, readback.receipt);
     }
-    if (journal.phase === 'group_committed') {
-      await this.dependencies.convergeSession({
-        sessionId: journal.sessionId,
-        expectedGeneration: journal.sessionGenerationAfter!,
-        source: 'group',
-        groupRevision: journal.groupRevisionAfter!,
-      });
-      return { status: 'group_committed', journal, groupRevision: journal.groupRevisionAfter! };
-    }
+    if (journal.phase === 'group_committed') return { status: 'unknown', journal };
     if (journal.phase === 'conflict') return { status: 'conflict', journal };
     if (journal.phase === 'store_unavailable') return { status: 'store_unavailable', journal };
 
@@ -231,10 +230,19 @@ export class GroupWorkspaceOperationCoordinator {
 
   private async convergeReceipt(
     journal: RepoGroupOperationJournal | undefined,
-    receipt: GroupCommitResult,
+    receipt: GroupCommitReceipt,
   ): Promise<GroupWorkspaceOperationResult> {
-    if (!journal) return receipt.status === 'unknown' ? { status: 'unknown' } : { status: 'store_unavailable' };
-    if (receipt.status === 'unknown') return this.markUnknown(journal);
+    if (!journal) return { status: 'store_unavailable' };
+    if (receipt.operationKey !== journal.operationKey
+      || receipt.payloadDigest !== journal.payloadDigest
+      || receipt.chatId !== journal.chatId
+      || receipt.targetWorkingDir !== journal.targetWorkingDir) {
+      return { status: 'unknown', journal };
+    }
+    if (journal.phase === 'group_committed' && (receipt.status !== 'committed'
+      || receipt.resultingRevision !== journal.groupRevisionAfter)) {
+      return { status: 'unknown', journal };
+    }
     if (receipt.status === 'committed') {
       let completed = journal;
       if (journal.phase === 'session_committed' || journal.phase === 'unknown') {
