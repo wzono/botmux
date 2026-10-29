@@ -433,6 +433,7 @@ import {
   sendPromptCacheKeepalive,
   sendWorkerSessionInput,
   killWorker,
+  suspendWorker,
   retireWorkerProcessOnly,
   retiringWorkersForSession,
   reapOrphanWorkers,
@@ -541,7 +542,7 @@ import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.j
 import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, runGroupWorkspaceRepoEntrypoint } from './core/command-handler.js';
 import { resolveGroupWorkspaceRepoSelection } from './core/repo-selection.js';
 import { resolveGroupWorkspaceCwd } from './core/group-workspace-policy.js';
-import { applySessionWorkingDir, setSessionWorkingDirMetadata, type SessionWorkingDirMutation } from './core/session-cwd.js';
+import { applySessionWorkingDir, runGroupWorkspaceSessionFollow, setSessionWorkingDirMetadata, type GroupWorkspaceFollowJournal, type SessionWorkingDirMutation } from './core/session-cwd.js';
 import { createGroupWorkspaceRouteRuntime } from './core/group-workspace-route-runtime.js';
 import { classifySlash, isCommandDecision, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
 import { deriveSessionPhase } from './core/session-phase.js';
@@ -6347,6 +6348,103 @@ async function submitQueuedMessage(
   markSessionActivity(ds, Date.now(), { human: senderIsBot === false });
   sessionStore.updateSession(ds.session);
   return true;
+}
+
+const GROUP_WORKSPACE_FOLLOW_EXIT_TIMEOUT_MS = 7_000;
+const GROUP_WORKSPACE_FOLLOW_READY_TIMEOUT_MS = 30_000;
+
+type FollowPersistedSession = Session & { groupWorkspaceFollow?: GroupWorkspaceFollowJournal };
+
+function waitForWorkerExit(worker: NonNullable<DaemonSession['worker']>): Promise<boolean> {
+  if (worker.exitCode !== null || worker.signalCode !== null) return Promise.resolve(true);
+  return new Promise(resolve => {
+    const timer = setTimeout(() => { cleanup(); resolve(false); }, GROUP_WORKSPACE_FOLLOW_EXIT_TIMEOUT_MS);
+    timer.unref?.();
+    const onExit = () => { cleanup(); resolve(true); };
+    const cleanup = () => { clearTimeout(timer); worker.off('exit', onExit); };
+    worker.once('exit', onExit);
+  });
+}
+
+async function waitForFollowWorkerReady(ds: DaemonSession, generation: number): Promise<{ ready: boolean; workingDir?: string }> {
+  const deadline = Date.now() + GROUP_WORKSPACE_FOLLOW_READY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (ds.workerGeneration === generation && ds.workerReady && ds.cliReady) {
+      return { ready: true, workingDir: getSessionWorkingDir(ds) };
+    }
+    if (!ds.worker || ds.worker.killed || (ds.workerGeneration ?? 0) > generation) return { ready: false };
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  return { ready: false };
+}
+
+/** Called only while the ordinary same-anchor FIFO/admission lock is held. */
+async function followGroupWorkspaceBeforeBusinessTurn(ds: DaemonSession): Promise<'continue' | 'stop'> {
+  if (ds.scope !== 'chat' || ds.session.workingDirSource !== 'group') return 'continue';
+  const group = await groupWorkspaceStore.read(ds.chatId);
+  if (group.status === 'store_unavailable') {
+    await sessionReply(ds.session.rootMessageId, '群目录状态暂不可用，本条消息未投递；请稍后重试。', 'text', ds.larkAppId);
+    return 'stop';
+  }
+  const followJournal = (ds.session as FollowPersistedSession).groupWorkspaceFollow;
+  if (!group.record || group.record.directory.kind !== 'bound'
+      || (!followJournal && group.record.revision <= (ds.session.groupWorkspaceRevision ?? -1))) return 'continue';
+  if (followJournal
+      && (followJournal.targetRevision !== group.record.revision
+        || followJournal.targetWorkingDir !== group.record.directory.workingDir)) {
+    await sessionReply(sessionAnchorId(ds), '群目录在会话迁移期间再次变化，本条消息未投递；请重试。', 'text', ds.larkAppId);
+    return 'stop';
+  }
+  const target = group.record.directory;
+  const health = await groupWorkspaceStore.probeBoundDirectoryForConsumption(ds.chatId);
+  if (health.status !== 'usable') {
+    await sessionReply(ds.session.rootMessageId, '群目录当前不可进入，本条消息未投递；请管理员修复绑定。', 'text', ds.larkAppId);
+    return 'stop';
+  }
+  const oldWorker = ds.worker;
+  let reservedGeneration = (ds.session.workerGeneration ?? 0) + 1;
+  let admission: WorkerForkAdmission | undefined;
+  const outcome = await runGroupWorkspaceSessionFollow(ds, {
+    workingDir: target.workingDir,
+    revision: group.record.revision,
+    directoryIdentity: health.usability.identity,
+  }, {
+    isIdle: current => !!current.worker && !current.worker.killed
+      && current.cliReady === true && current.lastScreenStatus === 'idle'
+      && !current.activeInteractiveTurn && !current.agentAttention
+      && !current.cascadeInFlight && !hasProtectedSessionMutationOwnership(current)
+      && (current.backgroundTaskCount ?? 0) === 0,
+    supportsReplacement: current => {
+      const backend = current.initConfig?.backendType ?? current.session.backendType;
+      return backend !== undefined && !isRemoteBackendType(backend);
+    },
+    isWorkerLive: current => !!current.worker && !current.worker.killed,
+    persist: input => {
+      const next = { ...ds.session } as FollowPersistedSession;
+      if (input.source && input.workingDir) {
+        setSessionWorkingDirMetadata(next, input as SessionWorkingDirMutation);
+      }
+      next.groupWorkspaceFollow = input.journal;
+      sessionStore.updateSession(next);
+      Object.assign(ds.session, next);
+      if (input.workingDir) ds.workingDir = input.workingDir;
+    },
+    suspend: current => suspendWorker(current, 'group_workspace_follow'),
+    kill: current => killWorker(current),
+    awaitExit: async () => !!oldWorker && await waitForWorkerExit(oldWorker),
+    spawn: current => forkWorker(current, '', {
+      resume: current.hasHistory,
+      onWorkerGenerationReserved: generation => { reservedGeneration = generation; },
+    }, { onAdmission: value => { admission = value; } }) && admission !== 'rejected' && admission !== 'deferred',
+    awaitReady: current => waitForFollowWorkerReady(current, reservedGeneration),
+    notice: kind => {
+      const text = kind === 'migrated'
+        ? `群目录已更新到 ${target.workingDir}，会话已安全重启。`
+        : '群目录跟随失败，本条消息未投递；请重试或检查会话状态。';
+      void sessionReply(sessionAnchorId(ds), text, 'text', ds.larkAppId);
+    },
+  });
+  return outcome.kind === 'migrated' || outcome.kind === 'unchanged' ? 'continue' : 'stop';
 }
 
 // Dependencies passed to command-handler
@@ -28808,6 +28906,11 @@ async function handleThreadReplyAdmitted(
     });
     return;
   }
+
+  // Auto-follow is part of the admitted same-anchor FIFO and runs before any
+  // queue append, turn mutation, or worker delivery. A deferred/failed follow
+  // leaves this business message unadmitted so the ingress retry can preserve it.
+  if (await followGroupWorkspaceBeforeBusinessTurn(ds) === 'stop') return;
 
   // Existing-owner route: append once after all pending-repo early returns.
   // 接纳标记不打在这里：append 仅供 dashboard 预览，真正的接纳在下方 live worker

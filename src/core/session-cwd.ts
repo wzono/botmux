@@ -12,6 +12,109 @@ export type SessionWorkingDirMutation =
   | { workingDir: string; source: 'group'; groupWorkspaceRevision: number; groupWorkspaceDirectoryIdentity?: { dev: string; ino: string } }
   | { workingDir: string; source: Exclude<SessionWorkingDirSource, 'group'>; groupWorkspaceRevision?: never; groupWorkspaceDirectoryIdentity?: never };
 
+export type GroupWorkspaceFollowJournal = {
+  targetWorkingDir: string;
+  targetRevision: number;
+  targetDirectoryIdentity?: { dev: string; ino: string };
+  previousRevision: number;
+  previousGeneration: number;
+  nextGeneration: number;
+  phase: 'prepared' | 'old_exited' | 'persisted' | 'spawned';
+};
+
+type FollowSession = Session & { groupWorkspaceFollow?: GroupWorkspaceFollowJournal };
+
+export interface GroupWorkspaceFollowDeps {
+  isIdle(ds: DaemonSession): boolean;
+  supportsReplacement(ds: DaemonSession): boolean;
+  isWorkerLive(ds: DaemonSession): boolean;
+  persist(input: ({ journal?: GroupWorkspaceFollowJournal; phase?: 'complete' | GroupWorkspaceFollowJournal['phase'] }
+    & Partial<SessionWorkingDirMutation> & { workerGeneration?: number })): void;
+  suspend(ds: DaemonSession): boolean;
+  kill(ds: DaemonSession): void;
+  awaitExit(ds: DaemonSession): Promise<boolean>;
+  spawn(ds: DaemonSession): boolean;
+  awaitReady(ds: DaemonSession): Promise<{ ready: boolean; workingDir?: string }>;
+  notice(kind: 'migrated' | 'failed'): void;
+}
+
+export type GroupWorkspaceFollowResult =
+  | { kind: 'unchanged' }
+  | { kind: 'deferred' }
+  | { kind: 'migrated' }
+  | { kind: 'failed'; error: string };
+
+/** Crash-resumable replacement at an admitted business-turn boundary. */
+export async function runGroupWorkspaceSessionFollow(
+  ds: DaemonSession,
+  target: { workingDir: string; revision: number; directoryIdentity?: { dev: string; ino: string } },
+  deps: GroupWorkspaceFollowDeps,
+): Promise<GroupWorkspaceFollowResult> {
+  const session = ds.session as FollowSession;
+  if (ds.scope !== 'chat' || session.workingDirSource !== 'group') return { kind: 'unchanged' };
+  if (!session.groupWorkspaceFollow
+      && session.groupWorkspaceRevision === target.revision
+      && session.workingDir === target.workingDir) return { kind: 'unchanged' };
+  if (!session.groupWorkspaceFollow && !deps.isIdle(ds)) return { kind: 'deferred' };
+  let notified = false;
+  const fail = (error: unknown): GroupWorkspaceFollowResult => {
+    if (!notified) { notified = true; deps.notice('failed'); }
+    return { kind: 'failed', error: error instanceof Error ? error.message : String(error) };
+  };
+  if (ds.adoptedFrom || !deps.supportsReplacement(ds)) return fail('worker replacement unsupported');
+
+  const previousGeneration = session.workerGeneration ?? 0;
+  const journal: GroupWorkspaceFollowJournal = session.groupWorkspaceFollow?.targetWorkingDir === target.workingDir
+    && session.groupWorkspaceFollow.targetRevision === target.revision
+    ? session.groupWorkspaceFollow
+    : { targetWorkingDir: target.workingDir, targetRevision: target.revision,
+        targetDirectoryIdentity: target.directoryIdentity,
+        previousRevision: session.groupWorkspaceRevision ?? -1,
+        previousGeneration, nextGeneration: previousGeneration + 1, phase: 'prepared' };
+  try {
+    if (!session.groupWorkspaceFollow) deps.persist({ journal, phase: journal.phase });
+    if (journal.phase === 'prepared') {
+      if (!deps.suspend(ds)) return fail('worker suspend refused');
+      deps.kill(ds);
+      if (!await deps.awaitExit(ds)) return fail('old worker exit timeout');
+      if (session.workingDirSource !== 'group'
+          || session.groupWorkspaceRevision !== journal.previousRevision
+          || session.workerGeneration !== journal.previousGeneration) {
+        return fail('session changed during worker replacement');
+      }
+      journal.phase = 'old_exited';
+      deps.persist({ journal, phase: journal.phase });
+    }
+    if (journal.phase === 'old_exited') {
+      deps.persist({ workingDir: target.workingDir, source: 'group',
+        groupWorkspaceRevision: target.revision,
+        groupWorkspaceDirectoryIdentity: journal.targetDirectoryIdentity,
+        journal: { ...journal, phase: 'persisted' } });
+      setSessionWorkingDirMetadata(session, { workingDir: target.workingDir, source: 'group',
+        groupWorkspaceRevision: target.revision,
+        groupWorkspaceDirectoryIdentity: journal.targetDirectoryIdentity });
+      ds.workingDir = target.workingDir;
+      journal.phase = 'persisted';
+    }
+    if (journal.phase === 'persisted') {
+      if (!deps.spawn(ds)) return fail('replacement worker spawn refused');
+      journal.phase = 'spawned';
+      deps.persist({ journal, phase: journal.phase });
+    } else if (journal.phase === 'spawned' && !deps.isWorkerLive(ds)) {
+      return fail('replacement worker generation missing during recovery');
+    }
+    const ready = await deps.awaitReady(ds);
+    if (!ready.ready) return fail('replacement worker not ready');
+    if (ready.workingDir !== target.workingDir) return fail('replacement worker cwd mismatch');
+    deps.persist({ journal: undefined, phase: 'complete' });
+    session.groupWorkspaceFollow = undefined;
+    deps.notice('migrated');
+    return { kind: 'migrated' };
+  } catch (error) {
+    return fail(error);
+  }
+}
+
 const SESSION_WORKING_DIR_SOURCES = new Set<SessionWorkingDirSource>([
   'explicit', 'oncall-explicit', 'oncall-default-auto', 'group',
   'bot-default', 'worktree', 'legacy-unknown',
