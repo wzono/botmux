@@ -3292,7 +3292,7 @@ async function ensureVcMeetingReceiverSession(
       memberEpoch: request.member.epoch,
     };
     session.lastMessageAt = new Date(now).toISOString();
-    session.workingDir = workingDir.resolvedPath;
+    setSessionWorkingDirMetadata(session, { workingDir: workingDir.resolvedPath, source: 'legacy-unknown' });
     session.cliId = bot.config.cliId;
     // Freeze the security-critical launch decision at creation.  A later live
     // Bot-config edit must neither weaken this session nor make an old
@@ -6936,7 +6936,7 @@ async function adoptCodexNotifierEvent(
     session.ownerOpenId = ownerOpenId;
     session.lastCallerOpenId = ownerOpenId;
     session.lastMessageAt = new Date(now).toISOString();
-    session.workingDir = event.cwd;
+    setSessionWorkingDirMetadata(session, { workingDir: event.cwd, source: 'explicit' });
     session.cliId = 'codex-app';
     sessionStore.updateSession(session);
     messageQueue.ensureQueue(anchor);
@@ -20238,6 +20238,7 @@ async function resolvePinnedWorkingDir(ctx: {
       if (statSync(resolved).isDirectory()) {
         return {
           pinnedWorkingDir: resolved,
+          workingDirMutation: { workingDir: resolved, source: 'explicit' } as SessionWorkingDirMutation,
           oncallEntry: undefined,
           inheritedFrom: null,
           pinnedFromBotDefault: false,
@@ -23124,7 +23125,11 @@ async function prepareIndependentCrossPrincipalSession(
       child.ownerUnionId = record.proposer.senderType === 'user' ? record.proposer.requestUserUnionId : undefined;
       child.creatorOpenId = proposerId;
       child.lastCallerOpenId = proposerId;
-      child.workingDir = workingDir;
+      setSessionWorkingDirMetadata(child, isolatedWorktree
+        ? { workingDir, source: 'worktree' }
+        : sourceDs.session.workingDirSource === 'group'
+          ? { workingDir, source: 'group', groupWorkspaceRevision: sourceDs.session.groupWorkspaceRevision! }
+          : { workingDir, source: sourceDs.session.workingDirSource ?? 'legacy-unknown' });
       child.nativeSessionTitle = title;
       child.nativeSessionTitleUserDefined = false;
       cloneIndependentLaunchPosture(sourceDs.session, child);
@@ -25316,6 +25321,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // first-message `/repo` command branch so both paths stay consistent.
   const {
     pinnedWorkingDir: configPinnedWorkingDir,
+    workingDirMutation: configWorkingDirMutation,
     oncallEntry,
     inheritedFrom,
     pinnedFromBotDefault: configPinnedFromBotDefault,
@@ -25375,6 +25381,13 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // 裸 `/repo` 兜底到的默认目录刻意不写 —— 与卡片「直接开始」的 pinWorkingDir: false
   // 同一条理由，也与今天 `/t /repo` 的落点逐字一致（那条路只在 pinned 存在时才写）。
   const persistedWorkingDir = lifecycleWorkingDir ?? headerWorktree?.repoPath ?? topicSpec?.workingDir ?? configPinnedWorkingDir;
+  const persistedWorkingDirMutation: SessionWorkingDirMutation | undefined = lifecycleWorkingDir
+    ? { workingDir: lifecycleWorkingDir, source: 'explicit' }
+    : headerWorktree?.repoPath
+      ? { workingDir: headerWorktree.repoPath, source: 'explicit' }
+      : topicSpec?.workingDir
+        ? { workingDir: topicSpec.workingDir, source: 'explicit' }
+        : configWorkingDirMutation;
   // A text-only bare `/t` is topic setup, not an empty CLI turn. Preserve the
   // repo-picker path when no cwd is pinned; a pinned cwd needs no setup owner,
   // so one visible reply can materialize the Lark thread and the first real
@@ -25563,8 +25576,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // resolveSessionLaunchModel 把它排在最高优先级。
     ...(topicSpec?.model ? { spawnModelOverride: topicSpec.model } : {}),
   };
-  if (persistedWorkingDir) {
-    ds.session.workingDir = persistedWorkingDir;
+  if (persistedWorkingDir && persistedWorkingDirMutation) {
+    setSessionWorkingDirMetadata(ds.session, persistedWorkingDirMutation);
     sessionStore.updateSession(ds.session);
   }
   const substituteReplyMode = substituteTrigger
@@ -29943,7 +29956,10 @@ async function autoCreateDocSession(
   session.larkAppId = larkAppId;
   session.scope = 'chat';
   session.lastMessageAt = new Date(now).toISOString();
-  session.workingDir = workingDir;
+  setSessionWorkingDirMetadata(session, {
+    workingDir,
+    source: sub.workingDir ? 'explicit' : effectiveDefaultWorkingDir(botCfg) ? 'bot-default' : 'legacy-unknown',
+  });
   session.cliId = botCfg.cliId;
   session.ownerOpenId = ctx.authorOpenId || sub.ownerOpenId;
   sessionStore.updateSession(session);

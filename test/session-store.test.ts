@@ -2657,6 +2657,32 @@ describe('closeSession()', () => {
     expect(getSession(session.sessionId)?.crossPrincipalInterruptions).toBeUndefined();
   });
 
+  it('persists an explicit repin across close/reload/reopen without inferring group provenance', () => {
+    const session = createSession('chat1', 'root1', 'Provenance reload');
+    Object.assign(session, {
+      workingDir: '/repo/group', workingDirSource: 'group', groupWorkspaceRevision: 4,
+    });
+    updateSession(session);
+    Object.assign(session, {
+      workingDir: '/repo/explicit', workingDirSource: 'explicit', groupWorkspaceRevision: undefined,
+    });
+    updateSession(session);
+
+    closeSession(session.sessionId);
+    init('test-app');
+    const reloaded = getSession(session.sessionId)!;
+    expect(reloaded).toMatchObject({
+      workingDir: '/repo/explicit', workingDirSource: 'explicit', status: 'closed',
+    });
+    expect(reloaded.groupWorkspaceRevision).toBeUndefined();
+
+    reactivateClosedSession(session.sessionId);
+    init('test-app');
+    expect(getSession(session.sessionId)).toMatchObject({
+      workingDir: '/repo/explicit', workingDirSource: 'explicit', status: 'active',
+    });
+  });
+
   it('should set status to closed and add closedAt timestamp', () => {
     const session = createSession('chat1', 'root1', 'To Close');
     closeSession(session.sessionId);

@@ -222,13 +222,12 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
           const created = store.createSession(ds.chatId, ds.session.rootMessageId, ds.session.title,
             ds.chatType, ds.scope, { source: 'other', inherit: ds.session });
           created.larkAppId = ds.larkAppId;
-          inheritSessionLaunchConfiguration(ds.session, created);
+          inheritSessionLaunchConfiguration(ds.session, created, ds.workingDir ?? ds.session.workingDir);
           for (const name of ['ownerOpenId', 'ownerUnionId', 'creatorOpenId', 'lastCallerOpenId',
             'larkThreadId', 'whiteboardId', 'quoteTargetId',
             'quoteTargetSenderOpenId', 'quoteTargetSenderIsBot'] as const) {
             if (name in ds.session) (created as unknown as Record<string, unknown>)[name] = structuredClone(ds.session[name as keyof Session]);
           }
-          created.workingDir = ds.workingDir ?? ds.session.workingDir;
           target = { session: created, worker: null, workerPort: null, workerToken: null,
             larkAppId: ds.larkAppId, chatId: ds.chatId, chatType: ds.chatType, scope: ds.scope,
             workingDir: created.workingDir, spawnedAt: Date.now(), cliVersion: ds.cliVersion,

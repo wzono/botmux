@@ -8,6 +8,7 @@ import { pidExistsEpermAlive } from '../utils/process-alive.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { DAEMON_HEARTBEAT_STALE_MS } from '../utils/daemon-heartbeat.js';
 import { cleanupMaterializedDashboardImages } from '../core/dashboard-images.js';
+import { setSessionWorkingDirMetadata } from '../core/session-cwd.js';
 import { getSessionTokenUsage } from '../core/cost-calculator.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
 import { removePromptContextDir } from './prompt-context-store.js';
@@ -4592,9 +4593,7 @@ export function ensureShadowPrincipalLane(args: {
           sessionId: child.sessionId,
           now,
         });
-        child.workingDir = worktree.workingDir;
-        child.workingDirSource = 'worktree';
-        child.groupWorkspaceRevision = undefined;
+        setSessionWorkingDirMetadata(child, { workingDir: worktree.workingDir, source: 'worktree' });
         child.principalLaneWorktree = worktree;
         persistRow(child);
         insertPrincipalLaneWorktreeProof(store, worktree);
@@ -4642,7 +4641,7 @@ export function ensureShadowPrincipalLane(args: {
         sessionId: child.sessionId,
         now,
       });
-      child.workingDir = worktree.workingDir;
+      setSessionWorkingDirMetadata(child, { workingDir: worktree.workingDir, source: 'worktree' });
       child.principalLaneWorktree = worktree;
     }
     persistRow(child);

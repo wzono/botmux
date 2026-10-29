@@ -12299,7 +12299,6 @@ async function forkFromSource(
     childSession.pendingForkSession = true;
     childSession.cliSessionId = lockedCliSessionId;
     childSession.cliId = ds.session.cliId;
-    childSession.workingDir = ds.workingDir ?? ds.session.workingDir;
     childSession.ownerOpenId = opts?.childOwnerOpenId ?? ds.session.ownerOpenId;
     childSession.backendType = ds.session.backendType;
     // Bot identity on the PERSISTED row. Every other createSession caller sets
@@ -12317,7 +12316,7 @@ async function forkFromSource(
     // a missing sandbox stamp on resume can silently disable isolation.
     // Model remains a launch record; current matching-CLI settings still win
     // in resolveSessionLaunchModel. Native pane/conversation IDs are separate.
-    inheritSessionLaunchConfiguration(ds.session, childSession);
+    inheritSessionLaunchConfiguration(ds.session, childSession, ds.workingDir ?? ds.session.workingDir);
     childSession.promptInjection = sessionPromptInjection(ds);
     childSession.nativeSessionTitle = childTitle;
     childSession.nativeSessionTitleUserDefined = true;

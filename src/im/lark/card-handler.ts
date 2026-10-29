@@ -106,7 +106,7 @@ import { readPrincipalLaneTurnBinding } from '../../core/principal-lane-turn.js'
 import { buildTerminalUrl, platformTerminalReadEntryActive } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, restoreDeletedWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
-import { repinSessionWorkingDir } from '../../core/session-cwd.js';
+import { repinSessionWorkingDir, setSessionWorkingDirMetadata } from '../../core/session-cwd.js';
 import { answerRestartWithoutWorkingDir, reclaimUnstartedOpening, recoveryCardForm, workingDirRecoveryPending } from '../../core/working-dir-recovery.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
 import { handleCommand } from '../../core/command-handler.js';
@@ -1053,9 +1053,7 @@ export async function commitRepoSelection(
         current.lastUserPrompt = undefined;
         current.lastCliInput = undefined;
         current.workingDir = dirPath;
-        session.workingDir = dirPath;
-        session.workingDirSource = 'explicit';
-        session.groupWorkspaceRevision = undefined;
+        setSessionWorkingDirMetadata(session, { workingDir: dirPath, source: 'explicit' });
         session.larkAppId = current.larkAppId;
         session.chatDisplayName = oldSession.chatDisplayName;
         session.ownerOpenId = oldSession.ownerOpenId;

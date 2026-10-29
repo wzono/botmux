@@ -82,7 +82,11 @@ describe('defaultOncall provenance and group workspace precedence', () => {
     const realResolution = await h.daemon.__testOnly_resolvePinnedWorkingDir({
       scope: 'chat', anchor: 'oc_group', chatId: 'oc_group', chatType: 'group', larkAppId: 'app_test',
     });
-    expect(realResolution.pinnedWorkingDir).toBe(h.groupDir);
+    expect(realResolution).toMatchObject({
+      pinnedWorkingDir: h.groupDir,
+      workingDirMutation: { workingDir: h.groupDir, source: 'group', groupWorkspaceRevision: 1 },
+      pinnedFromBotDefault: false,
+    });
   });
 
   it('manual oncall is explicit and outranks the group directory', async () => {
