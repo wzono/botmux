@@ -2450,6 +2450,7 @@ export interface GroupWorkspaceTextRouteInput {
   senderUnionId?: string;
   tenantKey?: string;
   messageId?: string;
+  humanProvenance?: boolean;
 }
 
 export interface GroupWorkspaceTextRouteDeps {
@@ -5881,6 +5882,7 @@ export function createLarkEventDispatcherRuntime(
           senderUnionId: humanSenderUnionId,
           tenantKey: sender?.tenant_key ?? sender?.sender_id?.tenant_key,
           messageId,
+          humanProvenance: sender?.sender_type === 'user',
         }, {
           resolveAuthority: handlers.resolveGroupWorkspaceRouteAuthority,
           handleRoute: handlers.handleGroupWorkspaceRoute,

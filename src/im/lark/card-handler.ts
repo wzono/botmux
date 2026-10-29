@@ -315,6 +315,7 @@ export interface GroupWorkspaceCardRouteInput {
   operatorUnionId?: string;
   tenantKey?: string;
   actionId?: string;
+  humanProvenance?: boolean;
 }
 
 export interface GroupWorkspaceCardRouteDeps {
@@ -5454,6 +5455,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       operatorUnionId: data.operator?.union_id,
       tenantKey: (data as CardActionData & { tenant_key?: string }).tenant_key,
       actionId: data.event_id ?? data.header?.event_id ?? data.event?.event_id,
+      // Card callbacks expose an SDK-verified human operator envelope rather than sender_type.
+      humanProvenance: !!operatorOpenId,
     }, {
       resolveAuthority: deps.resolveGroupWorkspaceRouteAuthority,
       handleRoute: deps.handleGroupWorkspaceRoute,

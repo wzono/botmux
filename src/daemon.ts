@@ -32589,7 +32589,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           : undefined;
       },
       readWorkspace: chatId => groupWorkspaceStore.read(chatId),
-      canSwitchSession: ds => !isRemoteBackendSession(ds)
+      canSwitchSession: (ds, actor) => actor.humanProvenance === true
+        && canOperate(cfg.larkAppId, ds.chatId, actor.openId, actor.unionId)
+        && !isRemoteBackendSession(ds)
         && !ds.worktreeCreating
         && !ds.pendingRepoCommitInFlight
         && !hasProtectedSessionMutationOwnership(ds),

@@ -20,6 +20,14 @@ export interface GroupWorkspaceAuthorityInput {
   operatorOpenId?: string;
   operatorUnionId?: string;
   tenantKey?: string;
+  /** Set only by a Lark event path that has already classified the actor as human. */
+  humanProvenance?: boolean;
+}
+
+export interface GroupWorkspaceSessionActor {
+  openId: string;
+  unionId: string;
+  humanProvenance: true;
 }
 
 export type GroupWorkspaceProductionRoute = GroupWorkspaceRouteIntent & {
@@ -40,7 +48,7 @@ export function createGroupWorkspaceRouteRuntime(options: {
   resolveAllowedUser: ResolveBotAllowedUser;
   resolveActorUnion: (openId: string) => Promise<string | undefined>;
   readWorkspace: (chatId: string) => Promise<WorkspaceAclRead>;
-  canSwitchSession: (session: DaemonSession) => boolean;
+  canSwitchSession: (session: DaemonSession, actor: GroupWorkspaceSessionActor) => boolean;
   dispatchRepo: (
     session: DaemonSession,
     selection: string,
@@ -57,7 +65,10 @@ export function createGroupWorkspaceRouteRuntime(options: {
     const envelopeUnionId = input.senderUnionId ?? input.operatorUnionId;
     const actorOpenId = input.senderOpenId ?? input.operatorOpenId;
     const tenantKey = input.tenantKey;
-    if (!tenantKey?.trim() || !actorOpenId || !envelopeUnionId?.startsWith('on_')) return undefined;
+    if (input.humanProvenance !== true
+      || !tenantKey?.trim()
+      || !actorOpenId
+      || !envelopeUnionId?.startsWith('on_')) return undefined;
     const verifiedUnionId = await options.resolveActorUnion(actorOpenId);
     if (verifiedUnionId !== envelopeUnionId) return undefined;
 
@@ -79,11 +90,16 @@ export function createGroupWorkspaceRouteRuntime(options: {
       && session.session.status === 'active'
       ? session
       : undefined;
+    const sessionActor: GroupWorkspaceSessionActor = {
+      openId: actorOpenId,
+      unionId: verifiedUnionId,
+      humanProvenance: true,
+    };
     return {
       actor: { tenantKey, unionId: verifiedUnionId },
       freshSnapshot: snapshot,
       workspaceManagers: workspace.record?.workspaceManagers,
-      canSwitchSession: !!exactSession && options.canSwitchSession(exactSession),
+      canSwitchSession: !!exactSession && options.canSwitchSession(exactSession, sessionActor),
     };
   };
 
@@ -99,7 +115,12 @@ export function createGroupWorkspaceRouteRuntime(options: {
       || session.chatType !== 'group'
       || session.scope !== 'chat'
       || session.session.status !== 'active'
-      || !options.canSwitchSession(session)) {
+      || !route.actorOpenId
+      || !options.canSwitchSession(session, {
+        openId: route.actorOpenId,
+        unionId: route.actor.unionId,
+        humanProvenance: true,
+      })) {
       await options.reply(route.chatId, '当前群会话不支持安全切换，本次未切换会话，也未写入群目录。');
       return;
     }
