@@ -542,7 +542,7 @@ import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.j
 import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, runGroupWorkspaceRepoEntrypoint } from './core/command-handler.js';
 import { resolveGroupWorkspaceRepoSelection } from './core/repo-selection.js';
 import { resolveGroupWorkspaceCwd } from './core/group-workspace-policy.js';
-import { applySessionWorkingDir, runGroupWorkspaceSessionFollow, setSessionWorkingDirMetadata, type SessionWorkingDirMutation } from './core/session-cwd.js';
+import { applySessionWorkingDir, resolveGroupWorkspaceFollowTarget, runGroupWorkspaceSessionFollow, setSessionWorkingDirMetadata, type SessionWorkingDirMutation } from './core/session-cwd.js';
 import { createGroupWorkspaceRouteRuntime } from './core/group-workspace-route-runtime.js';
 import { classifySlash, isCommandDecision, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
 import { deriveSessionPhase } from './core/session-phase.js';
@@ -1247,7 +1247,7 @@ async function restoreSessionsAndScheduleStartupRecovery(opts: {
   // includes workerless PTY rows and rows restored after the replacement spawn.
   for (const ds of activeSessions.values()) {
     if (ds.larkAppId !== opts.larkAppId || !ds.session.groupWorkspaceFollow) continue;
-    if (await followGroupWorkspaceBeforeBusinessTurn(ds, { recoverPersistedJournal: true }) === 'stop') {
+    if (await followGroupWorkspaceBeforeBusinessTurn(ds) === 'stop') {
       throw new Error(`workspace follow startup reconciliation failed for ${ds.session.sessionId}`);
     }
   }
@@ -6377,35 +6377,33 @@ async function waitForFollowWorkerReady(ds: DaemonSession, generation: number): 
 /** Called only while the ordinary same-anchor FIFO/admission lock is held. */
 async function followGroupWorkspaceBeforeBusinessTurn(
   ds: DaemonSession,
-  opts: { recoverPersistedJournal?: boolean } = {},
 ): Promise<'continue' | 'stop'> {
   if (ds.scope !== 'chat' || ds.session.workingDirSource !== 'group') return 'continue';
-  const journalAtStartup = opts.recoverPersistedJournal ? ds.session.groupWorkspaceFollow : undefined;
   const group = await groupWorkspaceStore.read(ds.chatId);
-  if (group.status === 'store_unavailable') {
+  const followJournal = (ds.session as FollowPersistedSession).groupWorkspaceFollow;
+  const resolution = resolveGroupWorkspaceFollowTarget({
+    journal: followJournal,
+    group,
+    currentRevision: ds.session.groupWorkspaceRevision,
+  });
+  if (resolution.kind === 'store_unavailable') {
     await sessionReply(ds.session.rootMessageId, '群目录状态暂不可用，本条消息未投递；请稍后重试。', 'text', ds.larkAppId);
     return 'stop';
   }
-  const followJournal = (ds.session as FollowPersistedSession).groupWorkspaceFollow;
-  if (!group.record || group.record.directory.kind !== 'bound'
-      || (!followJournal && group.record.revision <= (ds.session.groupWorkspaceRevision ?? -1))) return 'continue';
-  if (followJournal && !journalAtStartup
-      && (followJournal.targetRevision !== group.record.revision
-        || followJournal.targetWorkingDir !== group.record.directory.workingDir)) {
-    await sessionReply(sessionAnchorId(ds), '群目录在会话迁移期间再次变化，本条消息未投递；请重试。', 'text', ds.larkAppId);
-    return 'stop';
-  }
-  const target = journalAtStartup
-    ? { kind: 'bound' as const, workingDir: journalAtStartup.targetWorkingDir }
-    : group.record.directory;
-  const targetRevision = journalAtStartup?.targetRevision ?? group.record.revision;
-  const startupUsability = journalAtStartup
-    ? probePathUsability(target.workingDir, journalAtStartup.targetDirectoryIdentity
-      ? { expectedIdentity: journalAtStartup.targetDirectoryIdentity }
+  if (resolution.kind === 'continue') return 'continue';
+  // A durable journal freezes the migration target across later bind/unbind
+  // changes. Only a proven ready worker at that cwd may terminalize it.
+  const target = { kind: 'bound' as const, workingDir: resolution.target.workingDir };
+  const targetRevision = resolution.target.revision;
+  const frozenTargetUsability = followJournal
+    ? probePathUsability(target.workingDir, followJournal.targetDirectoryIdentity
+      ? { expectedIdentity: followJournal.targetDirectoryIdentity }
       : {})
     : undefined;
-  const health = startupUsability
-    ? (startupUsability.ok ? { status: 'usable' as const, usability: startupUsability } : { status: 'unusable' as const })
+  const health = frozenTargetUsability
+    ? (frozenTargetUsability.ok
+      ? { status: 'usable' as const, usability: frozenTargetUsability }
+      : { status: 'unusable' as const })
     : await groupWorkspaceStore.probeBoundDirectoryForConsumption(ds.chatId);
   if (health.status !== 'usable') {
     await sessionReply(ds.session.rootMessageId, '群目录当前不可进入，本条消息未投递；请管理员修复绑定。', 'text', ds.larkAppId);

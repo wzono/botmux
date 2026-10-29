@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import { runGroupWorkspaceSessionFollow } from '../src/core/session-cwd.js';
+import {
+  resolveGroupWorkspaceFollowTarget,
+  runGroupWorkspaceSessionFollow,
+} from '../src/core/session-cwd.js';
 
 type HarnessOptions = {
   source?: string; scope?: 'chat' | 'thread'; revision?: number; idle?: boolean;
@@ -44,6 +47,43 @@ function harness(opts: HarnessOptions = {}) {
 }
 
 describe('group workspace pre-turn worker follow', () => {
+  it.each(['prepared', 'old_exited', 'persisted', 'spawned'] as const)(
+    'keeps the durable %s target authoritative after the group is unbound',
+    phase => {
+      const journal = {
+        targetWorkingDir: '/x2', targetRevision: 2, previousRevision: 1,
+        previousGeneration: 4, nextGeneration: 5, phase,
+      };
+      expect(resolveGroupWorkspaceFollowTarget({
+        journal,
+        group: { status: 'available', record: { revision: 3, directory: { kind: 'unbound' } } },
+      })).toEqual({ kind: 'follow', target: { workingDir: '/x2', revision: 2 } });
+    },
+  );
+
+  it('does not admit an unbound group session while its follow journal is unresolved', () => {
+    expect(resolveGroupWorkspaceFollowTarget({
+      journal: {
+        targetWorkingDir: '/x2', targetRevision: 2, previousRevision: 1,
+        previousGeneration: 4, nextGeneration: 5, phase: 'persisted',
+      },
+      group: { status: 'available', record: { revision: 3, directory: { kind: 'unbound' } } },
+    }).kind).not.toBe('continue');
+  });
+
+  it.each(['prepared', 'old_exited', 'persisted', 'spawned'] as const)(
+    'recovers the durable %s target even while the group store is unavailable',
+    phase => {
+      expect(resolveGroupWorkspaceFollowTarget({
+        journal: {
+          targetWorkingDir: '/x2', targetRevision: 2, previousRevision: 1,
+          previousGeneration: 4, nextGeneration: 5, phase,
+        },
+        group: { status: 'store_unavailable' },
+      })).toEqual({ kind: 'follow', target: { workingDir: '/x2', revision: 2 } });
+    },
+  );
+
   it.each(['claude', 'codex'])('replaces an idle local PTY generation before delivering on %s', async () => {
     const h = harness();
     const result = await runGroupWorkspaceSessionFollow(h.ds, { workingDir: '/x2', revision: 2 }, h.deps);

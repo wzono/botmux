@@ -35,6 +35,44 @@ export type GroupWorkspaceFollowResult =
   | { kind: 'migrated' }
   | { kind: 'failed'; error: string };
 
+type GroupWorkspaceReadForFollow =
+  | { status: 'store_unavailable' }
+  | { status: 'available'; record?: {
+    revision: number;
+    directory: { kind: 'unbound' } | { kind: 'bound'; workingDir: string };
+  } };
+
+export type GroupWorkspaceFollowTargetResolution =
+  | { kind: 'continue' }
+  | { kind: 'store_unavailable' }
+  | { kind: 'follow'; target: { workingDir: string; revision: number } };
+
+/**
+ * Once a follow journal exists, its target is frozen durable intent. A later
+ * group unbind changes only new-session selection; it cannot make recovery
+ * admit a turn while the persisted session is workerless or still on old cwd.
+ */
+export function resolveGroupWorkspaceFollowTarget(input: {
+  journal?: GroupWorkspaceFollowJournal;
+  group: GroupWorkspaceReadForFollow;
+  currentRevision?: number;
+}): GroupWorkspaceFollowTargetResolution {
+  if (input.journal) {
+    return { kind: 'follow', target: {
+      workingDir: input.journal.targetWorkingDir,
+      revision: input.journal.targetRevision,
+    } };
+  }
+  if (input.group.status === 'store_unavailable') return { kind: 'store_unavailable' };
+  const record = input.group.record;
+  if (!record || record.directory.kind !== 'bound'
+      || record.revision <= (input.currentRevision ?? -1)) return { kind: 'continue' };
+  return { kind: 'follow', target: {
+    workingDir: record.directory.workingDir,
+    revision: record.revision,
+  } };
+}
+
 /** Crash-resumable replacement at an admitted business-turn boundary. */
 export async function runGroupWorkspaceSessionFollow(
   ds: DaemonSession,
