@@ -916,7 +916,7 @@ function readStoreEntries(ref: StoreFileRef, strict = false): [string, Session][
     const rows = db.prepare('SELECT session_id, row FROM sessions').all() as { session_id: string; row: string }[];
     const entries: [string, Session][] = [];
     for (const r of rows) {
-      try { entries.push([r.session_id, JSON.parse(r.row) as Session]); }
+      try { entries.push([r.session_id, parseSessionRow(r.row)]); }
       catch (error) { if (strict) throw error; /* display readers skip unparseable rows */ }
     }
     return entries;
@@ -931,12 +931,12 @@ function readStoreRowByKey(ref: StoreFileRef, sessionId: string): Session | unde
   // connection instead of opening one per call.
   if (ownStore && loaded && ref.appId === currentAppId && ref.path === getDbPath()) {
     const hit = ownStore.selectRow.get(sessionId) as { row: string } | undefined;
-    return hit ? JSON.parse(hit.row) as Session : undefined;
+    return hit ? parseSessionRow(hit.row) : undefined;
   }
   const db = openDbForRead(ref.path);
   try {
     const hit = db.prepare('SELECT row FROM sessions WHERE session_id = ?').get(sessionId) as { row: string } | undefined;
-    return hit ? JSON.parse(hit.row) as Session : undefined;
+    return hit ? parseSessionRow(hit.row) : undefined;
   } finally {
     db.close();
   }
@@ -968,7 +968,7 @@ function readStoreActiveRows(
     const out: Session[] = [];
     for (const r of rows) {
       try {
-        const session = JSON.parse(r.row) as Session;
+        const session = parseSessionRow(r.row);
         if (!session || typeof session !== 'object' || typeof session.sessionId !== 'string') {
           throw new Error('invalid session object');
         }
@@ -1439,7 +1439,7 @@ function readStrandedImportRows(dbFp: string): {
       let beyondBaseline = 0;
       for (const r of rows) {
         if (baselineRows.get(r.session_id) !== r.row) beyondBaseline++;
-        try { entries.push([r.session_id, JSON.parse(r.row) as Session]); } catch { unparseable++; }
+        try { entries.push([r.session_id, parseSessionRow(r.row)]); } catch { unparseable++; }
       }
       // "The orphan demonstrably replayed": SQLite accepted frames from it AND
       // it contributed rows the shell did not already have, with nothing corrupt.
@@ -1861,7 +1861,7 @@ function readOwnStoreAllRows(store: OwnSqliteStore): [string, Session][] {
   const rows = store.selectAll.all() as { session_id: string; row: string }[];
   const entries: [string, Session][] = [];
   for (const r of rows) {
-    try { entries.push([r.session_id, JSON.parse(r.row) as Session]); } catch { /* skip unparseable row */ }
+    try { entries.push([r.session_id, parseSessionRow(r.row)]); } catch { /* skip unparseable row */ }
   }
   return entries;
 }
@@ -1911,7 +1911,7 @@ export function getActiveRemoteShutdownSnapshotsBatch(
         const fresh = new Map<string, Session | undefined>();
         for (const sessionId of sessionIds) {
           const hit = select.get(sessionId) as { row: string } | undefined;
-          fresh.set(sessionId, hit ? JSON.parse(hit.row) as Session : undefined);
+          fresh.set(sessionId, hit ? parseSessionRow(hit.row) : undefined);
         }
         const invalid = sessionIds.filter((sessionId) => {
           const session = fresh.get(sessionId);
@@ -1980,7 +1980,7 @@ export function persistActiveRemoteLineagesExactBatch(
         const freshRows = new Map<string, { session: Session; raw: string } | undefined>();
         for (const sessionId of sessionIds) {
           const hit = select.get(sessionId) as { row: string } | undefined;
-          freshRows.set(sessionId, hit ? { session: JSON.parse(hit.row) as Session, raw: hit.row } : undefined);
+          freshRows.set(sessionId, hit ? { session: parseSessionRow(hit.row), raw: hit.row } : undefined);
         }
         const conflicts: string[] = [];
         for (const u of updates) {
@@ -2026,7 +2026,7 @@ export function persistActiveRemoteLineagesExactBatch(
       const verifiedRows = new Map<string, Session | undefined>();
       for (const sessionId of sessionIds) {
         const hit = select.get(sessionId) as { row: string } | undefined;
-        verifiedRows.set(sessionId, hit ? JSON.parse(hit.row) as Session : undefined);
+        verifiedRows.set(sessionId, hit ? parseSessionRow(hit.row) : undefined);
       }
       const ambiguous = updates.filter((u) => {
         const durable = verifiedRows.get(u.sessionId);
@@ -2070,7 +2070,36 @@ export function persistActiveRemoteLineagesExactBatch(
  *  the serialized row identical skips the write — the daemon fires several
  *  updateSession() calls per inbound message (activity bump, pid, stream-card
  *  state, …) and many of them change nothing. */
+const SESSION_WORKING_DIR_SOURCES = new Set<Session['workingDirSource']>([
+  'explicit', 'oncall-explicit', 'oncall-default-auto', 'group',
+  'bot-default', 'worktree', 'legacy-unknown',
+]);
+
+export function normalizeSessionWorkingDirProvenance<T extends Session>(session: T): T {
+  session.workingDirSource ??= 'legacy-unknown';
+  if (!SESSION_WORKING_DIR_SOURCES.has(session.workingDirSource)) {
+    throw new Error('invalid workingDirSource');
+  }
+  if (session.workingDirSource !== 'legacy-unknown'
+    && (typeof session.workingDir !== 'string' || !session.workingDir.trim())) {
+    throw new Error('cwd provenance requires a non-empty workingDir');
+  }
+  if (session.workingDirSource === 'group') {
+    if (!Number.isSafeInteger(session.groupWorkspaceRevision) || session.groupWorkspaceRevision! < 0) {
+      throw new Error('group cwd provenance requires a safe non-negative revision');
+    }
+  } else if (session.groupWorkspaceRevision !== undefined) {
+    throw new Error('non-group cwd provenance must not carry a group revision');
+  }
+  return session;
+}
+
+function parseSessionRow(row: string): Session {
+  return normalizeSessionWorkingDirProvenance(JSON.parse(row) as Session);
+}
+
 function persistRow(session: Session): void {
+  normalizeSessionWorkingDirProvenance(session);
   if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
   if (!ownStore) {
     throw new SessionStoreUnavailableError(
@@ -2082,7 +2111,7 @@ function persistRow(session: Session): void {
   testOnlyBeforeRowPersist?.(session.sessionId);
   const existing = ownStore.selectRow.get(session.sessionId) as { row: string } | undefined;
   if (existing) {
-    const durable = JSON.parse(existing.row) as Session;
+    const durable = parseSessionRow(existing.row);
     if (durable.workspaceRetirement) {
       if (session.status !== 'closed') throw new Error('workspace_retired');
       // Late whole-row writers may hold a pre-close copy. Retirement cannot
@@ -2228,7 +2257,7 @@ export function createSessionWithOwnedMutation<T>(
     for (const sessionId of unique) {
       const hit = store.selectRow.get(sessionId) as { row: string } | undefined;
       if (!hit) throw new Error(`atomic session creation cannot find ${sessionId}`);
-      fresh.set(sessionId, structuredClone(JSON.parse(hit.row) as Session));
+      fresh.set(sessionId, structuredClone(parseSessionRow(hit.row)));
     }
     result = mutate(fresh, created);
     for (const row of fresh.values()) persistRow(row);
@@ -2861,7 +2890,7 @@ export function updateSession(session: Session): void {
   catch (error) {
     const row = ownStore?.selectRow.get(session.sessionId) as { row: string } | undefined;
     if (row) {
-      const durable = JSON.parse(row.row) as Session;
+      const durable = parseSessionRow(row.row);
       const cached = sessions.get(session.sessionId);
       for (const target of new Set([session, cached].filter((s): s is Session => !!s))) {
         for (const key of Object.keys(target)) delete (target as unknown as Record<string, unknown>)[key];
@@ -2885,7 +2914,7 @@ export function updateDeploymentContinuation(
   if (!db) throw new SessionStoreUnavailableError(new Error('owned session store is not attached'));
   const hit = db.selectRow.get(session.sessionId) as { row: string } | undefined;
   if (!hit) throw new Error('continuation session is missing');
-  const durable = JSON.parse(hit.row) as Session;
+  const durable = parseSessionRow(hit.row);
   if (durable.status !== 'active'
     || JSON.stringify(durable.deploymentContinuation) !== JSON.stringify(expected)) {
     throw new Error('continuation authority changed');
@@ -2928,7 +2957,7 @@ export function mutateOwnedSessionsAtomically<T>(
     for (const sessionId of unique) {
       const hit = store.selectRow.get(sessionId) as { row: string } | undefined;
       if (!hit) throw new Error(`atomic session mutation cannot find ${sessionId}`);
-      fresh.set(sessionId, structuredClone(JSON.parse(hit.row) as Session));
+      fresh.set(sessionId, structuredClone(parseSessionRow(hit.row)));
     }
     result = mutate(fresh);
     for (const row of fresh.values()) persistRow(row);
@@ -3350,7 +3379,7 @@ export function ensurePrincipalLaneSource(args: {
   const result = runOwnedWriteTransaction(store, false, (): EnsurePrincipalLaneSourceResult => {
     const hit = store.selectRow.get(args.sourceSessionId) as { row: string } | undefined;
     if (!hit) throw new Error(`principal-lane source session not found: ${args.sourceSessionId}`);
-    const sourceSession = JSON.parse(hit.row) as Session;
+    const sourceSession = parseSessionRow(hit.row);
     if (sourceSession.status !== 'active') throw new Error('principal-lane source session is not active');
     if (sourceSession.principalLaneDisabledReason) {
       return { status: 'disabled', reason: sourceSession.principalLaneDisabledReason };
@@ -3577,7 +3606,7 @@ export function bootstrapPrincipalLaneSourceForIngress(args: {
     const hit = store.selectRow.get(args.sourceSessionId) as { row: string } | undefined;
     if (!hit) throw new Error(`principal-lane source session not found: ${args.sourceSessionId}`);
     let session: Session;
-    try { session = JSON.parse(hit.row) as Session; }
+    try { session = parseSessionRow(hit.row); }
     catch { return { status: 'retry', reason: 'source_owner_mismatch' }; }
     if (decideLegacySourceMigration({
       session,
@@ -4564,6 +4593,8 @@ export function ensureShadowPrincipalLane(args: {
           now,
         });
         child.workingDir = worktree.workingDir;
+        child.workingDirSource = 'worktree';
+        child.groupWorkspaceRevision = undefined;
         child.principalLaneWorktree = worktree;
         persistRow(child);
         insertPrincipalLaneWorktreeProof(store, worktree);
@@ -5582,7 +5613,7 @@ export function persistActiveRemoteLineageExact(
       db.exec('BEGIN IMMEDIATE');
       inTxn = true;
       const hit = select.get(sessionId) as { row: string } | undefined;
-      const next = applyChecksAndBuildNext(hit ? JSON.parse(hit.row) as Session : undefined);
+      const next = applyChecksAndBuildNext(hit ? parseSessionRow(hit.row) : undefined);
       const json = JSON.stringify(next);
       if (json !== hit!.row) {
         testOnlyBeforeRowPersist?.(sessionId);
@@ -6107,7 +6138,7 @@ function runUnownedRowTxn<T>(
     const hit = db.prepare('SELECT row FROM sessions WHERE session_id = ?')
       .get(target.sessionId) as { row: string } | undefined;
     if (!hit) return { outcome: 'missing' };
-    const current = JSON.parse(hit.row) as Session;
+    const current = parseSessionRow(hit.row);
     const { publish, result } = step(current);
     if (!publish) return result;
     db.prepare('UPDATE sessions SET status = ?, row = ? WHERE session_id = ?')

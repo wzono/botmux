@@ -59,8 +59,9 @@ describe('defaultOncall provenance and group workspace precedence', () => {
     });
     expect(h.dispatcher.evaluateTalk('app_test', 'oc_group', 'ou_stranger', undefined, undefined, 'group'))
       .toMatchObject({ allowed: true, reason: 'oncall' });
-    expect(h.policy.resolveGroupWorkspaceCwd({ oncall: entry, groupWorkingDir: h.groupDir }))
-      .toEqual({ workingDir: h.groupDir, source: 'group' });
+    expect(h.policy.resolveGroupWorkspaceCwd({
+      oncall: entry, groupWorkingDir: h.groupDir, groupWorkspaceRevision: 1,
+    })).toEqual({ workingDir: h.groupDir, source: 'group', groupWorkspaceRevision: 1 });
 
     const persisted = JSON.parse(readFileSync(h.configPath, 'utf8'))[0].oncallChats[0];
     expect(persisted.provenance).toBe('oncall-default-auto');

@@ -489,6 +489,15 @@ export interface MessageProvenance {
   updatedAt: string;
 }
 
+export type SessionWorkingDirSource =
+  | 'explicit'
+  | 'oncall-explicit'
+  | 'oncall-default-auto'
+  | 'group'
+  | 'bot-default'
+  | 'worktree'
+  | 'legacy-unknown';
+
 export interface Session {
   sessionId: string;
   /** Frozen opt-in at birth; ordinary sessions never inherit listener cleanup. */
@@ -783,6 +792,10 @@ export interface Session {
    *  `pid`; a row without it is never signalled through `pid`. */
   pidProcStart?: string;
   workingDir?: string;
+  /** Durable origin of workingDir. Missing legacy values normalize to legacy-unknown. */
+  workingDirSource?: SessionWorkingDirSource;
+  /** Present exactly when workingDirSource is group. */
+  groupWorkspaceRevision?: number;
   webPort?: number;
   /** Agent-registered local Web preview for this session. The daemon accepts
    * only a reachable literal loopback target through the session-scoped CLI

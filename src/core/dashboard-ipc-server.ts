@@ -4158,7 +4158,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
     }
     return jsonRes(res, forbidden ? 403 : 400, { ok: false, error: v.error });
   }
-  repinSessionWorkingDir(ds, v.resolvedPath);
+  repinSessionWorkingDir(ds, { workingDir: v.resolvedPath, source: 'explicit' });
   // ds.initConfig 与 repin 同步，且**无条件**（不只在 live-worker 分支里）：下次
   // forkWorker 用 initConfig 重建 init 消息，只在有活 worker 时更新的话，no-worker /
   // worker.killed 两条分支会留下「记录新、initConfig 旧」的分裂状态，冷启动把会话

@@ -3105,7 +3105,7 @@ export async function handleCommand(
           const suspended = !current.adoptedFrom
             && suspendWorker(current, 'working_dir_changed');
           if (!suspended) killWorker(current);
-          repinSessionWorkingDir(current, resolvedPath);
+          repinSessionWorkingDir(current, { workingDir: resolvedPath, source: 'explicit' });
           // cwd 变了，riff 多仓 stamp（选择卡多选时写入）随之失效——保留会让下次
           // refork 仍按旧仓库组合推导、无视新目录。
           current.session.riffRepoDirs = undefined;
@@ -3219,8 +3219,7 @@ export async function handleCommand(
             );
             if (!current || current !== ds || !current.pendingRepo) return false;
             if (selection) {
-              current.workingDir = selection.path;
-              current.session.workingDir = selection.path;
+              repinSessionWorkingDir(current, { workingDir: selection.path, source: 'explicit' });
               current.session.riffRepoDirs = selection.riffRepoDirs;
               sessionStore.updateSession(current.session);
             }
@@ -3479,6 +3478,8 @@ export async function handleCommand(
                 current.lastCliInput = undefined;
                 current.workingDir = selectedPath;
                 session.workingDir = selectedPath;
+                session.workingDirSource = 'explicit';
+                session.groupWorkspaceRevision = undefined;
                 session.larkAppId = current.larkAppId;
                 session.chatDisplayName = oldSession.chatDisplayName;
                 session.ownerOpenId = oldSession.ownerOpenId;
@@ -6762,12 +6763,11 @@ export async function startCodexAppThreadSession(
       return { status: 'pending' as const, anchor: sessionAnchorId(current) };
     }
     current.adoptedFrom = undefined;
-    current.workingDir = thread.cwd;
+    repinSessionWorkingDir(current, { workingDir: thread.cwd, source: 'explicit' });
     current.hasHistory = true;
     current.currentTurnTitle = undefined;
     current.lastScreenContent = undefined;
     current.lastScreenStatus = undefined;
-    current.session.workingDir = thread.cwd;
     current.session.title = `Codex App: ${title}`;
     current.session.cliId = existingAppServerEndpoint ? 'codex' : 'codex-app';
     current.session.cliSessionId = thread.threadId;
@@ -6901,8 +6901,7 @@ export async function startAdoptSession(
     if (hasProtectedSessionMutationOwnership(current)) {
       return { status: 'pending' as const, anchor: sessionAnchorId(current) };
     }
-    current.workingDir = target.cwd;
-    current.session.workingDir = target.cwd;
+    repinSessionWorkingDir(current, { workingDir: target.cwd, source: 'explicit' });
     current.session.title = `Adopt: ${project}`;
     current.session.serviceTier = 'inherit';
     current.adoptedFrom = adoptedFromForTarget(target);
@@ -7007,8 +7006,7 @@ export async function startResumeImportSession(
     if (hasProtectedSessionMutationOwnership(current)) {
       return { status: 'pending' as const, anchor: sessionAnchorId(current) };
     }
-    current.workingDir = target.cwd;
-    current.session.workingDir = target.cwd;
+    repinSessionWorkingDir(current, { workingDir: target.cwd, source: 'explicit' });
     current.session.cliSessionId = target.cliSessionId;
     current.session.title = target.title || `Import: ${project}`;
     // Resume sandbox decision is left to forkWorker (resume=true → not

@@ -767,6 +767,7 @@ import {
   type TurnTerminalCarrier,
 } from './types.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { setSessionWorkingDirMetadata } from './session-cwd.js';
 import { decideAutoRestart } from './restart-policy.js';
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { freezePrincipalLaneTurnBinding, readPrincipalLaneTurnBinding } from './principal-lane-turn.js';
@@ -14503,7 +14504,7 @@ export function forkWorker(
   // dir with no repo context) instead of getting its own repo card. Compared via
   // realpath so a symlinked/aliased $HOME is excluded too, not just the literal string.
   if (!ds.session.workingDir && cwd === rawCwd && !resolvesToHome(cwd)) {
-    ds.session.workingDir = cwd;
+    setSessionWorkingDirMetadata(ds.session, { workingDir: cwd, source: 'bot-default' });
     sessionStore.updateSession(ds.session);
   }
 

@@ -83,6 +83,7 @@ import {
   larkTransportEnabled,
 } from './types.js';
 import type { DaemonSession, GroupJoinContext } from './types.js';
+import { setSessionWorkingDirMetadata } from './session-cwd.js';
 import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime } from './pending-repo-journal.js';
 import { announceSessionRow, clearAgentAttention, markSessionActivity, stampHumanActivity, announcePendingRepoSession } from './session-activity.js';
 import { applyFollowActive, followActiveOpenedFreshTopic, recordFollowActiveFreshTopic } from './schedule-follow-active.js';
@@ -5326,14 +5327,19 @@ export async function deliverOwnerBatchTurn(
  *  模式下的 defaultOncall 目录；校验是真目录）。都没有 → undefined，表示「不钉目录」，交给
  *  forkOrShowRepoCard 弹 /repo 卡片让用户在群里选。与普通新话题的 resolvePinnedWorkingDir
  *  同口径（少了 sibling 继承那层，新群无 sibling 可继承）。*/
-function resolveDashboardSpawnWorkingDir(larkAppId: string, chatId: string): string | undefined {
-  const oncall = findOncallChat(larkAppId, chatId)?.workingDir;
-  if (oncall) return oncall;
+function resolveDashboardSpawnWorkingDir(larkAppId: string, chatId: string):
+  | { workingDir: string; source: 'oncall-explicit' | 'oncall-default-auto' | 'bot-default' }
+  | undefined {
+  const oncall = findOncallChat(larkAppId, chatId);
+  if (oncall?.workingDir) return {
+    workingDir: oncall.workingDir,
+    source: oncall.provenance === 'oncall-default-auto' ? 'oncall-default-auto' : 'oncall-explicit',
+  };
   const raw = effectiveDefaultWorkingDir(getBot(larkAppId).config);
   if (!raw) return undefined;
   const resolved = expandHome(raw);
   try {
-    if (statSync(resolved).isDirectory()) return resolved;
+    if (statSync(resolved).isDirectory()) return { workingDir: resolved, source: 'bot-default' };
   } catch { /* not a dir → 当作没配 */ }
   return undefined;
 }
@@ -5658,8 +5664,9 @@ export async function spawnDashboardSession(
       session.kanbanColumn = 'backlog';
     }
 
-    const workingDir = resolveDashboardSpawnWorkingDir(larkAppId, chatId);
-    if (workingDir) session.workingDir = workingDir;
+    const workingDirResolution = resolveDashboardSpawnWorkingDir(larkAppId, chatId);
+    const workingDir = workingDirResolution?.workingDir;
+    if (workingDirResolution) setSessionWorkingDirMetadata(session, workingDirResolution);
     sessionStore.updateSession(session);
     messageQueue.ensureQueue(anchor);
 
@@ -5802,7 +5809,10 @@ export async function createHeadlessSession(
       source: 'cli',
     };
     session.lastMessageAt = nowIso;
-    session.workingDir = wd.resolvedPath;
+    setSessionWorkingDirMetadata(session, {
+      workingDir: wd.resolvedPath,
+      source: args.workingDir ? 'explicit' : 'bot-default',
+    });
     if (args.reasoningEffort) session.reasoningEffort = args.reasoningEffort;
     sessionStore.updateSession(session);
     messageQueue.ensureQueue(chatId);

@@ -637,7 +637,7 @@ async function moveSessionForRecovery(
     if (hasProtectedSessionMutationOwnership(current)) return 'pending' as const;
     const suspended = !current.adoptedFrom && suspendWorker(current, 'working_dir_changed');
     if (!suspended) killWorker(current);
-    repinSessionWorkingDir(current, dirPath);
+    repinSessionWorkingDir(current, { workingDir: dirPath, source: 'explicit' });
     current.session.riffRepoDirs = riffRepoDirs;
     sessionStore.updateSession(current.session);
     markRepoCardConsumed(current, cardToWithdraw);
@@ -764,8 +764,7 @@ export async function commitRepoSelection(
       // "Start directly" launches in the resolved default cwd without pinning
       // HOME onto the session for sibling-bot inheritance.
       if (pinWorkingDir) {
-        ds.workingDir = dirPath;
-        ds.session.workingDir = dirPath;
+        repinSessionWorkingDir(ds, { workingDir: dirPath, source: 'explicit' });
       }
       // riff 多仓 stamp：只有多仓 worktree 流显式传入（保留用户选择顺序，首仓=primary）；
       // 其它选仓路径一律清除旧 stamp——workingDir 变了，旧的多仓组合不再成立。
@@ -1055,6 +1054,8 @@ export async function commitRepoSelection(
         current.lastCliInput = undefined;
         current.workingDir = dirPath;
         session.workingDir = dirPath;
+        session.workingDirSource = 'explicit';
+        session.groupWorkspaceRevision = undefined;
         session.larkAppId = current.larkAppId;
         session.chatDisplayName = oldSession.chatDisplayName;
         session.ownerOpenId = oldSession.ownerOpenId;

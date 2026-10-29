@@ -540,6 +540,7 @@ import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.j
 import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, runGroupWorkspaceRepoEntrypoint } from './core/command-handler.js';
 import { resolveGroupWorkspaceRepoSelection } from './core/repo-selection.js';
 import { resolveGroupWorkspaceCwd } from './core/group-workspace-policy.js';
+import { applySessionWorkingDir, setSessionWorkingDirMetadata, type SessionWorkingDirMutation } from './core/session-cwd.js';
 import { createGroupWorkspaceRouteRuntime } from './core/group-workspace-route-runtime.js';
 import { classifySlash, isCommandDecision, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
 import { deriveSessionPhase } from './core/session-phase.js';
@@ -6224,11 +6225,7 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
   ds.lastMessageAt = Date.now();
   ds.session.lastMessageAt = new Date(ds.lastMessageAt).toISOString();
   if (sub.workingDir && (!ds.worker || ds.worker.killed)) {
-    ds.workingDir = sub.workingDir;
-    ds.session.workingDir = sub.workingDir;
-    // An explicit doc-watch cwd replaces the previous repo selection. Keeping
-    // a multi-Riff stamp would make the cold refork ignore this new directory.
-    ds.session.riffRepoDirs = undefined;
+    applySessionWorkingDir(ds, { workingDir: sub.workingDir, source: 'explicit' });
   }
 
   if (ds.worker && !ds.worker.killed) {
@@ -20259,7 +20256,11 @@ async function resolvePinnedWorkingDir(ctx: {
   const groupWorkingDir = group?.status === 'available' && group.record?.directory.kind === 'bound'
     ? group.record.directory.workingDir
     : undefined;
-  const workspaceCwd = resolveGroupWorkspaceCwd({ oncall: oncallEntry, groupWorkingDir });
+  const workspaceCwd = resolveGroupWorkspaceCwd({
+    oncall: oncallEntry,
+    groupWorkingDir,
+    groupWorkspaceRevision: group?.status === 'available' ? group.record?.revision : undefined,
+  });
   const explicitOncallEntry = workspaceCwd?.source === 'oncall-explicit' ? oncallEntry : undefined;
   // Resolve the bot default first so we know whether inheritance is only the
   // ordinary last-resort fallback or must preempt an auto-created worktree.
@@ -20281,10 +20282,19 @@ async function resolvePinnedWorkingDir(ctx: {
       })
     : null;
   const pinnedWorkingDir = workspaceCwd?.workingDir ?? inheritedFrom?.workingDir ?? botDefaultWorkingDir;
+  const workingDirMutation: SessionWorkingDirMutation | undefined = workspaceCwd
+    ? workspaceCwd.source === 'group'
+      ? { workingDir: workspaceCwd.workingDir, source: 'group', groupWorkspaceRevision: workspaceCwd.groupWorkspaceRevision! }
+      : { workingDir: workspaceCwd.workingDir, source: workspaceCwd.source }
+    : inheritedFrom
+      ? { workingDir: inheritedFrom.workingDir, source: 'legacy-unknown' }
+      : botDefaultWorkingDir
+        ? { workingDir: botDefaultWorkingDir, source: 'bot-default' }
+        : undefined;
   // Only the bot-default winner opts into auto-worktree. A same-dir peer winner
   // keeps its exact workingDir and therefore suppresses worktree creation.
   const pinnedFromBotDefault = !workspaceCwd && !inheritedFrom && !!botDefaultWorkingDir;
-  return { pinnedWorkingDir, oncallEntry: explicitOncallEntry, inheritedFrom, pinnedFromBotDefault };
+  return { pinnedWorkingDir, workingDirMutation, oncallEntry: explicitOncallEntry, inheritedFrom, pinnedFromBotDefault };
 
 }
 
@@ -24225,7 +24235,7 @@ async function startInitialPassthroughSession(args: {
   fillNativeTopicId(session, scope, parsed.threadId);
   sessionStore.updateSession(session);
 
-  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+  const { pinnedWorkingDir, workingDirMutation, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
   // Auto-worktree: register PENDING (router buffers, no force-fork) and build the
   // worktree off the critical path (see willAutoWorktree / runAutoWorktreeCommit).
   const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
@@ -24252,8 +24262,8 @@ async function startInitialPassthroughSession(args: {
     currentTurnTitle: commandContent.substring(0, 50),
     workingDir: pinnedWorkingDir,
   };
-  if (pinnedWorkingDir) {
-    ds.session.workingDir = pinnedWorkingDir;
+  if (workingDirMutation) {
+    setSessionWorkingDirMetadata(ds.session, workingDirMutation);
     sessionStore.updateSession(ds.session);
   }
   const initialWindow = buildTurnParticipants(larkAppId, senderOpenId, resolvedSenderIsBotTriState, undefined, initialPassthroughSender?.name);
@@ -26066,7 +26076,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       // spawn path" (see resolvePinnedWorkingDir) — skipping it here also left
       // that write undone for the whole life of the chat, since later turns
       // reuse this session and never re-enter a spawn path.
-      const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+      const { pinnedWorkingDir, workingDirMutation, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
       // …EXCEPT when that dir would have triggered auto-worktree. There the bot
       // default is a worktree BASE, not a launch dir: the ordinary spawn paths
       // answer it with `pendingRepo` + a detached worktree build, which a daemon
@@ -26079,7 +26089,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       // its handler re-decides the dir straight away.
       const cmdAutoWorktree = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
       const cmdPinnedWorkingDir = cmd === '/repo' || !cmdAutoWorktree ? pinnedWorkingDir : undefined;
-      if (cmdPinnedWorkingDir) session.workingDir = cmdPinnedWorkingDir;
+      if (cmdPinnedWorkingDir && workingDirMutation) setSessionWorkingDirMetadata(session, workingDirMutation);
       let cmdPending: Partial<DaemonSession> | undefined;
       if (cmd === '/repo') {
         // First-message `/repo`: seed the same pending-repo state the card flow
@@ -26470,7 +26480,7 @@ async function handleBotAdded(
     const needsSharedReply = mode === 'group'
       && regularGroupMode === 'shared';
 
-    const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+    const { pinnedWorkingDir, workingDirMutation, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
     const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
     refreshCliVersion(botCfg);
 
@@ -26481,7 +26491,7 @@ async function handleBotAdded(
     session.lastCallerOpenId = humanOperatorOpenId;
     session.lastMessageAt = new Date(now).toISOString();
     session.scope = scope;
-    if (pinnedWorkingDir) session.workingDir = pinnedWorkingDir;
+    if (workingDirMutation) setSessionWorkingDirMetadata(session, workingDirMutation);
     sessionStore.updateSession(session);
     messageQueue.ensureQueue(anchor);
 
@@ -28347,7 +28357,7 @@ async function handleThreadReplyAdmitted(
 
     // Use the same layered oncall / inherit / default lookup as handleNewTopic
     // so stale inherited peers are ignored consistently in both spawn paths.
-    const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({
+    const { pinnedWorkingDir, workingDirMutation, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({
       scope,
       anchor,
       chatId: autoCreateChatId,
@@ -28395,8 +28405,8 @@ async function handleThreadReplyAdmitted(
       currentTurnTitle: parsed.content.substring(0, 50),
       workingDir: pinnedWorkingDir,
     };
-    if (pinnedWorkingDir) {
-      newDs.session.workingDir = pinnedWorkingDir;
+    if (workingDirMutation) {
+      setSessionWorkingDirMetadata(newDs.session, workingDirMutation);
       sessionStore.updateSession(newDs.session);
     }
     const substituteReplyMode = substituteTrigger
@@ -29806,10 +29816,10 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
         // EVERY session-needing daemon command, not just `/repo`, and skip the
         // pin when it would have meant auto-worktree. This record becomes the
         // thread's real session.
-        const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+        const { pinnedWorkingDir, workingDirMutation, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
         const cmdAutoWorktree = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
         const cmdPinnedWorkingDir = cmd === '/repo' || !cmdAutoWorktree ? pinnedWorkingDir : undefined;
-        if (cmdPinnedWorkingDir) session.workingDir = cmdPinnedWorkingDir;
+        if (cmdPinnedWorkingDir && workingDirMutation) setSessionWorkingDirMetadata(session, workingDirMutation);
         let cmdPending: Partial<DaemonSession> | undefined;
         if (cmd === '/repo') {
           cmdPending = { pendingRepo: true, pendingPrompt: '', workingDir: pinnedWorkingDir };
@@ -32767,7 +32777,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                 if (result.outcome === 'unknown') return { status: 'unknown' };
                 return { status: 'store_unavailable' };
               },
-              convergeSession: async () => undefined,
+              convergeSession: async input => {
+                const current = activeSessions.get(sessionKey(ds.chatId, cfg.larkAppId));
+                if (!current || (current.workerGeneration ?? 0) !== input.expectedGeneration) {
+                  throw new Error('session provenance convergence lost generation ownership');
+                }
+                applySessionWorkingDir(current, input.source === 'group'
+                  ? { workingDir: getSessionWorkingDir(current), source: 'group', groupWorkspaceRevision: input.groupRevision! }
+                  : { workingDir: getSessionWorkingDir(current), source: 'explicit' });
+              },
             });
             const result = await coordinator.execute({
               operationKey: groupWorkspaceOperationKey(request.sourceEventId, 'set'),

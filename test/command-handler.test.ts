@@ -5063,6 +5063,8 @@ describe('handleCommand', () => {
       expect(killWorker).toHaveBeenCalledWith(ds);
       expect(ds.workingDir).toBe('/home/testuser/other-project');
       expect(ds.session.workingDir).toBe('/home/testuser/other-project');
+      expect(ds.session.workingDirSource).toBe('explicit');
+      expect(ds.session.groupWorkspaceRevision).toBeUndefined();
       expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('工作目录已切换');
