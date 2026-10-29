@@ -153,6 +153,12 @@ import { recordCreatedWorktree } from '../services/botmux-worktree-store.js';
 import { offerWorktreeCleanup, runWorktreeCleanupJob } from './worktree-cleanup-run.js';
 import { runProjectGroupSlashCommand } from './project-group-command.js';
 import { runGroupContextSlashCommand } from './group-context-command.js';
+import type { TenantHumanId } from '../services/bot-admin-unions-store.js';
+import {
+  canonicalCardSourceEventId,
+  canonicalTextSourceEventId,
+  type CanonicalSourceResult,
+} from '../services/group-workspace-store.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -590,6 +596,106 @@ function invalidConfiguredWorkingDirs(ds: DaemonSession | undefined, larkAppId: 
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
+export type GroupWorkspaceRepoEntrypointResult =
+  | { status: 'session_committed' }
+  | { status: 'group_committed'; groupRevision: number; replayed?: boolean }
+  | { status: 'conflict' }
+  | { status: 'store_unavailable' }
+  | { status: 'unknown' }
+  | { status: 'protocol_conflict' }
+  | { status: 'aborted' };
+
+export type GroupWorkspaceRepoEntrypointRequest = {
+  kind: 'set' | 'unbind';
+  source: 'text' | 'card';
+  chatId: string;
+  actor: TenantHumanId;
+  selection?: string;
+  messageId?: string;
+  originMessageId?: string;
+  actionId?: string;
+  deliveryAttemptId?: string;
+};
+
+export interface GroupWorkspaceRepoEntrypointDeps {
+  executeSet(input: GroupWorkspaceRepoEntrypointRequest & { kind: 'set'; sourceEventId: string }): Promise<GroupWorkspaceRepoEntrypointResult>;
+  executeUnbind(input: GroupWorkspaceRepoEntrypointRequest & { kind: 'unbind'; sourceEventId: string }): Promise<GroupWorkspaceRepoEntrypointResult>;
+  reply(message: string): Promise<void>;
+  locale?: Locale;
+}
+
+function groupWorkspaceEntrypointSource(request: GroupWorkspaceRepoEntrypointRequest): CanonicalSourceResult {
+  return request.source === 'text'
+    ? canonicalTextSourceEventId({
+      tenantKey: request.actor.tenantKey,
+      chatId: request.chatId,
+      messageId: request.messageId ?? '',
+      deliveryAttemptId: request.deliveryAttemptId,
+    })
+    : canonicalCardSourceEventId({
+      tenantKey: request.actor.tenantKey,
+      chatId: request.chatId,
+      originMessageId: request.originMessageId ?? '',
+      actionId: request.actionId ?? '',
+      deliveryAttemptId: request.deliveryAttemptId,
+    });
+}
+
+/** Shared user-visible response boundary for text and card group-repo operations. */
+export async function runGroupWorkspaceRepoEntrypoint(
+  request: GroupWorkspaceRepoEntrypointRequest,
+  deps: GroupWorkspaceRepoEntrypointDeps,
+): Promise<GroupWorkspaceRepoEntrypointResult | { status: 'invalid_source' }> {
+  const source = groupWorkspaceEntrypointSource(request);
+  if (!source.ok) {
+    await deps.reply(t('cmd.repo.group.invalid_source', undefined, deps.locale));
+    return { status: 'invalid_source' };
+  }
+  const result = request.kind === 'set'
+    ? await deps.executeSet({ ...request, kind: 'set', sourceEventId: source.sourceEventId })
+    : await deps.executeUnbind({ ...request, kind: 'unbind', sourceEventId: source.sourceEventId });
+  const key = result.status === 'group_committed'
+    ? request.kind === 'unbind' ? 'cmd.repo.group.unbind_committed' : 'cmd.repo.group.committed'
+    : `cmd.repo.group.${result.status}`;
+  await deps.reply(t(key, result.status === 'group_committed'
+    ? { revision: result.groupRevision }
+    : undefined, deps.locale));
+  return result;
+}
+
+export interface GroupWorkspaceRepoShowLayer {
+  workingDir?: string;
+  source: string;
+}
+
+export interface GroupWorkspaceRepoShowState {
+  session?: GroupWorkspaceRepoShowLayer;
+  oncall?: GroupWorkspaceRepoShowLayer;
+  group: {
+    state: 'bound' | 'unbound' | 'missing' | 'unavailable';
+    workingDir?: string;
+    revision?: number;
+    source?: string;
+    health: string;
+  };
+  botDefault?: GroupWorkspaceRepoShowLayer;
+  resolved?: GroupWorkspaceRepoShowLayer;
+}
+
+export function formatGroupWorkspaceRepoShow(state: GroupWorkspaceRepoShowState, locale: Locale = 'zh'): string {
+  const none = locale === 'en' ? 'none' : '无';
+  const layer = (name: string, value?: GroupWorkspaceRepoShowLayer) =>
+    `${name}: ${value?.workingDir ?? none} (${value?.source ?? none})`;
+  const groupDirectory = state.group.state === 'bound' ? state.group.workingDir ?? none : state.group.state;
+  return [
+    layer('session', state.session),
+    layer('oncall', state.oncall),
+    `group: ${groupDirectory} (${state.group.source ?? none}; revision ${state.group.revision ?? none}; health ${state.group.health})`,
+    layer('default', state.botDefault),
+    layer('resolved', state.resolved),
+  ].join('\n');
+}
+
 export interface CommandHandlerDeps {
   activeSessions: Map<string, DaemonSession>;
   sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string, opts?: WorkerSessionReplyOptions) => Promise<string>;
@@ -606,6 +712,7 @@ export interface CommandHandlerDeps {
   invocationReplyTarget?: FrozenSessionReplyTarget;
   /** 会前预热文档评论会话：立即启动 CLI、读取文档并进入待命。 */
   prewarmDocCommentSession?: (ds: DaemonSession, sub: DocSubscription) => Promise<void>;
+  readGroupWorkspaceShow?: (ds: DaemonSession) => Promise<GroupWorkspaceRepoShowState>;
 }
 
 // ─── Schedule command ────────────────────────────────────────────────────────
@@ -3065,6 +3172,10 @@ export async function handleCommand(
         // A first message whose start was refused because the directory it fell
         // back to is missing still holds the session; `/repo <路径>` picks the
         // directory for it, like the recovery card (the no-card reply says so).
+        if (/^show$/i.test(repoArg) && ds && deps.readGroupWorkspaceShow) {
+          await sessionReply(rootId, formatGroupWorkspaceRepoShow(await deps.readGroupWorkspaceShow(ds), loc));
+          break;
+        }
         if (ds && !ds.pendingRepo && repoArg) reclaimUnstartedOpening(ds);
         if (ds && !ds.pendingRepo && !repoArg && onlyUnstartedOpeningHolds(ds)) {
           await sessionReply(

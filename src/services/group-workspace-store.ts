@@ -447,6 +447,24 @@ export class GroupWorkspaceStore {
     this.pathProbe = options.pathProbe ?? probePathUsability;
   }
 
+  async readReceipt(operationKey: string): Promise<
+    | { status: 'found'; receipt: GroupOperationReceipt }
+    | { status: 'missing' }
+    | { status: 'store_unavailable' }
+  > {
+    try {
+      mkdirSync(resolve(this.path, '..'), { recursive: true });
+      return await withFileLock(this.path, async () => {
+        const receipt = own(readRegistry(this.path).receipts, operationKey);
+        return receipt
+          ? { status: 'found' as const, receipt: structuredClone(receipt) }
+          : { status: 'missing' as const };
+      }, { maxWaitMs: this.lockTimeoutMs });
+    } catch {
+      return { status: 'store_unavailable' };
+    }
+  }
+
   async read(chatId: string): Promise<GroupWorkspaceReadResult> {
     try {
       mkdirSync(resolve(this.path, '..'), { recursive: true });

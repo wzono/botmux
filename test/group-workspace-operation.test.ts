@@ -204,7 +204,18 @@ describe('GroupWorkspaceOperationCoordinator', () => {
     await expect(replay.coordinator.execute({
       ...REQUEST, operationKey: 'caller-controlled', payloadDigest: 'different-intent',
     })).resolves.toMatchObject({ status: 'protocol_conflict' });
-    expect(replay.calls).toEqual([]);
+    expect(replay.calls).toEqual(['receipt']);
+  });
+
+  it('replays a host-wide committed receipt through a different receiver-local session', async () => {
+    const first = harness();
+    await expect(first.coordinator.execute(REQUEST)).resolves.toMatchObject({ status: 'group_committed' });
+    const replay = harness({ dataDir: dir() });
+    for (const [key, value] of first.receipts) replay.receipts.set(key, value);
+    await expect(replay.coordinator.execute({ ...REQUEST, sessionId: 'bot-b-session' }))
+      .resolves.toMatchObject({ status: 'group_committed', groupRevision: 3 });
+    expect(replay.switches).toBe(0);
+    expect(replay.commits).toBe(0);
   });
 
   it('looks up prior intent before target/revision and reuses frozen values after intervening change', async () => {

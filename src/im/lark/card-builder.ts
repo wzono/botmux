@@ -1519,6 +1519,16 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
               ),
             ],
           },
+          ...(rootMessageId ? [{
+            tag: 'column',
+            width: 'auto',
+            vertical_align: 'center',
+            elements: [callbackButton(
+              t('card.repo.group_unbind', undefined, locale),
+              'default',
+              { key: 'group_workspace_unbind', root_id: rootMessageId },
+            )],
+          }] : []),
         ],
       }]),
       {

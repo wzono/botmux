@@ -541,6 +541,7 @@ export const messages: Record<string, string> = {
   'cmd.rename.updated_unsupported': '✅ Botmux session title updated: {title}\n{cliName} does not support native session-name sync yet.',
   'cmd.rename.updated_failed': '⚠️ Botmux session title updated: {title}\nFailed to send the native rename request to {cliName}.',
   'cmd.repo.no_prior_scan': 'Run `/repo` first to see the project list.',
+  'card.repo.group_unbind': 'Unbind group workspace',
   'cmd.repo.index_out_of_range': 'Index out of range. Valid: 1-{max}',
   'cmd.repo.path_not_found': '❌ No such directory or project: `{arg}`\nPass an absolute path, a relative path, or a first-level project name under workingDir.',
   'cmd.repo.here_missing': '⚠️ This chat has no current working directory to reuse. Start a normal chat session first, or bind one with /oncall bind.',
@@ -562,6 +563,15 @@ export const messages: Record<string, string> = {
   'cmd.repo.worktree_created_not_switched': '🌿 Worktree created: `{path}` (branch `{branch}`), but the session changed meanwhile — not switched automatically. Use `/repo {path}` to open it.',
   'cmd.repo.worktree_switch_failed': '⚠️ Worktree created at `{path}`, but switching to it failed: {error}\nUse `/repo {path}` to open it manually.',
   'cmd.repo.switch_close_failed': '⚠️ Could not safely close the current session; repository was not switched: {error}',
+  'cmd.repo.group.invalid_source': '⚠️ The operation source could not be verified. The session and group workspace were not changed.',
+  'cmd.repo.group.session_committed': '⏳ The session switched, but the group workspace commit is still pending; success is not confirmed yet.',
+  'cmd.repo.group.conflict': '⚠️ The session switched, but the group workspace revision conflicted and was not updated. Run `/repo show` and retry.',
+  'cmd.repo.group.store_unavailable': '⚠️ The session switched, but group workspace storage is unavailable and was not updated.',
+  'cmd.repo.group.unknown': '⚠️ The session changed, but the group workspace result is unknown. It was not retried automatically; run `/repo show` to inspect it.',
+  'cmd.repo.group.protocol_conflict': '⚠️ The same immutable source carried a different request. The conflicting request was rejected.',
+  'cmd.repo.group.aborted': '⚠️ The session was not switched and the group workspace was not updated.',
+  'cmd.repo.group.committed': '✅ Group workspace updated (revision {revision}).',
+  'cmd.repo.group.unbind_committed': '✅ Group workspace unbound (revision {revision}).',
   // Used when 「default-directory-only」mode has「auto-create worktree」on, at new
   // session start (shared by interactive new topic / dashboard create / webhook).
   'worktree.auto_creating': '🌿 Creating an isolated worktree for this session (includes a git fetch, may take a few seconds)…',

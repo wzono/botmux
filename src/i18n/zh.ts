@@ -539,6 +539,7 @@ export const messages: Record<string, string> = {
   'cmd.rename.updated_unsupported': '✅ Botmux 会话标题已更新：{title}\n{cliName} 暂不支持原生会话名同步。',
   'cmd.rename.updated_failed': '⚠️ Botmux 会话标题已更新：{title}\n向 {cliName} 发送原生改名请求失败。',
   'cmd.repo.no_prior_scan': '请先执行 /repo 查看项目列表。',
+  'card.repo.group_unbind': '解除群目录',
   'cmd.repo.index_out_of_range': '序号超出范围，有效范围：1-{max}',
   'cmd.repo.path_not_found': '❌ 找不到目录或项目：`{arg}`\n请传入绝对路径、相对路径，或 workingDir 下的一级项目名。',
   'cmd.repo.here_missing': '⚠️ 当前群聊还没有可复用的工作目录。请先在普通群启动一个会话或使用 /oncall bind 绑定目录。',
@@ -560,6 +561,15 @@ export const messages: Record<string, string> = {
   'cmd.repo.worktree_created_not_switched': '🌿 worktree 已创建：`{path}`（分支 `{branch}`），但会话状态已变化，未自动切换。需要时可用 `/repo {path}` 打开。',
   'cmd.repo.worktree_switch_failed': '⚠️ worktree 已创建：`{path}`，但自动切换失败：{error}\n可用 `/repo {path}` 手动打开。',
   'cmd.repo.switch_close_failed': '⚠️ 无法安全关闭当前会话，仓库未切换：{error}',
+  'cmd.repo.group.invalid_source': '⚠️ 无法验证操作来源，本次未切换会话，也未写入群目录。',
+  'cmd.repo.group.session_committed': '⏳ 会话已切换，群目录提交待确认；暂不宣告成功。',
+  'cmd.repo.group.conflict': '⚠️ 会话已切换，但群目录版本冲突，群目录未更新。请执行 `/repo show` 查看当前状态后重新操作。',
+  'cmd.repo.group.store_unavailable': '⚠️ 会话已切换，但群目录存储不可用，群目录未更新。',
+  'cmd.repo.group.unknown': '⚠️ 会话状态已变化，但群目录提交结果未知；为避免覆盖，未自动重试。请执行 `/repo show` 检查。',
+  'cmd.repo.group.protocol_conflict': '⚠️ 同一来源对应了不同请求，协议冲突；本次未执行。',
+  'cmd.repo.group.aborted': '⚠️ 会话未切换，群目录也未更新。',
+  'cmd.repo.group.committed': '✅ 群目录更新成功（revision {revision}）。',
+  'cmd.repo.group.unbind_committed': '✅ 群目录解绑成功（revision {revision}）。',
   // 「仅默认目录」模式开启「自动创建 worktree」后，新会话启动时用（daemon 交互新话题 /
   // dashboard 建会话 / webhook 外部事件三条路复用）。
   'worktree.auto_creating': '🌿 正在为本会话创建独立 worktree（含 git fetch，可能需要几秒）…',

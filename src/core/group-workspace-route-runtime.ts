@@ -54,6 +54,8 @@ export function createGroupWorkspaceRouteRuntime(options: {
     selection: string,
     context: { actor: TenantHumanId; actorOpenId?: string; messageId?: string },
   ) => Promise<void> | void;
+  /** Task 6 dedicated saga entrypoint. When present it owns set/unbind completely. */
+  executeGroupWorkspaceRoute?: (route: GroupWorkspaceProductionRoute, session?: DaemonSession) => Promise<void> | void;
   reply: (chatId: string, message: string) => Promise<void> | void;
   now?: () => number;
 }) {
@@ -104,11 +106,15 @@ export function createGroupWorkspaceRouteRuntime(options: {
   };
 
   const handleRoute = async (route: GroupWorkspaceProductionRoute): Promise<void> => {
+    const session = options.activeSessions.get(options.sessionKey(route.chatId, options.larkAppId));
+    if (options.executeGroupWorkspaceRoute) {
+      await options.executeGroupWorkspaceRoute(route, session);
+      return;
+    }
     if (route.kind === 'unbind') {
       await options.reply(route.chatId, '群目录解绑操作尚未接入持久化协调器；本次未写入群目录。');
       return;
     }
-    const session = options.activeSessions.get(options.sessionKey(route.chatId, options.larkAppId));
     if (!session
       || session.larkAppId !== options.larkAppId
       || session.chatId !== route.chatId

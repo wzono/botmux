@@ -35,8 +35,8 @@ export interface GroupWorkspaceOperationRequest {
 }
 
 export type GroupWorkspaceOperationResult =
-  | { status: 'group_committed'; journal: RepoGroupOperationJournal; groupRevision: number }
-  | { status: 'conflict'; journal: RepoGroupOperationJournal; currentRevision?: number }
+  | { status: 'group_committed'; journal?: RepoGroupOperationJournal; groupRevision: number }
+  | { status: 'conflict'; journal?: RepoGroupOperationJournal; currentRevision?: number }
   | { status: 'store_unavailable'; journal?: RepoGroupOperationJournal }
   | { status: 'unknown'; journal?: RepoGroupOperationJournal }
   | { status: 'protocol_conflict'; journal?: RepoGroupOperationJournal };
@@ -105,13 +105,28 @@ export class GroupWorkspaceOperationCoordinator {
     const canonicalRequest = { ...request, operationKey: canonicalOperationKey };
     const existing = await this.dependencies.journalStore.getByIntent(request.sourceEventId, request.kind);
     if (existing.status === 'store_unavailable') return { status: 'store_unavailable' };
-    if (existing.status === 'found' && !sameIntent(existing.journal, canonicalRequest)) {
-      return { status: 'protocol_conflict', journal: existing.journal };
-    }
     const receiptLookup = await this.dependencies.lookupGroupReceipt(canonicalOperationKey);
     if (receiptLookup.status === 'store_unavailable') return { status: 'unknown' };
     if (receiptLookup.status === 'found') {
-      return this.convergeReceipt(existing.status === 'found' ? existing.journal : undefined, receiptLookup.receipt);
+      if (receiptLookup.receipt.payloadDigest !== canonicalRequest.payloadDigest
+        || receiptLookup.receipt.chatId !== canonicalRequest.chatId) {
+        return { status: 'protocol_conflict', journal: existing.status === 'found' ? existing.journal : undefined };
+      }
+      // A canonical receipt is host-wide authority. Historical recovery may arrive
+      // through another Bot and therefore have a different receiver-local session.
+      if (existing.status !== 'found' || !sameIntent(existing.journal, canonicalRequest)) {
+        return receiptLookup.receipt.status === 'committed'
+          ? { status: 'group_committed', journal: existing.status === 'found' ? existing.journal : undefined,
+            groupRevision: receiptLookup.receipt.resultingRevision }
+          : receiptLookup.receipt.status === 'conflict'
+            ? { status: 'conflict', journal: existing.status === 'found' ? existing.journal : undefined,
+              currentRevision: receiptLookup.receipt.currentRevision }
+            : { status: 'store_unavailable', journal: existing.status === 'found' ? existing.journal : undefined };
+      }
+      return this.convergeReceipt(existing.journal, receiptLookup.receipt);
+    }
+    if (existing.status === 'found' && !sameIntent(existing.journal, canonicalRequest)) {
+      return { status: 'protocol_conflict', journal: existing.journal };
     }
 
     let journal: RepoGroupOperationJournal;
