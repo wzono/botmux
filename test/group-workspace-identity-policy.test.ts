@@ -222,6 +222,31 @@ describe('fresh cross-app administrator identity', () => {
 
     await expect(refresh).resolves.toBeUndefined();
   });
+
+  it('does not reuse a snapshot from the future after the clock moves backward', async () => {
+    const registered = bots();
+    let clock = 2_000;
+    const snapshot = await loadFreshBotAdminUnionSnapshot({
+      registeredBots: registered,
+      resolveAllowedUser: async () => human,
+      now: () => clock,
+      ttlMs: 1_000,
+    });
+    const refresh = vi.fn(async () => {
+      throw new Error('conversion unavailable');
+    });
+
+    clock = 1_500;
+
+    await expect(loadFreshBotAdminUnionSnapshot({
+      registeredBots: registered,
+      snapshot,
+      resolveAllowedUser: refresh,
+      now: () => clock,
+      ttlMs: 1_000,
+    })).resolves.toBeUndefined();
+    expect(refresh).toHaveBeenCalled();
+  });
 });
 
 describe('group workspace manager policy', () => {

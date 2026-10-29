@@ -166,7 +166,10 @@ export async function loadFreshBotAdminUnionSnapshot(options: {
   const identityConfigs = snapshotIdentityConfigs(options.registeredBots);
   const fingerprint = botAdminIdentityConfigFingerprint(identityConfigs);
   if (options.snapshot?.configFingerprint === fingerprint
+    && Number.isFinite(now)
+    && Number.isFinite(options.snapshot.updatedAt)
     && Number.isFinite(options.snapshot.expiresAt)
+    && options.snapshot.updatedAt <= now
     && now < options.snapshot.expiresAt) return options.snapshot;
   try {
     const resolved = await computeFreshBotAdminUnions(identityConfigs, options.resolveAllowedUser);
