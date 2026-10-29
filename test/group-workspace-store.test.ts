@@ -1,4 +1,5 @@
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { atomicWriteFileSync } from '../src/utils/atomic-write.js';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -162,6 +163,129 @@ describe('GroupWorkspaceStore', () => {
     });
   });
 
+  it.each([
+    ['blank chatId', { chatId: ' ' }],
+    ['non-canonical sourceEventId', { sourceEventId: 'delivery-attempt-1' }],
+    ['unstable actor tenant', { actor: { tenantKey: ' tenant-a', unionId: 'on_user_u' } }],
+    ['unstable actor union', { actor: { tenantKey: 'tenant-a', unionId: 'ou_app_scoped' } }],
+    ['negative revision', { expectedRevision: -1 }],
+    ['unsafe revision', { expectedRevision: Number.MAX_SAFE_INTEGER + 1 }],
+    ['negative generation', { expectedSessionGeneration: -1 }],
+    ['non-finite time', { now: Number.POSITIVE_INFINITY }],
+    ['negative time', { now: -1 }],
+    ['non-boolean semantic validity', { directoryValid: 'yes' }],
+    ['relative target despite semantic validity', { requestedWorkingDir: 'relative' }],
+    ['blank invalid target', { requestedWorkingDir: '', directoryValid: false }],
+  ])('rejects malformed mutation input before lookup or write: %s', async (_name, patch) => {
+    const dir = dataDir();
+    const path = join(dir, 'group-workspaces.json');
+    writeFileSync(path, JSON.stringify({ schemaVersion: 1, records: {}, receipts: {} }));
+    let reads = 0;
+    let writes = 0;
+    const store = new GroupWorkspaceStore(dir, {
+      onRegistryRead: () => { reads += 1; },
+      writer: (...args) => {
+        writes += 1;
+        atomicWriteFileSync(...args);
+      },
+    });
+    const result = await store.mutate({
+      ...setInput({ sourceEventId: textSource(`om_invalid_${_name}`), workingDir: '/tmp/X', expectedRevision: 0 }),
+      ...patch,
+    } as any);
+    expect(result).toEqual({ outcome: 'store_unavailable' });
+    expect(reads).toBe(0);
+    expect(writes).toBe(0);
+    expect(readFileSync(path, 'utf8')).toBe(JSON.stringify({ schemaVersion: 1, records: {}, receipts: {} }));
+  });
+
+  it('leaves a readable store byte-for-byte unchanged for malformed mutation input', async () => {
+    const dir = dataDir();
+    const path = join(dir, 'group-workspaces.json');
+    const store = new GroupWorkspaceStore(dir);
+    await store.mutate(setInput({
+      sourceEventId: textSource('om_valid_seed'), workingDir: '/tmp/seed', expectedRevision: 0,
+    }));
+    const before = readFileSync(path, 'utf8');
+    const result = await store.mutate({
+      ...setInput({ sourceEventId: textSource('om_bad_after_seed'), workingDir: '/tmp/bad', expectedRevision: 1 }),
+      now: Number.NaN,
+    });
+    expect(result).toEqual({ outcome: 'store_unavailable' });
+    expect(readFileSync(path, 'utf8')).toBe(before);
+    expect(await new GroupWorkspaceStore(dir).read(CHAT)).toMatchObject({
+      status: 'available', record: { revision: 1, directory: { workingDir: '/tmp/seed' } },
+    });
+  });
+
+  it('exposes lookup counters used to prove validation and replay short-circuit ordering', async () => {
+    const dir = dataDir();
+    let reads = 0;
+    let records = 0;
+    let targets = 0;
+    const store = new GroupWorkspaceStore(dir, {
+      onRegistryRead: () => { reads += 1; },
+      onCurrentRecordAccess: () => { records += 1; },
+      onCanonicalTargetAccess: () => { targets += 1; },
+    });
+    await store.mutate(setInput({
+      sourceEventId: textSource('om_counter_wiring'), workingDir: '/tmp/X', expectedRevision: 0,
+    }));
+    expect({ reads, records, targets }).toEqual({ reads: 1, records: 1, targets: 1 });
+  });
+
+  it('returns store_unavailable when an injected write fails before rename and leaves no receipt', async () => {
+    const dir = dataDir();
+    const store = new GroupWorkspaceStore(dir, {
+      writer: () => { throw new Error('before rename'); },
+    });
+    const result = await store.mutate(setInput({
+      sourceEventId: textSource('om_before_rename'),
+      workingDir: '/tmp/X',
+      expectedRevision: 0,
+    }));
+    expect(result).toEqual({ outcome: 'store_unavailable' });
+    expect(await new GroupWorkspaceStore(dir).read(CHAT)).toEqual({ status: 'available', record: undefined });
+  });
+
+  it('reconciles an injected post-rename failure to the committed receipt without retrying', async () => {
+    const dir = dataDir();
+    let writes = 0;
+    const store = new GroupWorkspaceStore(dir, {
+      writer: (...args) => {
+        writes += 1;
+        atomicWriteFileSync(...args);
+        throw new Error('directory fsync result lost');
+      },
+    });
+    const result = await store.mutate(setInput({
+      sourceEventId: textSource('om_after_rename'),
+      workingDir: '/tmp/X',
+      expectedRevision: 0,
+    }));
+    expect(result).toMatchObject({ outcome: 'committed', receipt: { resultingRevision: 1 } });
+    expect(writes).toBe(1);
+    expect(await new GroupWorkspaceStore(dir).read(CHAT)).toMatchObject({
+      status: 'available', record: { revision: 1, directory: { workingDir: '/tmp/X' } },
+    });
+  });
+
+  it('returns unknown when a caught write cannot be reconciled from the durable store', async () => {
+    const dir = dataDir();
+    const store = new GroupWorkspaceStore(dir, {
+      writer: (path) => {
+        writeFileSync(path, '{ambiguous unreadable replacement');
+        throw new Error('directory fsync result lost');
+      },
+    });
+    const result = await store.mutate(setInput({
+      sourceEventId: textSource('om_unknown'),
+      workingDir: '/tmp/X',
+      expectedRevision: 0,
+    }));
+    expect(result).toEqual({ outcome: 'unknown' });
+  });
+
   it('returns store_unavailable when the cross-process lock cannot be acquired', async () => {
     const dir = dataDir();
     writeFileSync(join(dir, 'group-workspaces.json.lock'), String(process.pid));
@@ -211,22 +335,44 @@ describe('GroupWorkspaceStore', () => {
     expect(cardB).not.toEqual(cardA);
   });
 
-  it('looks up a historical receipt before current revision and reuses its frozen values after restart', async () => {
+  it('shares text identity across Bots and replays historical M1 after recovery without writing current revision or target', async () => {
     const dir = dataDir();
-    const firstStore = new GroupWorkspaceStore(dir);
-    const m1 = textSource('om_m1');
+    const botA = new GroupWorkspaceStore(dir);
+    const m1FromBotA = canonicalTextSourceEventId({
+      tenantKey: 'tenant-a', chatId: CHAT, messageId: 'om_m1', deliveryAttemptId: 'bot-a-live-attempt',
+    });
+    const m1FromBotBRecovery = canonicalTextSourceEventId({
+      tenantKey: 'tenant-a', chatId: CHAT, messageId: 'om_m1', deliveryAttemptId: 'bot-b-historical-recovery',
+    });
+    if (!m1FromBotA.ok || !m1FromBotBRecovery.ok) throw new Error('unexpected source failure');
+    expect(m1FromBotBRecovery).toEqual(m1FromBotA);
     const m2 = textSource('om_m2');
-    const m1Input = setInput({ sourceEventId: m1, workingDir: '/tmp/X', expectedRevision: 0, expectedSessionGeneration: 7 });
-    const first = await firstStore.mutate(m1Input);
-    await firstStore.mutate(setInput({ sourceEventId: m2, workingDir: '/tmp/Y', expectedRevision: 1, expectedSessionGeneration: 8 }));
+    const m1Input = setInput({ sourceEventId: m1FromBotA.sourceEventId, workingDir: '/tmp/X', expectedRevision: 0, expectedSessionGeneration: 7 });
+    const first = await botA.mutate(m1Input);
+    await botA.mutate(setInput({ sourceEventId: m2, workingDir: '/tmp/Y', expectedRevision: 1, expectedSessionGeneration: 8 }));
 
-    const replay = await new GroupWorkspaceStore(dir).mutate({
+    let botBWrites = 0;
+    let botBRecordAccesses = 0;
+    let botBTargetAccesses = 0;
+    const botBReloaded = new GroupWorkspaceStore(dir, {
+      onCurrentRecordAccess: () => { botBRecordAccesses += 1; },
+      onCanonicalTargetAccess: () => { botBTargetAccesses += 1; },
+      writer: (...args) => {
+        botBWrites += 1;
+        atomicWriteFileSync(...args);
+      },
+    });
+    const replay = await botBReloaded.mutate({
       ...m1Input,
+      sourceEventId: m1FromBotBRecovery.sourceEventId,
       // Values derived from current state must not change the semantic digest or frozen receipt.
       expectedRevision: 2,
       expectedSessionGeneration: 99,
     });
     expect(replay).toEqual(first);
+    expect(botBWrites).toBe(0);
+    expect(botBRecordAccesses).toBe(0);
+    expect(botBTargetAccesses).toBe(0);
     expect(replay).toMatchObject({
       outcome: 'committed',
       receipt: {

@@ -115,14 +115,20 @@ export type GroupWorkspaceMutation = GroupWorkspaceSetMutation | GroupWorkspaceU
 export type GroupWorkspaceMutationResult =
   | { outcome: GroupOperationTerminalOutcome; receipt: GroupOperationReceipt }
   | { outcome: 'protocol_conflict'; existingReceipt: GroupOperationReceipt }
-  | { outcome: 'store_unavailable' };
+  | { outcome: 'store_unavailable' | 'unknown' };
 
 export type GroupWorkspaceReadResult =
   | { status: 'available'; record: GroupWorkspaceRecord | undefined }
   | { status: 'store_unavailable' };
 
+type GroupWorkspaceWriter = typeof atomicWriteFileSync;
+
 export interface GroupWorkspaceStoreOptions {
   lockTimeoutMs?: number;
+  writer?: GroupWorkspaceWriter;
+  onRegistryRead?: () => void;
+  onCurrentRecordAccess?: () => void;
+  onCanonicalTargetAccess?: () => void;
 }
 
 function digest(domain: string, value: unknown): string {
@@ -194,8 +200,9 @@ function isTenantHumanId(value: unknown): value is TenantHumanId {
   return isObject(value)
     && typeof value.tenantKey === 'string'
     && value.tenantKey.length > 0
+    && value.tenantKey.trim() === value.tenantKey
     && typeof value.unionId === 'string'
-    && value.unionId.startsWith('on_');
+    && /^on_\S+$/.test(value.unionId);
 }
 
 function isDirectoryState(value: unknown): value is GroupDirectoryState {
@@ -321,13 +328,52 @@ function actorAllowed(input: GroupWorkspaceMutation, current: GroupWorkspaceReco
   return !managers?.length || managers.some(manager => sameActor(manager, input.actor));
 }
 
+function isStableOpaqueId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.trim() === value;
+}
+
+function validMutation(input: unknown): input is GroupWorkspaceMutation {
+  if (!isObject(input)
+    || (input.kind !== 'set' && input.kind !== 'unbind')
+    || !isStableOpaqueId(input.chatId)
+    || !isStableOpaqueId(input.sourceEventId)
+    || !/^group-workspace-(?:text-source|card-source)-v1:sha256:[0-9a-f]{64}$/.test(input.sourceEventId as string)
+    || !isTenantHumanId(input.actor)
+    || typeof input.authorized !== 'boolean'
+    || !Number.isSafeInteger(input.expectedRevision) || (input.expectedRevision as number) < 0
+    || !Number.isFinite(input.now) || (input.now as number) < 0
+    || (input.originMessageId !== undefined && !isStableOpaqueId(input.originMessageId))) {
+    return false;
+  }
+  if (input.kind === 'unbind') return input.expectedSessionGeneration === undefined;
+  if (typeof input.directoryValid !== 'boolean'
+    || typeof input.requestedWorkingDir !== 'string'
+    || !input.requestedWorkingDir
+    || (input.directoryValid && !isAbsolute(input.requestedWorkingDir))
+    || (input.directoryValid && !isAbsolute(canonicalWorkingDir(input.requestedWorkingDir)))
+    || (input.expectedSessionGeneration !== undefined
+      && (!Number.isSafeInteger(input.expectedSessionGeneration)
+        || (input.expectedSessionGeneration as number) < 0))) {
+    return false;
+  }
+  return true;
+}
+
 export class GroupWorkspaceStore {
   private readonly path: string;
   private readonly lockTimeoutMs: number | undefined;
+  private readonly writer: GroupWorkspaceWriter;
+  private readonly onRegistryRead: (() => void) | undefined;
+  private readonly onCurrentRecordAccess: (() => void) | undefined;
+  private readonly onCanonicalTargetAccess: (() => void) | undefined;
 
   constructor(dataDir: string, options: GroupWorkspaceStoreOptions = {}) {
     this.path = join(dataDir, GROUP_WORKSPACE_STORE_FILE);
     this.lockTimeoutMs = options.lockTimeoutMs;
+    this.writer = options.writer ?? atomicWriteFileSync;
+    this.onRegistryRead = options.onRegistryRead;
+    this.onCurrentRecordAccess = options.onCurrentRecordAccess;
+    this.onCanonicalTargetAccess = options.onCanonicalTargetAccess;
   }
 
   async read(chatId: string): Promise<GroupWorkspaceReadResult> {
@@ -343,11 +389,13 @@ export class GroupWorkspaceStore {
   }
 
   async mutate(input: GroupWorkspaceMutation): Promise<GroupWorkspaceMutationResult> {
+    if (!validMutation(input)) return { outcome: 'store_unavailable' };
     const operationKey = groupWorkspaceOperationKey(input.sourceEventId, input.kind);
     const payloadDigest = canonicalGroupOperationPayloadDigest(input);
     try {
       mkdirSync(resolve(this.path, '..'), { recursive: true });
       return await withFileLock(this.path, async () => {
+        this.onRegistryRead?.();
         const registry = readRegistry(this.path);
 
         // Replay is intentionally decided before reading the current record/revision.
@@ -367,6 +415,7 @@ export class GroupWorkspaceStore {
           };
         }
 
+        this.onCurrentRecordAccess?.();
         const current = registry.records[input.chatId];
         let outcome: Exclude<GroupOperationTerminalOutcome, 'store_unavailable'>;
         let resultingRevision: number | undefined;
@@ -415,15 +464,34 @@ export class GroupWorkspaceStore {
             ? { expectedSessionGeneration: input.expectedSessionGeneration }
             : {}),
           ...(input.kind === 'set'
-            ? { canonicalTargetWorkingDir: canonicalWorkingDir(input.requestedWorkingDir) }
+            ? (this.onCanonicalTargetAccess?.(), {
+              canonicalTargetWorkingDir: canonicalWorkingDir(input.requestedWorkingDir),
+            })
             : {}),
         };
         registry.receipts[operationKey] = receipt;
-        atomicWriteFileSync(this.path, `${JSON.stringify(registry, null, 2)}\n`, {
-          mode: 0o600,
-          durable: true,
-          followTargetSymlink: false,
-        });
+        try {
+          this.writer(this.path, `${JSON.stringify(registry, null, 2)}\n`, {
+            mode: 0o600,
+            durable: true,
+            followTargetSymlink: false,
+          });
+        } catch {
+          // The atomic writer can throw after rename while fsyncing the directory.
+          // Reconcile exactly once under the same lock; never retry the mutation.
+          let reconciled: GroupWorkspaceRegistry;
+          try {
+            reconciled = readRegistry(this.path);
+          } catch {
+            return { outcome: 'unknown' as const };
+          }
+          const durableReceipt = reconciled.receipts[operationKey];
+          if (!durableReceipt) return { outcome: 'store_unavailable' as const };
+          if (durableReceipt.payloadDigest !== payloadDigest || durableReceipt.chatId !== input.chatId) {
+            return { outcome: 'unknown' as const };
+          }
+          return { outcome: durableReceipt.outcome, receipt: structuredClone(durableReceipt) };
+        }
         return { outcome, receipt: structuredClone(receipt) };
       }, { maxWaitMs: this.lockTimeoutMs });
     } catch {
