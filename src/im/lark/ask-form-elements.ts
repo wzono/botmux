@@ -14,8 +14,11 @@ export function buildAskFormElements(ask: PendingAsk, locale: Locale, result?: A
     if (/[\uD800-\uDBFF]$/.test(head)) head = head.slice(0, -1);
     return head + (en ? '… (full answer returned to caller)' : '…（完整答案已返回调用方）');
   };
+  const deadline = ask.deadlineAt === null
+    ? (en ? 'No deadline' : '无截止时间')
+    : new Date(ask.deadlineAt).toLocaleString(en ? 'en-US' : 'zh-CN');
   const elements: Array<Record<string, any>> = [{ tag: 'markdown', content:
-    `${en ? 'Deadline' : '等待截止'}：${new Date(ask.deadlineAt).toLocaleString(en ? 'en-US' : 'zh-CN')}\n`
+    `${en ? 'Deadline' : '等待截止'}：${deadline}\n`
     + (ask.answererOpenId ? (en ? 'Only the designated respondent may submit.' : '仅指定答题人可提交。')
       : (en ? 'Members allowed to talk to this bot may answer; this does not grant business approval.' : '本会话可对话成员可作答；不代表具备业务批准权。')) }];
   if (result) {

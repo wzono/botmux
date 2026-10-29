@@ -483,17 +483,24 @@ function renderAskCardWithCap(
       body: { elements: buildAskFormElements(capped, locale, result, Math.min(300, promptCap)) } });
   }
   const optionLayout = askOptionLayoutForBot(ask.larkAppId);
-  const deadline = new Date(ask.deadlineAt).toLocaleString('zh-CN');
+  // timeoutMs=null + deadlineAt=null = 永久等待的 ask：卡片不展示截止字段，
+  // 未 settle 时显示「等待你回答」。
+  const permanent = ask.deadlineAt === null;
+  const deadline = permanent ? null : new Date(ask.deadlineAt!).toLocaleString('zh-CN');
   const status = result ? settleStatus(result, ask, locale) : undefined;
   const confirmEmptyArmed = !!opts?.confirmEmptyArmed && !status;
 
-  // 截止时间 + 可答复人 字段行（settled 与 unsettled 均展示）
+  // 截止时间 + 可答复人 字段行（settled 与 unsettled 均展示；永久等待无截止字段）
+  const metaFields: Array<Record<string, unknown>> = [];
+  if (!permanent) {
+    metaFields.push({ is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.deadline', undefined, locale)}**\n${escapeMd(deadline ?? '')}` } });
+  } else if (status) {
+    metaFields.push({ is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.deadline', undefined, locale)}**\n${t('card.ask.permanent', undefined, locale)}` } });
+  }
+  metaFields.push({ is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.answerable', undefined, locale)}**\n${escapeMd(approverSummary(ask, locale))}` } });
   const metaDiv = {
     tag: 'div',
-    fields: [
-      { is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.deadline', undefined, locale)}**\n${escapeMd(deadline)}` } },
-      { is_short: true, text: { tag: 'lark_md', content: `**${t('card.ask.field.answerable', undefined, locale)}**\n${approverSummary(ask, locale)}` } },
-    ],
+    fields: metaFields,
   };
 
   const elements: Array<Record<string, unknown>> = [metaDiv];
@@ -636,13 +643,14 @@ function renderAskCardWithCap(
 
     // 自定义回复提示：选项都不满意时，直接在话题里回复一句文字即可当答案。
     elements.push({ tag: 'hr' });
+    const noteLines: string[] = [];
+    if (permanent) noteLines.push(t('card.ask.permanent', undefined, locale));
+    noteLines.push(t(ask.deliveryTarget ? 'card.ask.document_reply_hint'
+      : ask.originKind === 'native-user-input-async' ? 'card.ask.async_reply_hint'
+        : textReplyRequired ? 'card.ask.text_reply_hint' : 'card.ask.custom_reply_hint', undefined, locale));
     elements.push({
       tag: 'note',
-      elements: [
-        { tag: 'plain_text', content: t(ask.deliveryTarget ? 'card.ask.document_reply_hint'
-          : ask.originKind === 'native-user-input-async' ? 'card.ask.async_reply_hint'
-            : textReplyRequired ? 'card.ask.text_reply_hint' : 'card.ask.custom_reply_hint', undefined, locale) },
-      ],
+      elements: noteLines.map(content => ({ tag: 'plain_text', content })),
     });
   }
 
