@@ -2254,6 +2254,7 @@ async function bindDefaultOncallBeforeTalk(
     logger.warn(`[oncall:${larkAppId}] pre-permission auto-bind failed for ${chatId.substring(0, 12)}: ${err}`),
   );
 }
+export const __testOnly_bindDefaultOncallBeforeTalk = bindDefaultOncallBeforeTalk;
 /**
  * BOT 发送方的 talk 判定 —— bot 路由闸（外部 bot @ 本 bot）的**唯一**入口。
  *

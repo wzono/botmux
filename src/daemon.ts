@@ -539,6 +539,7 @@ import {
 import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.js';
 import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, runGroupWorkspaceRepoEntrypoint } from './core/command-handler.js';
 import { resolveGroupWorkspaceRepoSelection } from './core/repo-selection.js';
+import { resolveGroupWorkspaceCwd } from './core/group-workspace-policy.js';
 import { createGroupWorkspaceRouteRuntime } from './core/group-workspace-route-runtime.js';
 import { classifySlash, isCommandDecision, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
 import { deriveSessionPhase } from './core/session-phase.js';
@@ -20252,30 +20253,39 @@ async function resolvePinnedWorkingDir(ctx: {
   if (!oncallEntry) {
     oncallEntry = await maybeAutoBindDefaultOncall(ctx.larkAppId, ctx.chatId, ctx.chatType);
   }
+  const group = ctx.chatType === 'group'
+    ? await groupWorkspaceStore.read(ctx.chatId)
+    : undefined;
+  const groupWorkingDir = group?.status === 'available' && group.record?.directory.kind === 'bound'
+    ? group.record.directory.workingDir
+    : undefined;
+  const workspaceCwd = resolveGroupWorkspaceCwd({ oncall: oncallEntry, groupWorkingDir });
+  const explicitOncallEntry = workspaceCwd?.source === 'oncall-explicit' ? oncallEntry : undefined;
   // Resolve the bot default first so we know whether inheritance is only the
   // ordinary last-resort fallback or must preempt an auto-created worktree.
-  const botDefaultWorkingDir = !oncallEntry
+  const botDefaultWorkingDir = !workspaceCwd
     ? resolveBotDefaultWorkingDir(ctx.larkAppId)
     : undefined;
-  const preferPeerOverAutoWorktree = !oncallEntry
+  const preferPeerOverAutoWorktree = !workspaceCwd
     && !!botDefaultWorkingDir
     && botAutoWorktreeEnabled(ctx.larkAppId);
   // Peer inheritance is normally the fallback after this bot's own default. When
   // that default would create a fresh worktree, however, "bot@bot 同目录拉起"
   // takes priority: a valid same-anchor peer suppresses auto-worktree for this
   // session. The per-bot gate is enforced inside findInheritablePeer.
-  const inheritedFrom = (!oncallEntry && (!botDefaultWorkingDir || preferPeerOverAutoWorktree))
+  const inheritedFrom = (!workspaceCwd && (!botDefaultWorkingDir || preferPeerOverAutoWorktree))
     ? findInheritablePeer({
         scope: ctx.scope, anchor: ctx.anchor, chatId: ctx.chatId, chatType: ctx.chatType,
         selfAppId: ctx.larkAppId,
         botToBotSameDir: getBot(ctx.larkAppId).config.botToBotSameDir !== false,
       })
     : null;
-  const pinnedWorkingDir = oncallEntry?.workingDir ?? inheritedFrom?.workingDir ?? botDefaultWorkingDir;
+  const pinnedWorkingDir = workspaceCwd?.workingDir ?? inheritedFrom?.workingDir ?? botDefaultWorkingDir;
   // Only the bot-default winner opts into auto-worktree. A same-dir peer winner
   // keeps its exact workingDir and therefore suppresses worktree creation.
-  const pinnedFromBotDefault = !oncallEntry && !inheritedFrom && !!botDefaultWorkingDir;
-  return { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault };
+  const pinnedFromBotDefault = !workspaceCwd && !inheritedFrom && !!botDefaultWorkingDir;
+  return { pinnedWorkingDir, oncallEntry: explicitOncallEntry, inheritedFrom, pinnedFromBotDefault };
+
 }
 
 export const __testOnly_resolvePinnedWorkingDir = resolvePinnedWorkingDir;

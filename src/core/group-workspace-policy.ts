@@ -15,6 +15,20 @@ export type GroupWorkspaceRouteIntent =
   | { kind: 'set'; selection: string }
   | { kind: 'unbind' };
 
+export type GroupWorkspaceCwdSource = 'oncall-explicit' | 'group' | 'oncall-default-auto';
+
+/** Resolve only the oncall/group layers; later tasks add session-wide provenance. */
+export function resolveGroupWorkspaceCwd(input: {
+  oncall?: { workingDir: string; provenance?: 'oncall-explicit' | 'oncall-default-auto' };
+  groupWorkingDir?: string;
+}): { workingDir: string; source: GroupWorkspaceCwdSource } | undefined {
+  const oncallIsExplicit = input.oncall && input.oncall.provenance !== 'oncall-default-auto';
+  if (oncallIsExplicit) return { workingDir: input.oncall!.workingDir, source: 'oncall-explicit' };
+  if (input.groupWorkingDir) return { workingDir: input.groupWorkingDir, source: 'group' };
+  if (input.oncall) return { workingDir: input.oncall.workingDir, source: 'oncall-default-auto' };
+  return undefined;
+}
+
 export interface GroupWorkspaceRouteAuthority {
   actor: TenantHumanId;
   freshSnapshot: FreshBotAdminUnionSnapshot;
