@@ -78,11 +78,11 @@ interface GroupWorkspaceRecord {
 
 type GroupOperationKind = 'set' | 'unbind';
 interface GroupOperationReceipt {
-  operationKey: string;          // digest(sourceEventId, kind, payloadDigest)
-  sourceEventId: string;         // 文本消息事件；卡片为 action event id
-  originMessageId?: string;      // 卡片原始请求/卡片消息，仅审计，不作幂等键
+  operationKey: string;          // digest(sourceEventId, kind)
+  sourceEventId: string;         // 下述文本/卡片 canonical source identity 的稳定 digest
+  originMessageId?: string;      // 卡片原始请求/卡片消息，参与卡片 source identity 并供审计
   kind: GroupOperationKind;
-  payloadDigest: string;         // canonical chatId + target/tombstone + expectedRevision
+  payloadDigest: string;         // 首次请求的 canonical semantic intent；明确不含 expectedRevision
   chatId: string;
   outcome: 'committed' | 'conflict' | 'invalid_dir' | 'unauthorized' | 'store_unavailable';
   resultingRevision?: number;
@@ -92,7 +92,12 @@ interface GroupOperationReceipt {
 }
 ```
 
-收据跨重启持久保留（首版不做自动清理）；同 `sourceEventId + kind + payloadDigest` 返回原收据，不再切会话或写群。相同 source event 携带不同 payload/kind 视为协议冲突并拒绝。卡片 action event id 是真实源事件；原请求/card message id 只用于关联，因此同一张卡的两个独立 action 不会被误合并。解绑自身也有 receipt，并提交 `revision + 1` 的 tombstone；后续重绑继续递增。解绑不删除 `workspaceManagers`，因此不会扩大 ACL。
+`sourceEventId` 必须是跨接收 Bot、跨实时投递与历史恢复都相同的 canonical stable identity：
+
+- 文本命令使用带版本的 tuple/digest `(stableTenantIdentity, chatId, originalImmutableLarkMessageId)`。`originalImmutableLarkMessageId` 只取飞书原始 `message_id`；投递 `event_id`、delivery/attempt id 仅写审计字段，绝不进入 `sourceEventId`、`operationKey` 或其他幂等键。`stableTenantIdentity` 优先取事件中可信的 tenant key；缺失时只允许回退到已通过飞书身份转换验证、且在各接收 app 下解析为同一 tenant key 的宿主机 tenant 映射。无法建立这种稳定 tenant identity 时 fail closed，不读取/创建 operation，也不执行 session/group 副作用；app id、Bot id 或 app-scoped `open_id` 不能充当回退值。
+- 卡片动作保留独立的 source identity：使用带版本的 tuple/digest `(stableTenantIdentity, chatId, originalImmutableRequestOrCardMessageId, immutableActionIdentity)`；其中 immutable action identity 是飞书 action event id（或平台明确保证不可变且全局唯一的等价 action id）。原始请求/card 与 action identity 都参与 canonical source identity，投递 attempt id 仍只供审计，因此同一张卡的两个独立 action 不会被误合并，单个 action 的重复投递会命中同一 operation。
+
+收据跨重启持久保留（首版不做自动清理）。幂等查找的唯一顺序不变量是：**在读取当前 group revision、重新解析 repo target 或执行任何副作用之前**，先按 `(canonical sourceEventId, operation kind)` 查 journal/receipt。若已存在，先将本次请求的 canonical semantic intent 与首次操作冻结的 `payloadDigest` 比较；该 digest 覆盖 `chatId + kind + normalized selection/requested path`（unbind 为 tombstone），明确排除 `expectedRevision` 以及任何当前状态。digest 不同即以 protocol conflict 拒绝；digest 相同则复用首次 journal 冻结的 canonical target、`expectedRevision` 和 expected session generation，禁止重新解析 target 或重读 revision 来改写它们。只有首次看见 `(sourceEventId, kind)` 时才解析 canonical target、读取当前 revision/session generation，并把 semantic payload digest、target、`expectedRevision`、session generation 一次性持久化。这样介入写入改变 revision 后的重放仍返回首次操作结果，`payloadDigest` 不会因 revision 重读而变化。解绑自身也有 receipt，并提交 `revision + 1` 的 tombstone；后续重绑继续递增。解绑不删除 `workspaceManagers`，因此不会扩大 ACL。
 
 共享 store 损坏、lock/read/write/fsync/rename 失败均 fail closed；不能解释成“没有绑定”。
 
@@ -112,6 +117,7 @@ type RepoGroupOperationPhase =
 interface RepoGroupOperationJournal {
   operationKey: string;
   sourceEventId: string;
+  payloadDigest: string;          // 首次 semantic intent，不含 expectedGroupRevision
   chatId: string;
   sessionId: string;
   expectedSessionGeneration: number;
@@ -126,8 +132,8 @@ interface RepoGroupOperationJournal {
 
 状态转移：
 
-1. 授权、路径可用性与当前 revision 校验后，在任何 session/worker 副作用前写 `prepared`。
-2. 重放/恢复先读 journal/receipt：终态直接返回；`prepared` 先读回 session generation/cwd，只有能证明未提交时才执行一次 switch，能证明已提交则推进，无法证明则置 `unknown` 并停止人工可见操作。
+1. 入口先用 canonical `sourceEventId + kind` 查 journal/receipt，并按上节校验 semantic intent；命中时复用冻结的 target、expected revision 与 session generation。只有首次操作才解析 target、读取当前 revision/session generation；授权、路径可用性与 revision 校验后，在任何 session/worker 副作用前把这些值连同不含 expectedRevision 的 payload digest 写入 `prepared`。
+2. 重放/恢复不得先重读 revision 或重新解析 target；终态 receipt 直接返回，`prepared` 使用冻结值读回 session generation/cwd，只有能证明未提交时才执行一次 switch，能证明已提交则推进，无法证明则置 `unknown` 并停止人工可见操作。
 3. session 安全切换及持久化完成后写 `session_committed`，记录新 generation。此时会话目标目录的 provenance 是 `explicit`，直到 group CAS 成功；这样群提交失败时不会被后续 auto-follow 覆盖。
 4. 以 journal 的 expected revision 做 group CAS。成功时在同一 group-store 锁/原子写中写 record 与 operation receipt；receipt 是群提交的权威证明。释放 group 锁后再将 journal 标记 `group_committed`，并把该 session provenance 收敛为 `group` + 新 revision；任一后续写入结果未知时，恢复均以 receipt + session generation 读回收敛，不重复 group CAS。
 5. CAS 冲突写 `conflict` receipt；store 明确失败写 `store_unavailable` receipt（若底层提交结果不确定则 journal 为 `unknown`，不得伪造失败 receipt）。两者都保留已切换会话为 `explicit`，明确提示“会话已切换，群目录未更新”及当前群值/修复方式，不自动重基。
@@ -170,7 +176,7 @@ thread、`explicit`、两种 oncall、bot-default、legacy-unknown 都不自动�
 2. thread `/repo Y` 只影响该 thread；`/repo wt`、`/repo here` 不写群。
 3. 显式 oncall Z 优先于 group X；defaultOncall 自动目录 Z 不遮蔽 X，但 oncall 授权不变；历史无来源 oncall 保守保持旧行为。
 4. 同一真人在 A/B app 下不同 open_id 均归一到同租户 union_id，文本和卡片可管理；普通成员、Bot、租户不符、旧配置指纹快照、收紧名单均拒绝。窄 bypass 不放行任何其他命令/范围。
-5. `M1 set X → M2 set Y → replay M1` 返回 M1 收据且 Y 不变；同 source 不同 payload 拒绝；跨 Bot/重启同样成立。
+5. 文本 M1 的 canonical source ID 在不同接收 Bot、实时投递与历史恢复中都由同一 tenant/chat/original message tuple 得到；delivery event/attempt 变化不影响它。`M1 set X@r0 → M2 set Y@r1 → replay M1` 必须在重读 revision/重解析 target 前命中 M1，复用首次冻结的 X、r0 和 session generation，返回 M1 收据且 Y/r2 不变；payload digest 不含 expectedRevision。同 source 不同 semantic intent 拒绝；跨 Bot/重启同样成立。卡片则由原始请求/card + immutable action identity 区分 source。
 6. `set → unbind → set → 旧 CAS` 中 revision 单调且旧 CAS 失败；unbind 重放幂等，ACL 在 tombstone 上保留。
 7. 在 switch 前、session committed 后、group commit 结果未知、group committed 后回复前分别崩溃，恢复/重放不重复 switch/worker，不误报成功；CAS/ENOSPC/锁失败明确区分，最终回复只在 receipt 可证明后发出。
 8. group→`/cd`/显式 IPC→群更新不自动跟随；restart/resume 保留 provenance；legacy unknown 不误跟随。
