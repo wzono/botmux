@@ -6,6 +6,8 @@
 
 **Architecture:** Keep the accepted pure reducer and exact-turn admission unchanged. A small reaction-provider adapter returns total typed receipts; a pure convergence planner decides LIST/DELETE/CREATE and writes immutable SessionStore intents before provider mutations; a separate pure retention module bounds only settled rows. The existing live `turn_terminal` handler performs one best-effort feedback mutation and then continues its historical lifecycle regardless of feedback failure—there is no worker outbox, terminal ACK protocol, suspend handshake, or Web Terminal fence.
 
+**User-approved Ask boundary (2026-10-29):** `needs_user` projection requires a source-bound turn/attempt/worker generation. Shared-service and adopt hooks that cannot provide that identity still publish and resolve Ask cards, but capacity feedback remains unchanged and must fail closed. Do not synthesize the generation from the current Session or replacement worker.
+
 **Tech Stack:** TypeScript, Bun, Vitest, SessionStore, Lark reactions/cards, Dashboard React.
 
 ---
@@ -102,6 +104,7 @@ rtk bun run test -- test/capacity-wait-evidence.test.ts test/turn-feedback-state
 ```
 
 Expected: all tests pass; terminal remains absorbing, `needs_user` outranks capacity, and stale position is hidden.
+The Ask coverage gate additionally requires ordinary, explicit, and managed RPC producers with source-bound generation to project/resume attention; shared/adopt producers without it must keep feedback unchanged while their Ask remains usable.
 
 - [ ] **Step 2: Run exact-turn admission and routing tests**
 

@@ -1,8 +1,8 @@
 # Botmux 全量可信容量反馈设计
 
-日期：2026-10-27；2026-10-28 收窄恢复保证
+日期：2026-10-27；2026-10-28 收窄恢复保证；2026-10-29 用户确认 shared/adopt 例外
 
-状态：收窄设计已确认，待重写实施计划
+状态：收窄设计与 shared/adopt 例外已由用户确认
 
 目标分支：`topic/capacity-wait-feedback`
 
@@ -53,7 +53,7 @@
 1. 全部机器人使用同一 `dev` release 和同一状态模型。
 2. 明确容量等待在 5 秒内出现在 Dashboard 或飞书工作卡。
 3. 状态严格绑定 `app + session + turn + attempt + worker generation + native identity`，不能串到别的机器人或任务。
-4. 排队、等待用户、处理中、完成、失败的表情和卡片状态一致；已成功写入 SessionStore 的反馈状态和 reaction intent 可在 daemon 重启后恢复。
+4. 在能证明源 turn/attempt/worker generation 的普通、显式 Ask 和受管 RPC 路径中，排队、等待用户、处理中、完成、失败的表情和卡片状态一致；已成功写入 SessionStore 的反馈状态和 reaction intent 可在 daemon 重启后恢复。
 5. 误报时只关闭对应 `机器人 × adapter`，其余机器人继续工作。
 6. 每日定制版重建能从 manifest 恢复该 topic，不依赖 stash 或 live checkout 的未提交文件。
 
@@ -69,6 +69,7 @@
 - 不修改 ordinary、queued、Codex、VC、readonly、recovery 六类入口的既有 terminal ownership。
 - 不承诺 terminal 在首次 SessionStore 终态提交成功前恰好发生 daemon/worker 崩溃时无损；该窗口沿用 Botmux 现有行为。
 - 不为本功能新增两阶段 suspend、Web Terminal 写栅栏或完整 terminal lifecycle 重放。
+- 不为缺少 source-bound worker generation 的 shared-service / adopt hook 新增跨进程 Ask 代次协议。这两类特殊路径仍正常发布和回答 Ask，但容量反馈保持原状态，不投影 `needs_user`；不得从查询时的 current Session/worker generation 猜测事件归属。
 
 ## 4. 方案选择
 
@@ -151,11 +152,13 @@
 |---|---|---|---|
 | processing | 已接纳、未出现其它权威状态 | GoGoGo | 正在处理 |
 | capacity_waiting | 权威容量事件 | Coffee | 等待模型容量；有排位则展示排位与更新时间 |
-| needs_user | 已发布且可回答的 Ask/TUI | THINKING | 等待用户操作 |
+| needs_user | 已发布且可回答，并能证明源 turn/attempt/worker generation 的 Ask/TUI | THINKING | 等待用户操作 |
 | completed | 当前 turn 成功结束 | DONE | 已完成 |
 | failed | 当前 turn 失败 | ERROR | 失败及既有安全错误摘要 |
 
 优先级为 terminal > needs_user > capacity_waiting > processing。`needs_user` 解除后，如果同一 turn 的容量等待仍有效，则恢复 Coffee；权威进展、clear 或 terminal 才清除容量等待。
+
+用户已明确接受 shared-service / adopt hook 的展示例外：这两类路径没有可信的 source-bound worker generation 时，Ask 卡仍可发布、作答和回传，但反馈 ownership 必须 fail closed，不得切换 THINKING，也不得在回答后清理另一代 worker 的 attention。该例外只收窄容量状态展示，不改变 Ask 的投递、答复和业务结果。
 
 旧排位在 60 秒没有新权威观测后变为 stale，并隐藏具体排位；不能继续显示一个看似实时的旧数字。clear、terminal、关闭会话或 adapter kill switch 会立即清除相关卡片、Dashboard 状态、表情和提醒。
 
@@ -266,6 +269,7 @@
 - kill switch 只影响一个 `app × adapter`。
 - restart、checkpoint 写失败、pending 恢复、目录/文件权限和 symlink/rename race。
 - Dashboard、工作卡和 reaction 的实际投影行为；不以源码文本断言代替行为测试。
+- Ask/TUI 投影必须覆盖带 source-bound generation 的普通、显式和受管 RPC producer；shared-service / adopt hook 缺 generation 时验证 Ask 仍可回答、反馈保持原状态且不会串到当前 worker。
 - reaction intent 写入后模拟进程死亡：重启只能从该 intent 恢复，必须 LIST-before-mutate，且不能重复 CREATE/DELETE。
 - terminal 首次 SessionStore 提交失败窗口只验证“不会冒称已恢复”，不为此创建 outbox、attemptRef 或跨入口 lifecycle 协议。
 - 留存规则：非终态和任何未解决反馈义务永不裁剪；已收敛终态保留 7 天／最新 512，永久诊断保留 7 天／最新 128；10,000 行夹具验证精确结果且不修改输入。

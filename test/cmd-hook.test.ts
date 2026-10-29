@@ -407,6 +407,8 @@ describe('runHook', () => {
       expect(capturedBody?.chatId).toBe('c-adopt');
       expect(capturedBody?.rootMessageId).toBe('om_x');
       expect(capturedBody?.originWorkerGeneration).toBeUndefined();
+      // 用户确认的容量反馈例外：Ask 本身仍可回答；缺 source-bound generation
+      // 时 daemon 的 feedback ownership fail closed，不得借 current worker 代次。
       // 应输出答案 directive（非空）
       expect(result.stdout).toBeTruthy();
       const directive = JSON.parse(result.stdout);
