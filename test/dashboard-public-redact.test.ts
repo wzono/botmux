@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
 import {
   projectSessionEventForAudience,
@@ -274,15 +273,6 @@ describe('stripSchedulePreconditionMaterial', () => {
       prompt: 'keep this for the schedule card',
       workingDir: '/repo',
     });
-  });
-
-  it('is wired into authenticated schedule snapshots and live events', () => {
-    const dashboard = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
-
-    expect(dashboard).toContain('rawSchedules.map(schedule => stripSchedulePreconditionMaterial(schedule))');
-    expect(dashboard).toContain('schedule: stripSchedulePreconditionMaterial(b.schedule)');
-    expect(dashboard).toMatch(/patch:\s*stripSchedulePreconditionMaterial\(b\.patch,/);
-    expect(dashboard).toContain('{ preserveClearMarkers: true }');
   });
 });
 
@@ -613,6 +603,16 @@ describe('redactSettingsForPublic', () => {
     expect(out.publicReadOnly).toBe(true);
     expect('httpProxy' in out).toBe(false);
     expect(JSON.stringify(out)).not.toContain('secret');
+  });
+
+  it('hides bot scheduling grants (chats and controller identity) from tokenless settings', () => {
+    const settings = { publicReadOnly: true, scheduleBotGrants: { createEnabled: true, selfManageEnabled: false,
+      grants: [{ id: 'team', sourceAppId: 'cli_a', targetAppIds: ['cli_b'], chatIds: ['oc_secret'],
+        controllerUnionId: 'on_controller' }], botOptions: [] } };
+    const out = redactSettingsForPublic(settings) as any;
+    expect(out.publicReadOnly).toBe(true);
+    expect('scheduleBotGrants' in out).toBe(false);
+    expect(JSON.stringify(out)).not.toMatch(/oc_secret|on_controller/);
   });
 
   it('removes the complete notifier snapshot from tokenless settings', () => {

@@ -26,6 +26,8 @@ vi.mock('node:child_process', () => ({
 
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import { busyProbeRegion } from '../src/utils/busy-probe.js';
+import { shouldWriteNow } from '../src/utils/input-gate.js';
+import { isTypeAheadBlockedByBypass, resolvePtyInputPolicy } from '../src/utils/pty-input-policy.js';
 import { TERMINAL_CANCEL_COOLDOWN_MS } from '../src/adapters/backend/critical-control-key.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
@@ -223,6 +225,43 @@ describe('zero injection with structured final reply adapters', () => {
   }
 });
 
+// Input submitted while Pi is busy is written to the session only when Pi
+// dequeues it; the extension records the acceptance at submit time instead.
+describe('pi turn-boundary extension: queued input marker', () => {
+  for (const [name, load] of [
+    ['typed twin', async () => (await import('../src/adapters/cli/pi-turn-boundary-extension.js')).default],
+    ['runtime source', async () => (await import('../src/adapters/cli/pi-turn-boundary-extension.mjs' as string)).default],
+  ] as const) {
+    it(`${name}: marks input Pi will queue, and nothing for idle input`, async () => {
+      const register = await load();
+      const handlers: Record<string, (event?: any) => any> = {};
+      const appendEntry = vi.fn();
+      register({ on: (event: string, handler: any) => { handlers[event] = handler; }, appendEntry } as any);
+      expect(handlers.input({ type: 'input', text: 'idle', source: 'interactive' })).toBeUndefined();
+      expect(appendEntry).not.toHaveBeenCalled();
+      handlers.input({ type: 'input', text: 'busy', source: 'interactive', streamingBehavior: 'steer' });
+      handlers.input({ type: 'input', text: 'later', source: 'interactive', streamingBehavior: 'followUp' });
+      expect(appendEntry.mock.calls).toEqual([
+        ['botmux-input-queued', { behavior: 'steer' }],
+        ['botmux-input-queued', { behavior: 'followUp' }],
+      ]);
+    });
+
+    it(`${name}: still registers every other handler when the input event is rejected`, async () => {
+      const register = await load();
+      const handlers: Record<string, (event?: any) => any> = {};
+      register({
+        on: (event: string, handler: any) => {
+          if (event === 'input') throw new Error('unknown event');
+          handlers[event] = handler;
+        },
+        appendEntry: vi.fn(),
+      } as any);
+      expect(Object.keys(handlers).sort()).toEqual(['agent_end', 'agent_settled', 'before_agent_start', 'session_start']);
+    });
+  }
+});
+
 describe('claude-code buildArgs', () => {
   it('zero injection omits Botmux system prompts and both plugin directories on fresh and resumed CLI launches', () => {
     for (const resume of [false, true]) {
@@ -274,6 +313,12 @@ describe('claude-code buildArgs', () => {
     }
   });
 
+  it('writes promptCacheTtl into --settings only when configured', () => {
+    const settingsOf = (args: string[]) => JSON.parse(args[args.indexOf('--settings') + 1]);
+    expect(settingsOf(adapter.buildArgs({ sessionId: 's', resume: false })).promptCacheTtl).toBeUndefined();
+    expect(settingsOf(adapter.buildArgs({ sessionId: 's', resume: false, promptCacheTtl: '1h' })).promptCacheTtl).toBe('1h');
+  });
+
   it('passes inline --settings that skips the dangerous-mode prompt', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false });
     const idx = args.indexOf('--settings');
@@ -297,6 +342,13 @@ describe('claude-code buildArgs', () => {
     expect(parsed.statusLine.type).toBe('command');
     expect(parsed.statusLine.command.endsWith('statusline')).toBe(true);
     expect(adapter.hookInstall?.sessionStartCommand).toContain('session-ready');
+  });
+
+  it('installs the StopFailure hook globally, next to the other botmux Claude hooks', () => {
+    // Claude ends API-error turns without running Stop hooks; this is the only
+    // structured signal botmux gets for them (see services/claude-stop-failure.ts).
+    expect(adapter.hookInstall?.format).toBe('claude-settings');
+    expect(adapter.hookInstall?.stopFailureCommand?.endsWith(' __claude-stop-failure-v1')).toBe(true);
   });
 
   it('ignores initialPrompt (not passed via args)', () => {
@@ -3422,14 +3474,16 @@ describe('idleToBusyPattern', () => {
     expect(busy!.test('Working through the implementation')).toBe(false);
   });
 
-  it('pi opts in with the same Working... marker as its busyPattern', () => {
-    // Pi's `Working...` is an ephemeral status line (never part of transcript
+  it('pi opts in with the same busy-line marker as its busyPattern', () => {
+    // Pi's busy line is an ephemeral status line (never part of transcript
     // history redraws), so idle→busy recovery is safe: a falsely published
     // ready self-heals when the marker renders again.
     const adapter = createPiAdapter('/bin/pi');
     expect(adapter.idleToBusyPattern).toBeDefined();
     expect(adapter.idleToBusyPattern!.source).toBe(adapter.busyPattern!.source);
     expect(adapter.idleToBusyPattern!.test('● Working... (esc to interrupt)')).toBe(true);
+    // Pi 1.3.0 frame as it appears in the ANSI-stripped PTY stream.
+    expect(adapter.idleToBusyPattern!.test('── ⠙ Working ──')).toBe(true);
     expect(adapter.idleToBusyPattern!.test('Working through the implementation')).toBe(false);
   });
 
@@ -3567,6 +3621,21 @@ describe('readyPattern', () => {
     expect(adapter.busyPattern).toBeDefined();
     expect(adapter.busyPattern!.test('esc to cancel')).toBe(true);
     expect(typeof adapter.isSessionBusy).toBe('function');
+    expect(adapter.supportsTypeAhead).toBe(true);
+    const bypassedPolicy = resolvePtyInputPolicy(adapter, true, false, isTypeAheadBlockedByBypass(adapter, false));
+    const restrictedPolicy = resolvePtyInputPolicy(adapter, true, false, isTypeAheadBlockedByBypass(adapter, true));
+    expect(shouldWriteNow({
+      isPromptReady: false,
+      isFlushing: false,
+      supportsTypeAhead: bypassedPolicy.supportsTypeAhead,
+      awaitingFirstPrompt: false,
+    })).toBe(true);
+    expect(shouldWriteNow({
+      isPromptReady: false,
+      isFlushing: false,
+      supportsTypeAhead: restrictedPolicy.supportsTypeAhead,
+      awaitingFirstPrompt: false,
+    })).toBe(false);
   });
 
   it('mtr has no readyPattern', () => {
@@ -3851,6 +3920,12 @@ describe('altScreen property', () => {
 
   it('pi native TUI uses alt screen', () => {
     expect(createPiAdapter('/bin/pi').altScreen).toBe(true);
+  });
+
+  it('pi read-only viewers may forward wheel-only scroll', () => {
+    // Pi >= 1.0 defaults to fullscreen mode, so its transcript lives inside
+    // the TUI rather than xterm/tmux scrollback.
+    expect(createPiAdapter('/bin/pi').readOnlyRemoteScroll).toBe(true);
   });
 
   it('copilot uses alt screen (Ink TUI)', () => {
@@ -4449,6 +4524,45 @@ describe('resumeRequiresCliSessionId capability', () => {
   });
 });
 
+describe('claude-code checkResumeTargetExists', () => {
+  const sessionId = '3becbc33-71b1-4694-9b98-7a975ed890c6';
+  let dataDir: string;
+  let workingDir: string;
+  beforeEach(() => {
+    dataDir = mkdtempSync(join(tmpdir(), 'botmux-claude-probe-'));
+    workingDir = mkdtempSync(join(tmpdir(), 'botmux-claude-cwd-'));
+  });
+  afterEach(() => {
+    rmSync(dataDir, { recursive: true, force: true });
+    rmSync(workingDir, { recursive: true, force: true });
+  });
+  const projectDir = () => join(dataDir, 'projects', realpathSync(workingDir).replace(/[^A-Za-z0-9-]/g, '-'));
+
+  it('is false when a first launch died before writing its own transcript', () => {
+    // The cwd's project dir is shared with sibling sessions; it existing proves
+    // nothing about this session. `--resume` would exit "No conversation found".
+    mkdirSync(projectDir(), { recursive: true });
+    writeFileSync(join(projectDir(), `${randomUUID()}.jsonl`), '{}\n');
+    const adapter = createClaudeCodeAdapter('/usr/bin/claude');
+    expect(adapter.checkResumeTargetExists?.({ sessionId, workingDir, dataDir })).toBe(false);
+  });
+
+  it('stays inconclusive for a recorded CLI id whose transcript is not in this cwd', () => {
+    mkdirSync(projectDir(), { recursive: true });
+    const adapter = createClaudeCodeAdapter('/usr/bin/claude');
+    expect(adapter.checkResumeTargetExists?.({
+      sessionId, cliSessionId: randomUUID(), workingDir, dataDir,
+    })).toBeUndefined();
+  });
+
+  it('is true once the session transcript exists', () => {
+    mkdirSync(projectDir(), { recursive: true });
+    writeFileSync(join(projectDir(), `${sessionId}.jsonl`), '{}\n');
+    const adapter = createClaudeCodeAdapter('/usr/bin/claude');
+    expect(adapter.checkResumeTargetExists?.({ sessionId, workingDir, dataDir })).toBe(true);
+  });
+});
+
 describe('kiro-cli buildArgs', () => {
   const adapter = createKiroCliAdapter('/usr/bin/kiro-cli');
 
@@ -4574,7 +4688,12 @@ describe('traex/coco sandbox authPaths', () => {
     // silenced by exposing the done-markers READ-ONLY via sandboxReadonlyPaths.
     const adapter = createTraexAdapter('/bin/traex');
     expect(adapter.authPaths).toEqual(['~/.trae/cli']);
+    expect(adapter.mcpGateway).toEqual({
+      configPath: join(homedir(), '.trae', 'traecli.toml'),
+      format: 'codex-toml',
+    });
     expect(adapter.sandboxReadonlyPaths?.()).toEqual([
+      join(homedir(), '.trae', 'traecli.toml'),
       '~/.trae/.coco-rollouts-migrated',
       '~/.trae/.coco-migrated',
     ]);
@@ -4586,7 +4705,12 @@ describe('traex/coco sandbox authPaths', () => {
     // transcript bridge reads).
     const adapter = createCocoAdapter('/bin/coco');
     expect(adapter.authPaths).toEqual(['~/.trae/cli', '~/.cache/coco']);
+    expect(adapter.mcpGateway).toEqual({
+      configPath: join(homedir(), '.trae', 'traecli.toml'),
+      format: 'codex-toml',
+    });
     expect(adapter.sandboxReadonlyPaths?.()).toEqual([
+      join(homedir(), '.trae', 'traecli.toml'),
       '~/.trae/.coco-rollouts-migrated',
       '~/.trae/.coco-migrated',
     ]);

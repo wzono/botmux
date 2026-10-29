@@ -17,6 +17,8 @@ import {
   readGlobalConfig,
   writeCodexNotifierConfig,
   writeHostOverloadAlertConfig,
+  writeScheduleBotGrantConfig,
+  ignoredScheduleBotGrantCount,
 } from '../src/global-config.js';
 import { resolveCodexNotifierConfig } from '../src/features/codex-notifier/config.js';
 
@@ -26,14 +28,44 @@ describe('global dashboard config', () => {
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'botmux-global-config-'));
     vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home);
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', join(home, 'config.json'));
+    vi.stubEnv('BOTS_CONFIG', join(home, 'bots.json'));
     vi.stubEnv('BOTMUX_WORKFLOW_ENABLED', '');
     vi.stubEnv('BOTMUX_MULTI_TOPIC_ENABLED', '');
     mkdirSync(dirname(globalConfigPath()), { recursive: true });
   });
 
+  it.each([
+    [{ volcengine: null }, { volcengine: null }],
+    [{ volcengine: { mode: 'typo' }, asr: { enabled: true } }, { volcengine: null, asr: { enabled: true } }],
+    [{ engine: 'volcengine', volcengine: { mode: 'agent-plan', apiKey: ' P ' } },
+      { engine: 'volcengine', volcengine: { mode: 'agent-plan', apiKey: 'P' } }],
+    [{ volcengine: { apiKey: '' } }, { volcengine: { apiKey: '' } }],
+    [{ rate: 1.2 }, { rate: 1.2 }],
+    [{ speaker: 'custom' }, { speaker: 'custom' }],
+  ])('retains Volcengine denial and scalar overrides on disk, row %#', (voice, expected) => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ voice }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().voice).toEqual(expected);
+  });
+
   afterEach(() => {
     vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
+  });
+
+  it('keeps unrelated settings and the kill switch when meeting policy is malformed', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ lang: 'zh', vcMeetingAgent: { enabled: false, listenerPolicy: { rawMessages: 'false' } } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().vcMeetingAgent).toEqual({ enabled: false, listenerPolicy: { rawMessages: false, finalSummary: false, allowSummarySharing: false } });
+  });
+
+  it('round-trips global meeting listener defaults without changing consumer selection', () => {
+    const listenerPolicy = { rawMessages: false, finalSummary: true, allowSummarySharing: true };
+    writeFileSync(globalConfigPath(), JSON.stringify({ vcMeetingAgent: { enabled: true, listenerPolicy } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().vcMeetingAgent).toEqual({ enabled: true, listenerPolicy });
   });
 
   it('reads only boolean dashboard settings', () => {
@@ -485,6 +517,14 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().plugins).toEqual(['agent-chrome', 'gitlab']);
   });
 
+  it('reads a valid MCP Gateway timeout ceiling and drops unsafe values', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ mcpGatewayMaxToolTimeoutMs: 900_000 }));
+    expect(readGlobalConfig().mcpGatewayMaxToolTimeoutMs).toBe(900_000);
+    invalidateGlobalConfigCache();
+    writeFileSync(globalConfigPath(), JSON.stringify({ mcpGatewayMaxToolTimeoutMs: 2_147_483_648 }));
+    expect(readGlobalConfig().mcpGatewayMaxToolTimeoutMs).toBeUndefined();
+  });
+
   it('readGlobalConfig sees fresh values immediately after a merge (cache invalidation)', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({ dashboard: { publicReadOnly: true } }));
     expect(readGlobalConfig().dashboard?.publicReadOnly).toBe(true); // primes the TTL cache
@@ -504,6 +544,45 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().httpProxy).toBeUndefined();
   });
 
+  it('loads explicit bot scheduling scopes without accepting malformed or ambiguous grants', () => {
+    const grant = { id: 'team', sourceAppId: 'cli_source', targetAppIds: ['cli_target', 'cli_target'],
+      chatIds: ['oc_team'], controllerUnionId: 'on_admin' };
+    writeFileSync(globalConfigPath(), JSON.stringify({ scheduleDelegation: { botGrants: [
+      grant, { ...grant, id: 'bad', controllerUnionId: 'ou_app_scoped' },
+      { ...grant, id: 'duplicate' }, { ...grant, id: 'duplicate' },
+    ] } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().scheduleDelegation?.botGrants).toEqual([{ ...grant, targetAppIds: ['cli_target'] }]);
+    // The Dashboard is told how many hand-edited entries it cannot show.
+    expect(ignoredScheduleBotGrantCount()).toBe(3);
+  });
+  it('writes the Dashboard bot-grant entry without storing defaults or touching other delegation keys', () => {
+    const grant = { id: 'team', sourceAppId: 'cli_source', targetAppIds: ['cli_target', 'cli_target'],
+      chatIds: ['oc_team'], controllerUnionId: 'on_admin' };
+    const disk = () => JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
+    writeFileSync(globalConfigPath(), JSON.stringify({ lang: 'zh' }));
+    // Turning things off on a host that never had them leaves the file as it was.
+    writeScheduleBotGrantConfig({ createEnabled: false, selfManageEnabled: false, botGrants: [] });
+    expect(disk()).toEqual({ lang: 'zh' });
+
+    writeScheduleBotGrantConfig({ createEnabled: true, botGrants: [grant] });
+    expect(disk().scheduleDelegation).toEqual({ createEnabled: true,
+      botGrants: [{ ...grant, targetAppIds: ['cli_target'] }] });
+
+    // Hand-edited keys this entry does not own survive every write.
+    writeFileSync(globalConfigPath(), JSON.stringify({ scheduleDelegation: {
+      ...disk().scheduleDelegation, runEnabled: false, runScopes: ['bytedcli'], futureKey: 1 } }));
+    writeScheduleBotGrantConfig({ selfManageEnabled: true });
+    writeScheduleBotGrantConfig({ createEnabled: false, botGrants: [] });
+    expect(disk().scheduleDelegation).toEqual({ selfManageEnabled: true, runEnabled: false,
+      runScopes: ['bytedcli'], futureKey: 1 });
+
+    // Back to every default: the whole block goes.
+    writeFileSync(globalConfigPath(), JSON.stringify({ lang: 'zh', scheduleDelegation: { selfManageEnabled: true } }));
+    writeScheduleBotGrantConfig({ selfManageEnabled: false });
+    expect(disk()).toEqual({ lang: 'zh' });
+    expect(readGlobalConfig().scheduleDelegation).toBeUndefined();
+  });
   it('keeps schedule delegation issuance and execution revocation independent', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       scheduleDelegation: { createEnabled: true, runEnabled: false,
