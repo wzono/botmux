@@ -2449,12 +2449,14 @@ export interface GroupWorkspaceTextRouteInput {
   senderOpenId?: string;
   senderUnionId?: string;
   tenantKey?: string;
+  messageId?: string;
 }
 
 export interface GroupWorkspaceTextRouteDeps {
   resolveAuthority: (input: GroupWorkspaceTextRouteInput) => Promise<GroupWorkspaceRouteAuthority | undefined>;
   handleRoute: (route: GroupWorkspaceRouteIntent & {
     source: 'text'; chatId: string; actor: import('../../services/bot-admin-unions-store.js').TenantHumanId;
+    actorOpenId?: string; messageId?: string;
   }) => Promise<void> | void;
   canRunGenericCommand: () => boolean;
   replyDenied: (message: string) => Promise<void> | void;
@@ -2482,7 +2484,14 @@ export async function tryDispatchGroupWorkspaceTextRoute(
     await deps.replyDenied('你有群目录管理权限，但没有接收机器人的会话切换权限；本次未切换会话，也未写入群目录。');
     return 'switch_denied';
   }
-  await deps.handleRoute({ ...intent, source: 'text', chatId: input.chatId, actor: authority.actor });
+  await deps.handleRoute({
+    ...intent,
+    source: 'text',
+    chatId: input.chatId,
+    actor: authority.actor,
+    actorOpenId: input.senderOpenId,
+    messageId: input.messageId,
+  });
   return 'dispatched';
 }
 
@@ -5778,6 +5787,15 @@ export function createLarkEventDispatcherRuntime(
         }
       }
 
+      // Freeze immutable ingress topology before `/t`, shared-topic folding, or
+      // chat-mode recovery rewrites routing scope/source. A regular-group
+      // top-level event stays eligible in `new-topic` mode, while a real reply
+      // (`root_id + thread_id`) can never become eligible through later rewrites.
+      const ordinaryGroupTopLevel = chatType === 'group'
+        && !message.root_id
+        && routingSource !== 'topic-chat'
+        && routingSource !== 'real-thread';
+
       // 主动开工 — 场景②: capture only genuine topic-group seeds NOW, before
       // `/t` or the regular-group new-topic mode can create the same
       // {thread, anchor=messageId} shape in a regular group. autoStartOnNewTopic
@@ -5857,11 +5875,12 @@ export function createLarkEventDispatcherRuntime(
           text: extractMessageTextForRouting(message) ?? '',
           chatId,
           chatType,
-          scope: routing.scope,
-          regularGroupTopLevel: routingSource === 'regular-group-chat' || routingSource === 'regular-group-thread',
+          scope: ordinaryGroupTopLevel ? 'chat' : routing.scope,
+          regularGroupTopLevel: ordinaryGroupTopLevel,
           senderOpenId,
           senderUnionId: humanSenderUnionId,
           tenantKey: sender?.tenant_key ?? sender?.sender_id?.tenant_key,
+          messageId,
         }, {
           resolveAuthority: handlers.resolveGroupWorkspaceRouteAuthority,
           handleRoute: handlers.handleGroupWorkspaceRoute,

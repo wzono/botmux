@@ -298,6 +298,49 @@ beforeEach(() => {
   mockGetChatInfo.mockReset().mockResolvedValue({ userCount: 3, botCount: 1 });
 });
 
+describe('group workspace production event route', () => {
+  it('admits a regular-group top-level /repo in new-topic mode but rejects an actual reply', async () => {
+    capturedHandlers = {};
+    __resetEventClaimsForTest();
+    setupBotState({ allowedUsers: [], configAllowedUsers: ['ou_owner'], regularGroupReplyMode: 'new-topic' });
+    mockGetChatMode.mockResolvedValue('group');
+    const handlers = makeHandlers();
+    const resolveAuthority = vi.fn(async () => ({
+      actor: { tenantKey: 'tenant-1', unionId: 'on_admin' },
+      freshSnapshot: { configFingerprint: 'f', admins: [{ tenantKey: 'tenant-1', unionId: 'on_admin' }], updatedAt: 1, expiresAt: 2 },
+      canSwitchSession: true,
+    }));
+    const handleRoute = vi.fn(async () => undefined);
+    handlers.resolveGroupWorkspaceRouteAuthority = resolveAuthority;
+    handlers.handleGroupWorkspaceRoute = handleRoute;
+    createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+
+    const top = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID, content: JSON.stringify({ text: '/repo /repos/x' }),
+      messageId: 'om_top', chatId: 'oc_group', chatType: 'group',
+    });
+    top.sender.sender_id = { open_id: USER_OPEN_ID, union_id: 'on_admin' } as any;
+    (top.sender as any).tenant_key = 'tenant-1';
+    await capturedHandlers['im.message.receive_v1'](top);
+    await flushEventWork();
+    expect(handleRoute).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'set', chatId: 'oc_group', selection: '/repos/x', actorOpenId: USER_OPEN_ID, messageId: 'om_top',
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+
+    handleRoute.mockClear();
+    const reply = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID, content: JSON.stringify({ text: '/repo /repos/y' }),
+      rootId: 'om_root', threadId: 'omt_thread', messageId: 'om_reply', chatId: 'oc_group', chatType: 'group',
+    });
+    reply.sender.sender_id = { open_id: USER_OPEN_ID, union_id: 'on_admin' } as any;
+    (reply.sender as any).tenant_key = 'tenant-1';
+    await capturedHandlers['im.message.receive_v1'](reply);
+    expect(handleRoute).not.toHaveBeenCalled();
+  });
+});
+
 describe('im.message.receive_v1 — forwarded topic clarification coalescing', () => {
   let handlers: ReturnType<typeof makeHandlers>;
 

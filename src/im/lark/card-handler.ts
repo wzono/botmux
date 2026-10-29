@@ -321,7 +321,7 @@ export interface GroupWorkspaceCardRouteDeps {
   resolveAuthority: (input: GroupWorkspaceCardRouteInput) => Promise<GroupWorkspaceRouteAuthority | undefined>;
   handleRoute: (route: GroupWorkspaceRouteIntent & {
     source: 'card'; chatId: string; actor: import('../../services/bot-admin-unions-store.js').TenantHumanId;
-    originMessageId: string; actionId: string;
+    actorOpenId?: string; originMessageId: string; actionId: string;
   }) => Promise<void> | void;
   canRunGenericCardAction: () => boolean;
 }
@@ -352,6 +352,7 @@ export async function tryDispatchGroupWorkspaceCardRoute(
     source: 'card',
     chatId: input.chatId,
     actor: authority.actor,
+    actorOpenId: input.operatorOpenId,
     originMessageId: input.cardMessageId!,
     actionId: input.actionId!,
   });
@@ -5312,9 +5313,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     return;
   }
 
-  // Handle dropdown selections (option-based)
-  const option = action?.option;
-  if (!option) {
+  // Handle dropdown selections (option-based). The reserved group-unbind
+  // callback is button-shaped and therefore intentionally carries no option.
+  const reservedGroupWorkspaceUnbind = action?.value?.key === 'group_workspace_unbind';
+  const option = reservedGroupWorkspaceUnbind ? '' : action?.option;
+  if (!reservedGroupWorkspaceUnbind && !option) {
     logger.warn('Card action received but no option or action value');
     return;
   }
@@ -5388,19 +5391,22 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
 
   // Handle repo select card (option-based dropdowns: plain switch, or
   // `repo_worktree` = create a worktree from the picked repo and open that).
+  // `group_workspace_unbind` is a reserved authenticated callback contract for
+  // Task 4. It intentionally reuses the exact current repo-card capability and
+  // does not appear in the UI until the later operation coordinator exists.
   // Require an explicit, recognized key: botmux's own dropdowns always set
   // `repo_switch` / `repo_worktree` (card-builder.ts). Treating a keyless
   // `option + root_id` as a plain switch let a hand-crafted card drive the
   // session's working dir to an arbitrary path — reject anything unrecognized.
   const repoKey = action?.value?.key;
-  if (repoKey !== 'repo_switch' && repoKey !== 'repo_worktree') {
+  if (repoKey !== 'repo_switch' && repoKey !== 'repo_worktree' && repoKey !== 'group_workspace_unbind') {
     logger.warn(`Card action: unrecognized repo dropdown key ${repoKey ?? '(none)'} — ignoring`);
     return;
   }
   const isWorktreeOpen = repoKey === 'repo_worktree';
   const selectedPath = option;
   const rootId = action?.value?.root_id;
-  logger.info(`Card action: repo ${isWorktreeOpen ? 'worktree-open' : 'switch'} to ${selectedPath} (root_id: ${rootId})`);
+  logger.info(`Card action: repo ${repoKey === 'group_workspace_unbind' ? 'group-unbind' : isWorktreeOpen ? 'worktree-open' : 'switch'} to ${selectedPath} (root_id: ${rootId})`);
 
   if (!rootId) {
     logger.warn('Card action: no root_id in action value');
@@ -5457,6 +5463,9 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     if (groupRoute.status === 'switch_denied') {
       return { toast: { type: 'error', content: groupRoute.toast } };
     }
+  }
+  if (repoKey === 'group_workspace_unbind') {
+    return { toast: { type: 'error', content: '群目录解绑未通过专用授权路由，本次未写入群目录。' } };
   }
 
   // 权限边界：pendingRepo（首次选 repo 才能 spawn）放行「会话发起人 或 canOperate」，

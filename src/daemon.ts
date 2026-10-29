@@ -2,7 +2,8 @@ import { recordDeploymentContinuation, cancelDeploymentContinuation } from './se
 import { deploymentContinuationAuthority } from './core/deployment-continuation-authority.js';
 import { shareVcMeetingSummary } from './services/vc-meeting-summary-share.js';
 import { isCurrentBotInChat, resolveUnionIdFromOpenIdStrict } from './im/lark/client.js';
-import { createBotAdminUnionsPublisher, readBotAdminUnions } from './services/bot-admin-unions-store.js';
+import { createBotAdminUnionsPublisher, readBotAdminUnions, type BotAdminIdentityConfig } from './services/bot-admin-unions-store.js';
+import { GroupWorkspaceStore } from './services/group-workspace-store.js';
 import { DecisionBoardService } from './core/decision-board/service.js';
 import { lookupChatAcrossBots } from './core/decision-board/chat-lookup.js';
 import { createBoardChatProbes, sameOwnerAs } from './services/board-chat-probes.js';
@@ -88,7 +89,7 @@ import { botmuxVersion } from './utils/install-info.js';
 import { SESSION_STORE_PROTOCOL } from './utils/daemon-version-display.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
-import { addReaction, deleteMessage, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageUpdateExpiredError, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { addReaction, deleteMessage, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageUpdateExpiredError, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, resolveUserUnionId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -527,6 +528,7 @@ import {
 } from './services/group-collaboration-mode-store.js';
 import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.js';
 import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
+import { createGroupWorkspaceRouteRuntime } from './core/group-workspace-route-runtime.js';
 import { classifySlash, isCommandDecision, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
 import { deriveSessionPhase } from './core/session-phase.js';
 import { noteObservedCliVersion } from './core/cli-version-history.js';
@@ -7172,8 +7174,24 @@ const cardClickTurns = createCardClickTurnBinder({
 });
 setCardClickTurnPoster((larkAppId, body) => cardClickTurns.post(larkAppId, body));
 
+const groupWorkspaceStore = new GroupWorkspaceStore(config.session.dataDir);
+const groupWorkspaceRouteRuntimes = new Map<string, ReturnType<typeof createGroupWorkspaceRouteRuntime>>();
+
 const cardDeps: CardHandlerDeps = {
   activeSessions,
+  resolveGroupWorkspaceRouteAuthority: input => {
+    const runtime = selfDaemonLarkAppId
+      ? groupWorkspaceRouteRuntimes.get(selfDaemonLarkAppId)
+      : undefined;
+    return runtime ? runtime.resolveAuthority(input) : Promise.resolve(undefined);
+  },
+  handleGroupWorkspaceRoute: route => {
+    const runtime = selfDaemonLarkAppId
+      ? groupWorkspaceRouteRuntimes.get(selfDaemonLarkAppId)
+      : undefined;
+    if (!runtime) throw new Error('group workspace route runtime unavailable');
+    return runtime.handleRoute(route);
+  },
   sessionReply,
   lastRepoScan,
   vcMeetingCardAction: (data, appId) => handleVcMeetingCardAction(data, appId),
@@ -32542,7 +32560,65 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     });
     setInputCaptureRuntime(cfg.larkAppId, inputCapture);
     inputCapture.start();
+    const groupWorkspaceRouteRuntime = createGroupWorkspaceRouteRuntime({
+      larkAppId: cfg.larkAppId,
+      activeSessions,
+      sessionKey,
+      registeredBots: tenantKey => getAllBots()
+        .filter(candidate => !candidate.config.apiOnly)
+        .map((candidate): BotAdminIdentityConfig => ({
+          larkAppId: candidate.config.larkAppId,
+          tenantKey,
+          brand: candidate.config.brand,
+          resolvedAllowedUsers: candidate.config.allowedUsers ?? candidate.resolvedAllowedUsers,
+        })),
+      resolveAllowedUser: async (candidate, allowedUser) => {
+        const state = getBot(candidate.larkAppId);
+        const openId = state.rawAllowedUserResolution.get(allowedUser)
+          ?? (allowedUser.startsWith('ou_') ? allowedUser : undefined);
+        if (!openId) return undefined;
+        const resolved = await resolveUserUnionId(candidate.larkAppId, openId);
+        return resolved.unionId?.startsWith('on_')
+          ? { tenantKey: candidate.tenantKey, unionId: resolved.unionId }
+          : undefined;
+      },
+      resolveActorUnion: async openId => {
+        const resolved = await resolveUnionIdFromOpenIdStrict(cfg.larkAppId, openId);
+        return resolved.status === 'resolved' && resolved.unionId.startsWith('on_')
+          ? resolved.unionId
+          : undefined;
+      },
+      readWorkspace: chatId => groupWorkspaceStore.read(chatId),
+      canSwitchSession: ds => !isRemoteBackendSession(ds)
+        && !ds.worktreeCreating
+        && !ds.pendingRepoCommitInFlight
+        && !hasProtectedSessionMutationOwnership(ds),
+      dispatchRepo: async (ds, selection, context) => {
+        const messageId = context.messageId ?? randomUUID();
+        await handleCommand('/repo', ds.chatId, {
+          messageId,
+          rootId: ds.chatId,
+          chatId: ds.chatId,
+          chatType: 'group',
+          senderId: context.actorOpenId ?? '',
+          senderUnionId: context.actor.unionId,
+          senderType: 'user',
+          msgType: 'text',
+          content: `/repo ${selection}`,
+          createTime: String(Date.now()),
+        }, commandDepsForInvocation({
+          scope: 'chat', chatId: ds.chatId, anchor: ds.chatId, messageId,
+        }), cfg.larkAppId);
+      },
+      reply: async (chatId, message) => {
+        await sessionReply(chatId, message, undefined, cfg.larkAppId);
+      },
+    });
+    groupWorkspaceRouteRuntimes.set(cfg.larkAppId, groupWorkspaceRouteRuntime);
+
     const botEventHandlers: EventHandlers = {
+      resolveGroupWorkspaceRouteAuthority: groupWorkspaceRouteRuntime.resolveAuthority,
+      handleGroupWorkspaceRoute: groupWorkspaceRouteRuntime.handleRoute,
       captureHumanInput: data => captureInboundText(data, inputCapture,
         id => isKnownPeerBot(config.session.dataDir, cfg.larkAppId, id)),
       handleCardAction: (data, appId) => withBotTurnAdmission(

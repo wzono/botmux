@@ -50,16 +50,23 @@ export function classifyGroupWorkspaceCardRoute(input: {
   currentRepoCardMessageId?: string;
   actionId?: string;
 }): GroupWorkspaceRouteIntent | undefined {
-  if (input.repoKey !== 'repo_switch'
+  const kind = input.repoKey === 'repo_switch'
+    ? 'set'
+    : input.repoKey === 'group_workspace_unbind'
+      ? 'unbind'
+      : undefined;
+  if (!kind
     || input.chatType !== 'group'
-    || !input.selection?.trim()
+    || (kind === 'set' && !input.selection?.trim())
     || !input.actionId
     || !input.callbackChatId
     || input.callbackChatId !== input.chatId
     || input.rootId !== input.chatId
     || !input.cardMessageId
     || input.cardMessageId !== input.currentRepoCardMessageId) return undefined;
-  return { kind: 'set', selection: input.selection.trim() };
+  return kind === 'unbind'
+    ? { kind }
+    : { kind, selection: input.selection!.trim() };
 }
 
 export function authorizeGroupWorkspaceRoute(

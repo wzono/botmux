@@ -193,14 +193,22 @@ describe('narrow classifiers', () => {
       .toBeUndefined();
   });
 
-  it('requires exact chat and original card capability', () => {
+  it('requires exact chat, authenticated action, and original card capability', () => {
     expect(classifyGroupWorkspaceCardRoute({
       repoKey: 'repo_switch', selection: 'x', chatId: CHAT, callbackChatId: CHAT, rootId: CHAT,
       chatType: 'group', cardMessageId: 'om_card', currentRepoCardMessageId: 'om_card', actionId: 'evt_1',
     })).toEqual({ kind: 'set', selection: 'x' });
     expect(classifyGroupWorkspaceCardRoute({
+      repoKey: 'group_workspace_unbind', chatId: CHAT, callbackChatId: CHAT, rootId: CHAT,
+      chatType: 'group', cardMessageId: 'om_card', currentRepoCardMessageId: 'om_card', actionId: 'evt_2',
+    })).toEqual({ kind: 'unbind' });
+    expect(classifyGroupWorkspaceCardRoute({
       repoKey: 'repo_switch', selection: 'x', chatId: CHAT, callbackChatId: 'other', rootId: CHAT,
       chatType: 'group', cardMessageId: 'om_card', currentRepoCardMessageId: 'om_card', actionId: 'evt_1',
+    })).toBeUndefined();
+    expect(classifyGroupWorkspaceCardRoute({
+      repoKey: 'group_workspace_unbind', chatId: CHAT, callbackChatId: CHAT, rootId: CHAT,
+      chatType: 'group', cardMessageId: 'om_card', currentRepoCardMessageId: 'om_card', actionId: undefined,
     })).toBeUndefined();
   });
 });
