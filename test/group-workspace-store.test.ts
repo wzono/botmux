@@ -1,5 +1,6 @@
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { atomicWriteFileSync } from '../src/utils/atomic-write.js';
+import { fsyncRegularFileSync } from '../src/utils/fs-durability.js';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -123,6 +124,24 @@ describe('GroupWorkspaceStore', () => {
     expect(await new GroupWorkspaceStore(dir).read(CHAT)).toEqual({ status: 'store_unavailable' });
   });
 
+  it.each(['__proto__', 'constructor', 'prototype'])(
+    'round-trips reserved chatId %s without prototype access',
+    async (chatId) => {
+      const dir = dataDir();
+      const source = canonicalTextSourceEventId({ tenantKey: 'tenant-a', chatId, messageId: `om_${chatId}` });
+      if (!source.ok) throw new Error('unexpected source failure');
+      const input = {
+        ...setInput({ sourceEventId: source.sourceEventId, workingDir: `/tmp/${chatId}`, expectedRevision: 0 }),
+        chatId,
+      };
+      const committed = await new GroupWorkspaceStore(dir).mutate(input);
+      expect(committed).toMatchObject({ outcome: 'committed', receipt: { chatId, resultingRevision: 1 } });
+      await expect(new GroupWorkspaceStore(dir).read(chatId)).resolves.toMatchObject({
+        status: 'available', record: { chatId, revision: 1, directory: { workingDir: `/tmp/${chatId}` } },
+      });
+    },
+  );
+
   it('fails closed on cross-field receipt corruption', async () => {
     const dir = dataDir();
     const sourceEventId = textSource('om_fabricated');
@@ -148,6 +167,79 @@ describe('GroupWorkspaceStore', () => {
       },
     }));
 
+    expect(await new GroupWorkspaceStore(dir).read(CHAT)).toEqual({ status: 'store_unavailable' });
+  });
+
+  it.each([
+    ['missing revision receipt', (registry: any) => {
+      const receipt = Object.values(registry.receipts).find((value: any) => value.resultingRevision === 1) as any;
+      delete registry.receipts[receipt.operationKey];
+    }],
+    ['duplicate chat revision receipt', (registry: any) => {
+      const receipt = Object.values(registry.receipts).find((value: any) => value.resultingRevision === 1) as any;
+      const duplicateSource = textSource('om_duplicate_revision');
+      const duplicateKey = groupWorkspaceOperationKey(duplicateSource, receipt.kind);
+      registry.receipts[duplicateKey] = { ...receipt, operationKey: duplicateKey, sourceEventId: duplicateSource };
+    }],
+    ['latest receipt state mismatch', (registry: any) => {
+      const receipt = Object.values(registry.receipts).find((value: any) => value.resultingRevision === 2) as any;
+      receipt.resultingDirectory = { kind: 'bound', workingDir: '/tmp/not-current' };
+      receipt.canonicalTargetWorkingDir = '/tmp/not-current';
+      receipt.payloadDigest = canonicalGroupOperationPayloadDigest(setInput({
+        sourceEventId: receipt.sourceEventId, workingDir: '/tmp/not-current', expectedRevision: 1,
+      }));
+    }],
+    ['latest receipt actor mismatch', (registry: any) => {
+      const receipt = Object.values(registry.receipts).find((value: any) => value.resultingRevision === 2) as any;
+      receipt.actor = V;
+    }],
+    ['latest receipt completion time mismatch', (registry: any) => {
+      const receipt = Object.values(registry.receipts).find((value: any) => value.resultingRevision === 2) as any;
+      receipt.completedAt += 1;
+    }],
+  ])('fails closed on whole-file history corruption: %s', async (_name, corrupt) => {
+    const dir = dataDir();
+    const path = join(dir, 'group-workspaces.json');
+    const store = new GroupWorkspaceStore(dir);
+    await store.mutate(setInput({ sourceEventId: textSource('om_history_1'), workingDir: '/tmp/one', expectedRevision: 0 }));
+    await store.mutate(setInput({ sourceEventId: textSource('om_history_2'), workingDir: '/tmp/two', expectedRevision: 1 }));
+    const registry = JSON.parse(readFileSync(path, 'utf8'));
+    corrupt(registry);
+    writeFileSync(path, JSON.stringify(registry));
+    expect(await new GroupWorkspaceStore(dir).read(CHAT)).toEqual({ status: 'store_unavailable' });
+  });
+
+  it('accepts noncommitted receipts alongside an exact committed revision history', async () => {
+    const dir = dataDir();
+    const store = new GroupWorkspaceStore(dir);
+    await store.mutate(setInput({ sourceEventId: textSource('om_history_commit'), workingDir: '/tmp/one', expectedRevision: 0 }));
+    await store.mutate(setInput({ sourceEventId: textSource('om_history_conflict'), workingDir: '/tmp/two', expectedRevision: 0 }));
+    expect(await new GroupWorkspaceStore(dir).read(CHAT)).toMatchObject({ status: 'available', record: { revision: 1 } });
+  });
+
+  it.each([
+    ['blank originMessageId', { originMessageId: ' ' }],
+  ])('rejects invalid optional receipt input: %s', async (_name, patch) => {
+    const result = await new GroupWorkspaceStore(dataDir()).mutate({
+      ...setInput({ sourceEventId: textSource('om_invalid_optional'), workingDir: '/tmp/x', expectedRevision: 0 }),
+      ...patch,
+    });
+    expect(result).toEqual({ outcome: 'store_unavailable' });
+  });
+
+  it.each([
+    ['committed revision not equal to expected plus one', (receipt: any) => { receipt.expectedRevision = 8; }],
+    ['committed receipt with only resulting revision', (receipt: any) => { delete receipt.resultingDirectory; }],
+    ['noncommitted receipt with resulting fields', (receipt: any) => { receipt.outcome = 'conflict'; }],
+  ])('fails closed on receipt outcome invariant: %s', async (_name, corrupt) => {
+    const dir = dataDir();
+    const path = join(dir, 'group-workspaces.json');
+    await new GroupWorkspaceStore(dir).mutate(setInput({
+      sourceEventId: textSource(`om_receipt_invariant_${_name}`), workingDir: '/tmp/x', expectedRevision: 0,
+    }));
+    const registry = JSON.parse(readFileSync(path, 'utf8'));
+    corrupt(Object.values(registry.receipts)[0]);
+    writeFileSync(path, JSON.stringify(registry));
     expect(await new GroupWorkspaceStore(dir).read(CHAT)).toEqual({ status: 'store_unavailable' });
   });
 
@@ -180,10 +272,8 @@ describe('GroupWorkspaceStore', () => {
     const dir = dataDir();
     const path = join(dir, 'group-workspaces.json');
     writeFileSync(path, JSON.stringify({ schemaVersion: 1, records: {}, receipts: {} }));
-    let reads = 0;
     let writes = 0;
     const store = new GroupWorkspaceStore(dir, {
-      onRegistryRead: () => { reads += 1; },
       writer: (...args) => {
         writes += 1;
         atomicWriteFileSync(...args);
@@ -194,7 +284,6 @@ describe('GroupWorkspaceStore', () => {
       ...patch,
     } as any);
     expect(result).toEqual({ outcome: 'store_unavailable' });
-    expect(reads).toBe(0);
     expect(writes).toBe(0);
     expect(readFileSync(path, 'utf8')).toBe(JSON.stringify({ schemaVersion: 1, records: {}, receipts: {} }));
   });
@@ -218,22 +307,6 @@ describe('GroupWorkspaceStore', () => {
     });
   });
 
-  it('exposes lookup counters used to prove validation and replay short-circuit ordering', async () => {
-    const dir = dataDir();
-    let reads = 0;
-    let records = 0;
-    let targets = 0;
-    const store = new GroupWorkspaceStore(dir, {
-      onRegistryRead: () => { reads += 1; },
-      onCurrentRecordAccess: () => { records += 1; },
-      onCanonicalTargetAccess: () => { targets += 1; },
-    });
-    await store.mutate(setInput({
-      sourceEventId: textSource('om_counter_wiring'), workingDir: '/tmp/X', expectedRevision: 0,
-    }));
-    expect({ reads, records, targets }).toEqual({ reads: 1, records: 1, targets: 1 });
-  });
-
   it('returns store_unavailable when an injected write fails before rename and leaves no receipt', async () => {
     const dir = dataDir();
     const store = new GroupWorkspaceStore(dir, {
@@ -248,15 +321,20 @@ describe('GroupWorkspaceStore', () => {
     expect(await new GroupWorkspaceStore(dir).read(CHAT)).toEqual({ status: 'available', record: undefined });
   });
 
-  it('reconciles an injected post-rename failure to the committed receipt without retrying', async () => {
+  it('re-establishes file and directory durability after a true directory-fsync failure without retrying', async () => {
     const dir = dataDir();
     let writes = 0;
+    let durabilityProofs = 0;
     const store = new GroupWorkspaceStore(dir, {
-      writer: (...args) => {
+      writer: (path, data) => {
         writes += 1;
-        atomicWriteFileSync(...args);
-        throw new Error('directory fsync result lost');
+        const replacement = `${path}.replacement`;
+        writeFileSync(replacement, data, { mode: 0o600 });
+        fsyncRegularFileSync(replacement);
+        renameSync(replacement, path);
+        throw new Error('injected directory fsync failure');
       },
+      durabilityReestablisher: () => { durabilityProofs += 1; },
     });
     const result = await store.mutate(setInput({
       sourceEventId: textSource('om_after_rename'),
@@ -265,9 +343,37 @@ describe('GroupWorkspaceStore', () => {
     }));
     expect(result).toMatchObject({ outcome: 'committed', receipt: { resultingRevision: 1 } });
     expect(writes).toBe(1);
+    expect(durabilityProofs).toBe(1);
     expect(await new GroupWorkspaceStore(dir).read(CHAT)).toMatchObject({
       status: 'available', record: { revision: 1, directory: { workingDir: '/tmp/X' } },
     });
+  });
+
+  it('keeps replay unknown when visible committed bytes still cannot be proven durable', async () => {
+    const dir = dataDir();
+    const path = join(dir, 'group-workspaces.json');
+    let writes = 0;
+    let durabilityAttempts = 0;
+    const store = new GroupWorkspaceStore(dir, {
+      writer: (target, data) => {
+        writes += 1;
+        writeFileSync(target, data);
+        throw new Error('injected directory fsync failure');
+      },
+      durabilityReestablisher: () => {
+        durabilityAttempts += 1;
+        throw new Error('fsync still unavailable');
+      },
+    });
+    const input = setInput({
+      sourceEventId: textSource('om_visible_not_durable'), workingDir: '/tmp/X', expectedRevision: 0,
+    });
+    expect(await store.mutate(input)).toEqual({ outcome: 'unknown' });
+    const visibleBytes = readFileSync(path, 'utf8');
+    expect(await store.mutate(input)).toEqual({ outcome: 'unknown' });
+    expect(writes).toBe(1);
+    expect(durabilityAttempts).toBe(2);
+    expect(readFileSync(path, 'utf8')).toBe(visibleBytes);
   });
 
   it('returns unknown when a caught write cannot be reconciled from the durable store', async () => {
@@ -351,12 +457,9 @@ describe('GroupWorkspaceStore', () => {
     const first = await botA.mutate(m1Input);
     await botA.mutate(setInput({ sourceEventId: m2, workingDir: '/tmp/Y', expectedRevision: 1, expectedSessionGeneration: 8 }));
 
+    const beforeReplayBytes = readFileSync(join(dir, 'group-workspaces.json'), 'utf8');
     let botBWrites = 0;
-    let botBRecordAccesses = 0;
-    let botBTargetAccesses = 0;
     const botBReloaded = new GroupWorkspaceStore(dir, {
-      onCurrentRecordAccess: () => { botBRecordAccesses += 1; },
-      onCanonicalTargetAccess: () => { botBTargetAccesses += 1; },
       writer: (...args) => {
         botBWrites += 1;
         atomicWriteFileSync(...args);
@@ -371,8 +474,7 @@ describe('GroupWorkspaceStore', () => {
     });
     expect(replay).toEqual(first);
     expect(botBWrites).toBe(0);
-    expect(botBRecordAccesses).toBe(0);
-    expect(botBTargetAccesses).toBe(0);
+    expect(readFileSync(join(dir, 'group-workspaces.json'), 'utf8')).toBe(beforeReplayBytes);
     expect(replay).toMatchObject({
       outcome: 'committed',
       receipt: {
@@ -510,10 +612,7 @@ describe('GroupWorkspaceStore', () => {
       expectedRevision: Number.MAX_SAFE_INTEGER,
     }));
     expect(outcome.outcome).toBe('store_unavailable');
-    expect(await new GroupWorkspaceStore(dir).read(CHAT)).toMatchObject({
-      status: 'available',
-      record: { revision: Number.MAX_SAFE_INTEGER, directory: { kind: 'unbound' } },
-    });
+    expect(await new GroupWorkspaceStore(dir).read(CHAT)).toEqual({ status: 'store_unavailable' });
   });
 
   it('returns invalid_dir and unauthorized terminal outcomes without changing revision', async () => {

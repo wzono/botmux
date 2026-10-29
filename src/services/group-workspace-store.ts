@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync } from 'node:fs';
-import { isAbsolute, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import type { TenantHumanId } from './bot-admin-unions-store.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { fsyncFilesAndDirectorySync } from '../utils/fs-durability.js';
 import { withFileLock } from '../utils/file-lock.js';
 
 export const GROUP_WORKSPACE_STORE_FILE = 'group-workspaces.json';
@@ -122,13 +123,12 @@ export type GroupWorkspaceReadResult =
   | { status: 'store_unavailable' };
 
 type GroupWorkspaceWriter = typeof atomicWriteFileSync;
+type DurabilityReestablisher = (filePath: string) => void;
 
 export interface GroupWorkspaceStoreOptions {
   lockTimeoutMs?: number;
   writer?: GroupWorkspaceWriter;
-  onRegistryRead?: () => void;
-  onCurrentRecordAccess?: () => void;
-  onCanonicalTargetAccess?: () => void;
+  durabilityReestablisher?: DurabilityReestablisher;
 }
 
 function digest(domain: string, value: unknown): string {
@@ -188,12 +188,24 @@ export function groupWorkspaceOperationKey(sourceEventId: string, kind: GroupOpe
   return digest('group-workspace-operation-v1', [OPERATION_KEY_VERSION, sourceEventId, kind]);
 }
 
+function nullMap<T>(): Record<string, T> {
+  return Object.create(null) as Record<string, T>;
+}
+
 function emptyRegistry(): GroupWorkspaceRegistry {
-  return { schemaVersion: SCHEMA_VERSION, records: {}, receipts: {} };
+  return { schemaVersion: SCHEMA_VERSION, records: nullMap(), receipts: nullMap() };
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function own<T>(map: Record<string, T>, key: string): T | undefined {
+  return Object.prototype.hasOwnProperty.call(map, key) ? map[key] : undefined;
+}
+
+function toNullMap<T>(value: Record<string, T>): Record<string, T> {
+  return Object.assign(nullMap<T>(), value);
 }
 
 function isTenantHumanId(value: unknown): value is TenantHumanId {
@@ -240,6 +252,7 @@ function validateReceipt(value: unknown, key: string): asserts value is GroupOpe
     || value.operationKey !== groupWorkspaceOperationKey(value.sourceEventId, value.kind)
     || typeof value.payloadDigest !== 'string' || !value.payloadDigest
     || typeof value.chatId !== 'string' || !value.chatId
+    || (value.originMessageId !== undefined && !isStableOpaqueId(value.originMessageId))
     || !TERMINAL_OUTCOMES.has(value.outcome as GroupOperationTerminalOutcome)
     || !isTenantHumanId(value.actor)
     || !Number.isFinite(value.completedAt)
@@ -256,6 +269,9 @@ function validateReceipt(value: unknown, key: string): asserts value is GroupOpe
   const committed = value.outcome === 'committed';
   if (committed !== (value.resultingRevision !== undefined && value.resultingDirectory !== undefined)) {
     throw new Error(`invalid group workspace receipt outcome shape: ${key}`);
+  }
+  if (committed && value.resultingRevision !== (value.expectedRevision as number) + 1) {
+    throw new Error(`invalid group workspace committed revision: ${key}`);
   }
   if (value.kind === 'set') {
     if (typeof value.canonicalTargetWorkingDir !== 'string') {
@@ -299,16 +315,36 @@ function readRegistry(path: string): GroupWorkspaceRegistry {
   }
   for (const [key, value] of Object.entries(parsed.records)) validateRecord(value, key);
   for (const [key, value] of Object.entries(parsed.receipts)) validateReceipt(value, key);
-  const registry = parsed as unknown as GroupWorkspaceRegistry;
+  const registry: GroupWorkspaceRegistry = {
+    schemaVersion: SCHEMA_VERSION,
+    records: toNullMap(parsed.records as Record<string, GroupWorkspaceRecord>),
+    receipts: toNullMap(parsed.receipts as Record<string, GroupOperationReceipt>),
+  };
+  const committedByChatRevision = new Map<string, GroupOperationReceipt>();
   for (const receipt of Object.values(registry.receipts)) {
     if (receipt.outcome !== 'committed') continue;
-    const record = registry.records[receipt.chatId];
+    const record = own(registry.records, receipt.chatId);
     if (!record || receipt.resultingRevision! > record.revision) {
       throw new Error(`committed group workspace receipt is ahead of record: ${receipt.operationKey}`);
     }
-    if (receipt.resultingRevision === record.revision
-      && JSON.stringify(receipt.resultingDirectory) !== JSON.stringify(record.directory)) {
-      throw new Error(`latest group workspace receipt disagrees with record: ${receipt.operationKey}`);
+    const historyKey = JSON.stringify([receipt.chatId, receipt.resultingRevision]);
+    if (committedByChatRevision.has(historyKey)) {
+      throw new Error(`duplicate committed group workspace revision: ${historyKey}`);
+    }
+    committedByChatRevision.set(historyKey, receipt);
+  }
+  for (const record of Object.values(registry.records)) {
+    for (let revision = 1; revision <= record.revision; revision += 1) {
+      if (!committedByChatRevision.has(JSON.stringify([record.chatId, revision]))) {
+        throw new Error(`missing committed group workspace revision: ${record.chatId}:${revision}`);
+      }
+    }
+    const latest = committedByChatRevision.get(JSON.stringify([record.chatId, record.revision]));
+    if (!latest
+      || JSON.stringify(latest.resultingDirectory) !== JSON.stringify(record.directory)
+      || !sameActor(latest.actor, record.updatedBy)
+      || latest.completedAt !== record.updatedAt) {
+      throw new Error(`latest group workspace receipt disagrees with record: ${record.chatId}`);
     }
   }
   return registry;
@@ -363,17 +399,14 @@ export class GroupWorkspaceStore {
   private readonly path: string;
   private readonly lockTimeoutMs: number | undefined;
   private readonly writer: GroupWorkspaceWriter;
-  private readonly onRegistryRead: (() => void) | undefined;
-  private readonly onCurrentRecordAccess: (() => void) | undefined;
-  private readonly onCanonicalTargetAccess: (() => void) | undefined;
+  private readonly durabilityReestablisher: DurabilityReestablisher;
 
   constructor(dataDir: string, options: GroupWorkspaceStoreOptions = {}) {
     this.path = join(dataDir, GROUP_WORKSPACE_STORE_FILE);
     this.lockTimeoutMs = options.lockTimeoutMs;
     this.writer = options.writer ?? atomicWriteFileSync;
-    this.onRegistryRead = options.onRegistryRead;
-    this.onCurrentRecordAccess = options.onCurrentRecordAccess;
-    this.onCanonicalTargetAccess = options.onCanonicalTargetAccess;
+    this.durabilityReestablisher = options.durabilityReestablisher
+      ?? (filePath => fsyncFilesAndDirectorySync(dirname(filePath), [filePath]));
   }
 
   async read(chatId: string): Promise<GroupWorkspaceReadResult> {
@@ -381,7 +414,7 @@ export class GroupWorkspaceStore {
       mkdirSync(resolve(this.path, '..'), { recursive: true });
       return await withFileLock(this.path, async () => {
         const registry = readRegistry(this.path);
-        return { status: 'available' as const, record: cloneRecord(registry.records[chatId]) };
+        return { status: 'available' as const, record: cloneRecord(own(registry.records, chatId)) };
       }, { maxWaitMs: this.lockTimeoutMs });
     } catch {
       return { status: 'store_unavailable' };
@@ -395,14 +428,18 @@ export class GroupWorkspaceStore {
     try {
       mkdirSync(resolve(this.path, '..'), { recursive: true });
       return await withFileLock(this.path, async () => {
-        this.onRegistryRead?.();
         const registry = readRegistry(this.path);
 
         // Replay is intentionally decided before reading the current record/revision.
-        const existing = registry.receipts[operationKey];
+        const existing = own(registry.receipts, operationKey);
         if (existing) {
           if (existing.payloadDigest !== payloadDigest || existing.chatId !== input.chatId) {
             return { outcome: 'protocol_conflict' as const, existingReceipt: structuredClone(existing) };
+          }
+          try {
+            this.durabilityReestablisher(this.path);
+          } catch {
+            return { outcome: 'unknown' as const };
           }
           return { outcome: existing.outcome, receipt: structuredClone(existing) };
         }
@@ -415,8 +452,7 @@ export class GroupWorkspaceStore {
           };
         }
 
-        this.onCurrentRecordAccess?.();
-        const current = registry.records[input.chatId];
+        const current = own(registry.records, input.chatId);
         let outcome: Exclude<GroupOperationTerminalOutcome, 'store_unavailable'>;
         let resultingRevision: number | undefined;
         let resultingDirectory: GroupDirectoryState | undefined;
@@ -464,9 +500,7 @@ export class GroupWorkspaceStore {
             ? { expectedSessionGeneration: input.expectedSessionGeneration }
             : {}),
           ...(input.kind === 'set'
-            ? (this.onCanonicalTargetAccess?.(), {
-              canonicalTargetWorkingDir: canonicalWorkingDir(input.requestedWorkingDir),
-            })
+            ? { canonicalTargetWorkingDir: canonicalWorkingDir(input.requestedWorkingDir) }
             : {}),
         };
         registry.receipts[operationKey] = receipt;
@@ -485,9 +519,14 @@ export class GroupWorkspaceStore {
           } catch {
             return { outcome: 'unknown' as const };
           }
-          const durableReceipt = reconciled.receipts[operationKey];
+          const durableReceipt = own(reconciled.receipts, operationKey);
           if (!durableReceipt) return { outcome: 'store_unavailable' as const };
           if (durableReceipt.payloadDigest !== payloadDigest || durableReceipt.chatId !== input.chatId) {
+            return { outcome: 'unknown' as const };
+          }
+          try {
+            this.durabilityReestablisher(this.path);
+          } catch {
             return { outcome: 'unknown' as const };
           }
           return { outcome: durableReceipt.outcome, receipt: structuredClone(durableReceipt) };
