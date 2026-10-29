@@ -1767,7 +1767,7 @@ export function buildNewTopicCliInput(
  * Mirrors buildNewTopicPrompt structure but for subsequent messages.
  * Session ID is omitted for adopt mode and CLIs with injectsSessionContext.
  */
-type FollowUpBlockKey = 'sessionId' | 'role' | 'credentials' | 'summaryMemory' | 'reminder' | 'whiteboard' | 'groupHistory' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
+type FollowUpBlockKey = 'sessionId' | 'role' | 'credentials' | 'summaryMemory' | 'formatting' | 'reminder' | 'whiteboard' | 'groupHistory' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
 
 /**
  * 按既有顺序构造 follow-up 的各个块。inline 模式直接 join；hook 模式
@@ -1840,6 +1840,9 @@ function buildFollowUpBlocks(
     locale: opts?.locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, opts?.locale);
+  const formattingBlock = opts?.cliId !== 'mira' && !noTransport
+    ? `<botmux_formatting>${t('ai.followup.feishu_safe_emphasis', undefined, opts?.locale)}</botmux_formatting>`
+    : '';
   const skipSessionId = opts?.isAdoptMode || (opts?.cliId
     ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
     : false);
@@ -1860,6 +1863,7 @@ function buildFollowUpBlocks(
     }
   }
   if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
+  if (formattingBlock && !bare) blocks.push({ key: 'formatting', text: formattingBlock });
   // transcript：不注入 reminder（判定同样落在 KEY 选择层，hook 模式的 sidecar 自然为空
   // → buildFollowUpCliInput 回退 inline 且不写 sidecar）。
   if (opts?.cliId !== 'mira' && !transcript) {
@@ -1909,6 +1913,9 @@ function buildFollowUpBlocks(
       })
       : hookMode ? content : `<user_message>\n${content}\n</user_message>`,
   });
+  // transcript + solo keeps the historical contract that visible content starts
+  // with the user's text. Hook mode still extracts this block into its sidecar.
+  if (formattingBlock && bare) blocks.push({ key: 'formatting', text: formattingBlock });
 
   const senderBlock = bare ? '' : renderSenderTag(opts?.sender, opts?.larkAppId);
   if (senderBlock) blocks.push({ key: 'sender', text: senderBlock });
@@ -2109,7 +2116,7 @@ export function buildFollowUpCliInput(
   const hookTurnId = opts?.turnId;
   if (resolveEnvelopeInjectionMode(opts) === 'hook' && hookTurnId) {
     const blocks = buildFollowUpBlocks(content, sessionId, opts, true);
-    const ENVELOPE_KEYS = new Set<FollowUpBlockKey>(['reminder', 'whiteboard', 'sender', 'mentions']);
+    const ENVELOPE_KEYS = new Set<FollowUpBlockKey>(['formatting', 'reminder', 'whiteboard', 'sender', 'mentions']);
     const ptyText = blocks
       .filter((b) => !ENVELOPE_KEYS.has(b.key))
       .map((b) => b.text)
