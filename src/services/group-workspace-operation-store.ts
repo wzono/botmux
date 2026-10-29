@@ -13,6 +13,8 @@ export type RepoGroupOperationPhase =
   | 'session_committed'
   | 'group_committed'
   | 'conflict'
+  | 'invalid_dir'
+  | 'unauthorized'
   | 'store_unavailable'
   | 'unknown';
 
@@ -84,7 +86,7 @@ function isActor(value: unknown): value is TenantHumanId {
 }
 
 const PHASES = new Set<RepoGroupOperationPhase>([
-  'prepared', 'session_committed', 'group_committed', 'conflict', 'store_unavailable', 'unknown',
+  'prepared', 'session_committed', 'group_committed', 'conflict', 'invalid_dir', 'unauthorized', 'store_unavailable', 'unknown',
 ]);
 
 function validNonnegativeInteger(value: unknown): value is number {
@@ -111,7 +113,8 @@ function validateJournal(value: unknown, key: string): asserts value is RepoGrou
     || (value.phase === 'prepared' && (value.sessionGenerationAfter !== undefined || value.groupRevisionAfter !== undefined))
     || (value.phase === 'session_committed' && value.sessionGenerationAfter === undefined)
     || (value.phase === 'group_committed' && (value.sessionGenerationAfter === undefined || value.groupRevisionAfter === undefined))
-    || ((value.phase === 'conflict' || value.phase === 'store_unavailable') && value.sessionGenerationAfter === undefined)) {
+    || ((value.phase === 'conflict' || value.phase === 'invalid_dir' || value.phase === 'unauthorized'
+      || value.phase === 'store_unavailable') && value.sessionGenerationAfter === undefined)) {
     throw new Error(`invalid group workspace operation journal: ${key}`);
   }
 }
@@ -164,7 +167,8 @@ function sameFrozenIntent(left: RepoGroupOperationJournal, right: RepoGroupOpera
 function mayTransition(from: RepoGroupOperationPhase, to: RepoGroupOperationPhase): boolean {
   if (from === 'prepared') return to === 'session_committed' || to === 'unknown';
   if (from === 'session_committed') {
-    return to === 'group_committed' || to === 'conflict' || to === 'store_unavailable' || to === 'unknown';
+    return to === 'group_committed' || to === 'conflict' || to === 'invalid_dir' || to === 'unauthorized'
+      || to === 'store_unavailable' || to === 'unknown';
   }
   return false;
 }
@@ -268,7 +272,7 @@ export class GroupWorkspaceOperationStore {
 
   async convergeReceipt(
     operationKey: string,
-    phase: Extract<RepoGroupOperationPhase, 'group_committed' | 'conflict' | 'store_unavailable'>,
+    phase: Extract<RepoGroupOperationPhase, 'group_committed' | 'conflict' | 'invalid_dir' | 'unauthorized' | 'store_unavailable'>,
     patch: Pick<RepoGroupOperationJournal, 'updatedAt'>
       & Partial<Pick<RepoGroupOperationJournal, 'groupRevisionAfter'>>,
   ): Promise<OperationTransitionResult> {

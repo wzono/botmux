@@ -10,6 +10,7 @@ import {
 } from '../src/services/group-workspace-operation-store.js';
 import {
   GroupWorkspaceOperationCoordinator,
+  executeGroupWorkspaceUnbind,
   type GroupCommitReceipt,
   type GroupCommitResult,
   type GroupWorkspaceOperationDependencies,
@@ -180,6 +181,52 @@ const REQUEST = {
   operationKey: BASE.operationKey, sourceEventId: BASE.sourceEventId, kind: BASE.kind,
   payloadDigest: BASE.payloadDigest, chatId: BASE.chatId, sessionId: BASE.sessionId, actor: ACTOR,
 };
+
+describe('executeGroupWorkspaceUnbind', () => {
+  function unbindHarness(crashAt?: string) {
+    const dataDir = dir();
+    const journalStore = new GroupWorkspaceOperationStore(dataDir);
+    const receipts = new Map<string, any>();
+    let revision = 2;
+    const sourceEventId = BASE.sourceEventId;
+    const operationKey = groupWorkspaceOperationKey(sourceEventId, 'unbind');
+    const deps = {
+      journalStore,
+      now: () => 100,
+      readCurrentRevision: async () => ({ status: 'available' as const, revision }),
+      readReceipt: async (key: string) => receipts.has(key)
+        ? { status: 'found' as const, receipt: receipts.get(key) }
+        : { status: 'missing' as const },
+      mutate: async (input: any) => {
+        revision += 1;
+        const receipt = { operationKey, sourceEventId, kind: 'unbind', payloadDigest: input.payloadDigest
+          ?? 'unused', chatId: BASE.chatId, outcome: 'committed', resultingRevision: revision,
+          resultingDirectory: { kind: 'unbound' }, actor: ACTOR, completedAt: input.now,
+          expectedRevision: input.expectedRevision };
+        const { canonicalGroupOperationPayloadDigest } = await import('../src/services/group-workspace-store.js');
+        receipt.payloadDigest = canonicalGroupOperationPayloadDigest(input);
+        receipts.set(operationKey, receipt);
+        return { outcome: 'committed' as const, receipt };
+      },
+      afterBoundary: async (boundary: string) => { if (boundary === crashAt) throw new Error(boundary); },
+    };
+    const request = { sourceEventId, chatId: BASE.chatId, actor: ACTOR };
+    return { deps, request, journalStore };
+  }
+
+  it.each(['commit_before_readback', 'readback_before_convergence', 'convergence_before_persisted_readback'])
+  ('returns success only after replay converges and re-reads the journal after %s', async boundary => {
+    const h = unbindHarness(boundary);
+    await expect(executeGroupWorkspaceUnbind(h.request, h.deps)).rejects.toThrow(boundary);
+    h.deps.afterBoundary = async () => undefined;
+    await expect(executeGroupWorkspaceUnbind(h.request, h.deps)).resolves.toMatchObject({
+      status: 'group_committed', groupRevision: 3,
+    });
+    await expect(h.journalStore.getByIntent(h.request.sourceEventId, 'unbind')).resolves.toMatchObject({
+      status: 'found', journal: { phase: 'group_committed', groupRevisionAfter: 3 },
+    });
+  });
+});
 
 describe('GroupWorkspaceOperationCoordinator', () => {
   it('rejects unbind at the session-to-group coordinator seam', async () => {

@@ -394,6 +394,30 @@ function sameActor(left: TenantHumanId, right: TenantHumanId): boolean {
   return left.tenantKey === right.tenantKey && left.unionId === right.unionId;
 }
 
+/** Exact authoritative receipt match for a frozen mutation intent. */
+export function groupWorkspaceReceiptMatchesMutation(
+  receipt: GroupOperationReceipt,
+  input: GroupWorkspaceMutation,
+): boolean {
+  return receipt.operationKey === groupWorkspaceOperationKey(input.sourceEventId, input.kind)
+    && receipt.sourceEventId === input.sourceEventId
+    && receipt.kind === input.kind
+    && receipt.payloadDigest === canonicalGroupOperationPayloadDigest(input)
+    && receipt.chatId === input.chatId
+    && receipt.expectedRevision === input.expectedRevision
+    && receipt.originMessageId === input.originMessageId
+    && sameActor(receipt.actor, input.actor)
+    && (input.kind === 'unbind'
+      ? receipt.canonicalTargetWorkingDir === undefined
+        && receipt.expectedSessionGeneration === undefined
+        && (receipt.outcome !== 'committed' || receipt.resultingDirectory?.kind === 'unbound')
+      : receipt.canonicalTargetWorkingDir === canonicalWorkingDir(input.requestedWorkingDir)
+        && receipt.expectedSessionGeneration === input.expectedSessionGeneration
+        && (receipt.outcome !== 'committed'
+          || (receipt.resultingDirectory?.kind === 'bound'
+            && receipt.resultingDirectory.workingDir === canonicalWorkingDir(input.requestedWorkingDir))));
+}
+
 function actorAllowed(input: GroupWorkspaceMutation, current: GroupWorkspaceRecord | undefined): boolean {
   if (!input.authorized) return false;
   const managers = current?.workspaceManagers;

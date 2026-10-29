@@ -603,6 +603,8 @@ export type GroupWorkspaceRepoEntrypointResult =
   | { status: 'store_unavailable' }
   | { status: 'unknown' }
   | { status: 'protocol_conflict' }
+  | { status: 'invalid_dir' }
+  | { status: 'unauthorized' }
   | { status: 'aborted' };
 
 export type GroupWorkspaceRepoEntrypointRequest = {
@@ -656,7 +658,9 @@ export async function runGroupWorkspaceRepoEntrypoint(
     : await deps.executeUnbind({ ...request, kind: 'unbind', sourceEventId: source.sourceEventId });
   const key = result.status === 'group_committed'
     ? request.kind === 'unbind' ? 'cmd.repo.group.unbind_committed' : 'cmd.repo.group.committed'
-    : `cmd.repo.group.${result.status}`;
+    : request.kind === 'unbind'
+      ? `cmd.repo.group.unbind_${result.status}`
+      : `cmd.repo.group.${result.status}`;
   await deps.reply(t(key, result.status === 'group_committed'
     ? { revision: result.groupRevision }
     : undefined, deps.locale));
@@ -666,17 +670,21 @@ export async function runGroupWorkspaceRepoEntrypoint(
 export interface GroupWorkspaceRepoShowLayer {
   workingDir?: string;
   source: string;
+  revision?: number;
 }
 
 export interface GroupWorkspaceRepoShowState {
   session?: GroupWorkspaceRepoShowLayer;
-  oncall?: GroupWorkspaceRepoShowLayer;
+  explicitOncall?: GroupWorkspaceRepoShowLayer;
+  defaultOncall?: GroupWorkspaceRepoShowLayer;
   group: {
     state: 'bound' | 'unbound' | 'missing' | 'unavailable';
     workingDir?: string;
     revision?: number;
     source?: string;
     health: string;
+    updatedAt?: number;
+    managers?: string[];
   };
   botDefault?: GroupWorkspaceRepoShowLayer;
   resolved?: GroupWorkspaceRepoShowLayer;
@@ -685,12 +693,14 @@ export interface GroupWorkspaceRepoShowState {
 export function formatGroupWorkspaceRepoShow(state: GroupWorkspaceRepoShowState, locale: Locale = 'zh'): string {
   const none = locale === 'en' ? 'none' : '无';
   const layer = (name: string, value?: GroupWorkspaceRepoShowLayer) =>
-    `${name}: ${value?.workingDir ?? none} (${value?.source ?? none})`;
+    `${name}: ${value?.workingDir ?? none} (${value?.source ?? none}${value?.revision !== undefined ? `; revision ${value.revision}` : ''})`;
   const groupDirectory = state.group.state === 'bound' ? state.group.workingDir ?? none : state.group.state;
+  const managers = state.group.managers?.length ? state.group.managers.join(', ') : none;
   return [
     layer('session', state.session),
-    layer('oncall', state.oncall),
-    `group: ${groupDirectory} (${state.group.source ?? none}; revision ${state.group.revision ?? none}; health ${state.group.health})`,
+    layer('explicit oncall', state.explicitOncall),
+    layer('default oncall', state.defaultOncall),
+    `group: ${groupDirectory} (${state.group.source ?? none}; revision ${state.group.revision ?? none}; updated ${state.group.updatedAt ?? none}; managers ${managers}; health ${state.group.health})`,
     layer('default', state.botDefault),
     layer('resolved', state.resolved),
   ].join('\n');

@@ -9,7 +9,11 @@ import {
   groupWorkspaceOperationKey,
 } from './services/group-workspace-store.js';
 import { GroupWorkspaceOperationStore } from './services/group-workspace-operation-store.js';
-import { GroupWorkspaceOperationCoordinator, type GroupCommitReceipt } from './core/group-workspace-operation.js';
+import {
+  GroupWorkspaceOperationCoordinator,
+  executeGroupWorkspaceUnbind,
+  type GroupCommitReceipt,
+} from './core/group-workspace-operation.js';
 import { DecisionBoardService } from './core/decision-board/service.js';
 import { lookupChatAcrossBots } from './core/decision-board/chat-lookup.js';
 import { createBoardChatProbes, sameOwnerAs } from './services/board-chat-probes.js';
@@ -6357,19 +6361,35 @@ const commandDeps: CommandHandlerDeps = {
   readGroupWorkspaceShow: async ds => {
     const group = await groupWorkspaceStore.read(ds.chatId);
     const oncall = findOncallChat(ds.larkAppId, ds.chatId);
-    const botDefault = effectiveDefaultWorkingDir(getBot(ds.larkAppId).config);
+    const botConfig = getBot(ds.larkAppId).config;
+    const botDefault = botConfig.defaultWorkingDir;
+    const defaultOncall = botConfig.defaultOncall?.enabled ? botConfig.defaultOncall.workingDir : undefined;
+    const persistedWorkingDir = ds.session.workingDir;
+    const runtimeWorkingDir = ds.workingDir ? expandHome(ds.workingDir) : undefined;
+    const resolvedWorkingDir = getSessionWorkingDir(ds);
+    const resolvedSource = runtimeWorkingDir && resolvedWorkingDir === runtimeWorkingDir
+      ? 'runtime-session'
+      : persistedWorkingDir && resolvedWorkingDir === expandHome(persistedWorkingDir)
+        ? 'session-persisted'
+        : 'current-policy (legacy/unknown provenance)';
     return {
-      session: { workingDir: getSessionWorkingDir(ds), source: 'session' },
-      ...(oncall?.workingDir ? { oncall: { workingDir: oncall.workingDir, source: 'oncall' } } : {}),
+      session: { workingDir: persistedWorkingDir ?? resolvedWorkingDir,
+        source: persistedWorkingDir ? 'session-persisted (legacy/unknown provenance)' : 'not-persisted' },
+      ...(oncall?.workingDir ? { explicitOncall: { workingDir: oncall.workingDir, source: 'oncall-explicit' } } : {}),
+      ...(defaultOncall ? { defaultOncall: { workingDir: defaultOncall, source: 'default-oncall-config' } } : {}),
       group: group.status === 'store_unavailable'
         ? { state: 'unavailable', health: 'store_unavailable' }
         : !group.record ? { state: 'missing', health: 'available' }
           : group.record.directory.kind === 'unbound'
-            ? { state: 'unbound', revision: group.record.revision, source: 'group', health: 'tombstone' }
+            ? { state: 'unbound', revision: group.record.revision, source: 'group', health: 'tombstone',
+              updatedAt: group.record.updatedAt,
+              managers: group.record.workspaceManagers?.map(manager => `${manager.tenantKey}/${manager.unionId}`) }
             : { state: 'bound', workingDir: group.record.directory.workingDir, revision: group.record.revision,
-              source: 'group', health: (await groupWorkspaceStore.probeBoundDirectoryForConsumption(ds.chatId)).status },
-      ...(botDefault ? { botDefault: { workingDir: botDefault, source: 'bot-default' } } : {}),
-      resolved: { workingDir: getSessionWorkingDir(ds), source: 'session' },
+              source: 'group', updatedAt: group.record.updatedAt,
+              managers: group.record.workspaceManagers?.map(manager => `${manager.tenantKey}/${manager.unionId}`),
+              health: (await groupWorkspaceStore.probeBoundDirectoryForConsumption(ds.chatId)).status },
+      ...(botDefault ? { botDefault: { workingDir: botDefault, source: 'bot-default-config' } } : {}),
+      resolved: { workingDir: resolvedWorkingDir, source: resolvedSource },
     };
   },
 };
@@ -32748,74 +32768,21 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               : { status: result.status };
           },
           executeUnbind: async request => {
-            const payloadDigest = canonicalGroupOperationPayloadDigest({
-              kind: 'unbind', chatId: request.chatId, sourceEventId: request.sourceEventId,
-              expectedRevision: 0, actor: request.actor, authorized: true, now: 0,
-            });
-            const operationKey = groupWorkspaceOperationKey(request.sourceEventId, 'unbind');
-            const receipt = await groupWorkspaceStore.readReceipt(operationKey);
-            if (receipt.status === 'found') {
-              if (receipt.receipt.payloadDigest !== payloadDigest || receipt.receipt.chatId !== request.chatId) {
-                return { status: 'protocol_conflict' };
-              }
-              return receipt.receipt.outcome === 'committed'
-                ? { status: 'group_committed', groupRevision: receipt.receipt.resultingRevision! }
-                : receipt.receipt.outcome === 'conflict' ? { status: 'conflict' }
-                  : { status: 'store_unavailable' };
-            }
-            if (receipt.status === 'store_unavailable') return { status: 'unknown' };
-            const prior = await groupWorkspaceOperationStore.getByIntent(request.sourceEventId, 'unbind');
-            if (prior.status === 'store_unavailable') return { status: 'store_unavailable' };
-            let journal = prior.status === 'found' ? prior.journal : undefined;
-            if (journal && (journal.payloadDigest !== payloadDigest || journal.chatId !== request.chatId
-              || journal.actor.tenantKey !== request.actor.tenantKey || journal.actor.unionId !== request.actor.unionId)) {
-              return { status: 'protocol_conflict' };
-            }
-            if (!journal) {
-              const current = await groupWorkspaceStore.read(request.chatId);
-              if (current.status !== 'available') return { status: 'store_unavailable' };
-              const prepared = await groupWorkspaceOperationStore.prepare({
-                operationKey, sourceEventId: request.sourceEventId, kind: 'unbind', payloadDigest,
-                chatId: request.chatId, sessionId: 'group-workspace-unbind',
-                expectedSessionGeneration: 0, expectedGroupRevision: current.record?.revision ?? 0,
-                targetWorkingDir: '/', actor: request.actor, phase: 'prepared', updatedAt: Date.now(),
-              });
-              if (prepared.status === 'store_unavailable') return { status: 'store_unavailable' };
-              if (prepared.status === 'protocol_conflict') return { status: 'protocol_conflict' };
-              journal = prepared.journal;
-              const advanced = await groupWorkspaceOperationStore.transition(operationKey, 'session_committed', {
-                sessionGenerationAfter: 0, updatedAt: Date.now(),
-              });
-              if (advanced.status !== 'updated') return { status: 'unknown' };
-              journal = advanced.journal;
-            }
-            if (journal.phase === 'group_committed' && journal.groupRevisionAfter) {
-              return { status: 'group_committed', groupRevision: journal.groupRevisionAfter };
-            }
-            if (journal.phase === 'conflict') return { status: 'conflict' };
-            if (journal.phase === 'store_unavailable') return { status: 'store_unavailable' };
-            if (journal.phase !== 'session_committed') return { status: 'unknown' };
-            const result = await groupWorkspaceStore.mutate({
-              kind: 'unbind', chatId: request.chatId, sourceEventId: request.sourceEventId,
+            return executeGroupWorkspaceUnbind({
+              sourceEventId: request.sourceEventId, chatId: request.chatId, actor: request.actor,
               ...(route.originMessageId ? { originMessageId: route.originMessageId } : {}),
-              expectedRevision: journal.expectedGroupRevision, actor: request.actor,
-              authorized: true, now: Date.now(),
+            }, {
+              journalStore: groupWorkspaceOperationStore,
+              now: Date.now,
+              readReceipt: operationKey => groupWorkspaceStore.readReceipt(operationKey),
+              readCurrentRevision: async chatId => {
+                const current = await groupWorkspaceStore.read(chatId);
+                return current.status === 'available'
+                  ? { status: 'available', revision: current.record?.revision ?? 0 }
+                  : current;
+              },
+              mutate: input => groupWorkspaceStore.mutate(input),
             });
-            const phase = result.outcome === 'committed' ? 'group_committed'
-              : result.outcome === 'conflict' ? 'conflict'
-                : result.outcome === 'unknown' ? 'unknown' : 'store_unavailable';
-            if (result.outcome !== 'protocol_conflict') {
-              await groupWorkspaceOperationStore.transition(operationKey, phase, {
-                ...(result.outcome === 'committed' ? { groupRevisionAfter: result.receipt.resultingRevision } : {}),
-                updatedAt: Date.now(),
-              });
-            }
-            return result.outcome === 'committed'
-              ? { status: 'group_committed', groupRevision: result.receipt.resultingRevision! }
-              : result.outcome === 'conflict' ? { status: 'conflict' }
-                : result.outcome === 'protocol_conflict' ? { status: 'protocol_conflict' }
-                  : result.outcome === 'unknown' ? { status: 'unknown' }
-                    : { status: 'store_unavailable' };
           },
         });
       },

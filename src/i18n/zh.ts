@@ -570,6 +570,14 @@ export const messages: Record<string, string> = {
   'cmd.repo.group.aborted': '⚠️ 会话未切换，群目录也未更新。',
   'cmd.repo.group.committed': '✅ 群目录更新成功（revision {revision}）。',
   'cmd.repo.group.unbind_committed': '✅ 群目录解绑成功（revision {revision}）。',
+  'cmd.repo.group.unbind_conflict': '⚠️ 解绑版本冲突，群目录未更新。请执行 `/repo show` 查看当前状态后重试。',
+  'cmd.repo.group.unbind_store_unavailable': '⚠️ 解绑存储不可用，暂不确认结果。',
+  'cmd.repo.group.unbind_unknown': '⚠️ 解绑结果未知；为避免覆盖，未自动重试。请执行 `/repo show` 检查。',
+  'cmd.repo.group.unbind_protocol_conflict': '⚠️ 解绑请求与同一来源的既有请求冲突，本次未执行。',
+  'cmd.repo.group.unbind_invalid_dir': '⚠️ 解绑请求无效，本次未执行。',
+  'cmd.repo.group.unbind_unauthorized': '⚠️ 无权解绑群目录，本次未执行。',
+  'cmd.repo.group.unbind_aborted': '⚠️ 解绑未执行，群目录未更新。',
+  'cmd.repo.group.unbind_session_committed': '⚠️ 解绑状态异常，暂不确认结果。',
   // 「仅默认目录」模式开启「自动创建 worktree」后，新会话启动时用（daemon 交互新话题 /
   // dashboard 建会话 / webhook 外部事件三条路复用）。
   'worktree.auto_creating': '🌿 正在为本会话创建独立 worktree（含 git fetch，可能需要几秒）…',

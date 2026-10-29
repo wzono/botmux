@@ -56,6 +56,21 @@ describe('group workspace /repo entrypoints', () => {
     expect(h.replies[0]).not.toMatch(/群目录更新成功/);
   });
 
+  it.each([
+    [{ status: 'conflict' as const }, /解绑.*冲突/],
+    [{ status: 'store_unavailable' as const }, /解绑.*不可用/],
+    [{ status: 'unknown' as const }, /解绑.*未知/],
+    [{ status: 'protocol_conflict' as const }, /解绑.*请求.*冲突/],
+    [{ status: 'aborted' as const }, /解绑.*未执行/],
+  ])('uses unbind-specific failure copy without claiming a session switch %#', async (result, pattern) => {
+    const h = harness(result);
+    await runGroupWorkspaceRepoEntrypoint({
+      kind: 'unbind', source: 'text', chatId: 'oc_chat', actor, messageId: 'om_unbind',
+    }, h.deps);
+    expect(h.replies[0]).toMatch(pattern);
+    expect(h.replies[0]).not.toMatch(/会话.*(?:切换|变化)/);
+  });
+
   it('replay success is receipt-derived and the entrypoint performs no switch or write itself', async () => {
     const h = harness({ status: 'group_committed', groupRevision: 3, replayed: true });
     await runGroupWorkspaceRepoEntrypoint(base, h.deps);
@@ -73,15 +88,18 @@ describe('group workspace /repo entrypoints', () => {
     expect(h.replies[0]).toMatch(/群目录解绑成功/);
   });
 
-  it('show reports session, oncall, group, default, final source, revision and health', () => {
+  it('show reports every current persisted layer without collapsing explicit and default oncall', () => {
     const output = formatGroupWorkspaceRepoShow({
-      session: { workingDir: '/repo/session', source: 'explicit' },
-      oncall: { workingDir: '/repo/oncall', source: 'oncall-explicit' },
-      group: { state: 'bound', workingDir: '/repo/group', revision: 7, source: 'group', health: 'usable' },
+      session: { workingDir: '/repo/session', source: 'legacy/unknown', revision: 6 },
+      explicitOncall: { workingDir: '/repo/oncall', source: 'oncall-explicit' },
+      defaultOncall: { workingDir: '/repo/auto', source: 'default-oncall-config' },
+      group: { state: 'bound', workingDir: '/repo/group', revision: 7, source: 'group', health: 'usable',
+        updatedAt: 1234, managers: ['tenant-a/on_manager'] },
       botDefault: { workingDir: '/repo/default', source: 'bot-default' },
-      resolved: { workingDir: '/repo/session', source: 'explicit' },
+      resolved: { workingDir: '/repo/session', source: 'session-persisted' },
     }, 'en');
-    for (const value of ['session', 'oncall', 'group', 'default', 'revision 7', 'usable', 'explicit']) {
+    for (const value of ['session', 'explicit oncall', 'default oncall', 'group', 'default', 'revision 7',
+      'revision 6', 'usable', 'updated 1234', 'tenant-a/on_manager', 'session-persisted', 'legacy/unknown']) {
       expect(output.toLowerCase()).toContain(value);
     }
   });

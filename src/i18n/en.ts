@@ -572,6 +572,14 @@ export const messages: Record<string, string> = {
   'cmd.repo.group.aborted': '⚠️ The session was not switched and the group workspace was not updated.',
   'cmd.repo.group.committed': '✅ Group workspace updated (revision {revision}).',
   'cmd.repo.group.unbind_committed': '✅ Group workspace unbound (revision {revision}).',
+  'cmd.repo.group.unbind_conflict': '⚠️ Unbind revision conflict; the group workspace was not updated. Run `/repo show` and retry.',
+  'cmd.repo.group.unbind_store_unavailable': '⚠️ Unbind storage is unavailable; the result is not confirmed.',
+  'cmd.repo.group.unbind_unknown': '⚠️ The unbind result is unknown. It was not retried automatically; run `/repo show` to inspect it.',
+  'cmd.repo.group.unbind_protocol_conflict': '⚠️ The unbind request conflicts with an existing request from the same source and was not executed.',
+  'cmd.repo.group.unbind_invalid_dir': '⚠️ The unbind request is invalid and was not executed.',
+  'cmd.repo.group.unbind_unauthorized': '⚠️ You are not authorized to unbind the group workspace.',
+  'cmd.repo.group.unbind_aborted': '⚠️ Unbind was not executed; the group workspace was not updated.',
+  'cmd.repo.group.unbind_session_committed': '⚠️ The unbind state is inconsistent; the result is not confirmed.',
   // Used when 「default-directory-only」mode has「auto-create worktree」on, at new
   // session start (shared by interactive new topic / dashboard create / webhook).
   'worktree.auto_creating': '🌿 Creating an isolated worktree for this session (includes a git fetch, may take a few seconds)…',
