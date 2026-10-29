@@ -5,6 +5,7 @@
 // 值导入会把它们打进浏览器 bundle。
 import type {
   BoardBatch,
+  BoardChatCheck,
   BoardDecision,
   BoardDraft,
   BoardEvent,
@@ -39,6 +40,12 @@ export interface RenderedLink {
   label?: string;
   text: string;
   url?: string;
+  /** 仅 chat：这一项的主群。旧 daemon 不给，按第一个群算（见 itemChatView）。 */
+  primary?: boolean;
+  /** 仅 chat：verified / unverified；缺省 = 核实功能上线前的旧关联，不打标。 */
+  chatCheck?: BoardChatCheck;
+  /** 仅 chat：查到的群名（text 已按「标签 > 群名」取好，这里只是原始值）。 */
+  chatName?: string;
 }
 
 export interface StewardStatus {
@@ -66,6 +73,36 @@ export interface BoardItemSummary extends BoardItem {
   unseen: boolean;
   url?: string;
   appLink?: string;
+}
+
+// ─── 事项关联的群 ─────────────────────────────────────────────────────────────
+
+export interface ItemChatView {
+  /** 这一项的群，主群在最前，其余按管家写入的顺序。 */
+  chats: RenderedLink[];
+  primary?: RenderedLink;
+  /** 只在没有群时生效（之后补了群，原因就不再成立）。 */
+  noChatReason?: string;
+  /** 没有群、也没写原因：页面标「缺群」，提醒管家补。 */
+  missing: boolean;
+}
+
+/** 汇总行和详情页共用：从关联里挑出群、定主群（服务端标的 primary，没标就是第一个群）。 */
+export function itemChatView(item: Pick<BoardItem, 'noChatReason'>, links: readonly RenderedLink[]): ItemChatView {
+  const chats = links.filter(l => l.kind === 'chat');
+  const primary = chats.find(l => l.primary) ?? chats[0];
+  const reason = item.noChatReason?.trim();
+  return {
+    chats: primary ? [primary, ...chats.filter(l => l !== primary)] : [],
+    ...(primary ? { primary } : {}),
+    ...(!primary && reason ? { noChatReason: reason } : {}),
+    missing: !primary && !reason,
+  };
+}
+
+/** 详情页下方的关联对象里不再重复列群（群在标题下方单独一栏）。 */
+export function nonChatLinks(links: readonly RenderedLink[]): RenderedLink[] {
+  return links.filter(l => l.kind !== 'chat');
 }
 
 export interface BoardListResponse {
@@ -153,6 +190,65 @@ export function boardSummaryHash(route: { appId?: string; view?: BoardView; q?: 
 
 export function boardItemHash(appId: string, seq: number): string {
   return `#/board/${encodeURIComponent(appId)}/${seq}`;
+}
+
+// ─── 详情页的上一项 / 下一项 ─────────────────────────────────────────────────
+
+/**
+ * owner 进详情页时看到的那份列表：哪张看板、哪个视图 / 搜索、按什么顺序。上一项 / 下一项
+ * 只在这份列表里走，顺序就是 owner 刚才看到的顺序，切换途中不重新排。
+ */
+export interface BoardNavList {
+  appId: string;
+  view: BoardView;
+  q?: string;
+  seqs: number[];
+}
+
+export const BOARD_NAV_STORAGE_KEY = 'botmux.decisionBoard.nav';
+
+export function navListFrom(appId: string, view: BoardView, q: string | undefined, items: readonly { seq: number }[]): BoardNavList {
+  const query = q?.trim();
+  return { appId, view, ...(query ? { q: query } : {}), seqs: items.map(i => i.seq) };
+}
+
+/** 从 sessionStorage 读回来的值不可信：形状不对就当没有。 */
+export function parseNavList(raw: unknown): BoardNavList | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.appId !== 'string' || !r.appId || !isView(r.view as string)) return null;
+  if (!Array.isArray(r.seqs) || !r.seqs.every(n => Number.isSafeInteger(n) && (n as number) > 0)) return null;
+  return { appId: r.appId, view: r.view as BoardView, ...(typeof r.q === 'string' && r.q ? { q: r.q } : {}), seqs: [...r.seqs as number[]] };
+}
+
+export interface BoardNeighbors {
+  prev?: number;
+  next?: number;
+  /** 从 1 起的位置。 */
+  position: number;
+  total: number;
+  view: BoardView;
+}
+
+/** 当前项在列表里的前后项；列表不是这张看板的、或者当前项不在列表里，返回 null。 */
+export function boardNeighbors(list: BoardNavList | null | undefined, appId: string, seq: number): BoardNeighbors | null {
+  if (!list || list.appId !== appId) return null;
+  const index = list.seqs.indexOf(seq);
+  if (index < 0) return null;
+  return {
+    ...(index > 0 ? { prev: list.seqs[index - 1] } : {}),
+    ...(index < list.seqs.length - 1 ? { next: list.seqs[index + 1] } : {}),
+    position: index + 1,
+    total: list.seqs.length,
+    view: list.view,
+  };
+}
+
+/** 直接从飞书链接打开详情页（没有经过列表）时，用这一项所在的视图当切换范围。 */
+export function viewForItemState(state: BoardState): BoardView {
+  if (state === 'decide' || state === 'accept') return 'decide';
+  if (state === 'active' || state === 'waiting') return 'active';
+  return 'all';
 }
 
 /** 要打开哪张看板：地址里点名且存在的那张，否则第一张。 */

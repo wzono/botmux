@@ -6,7 +6,7 @@
  * 发布的管理员 union_id 比（管理员在两边可以写成不同形态）。
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -16,7 +16,11 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 });
 
 import { getBot, registerBot, loadBotConfigs } from '../src/bot-registry.js';
-import { canOperate, canTalk, isTrustedSameOwnerSiblingBot, isVerifiedLocalSiblingBot } from '../src/im/lark/event-dispatcher.js';
+import {
+  canOperate, canTalk, evaluateBotTalk, evaluateTalk, isTrustedSameOwnerSiblingBot, isVerifiedLocalSiblingBot,
+  learnSameOwnerSiblingCrossRef, trustsSameOwnerSiblingApp,
+} from '../src/im/lark/event-dispatcher.js';
+import { ensureBotChatGrantMatrix } from '../src/cli/exact-chat-grant-client.js';
 import { computeBotAdminUnions, writeBotAdminUnions } from '../src/services/bot-admin-unions-store.js';
 import { recordTeamBot } from '../src/services/team-bots-store.js';
 
@@ -194,5 +198,153 @@ describe('same-owner sibling bot can operate', () => {
     expect(canOperate(RECV, 'oc_1', 'ou_team_in_recv', 'on_team_bot')).toBe(true);
     getBot(RECV).config.trustSameOwnerBots = false;
     expect(canOperate(RECV, 'oc_1', 'ou_team_in_recv', 'on_team_bot')).toBe(true);
+  });
+});
+
+describe('same-owner sibling bot can talk before this bot has recognized it', () => {
+  // 「还没认出」= 本 bot 的 cross-ref 里没有它（按名字从 @ 里学，可能还没学到）。免 @ 的话题
+  // 种子分支没有冷启动自愈，以前只能靠 create-group 预写的两两本群授权。
+  const COLD_SIB = 'ou_sib_not_learned_yet';
+  const COLD_OTHER = 'ou_other_not_learned_yet';
+  beforeEach(() => { writeFileSync(join(dir, `bot-openids-${RECV}.json`), '{}'); });
+
+  it('the same-owner sibling is let through by the sameOwnerBot leg, unmetered, with no chat grant', () => {
+    expect(getBot(RECV).config.chatGrants).toBeUndefined();
+    expect(evaluateBotTalk(RECV, 'oc_new', COLD_SIB, SIB_UNION)).toEqual({ allowed: true, reason: 'sameOwnerBot' });
+  });
+
+  it('trustSameOwnerBots=false turns the talk leg off as well', () => {
+    getBot(RECV).config.trustSameOwnerBots = false;
+    expect(evaluateBotTalk(RECV, 'oc_new', COLD_SIB, SIB_UNION)).toEqual({ allowed: false, reason: 'none' });
+  });
+
+  it('a sibling with another owner is unaffected: still needs to be recognized (or granted)', () => {
+    expect(evaluateBotTalk(RECV, 'oc_new', COLD_OTHER, OTHER_UNION)).toEqual({ allowed: false, reason: 'none' });
+    getBot(RECV).config.chatGrants = { oc_new: [COLD_OTHER] };
+    expect(evaluateBotTalk(RECV, 'oc_new', COLD_OTHER, OTHER_UNION)).toMatchObject({ allowed: true, reason: 'chatGrant' });
+    writeFileSync(join(dir, `bot-openids-${RECV}.json`), JSON.stringify({ other: OTHER_OPEN }));
+    expect(evaluateBotTalk(RECV, 'oc_x', OTHER_OPEN, OTHER_UNION)).toEqual({ allowed: true, reason: 'peer' });
+  });
+
+  it('a recognized same-owner sibling keeps hitting the peer leg first', () => {
+    writeFileSync(join(dir, `bot-openids-${RECV}.json`), JSON.stringify({ sib: SIB_OPEN }));
+    expect(evaluateBotTalk(RECV, 'oc_new', SIB_OPEN, SIB_UNION)).toEqual({ allowed: true, reason: 'peer' });
+  });
+
+  it('the block list still wins over the same-owner leg', () => {
+    getBot(RECV).resolvedBlockedUsers = [COLD_SIB];
+    expect(evaluateBotTalk(RECV, 'oc_new', COLD_SIB, SIB_UNION)).toEqual({ allowed: false, reason: 'blocked' });
+  });
+
+  it('without a Lark-stamped bot union_id (human path) the leg never fires', () => {
+    expect(evaluateTalk(RECV, 'oc_new', COLD_SIB, undefined, SIB_UNION, 'group')).toEqual({ allowed: false, reason: 'none' });
+    expect(canTalk(RECV, 'oc_new', COLD_SIB)).toBe(false);
+  });
+
+  it('the gate then teaches the cross-ref by union_id, so the next message hits the peer leg', () => {
+    writeFileSync(join(dir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: RECV, botName: 'Recv' }, { larkAppId: SIB, botName: 'SibBot' }, { larkAppId: OTHER, botName: 'OtherBot' },
+    ]));
+    expect(learnSameOwnerSiblingCrossRef(dir, RECV, COLD_SIB, SIB_UNION)).toBe(true);
+    expect(JSON.parse(readFileSync(join(dir, `bot-openids-${RECV}.json`), 'utf-8'))).toEqual({ SibBot: COLD_SIB });
+    expect(evaluateBotTalk(RECV, 'oc_new', COLD_SIB, SIB_UNION)).toEqual({ allowed: true, reason: 'peer' });
+  });
+
+  it('does not teach the cross-ref under a name another local bot also uses, or for an unknown union_id', () => {
+    writeFileSync(join(dir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: RECV, botName: 'Recv' }, { larkAppId: SIB, botName: 'Twin' }, { larkAppId: OTHER, botName: 'twin' },
+    ]));
+    expect(learnSameOwnerSiblingCrossRef(dir, RECV, COLD_SIB, SIB_UNION)).toBe(false);
+    expect(learnSameOwnerSiblingCrossRef(dir, RECV, 'ou_x', 'on_unknown_bot')).toBe(false);
+    expect(readFileSync(join(dir, `bot-openids-${RECV}.json`), 'utf-8')).toBe('{}');
+  });
+
+  it('an unknown or ambiguous union_id is not a sibling', () => {
+    expect(evaluateBotTalk(RECV, 'oc_new', 'ou_stranger', 'on_unknown_bot')).toEqual({ allowed: false, reason: 'none' });
+    writeFileSync(join(dir, 'bot-union-ids.json'), JSON.stringify({
+      [SIB]: { unionId: SIB_UNION, learnedAt: 1 },
+      [OTHER]: { unionId: SIB_UNION, learnedAt: 1 },
+    }));
+    expect(evaluateBotTalk(RECV, 'oc_new', COLD_SIB, SIB_UNION)).toEqual({ allowed: false, reason: 'none' });
+  });
+});
+
+describe('trustsSameOwnerSiblingApp: the talk leg predicted by app_id (create-group)', () => {
+  it('true exactly when the receiver would let the sibling talk as a same-owner bot', () => {
+    expect(trustsSameOwnerSiblingApp(dir, RECV, SIB)).toBe(true);
+    expect(trustsSameOwnerSiblingApp(dir, RECV, OTHER)).toBe(false);
+    expect(trustsSameOwnerSiblingApp(dir, RECV, RECV)).toBe(false);
+    getBot(RECV).config.trustSameOwnerBots = false;
+    expect(trustsSameOwnerSiblingApp(dir, RECV, SIB)).toBe(false);
+  });
+
+  it('false while the sibling has not learned its own union_id, or when that union_id is ambiguous', () => {
+    writeFileSync(join(dir, 'bot-union-ids.json'), JSON.stringify({ [OTHER]: { unionId: OTHER_UNION, learnedAt: 1 } }));
+    expect(trustsSameOwnerSiblingApp(dir, RECV, SIB)).toBe(false);
+    writeFileSync(join(dir, 'bot-union-ids.json'), JSON.stringify({
+      [SIB]: { unionId: SIB_UNION, learnedAt: 1 },
+      [OTHER]: { unionId: SIB_UNION, learnedAt: 1 },
+    }));
+    expect(trustsSameOwnerSiblingApp(dir, RECV, SIB)).toBe(false);
+  });
+
+  it('false (keep writing the grant) when the receiver is not registered in this process', () => {
+    expect(trustsSameOwnerSiblingApp(dir, 'cli_not_registered_here', SIB)).toBe(false);
+  });
+});
+
+describe('create-group grant matrix: no pairwise grant between same-owner bots on this machine', () => {
+  const RECV_UNION = 'on_recv_bot';
+  const daemonOf = (larkAppId: string) => ({ ipcPort: 1, larkAppId });
+
+  beforeEach(() => {
+    // create-group 在一个进程里注册所有参与的 bot，每个都可能是接收方。
+    for (const cfg of loadBotConfigs()) {
+      const st = registerBot(cfg);
+      if (cfg.larkAppId === SIB) st.resolvedAllowedUsers = ['ou_me_in_sib'];
+      if (cfg.larkAppId === OTHER) st.resolvedAllowedUsers = ['ou_someone_in_other'];
+    }
+    getBot(RECV).resolvedAllowedUsers = ['ou_me_in_recv'];
+    writeFileSync(join(dir, 'bot-union-ids.json'), JSON.stringify({
+      [RECV]: { unionId: RECV_UNION, learnedAt: 1 },
+      [SIB]: { unionId: SIB_UNION, learnedAt: 1 },
+      [OTHER]: { unionId: OTHER_UNION, learnedAt: 1 },
+    }));
+  });
+
+  const run = async (participants: string[]) => {
+    const written: Array<[string, string[]]> = [];
+    const looked: string[] = [];
+    const secret = vi.fn(() => 'secret');
+    await ensureBotChatGrantMatrix('oc_new', participants, {
+      findDaemon: appId => { looked.push(appId); return daemonOf(appId); },
+      secret,
+      needsGrant: (receiver, subject) => !trustsSameOwnerSiblingApp(dir, receiver, subject),
+      request: async input => { written.push([input.receiverLarkAppId, input.subjectLarkAppIds ?? []]); return { ok: true }; },
+      retryDelaysMs: [],
+    });
+    return { written, looked, secret };
+  };
+
+  it('writes only the pairs involving a bot of another owner', async () => {
+    const { written } = await run([RECV, SIB, OTHER]);
+    expect(written).toEqual([
+      [RECV, [OTHER]],
+      [SIB, [OTHER]],
+      [OTHER, [RECV, SIB]],
+    ]);
+  });
+
+  it('an all-same-owner group writes nothing and needs neither a daemon nor the secret', async () => {
+    const { written, looked, secret } = await run([RECV, SIB]);
+    expect(written).toEqual([]);
+    expect(looked).toEqual([]);
+    expect(secret).not.toHaveBeenCalled();
+  });
+
+  it('with the switch off on a receiver, that receiver gets its grants again', async () => {
+    getBot(SIB).config.trustSameOwnerBots = false;
+    const { written } = await run([RECV, SIB]);
+    expect(written).toEqual([[SIB, [RECV]]]);
   });
 });
