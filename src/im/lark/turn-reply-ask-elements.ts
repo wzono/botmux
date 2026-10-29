@@ -72,7 +72,9 @@ export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 
   }
   elements.push({ tag: 'markdown', text_size: 'notation', content: [
     t(textReplyRequired ? 'card.ask.text_reply_hint' : 'card.ask.custom_reply_hint', undefined, locale),
-    `${t('card.ask.field.deadline', undefined, locale)}: ${new Date(ask.deadlineAt).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN')}`,
+    ask.deadlineAt === null
+      ? `${t('card.ask.field.deadline', undefined, locale)}: ${t('card.grant.duration_permanent', undefined, locale)}`
+      : `${t('card.ask.field.deadline', undefined, locale)}: ${new Date(ask.deadlineAt).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN')}`,
     t('card.ask.answerable_talk_members', undefined, locale),
   ].join('\n') });
   return elements;

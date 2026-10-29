@@ -20,7 +20,7 @@ import { stripDispatchCompletionProtocol } from './core/dispatch.js';
 import { withConfiguredBotOwner } from './core/bot-owner-attribution.js';
 import { readCanonicalBotActorOwnerBindings } from './core/bot-actor-owner-binding.js';
 import { releaseExplicitAskHandoff, hasExplicitAskHandoff } from './core/ask-broker.js';
-import { createExplicitAskContinuation, explicitAskRecoveryRequest } from './core/explicit-ask-continuation.js';
+import { canResumeExplicitAskInSession, createExplicitAskContinuation, explicitAskRecoveryRequest } from './core/explicit-ask-continuation.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync, mkdirSync, unlinkSync, realpathSync } from 'node:fs';
@@ -929,6 +929,7 @@ import {
   setAskPersistStore as setAskPersistStoreBroker,
   registerAsk as registerAskBroker,
   registerHostAsk,
+  waitForAskDelivery,
   restorePersistedAsks as restorePersistedAsksBroker,
   startHookAskReclaim,
   findPendingAskByAnchor,
@@ -944,6 +945,7 @@ import {
 import { runCompletionProposalContinuation } from './core/completion-proposal-continuation.js';
 import { renderCompletionProposalCard } from './im/lark/completion-proposal-card.js';
 import { parseAskBody, registerAskForResponse } from './core/ask-api.js';
+import { resolveAskRootTarget } from './core/ask-into-target.js';
 import { CODEX_ASYNC_ASK_ORIGIN, deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget } from './services/codex-async-user-input.js';
 import { resolveDocumentAskDelivery } from './core/doc-comment-ask.js';
 import { isHumanOpenId } from './im/lark/client.js';
@@ -9164,10 +9166,13 @@ const explicitAskContinuation = createExplicitAskContinuation({
   hasHandoff: hasExplicitAskHandoff,
   canResume: receipt => {
     const ds = findActiveBySessionId(receipt.input.sessionId);
-    return sessionsRestored && !!ds && ds.larkAppId === receipt.input.larkAppId
-      && ds.chatId === receipt.input.chatId
-      && (ds.session.scope === 'chat' ? null : ds.session.rootMessageId) === receipt.input.rootMessageId
-      && (!receipt.result || !ds.worker || ds.lastScreenStatus === 'idle');
+    return sessionsRestored && !!ds && canResumeExplicitAskInSession(receipt, {
+      larkAppId: ds.larkAppId,
+      chatId: ds.chatId,
+      sessionId: ds.session.sessionId,
+      workerPresent: !!ds.worker,
+      lastScreenStatus: ds.lastScreenStatus,
+    });
   },
   dispatch: async (receipt, key) => {
     const ds = findActiveBySessionId(receipt.input.sessionId);
@@ -9285,6 +9290,26 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
         ? null
         : askSession.session.rootMessageId,
     });
+  }
+  if (boundAsk.requestedRootMessageId && !askSession) {
+    return jsonRes(res, 403, { ok: false, error: 'ask_origin_unproven' });
+  }
+  if (askSession && boundAsk.requestedRootMessageId) {
+    const target = await resolveAskRootTarget({
+      requestedRootMessageId: boundAsk.requestedRootMessageId,
+      ambientRootMessageId: boundAsk.rootMessageId,
+      authenticatedChatId: askSession.chatId,
+      larkAppId: askSession.larkAppId,
+      getMessageDetail,
+    });
+    if (!target.ok) {
+      return jsonRes(res, target.status, {
+        ok: false,
+        error: target.error,
+        ...('detail' in target ? { detail: target.detail } : {}),
+      });
+    }
+    boundAsk = { ...boundAsk, rootMessageId: target.rootMessageId };
   }
   if (askSession?.session.vcMeetingReceiver) {
     // A meeting receiver ask would post a Lark card outside the managed action
@@ -9415,6 +9440,20 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
     if (!managedExplicit) return jsonRes(res, 400, { error: 'invalid_acknowledgement' });
     const result = explicitAskContinuation.acknowledge(explicitInput);
     return result ? jsonRes(res, 200, result) : jsonRes(res, 409, { error: 'ask_result_not_ready' });
+  }
+  if (managedExplicit && explicitInput.timeoutMs === null) {
+    void explicitAskContinuation.wait(explicitInput).catch(error => {
+      logger.warn(`[ask-continuation] ${error instanceof Error ? error.message : String(error)}`);
+    });
+    try {
+      const delivery = await waitForAskDelivery(explicitInput);
+      return jsonRes(res, 200, {
+        kind: 'pending', requestId: explicitInput.requestId,
+        askId: delivery.askId, messageId: delivery.messageId, pending: true,
+      });
+    } catch (error) {
+      return jsonRes(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    }
   }
   const result = managedExplicit
     ? await explicitAskContinuation.wait(explicitInput)
