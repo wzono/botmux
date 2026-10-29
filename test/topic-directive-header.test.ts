@@ -445,61 +445,87 @@ describe('指令头：向后兼容（D9）', () => {
     expect(sentContents().join('\n')).toContain('话题已就绪');
   });
 
-  it('pinned raw route retains its command after guarded fork rejection', async () => {
-    registerAppBot({ defaultWorkingDir: botmuxRepo });
+  it.each([
+    { name: 'pinned raw', bot: () => registerAppBot({ defaultWorkingDir: botmuxRepo }), opening: '/t /goal ship the fix', raw: true },
+    { name: 'no-project raw', bot: () => registerAppBot({ workingDirs: [] }), opening: '/t /goal ship the fix', raw: true },
+    { name: 'pinned idle', bot: () => registerAppBot({ defaultWorkingDir: botmuxRepo }), opening: '/t /repo botmux', raw: false },
+    { name: 'no-project idle', bot: () => registerAppBot({ workingDirs: [] }), opening: '标题 /t /model sonnet', raw: false },
+  ])('$name guarded rejection stays retryable and admits only after repaired resend', async ({ bot, opening, raw }) => {
+    bot();
+    const rootId = `om_retry_${raw ? 'raw' : 'idle'}_${mocks.createdSessions.length}`;
     mocks.forkWorker.mockReturnValueOnce(false);
-    const firstCtx = groupCtx('om_raw_pinned_rejected');
+    const firstCtx = groupCtx(rootId);
 
-    await handleNewTopic(groupEvent('/t /goal ship the fix', firstCtx.messageId), firstCtx);
+    await handleNewTopic(groupEvent(opening, rootId), firstCtx);
 
     const ds = mocks.forkWorker.mock.calls[0][0];
     expect(ds.worker).toBeNull();
-    expect(ds.pendingRawInput).toBe('/goal ship the fix');
     expect(ds.initialStartPending).toBe(true);
+    expect(ds.initialGuardedLaunchRetry).toBe(raw ? 'raw' : 'idle');
     expect(firstCtx.ingressAdmission?.admitted).not.toBe(true);
+    if (raw) expect(ds.pendingRawInput).toBe('/goal ship the fix');
+    else expect(ds.session.initialUserTurnPending).toBeUndefined();
+
+    // Simulate repairing the guarded workspace/backend between attempts. The
+    // next same-topic message is both the retry probe and the ordered follower.
+    const retryCtx = threadCtxAt(rootId, `${rootId}_retry`);
+    await handleThreadReply(
+      threadEventAt(rootId, 'retry after repair', retryCtx.messageId),
+      retryCtx,
+    );
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(2);
+    expect(ds.worker).toBeTruthy();
+    expect(ds.initialGuardedLaunchRetry).toBeUndefined();
+    expect(retryCtx.ingressAdmission?.admitted).toBe(true);
+    if (raw) {
+      expect(ds.pendingRawInput).toBe('/goal ship the fix');
+      expect(ds.pendingFollowUpInput?.cliInput).toContain('retry after repair');
+    } else {
+      const retriedOpening = mocks.forkWorker.mock.calls[1][1];
+      expect(typeof retriedOpening === 'string' ? retriedOpening : retriedOpening.content)
+        .toContain('retry after repair');
+    }
   });
 
-  it('no-project raw route retains its command after guarded fork rejection', async () => {
-    registerAppBot({ workingDirs: [] });
-    mocks.forkWorker.mockReturnValueOnce(false);
-    const firstCtx = groupCtx('om_raw_picker_rejected');
-
-    await handleNewTopic(groupEvent('/t /goal ship the fix', firstCtx.messageId), firstCtx);
-
-    const ds = mocks.forkWorker.mock.calls[0][0];
-    expect(ds.worker).toBeNull();
-    expect(ds.pendingRawInput).toBe('/goal ship the fix');
-    expect(ds.initialStartPending).toBe(true);
-  });
-
-  it('pinned idle route keeps opening state unadmitted and sends no ready when guarded fork rejects', async () => {
+  it('serializes concurrent repaired resends into one successful retry start', async () => {
     registerAppBot({ defaultWorkingDir: botmuxRepo });
+    const rootId = 'om_retry_concurrent';
     mocks.forkWorker.mockReturnValueOnce(false);
-    const ctx = groupCtx('om_idle_pinned_rejected');
+    await handleNewTopic(groupEvent('/t /goal ship the fix', rootId), groupCtx(rootId));
 
-    await handleNewTopic(groupEvent('/t /repo botmux', ctx.messageId), ctx);
+    await Promise.all([
+      handleThreadReply(threadEventAt(rootId, 'retry one', 'om_retry_one'), threadCtxAt(rootId, 'om_retry_one')),
+      handleThreadReply(threadEventAt(rootId, 'retry two', 'om_retry_two'), threadCtxAt(rootId, 'om_retry_two')),
+    ]);
 
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(2);
+    expect(mocks.sendWorkerInput).toHaveBeenCalledTimes(1);
     const ds = mocks.forkWorker.mock.calls[0][0];
-    expect(ds.worker).toBeNull();
-    expect(ds.initialStartPending).toBe(true);
-    expect(ds.session.initialUserTurnPending).toBeUndefined();
-    expect(ctx.ingressAdmission?.admitted).not.toBe(true);
-    expect(sentContents().join('\n')).not.toContain('话题已就绪');
+    expect(ds.pendingFollowUpInput?.cliInput).toContain('retry one');
+    expect(JSON.stringify(mocks.sendWorkerInput.mock.calls[0])).toContain('retry two');
   });
 
-  it('no-project idle route keeps opening state unadmitted and sends no ready when guarded fork rejects', async () => {
-    registerAppBot({ workingDirs: [] });
-    const ctx = groupCtx('om_idle_picker_rejected');
-    mocks.forkWorker.mockReturnValueOnce(false);
+  it('keeps a repeatedly rejected guarded opening retryable without duplicating it', async () => {
+    registerAppBot({ defaultWorkingDir: botmuxRepo });
+    const rootId = 'om_retry_rejected_twice';
+    mocks.forkWorker.mockReturnValueOnce(false).mockReturnValueOnce(false);
+    await handleNewTopic(groupEvent('/t /goal ship the fix', rootId), groupCtx(rootId));
 
-    await handleNewTopic(groupEvent('标题 /t /model sonnet', ctx.messageId), ctx);
-
+    const secondCtx = threadCtxAt(rootId, 'om_retry_second');
+    await handleThreadReply(threadEventAt(rootId, 'retry one', secondCtx.messageId), secondCtx);
     const ds = mocks.forkWorker.mock.calls[0][0];
-    expect(ds.worker).toBeNull();
-    expect(ds.initialStartPending).toBe(true);
-    expect(ds.session.initialUserTurnPending).toBeUndefined();
-    expect(ctx.ingressAdmission?.admitted).not.toBe(true);
-    expect(sentContents().join('\n')).not.toContain('话题已就绪');
+    expect(ds.initialGuardedLaunchRetry).toBe('raw');
+    expect(secondCtx.ingressAdmission?.admitted).not.toBe(true);
+
+    const thirdCtx = threadCtxAt(rootId, 'om_retry_third');
+    await handleThreadReply(threadEventAt(rootId, 'retry two', thirdCtx.messageId), thirdCtx);
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(3);
+    expect(ds.pendingRawInput).toBe('/goal ship the fix');
+    expect(ds.pendingFollowUpInput?.cliInput).not.toContain('retry one');
+    expect(ds.pendingFollowUpInput?.cliInput.match(/retry two/g)).toHaveLength(1);
+    expect(thirdCtx.ingressAdmission?.admitted).toBe(true);
   });
 
   it('/t /goal … 这类既有冷启动用法不被解析器提前拒掉', async () => {
@@ -609,12 +635,22 @@ function threadEvent(text: string, messageId: string): any {
 }
 
 function threadCtx(messageId: string): RoutingContext {
+  return threadCtxAt(THREAD_ROOT, messageId);
+}
+
+function threadEventAt(rootId: string, text: string, messageId: string): any {
+  const event = threadEvent(text, messageId);
+  event.message.root_id = rootId;
+  return event;
+}
+
+function threadCtxAt(rootId: string, messageId: string): RoutingContext {
   return {
     chatId: GROUP,
     messageId,
     chatType: 'group',
     scope: 'thread',
-    anchor: THREAD_ROOT,
+    anchor: rootId,
     larkAppId: APP,
   } as RoutingContext;
 }

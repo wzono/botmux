@@ -23821,7 +23821,11 @@ function hasBufferedOpeningInput(ds: DaemonSession): boolean {
  * 用户下一条真消息才是这个会话的开场。
  */
 function forkReservedIdleSession(ds: DaemonSession): boolean {
-  if (forkWorker(ds, '', false) === false) return false;
+  if (forkWorker(ds, '', false) === false) {
+    ds.initialGuardedLaunchRetry = 'idle';
+    return false;
+  }
+  ds.initialGuardedLaunchRetry = undefined;
   markInitialUserTurnPending(ds);
   ds.pendingTurnId = undefined;
   ds.initialStartPending = ds.session.queuedActivationPending === true;
@@ -23879,6 +23883,7 @@ function forkReservedInitialRawSession(ds: DaemonSession, availableBots: Availab
         ds.session.queued = false;
         sessionStore.updateSession(ds.session);
       }
+      ds.initialGuardedLaunchRetry = 'raw';
       return false;
     }
   } catch (err) {
@@ -23891,6 +23896,7 @@ function forkReservedInitialRawSession(ds: DaemonSession, availableBots: Availab
     }
     throw err;
   }
+  ds.initialGuardedLaunchRetry = undefined;
   // Raw text and Enter are a single adapter-submission boundary. When this
   // cold start came through the durable pendingRepo fallback, retain the gate
   // through that ACK so a follower cannot be sent between those two beats.
@@ -24461,9 +24467,10 @@ async function startInitialPassthroughSession(args: {
     // fall through to the no-card opening below
   }
 
-  // 已 durable staging（picker，含 rawInput）且通过放弃闸：fork 失败后本条 raw
-  // passthrough 仍 durable 挂在会话上，重发会重复执行非幂等命令——先打接纳标。
-  onDurablyAdmitted?.();
+  // The picker staging still owns the opening bytes, but once we choose the
+  // no-project direct-launch route the guarded fork is the admission boundary.
+  // A synchronous refusal remains retryable and must still ask the sender to
+  // resend after repair; mark admitted only after that retry actually starts.
   ds.pendingRepo = false;
   await maybeSeedCardlessForceTopicTurn({
     ds,
@@ -24473,6 +24480,7 @@ async function startInitialPassthroughSession(args: {
   });
   const availableBots = await getAvailableBots(larkAppId, chatId);
   if (!forkReservedInitialRawSession(ds, availableBots)) return;
+  onDurablyAdmitted?.();
   logger.info(`[${tag(ds)}] ${repoCardDegraded ? 'Repo card unavailable' : 'No projects to select'}, queued initial raw passthrough ${commandContent.substring(0, 40)}`);
 }
 
@@ -27961,7 +27969,8 @@ async function handleThreadReplyAdmitted(
       || !ds
       || (ds.worker && !ds.worker.killed)
       || ds.pendingRepo
-      || ds.initialStartPending === true) return;
+      || ds.initialStartClaimToken !== undefined
+      || (ds.initialStartPending === true && ds.initialGuardedLaunchRetry === undefined)) return;
     initialStartClaimToken = randomUUID();
     ds.initialStartClaimToken = initialStartClaimToken;
     ds.initialStartPending = true;
@@ -28072,6 +28081,93 @@ async function handleThreadReplyAdmitted(
   // preparation. Re-check once at the final routing boundary so the oldest
   // surviving follower atomically takes over instead of proceeding unclaimed.
   tryAcquireInitialStartClaim();
+
+  // A guarded initial fork can reject synchronously after the session has been
+  // published. Its original opening remains in the source buffers, but unlike a
+  // normal initialStartPending owner there is no in-flight handler to consume
+  // them. The first later turn claims that retry generation, folds itself behind
+  // the retained opening, and retries the same guarded route. The token keeps
+  // concurrent resends out of this branch until the fork result is known.
+  if (ds && ownsInitialStartClaim() && ds.initialGuardedLaunchRetry) {
+    const retryKind = ds.initialGuardedLaunchRetry;
+    if (retryKind === 'raw') {
+      const pendingBot = getBot(ds.larkAppId);
+      // This resend is not admitted until the guarded fork accepts it. Snapshot
+      // every source/destination buffer touched by forkReservedInitialRawSession
+      // so a repeated rejection does not execute old unadmitted probes later.
+      const retryBufferSnapshot = {
+        pendingFollowUps: ds.pendingFollowUps,
+        pendingCodexAppFollowUps: ds.pendingCodexAppFollowUps,
+        pendingCodexAppFollowUpContexts: ds.pendingCodexAppFollowUpContexts,
+        pendingCodexAppFollowUpGateAccepted: ds.pendingCodexAppFollowUpGateAccepted,
+        pendingFollowUpInput: ds.pendingFollowUpInput,
+      };
+      const followUpSender = callerOpenId
+        ? { openId: callerOpenId, type: isForeignBot ? 'bot' as const : 'user' as const }
+        : undefined;
+      const followUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
+        attachments,
+        mentions: parsed.mentions,
+        isAdoptMode: false,
+        cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? pendingBot.config.cliId,
+        cliPathOverride: ds.session.cliPathOverride ?? pendingBot.config.cliPathOverride,
+        sender: followUpSender,
+        larkAppId,
+        chatId: ds.session.chatId,
+        whiteboardId: ds.session.whiteboardId,
+        substituteTrigger,
+        codexAppText: parsed.content,
+        codexAppApplicationContext,
+        codexAppMessageContext,
+        solo: ds.soloSession,
+        selfMention: { name: pendingBot.botName, openId: pendingBot.botOpenId },
+        sessionBackendType: ds.session.backendType,
+        promptInjection: sessionPromptInjection(ds),
+        turnId: parsed.messageId,
+        linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
+      });
+      ds.pendingFollowUps ??= [];
+      ds.pendingFollowUps.push(followUp.content);
+      ds.pendingCodexAppFollowUps ??= [];
+      ds.pendingCodexAppFollowUps.push(parsed.content);
+      ds.pendingCodexAppFollowUpContexts ??= [];
+      ds.pendingCodexAppFollowUpContexts.push(codexAppMessageContext ?? '');
+      ds.pendingCodexAppFollowUpGateAccepted ??= [];
+      ds.pendingCodexAppFollowUpGateAccepted.push(codexAppCleanInputAcceptedForSession(ds));
+      const availableBots = await getAvailableBots(larkAppId, ds.chatId);
+      if (!forkReservedInitialRawSession(ds, availableBots)) {
+        ds.pendingFollowUps = retryBufferSnapshot.pendingFollowUps;
+        ds.pendingCodexAppFollowUps = retryBufferSnapshot.pendingCodexAppFollowUps;
+        ds.pendingCodexAppFollowUpContexts = retryBufferSnapshot.pendingCodexAppFollowUpContexts;
+        ds.pendingCodexAppFollowUpGateAccepted = retryBufferSnapshot.pendingCodexAppFollowUpGateAccepted;
+        ds.pendingFollowUpInput = retryBufferSnapshot.pendingFollowUpInput;
+        return;
+      }
+    } else {
+      ds.pendingPrompt = promptContent;
+      ds.pendingTurnId = parsed.messageId;
+      ds.pendingAttachments = attachments.length > 0 ? attachments : undefined;
+      ds.pendingMentions = parsed.mentions;
+      ds.pendingSender = callerOpenId
+        ? { openId: callerOpenId, type: isForeignBot ? 'bot' : 'user' }
+        : undefined;
+      const availableBots = await getAvailableBots(larkAppId, ds.chatId);
+      if (hasBufferedOpeningInput(ds)) {
+        if (!forkReservedInitialSession(ds, availableBots)) {
+          ds.initialGuardedLaunchRetry = 'idle';
+          return;
+        }
+        ds.initialGuardedLaunchRetry = undefined;
+      } else if (!forkReservedIdleSession(ds)) {
+        return;
+      }
+    }
+    markIngressAdmitted(ctx);
+    if (ds.initialStartPending || (ds.session.queuedActivationTail?.length ?? 0) > 0) {
+      retainInitialStartClaim = true;
+    }
+    return;
+  }
 
   // A published worker:null owner is not necessarily ready to refork: its
   // opening turn may still be preparing. Buffer both repo-pending and

@@ -277,6 +277,10 @@ export interface DaemonSession {
    * reached the first fork yet. Same-anchor turns must buffer into the opening
    * input instead of reforking worker:null and overtaking it. In-memory only. */
   initialStartPending?: boolean;
+  /** A guarded first fork synchronously refused before consuming its opening.
+   * The opening buffers remain authoritative, but no handler owns a live start
+   * claim; the next same-anchor turn may claim and retry this exact launch. */
+  initialGuardedLaunchRetry?: 'raw' | 'idle';
   /** Restore quarantine: a durable activation-tail promotion failed transiently
    * during restoreActiveSessions, so the row was registered with its tail
    * un-promoted. The next fork boundary (toReattach blank fork / daemon inbound
