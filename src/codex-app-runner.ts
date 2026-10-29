@@ -14,6 +14,7 @@ import {
 } from './adapters/cli/codex-app-turn.js';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
 import { CODEX_APP_ACTIVE_WRITER_EXIT_CODE } from './services/codex-app-runner-protocol.js';
+import { captureCodexAppProcessIdentity, type CodexAppProcessIdentity } from './services/codex-app-process-attestation.js';
 import {
   CODEX_APP_CONTROL_BOOTSTRAP_ENV,
   CODEX_APP_CONTROL_FINAL_CHUNK_BYTES,
@@ -48,6 +49,7 @@ import { CodexAppCotCollector, prepareCodexAppCotMarker } from './services/codex
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
 import { parseCodexAsyncQuestions, parseCodexAsyncUserInput, codexAsyncSteerTargetMatches } from './services/codex-async-user-input.js';
 import { larkToolPromptFromEnv } from './core/lark-tool-binding.js';
+import { readProcessStartIdentity } from './utils/process-identity.js';
 
 type JsonObject = Record<string, any>;
 
@@ -331,6 +333,7 @@ function appDeveloperInstructions(args: Args): string {
 }
 
 class AppServerClient {
+  processIdentity?: CodexAppProcessIdentity;
   private child: ChildProcessWithoutNullStreams;
   /** NDJSON framing + pending table. 'microtask' dispatch keeps a response's
    *  awaiting continuation ahead of a notification coalesced behind it. */
@@ -353,6 +356,12 @@ class AppServerClient {
   get hasExited(): boolean {
     // 后代可能继续持有 stdio，进程退出不能等到 close 才识别。
     return this.child.exitCode !== null || this.child.signalCode !== null;
+  }
+
+  get executionIdentity(): { pid: number; procStart: string } | undefined {
+    if (process.platform !== 'linux' || this.hasExited || !this.child.pid) return undefined;
+    const procStart = readProcessStartIdentity(this.child.pid);
+    return procStart ? { pid: this.child.pid, procStart } : undefined;
   }
 
   constructor(codexBin: string, cwd: string) {
@@ -397,6 +406,7 @@ class AppServerClient {
       capabilities: { experimentalApi: true },
     }, { timeoutMs });
     this.notify('initialized');
+    this.processIdentity = captureCodexAppProcessIdentity(this.child.pid ?? 0);
   }
 
   request(
@@ -778,6 +788,8 @@ function emitRunnerState(
   busy = processing || queue.length > 0 || nativeActiveTurnId !== undefined,
   tracksTurn = activeTurn !== null,
 ): void {
+  const activeReplyTurnId = activeTurn?.accepted?.at(-1)?.replyTurnId;
+  const appServerProcess = client?.executionIdentity;
   emitMarker('state', {
     busy,
     atMs: Date.now(),
@@ -785,6 +797,11 @@ function emitRunnerState(
     // signed state. The worker uses this field as a runtime type-ahead gate;
     // authentication alone never releases a prompt.
     acceptingInput: runnerReady,
+    ...(busy && tracksTurn && activeReplyTurnId ? { activeReplyTurnId } : {}),
+    ...(client?.processIdentity ? { processIdentity: client.processIdentity } : {}),
+    // This process owns tool execution. The outer runner owns reply routing;
+    // the signed state must attest both sides of that process boundary.
+    ...(appServerProcess ? { appServerProcess } : {}),
     ...(busy && !tracksTurn ? { tracksTurn: false } : {}),
   });
 }
@@ -1631,6 +1648,15 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
     strictThreadResume = true;
     startupDeadlineAtMs ??= Date.now() + DEFAULT_REQUEST_TIMEOUT_MS;
     await initializeAppServer(startupDeadlineAtMs);
+    // No native turn has been submitted to the replacement engine yet. Publish
+    // its proof before thread/resume or turn/start can emit activity/tools.
+    // The queued input is still work: never publish prompt-ready at this edge.
+    emitMarker('state', {
+      busy: true, tracksTurn: false, acceptingInput: runnerReady, atMs: Date.now(),
+      ...(client.processIdentity ? { processIdentity: client.processIdentity } : {}),
+      ...(client.executionIdentity ? { appServerProcess: client.executionIdentity } : {}),
+      processIdentityBoundary: 'idle_restart',
+    });
   }
   if (threadReady && threadId) return threadId;
 
