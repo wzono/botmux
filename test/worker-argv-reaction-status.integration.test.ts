@@ -1278,9 +1278,9 @@ setInterval(() => {}, 1_000);
     // first prompt is still running. markPromptReady() would otherwise publish a
     // generic snapshot (projected idle, since isPromptReady was just set true)
     // BEFORE the busy arm re-publishes working. Combined with the first-turn
-    // publisher's working, the daemon would see working→idle and fire
-    // finishTurnReactions() — a premature DONE mid-turn. This regression asserts the
-    // fix: after the first working, no idle may reach the daemon before the busy arm.
+    // publisher's working, the daemon would see a false working→idle mid-turn.
+    // This regression still protects runtime status even though reactions now
+    // settle only from exact turn_terminal.
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-grok-first-turn-'));
     tempDirs.add(root);
     const dataDir = join(root, 'session');

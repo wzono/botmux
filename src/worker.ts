@@ -16967,9 +16967,9 @@ function markPromptReady(): void {
   // <task-notification>. isPromptReady was just set true above, so this generic
   // snapshot would project 'idle' and reach the daemon BEFORE the busy arm below
   // re-publishes 'working'. Combined with the first-turn working already sent by
-  // startScreenUpdates, the daemon would then see working→idle and fire
-  // finishTurnReactions() — a premature ✅ DONE mid-turn (and a
-  // 「工作中→等待输入→工作中」 flicker on the open card). The busy arm below owns the
+  // startScreenUpdates, the daemon would then see a false working→idle mid-turn
+  // and show a 「工作中→等待输入→工作中」 flicker on the open card. Reaction
+  // settlement is terminal-driven; the busy arm below owns the
   // correct 'working' publish for these paths, so this idle must not escape first.
   refreshBackgroundWait();
   if (renderer && !spawnArgvInitialPromptBusy && backgroundTaskTracker.pendingTurnAgents() === 0 && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
@@ -16991,7 +16991,7 @@ function markPromptReady(): void {
   //  - Grok-class argv-baked prompt + reliable turn terminal: first ready is
   //    pre-execution, so park as working until assistant_final/fireIdle;
   //  - quiescence argv CLIs (Pi/Gemini/MTR/OpenCode): first ready IS turn end
-  //    — seed working then idle so card-off gets working→idle (review P2).
+  //    — seed working then idle for runtime-status compatibility.
   const hasPendingWork =
     pendingMessages.length > 0
     || pendingRawInputs.length > 0
@@ -17009,9 +17009,8 @@ function markPromptReady(): void {
       log('Spawn argv initial prompt still in flight — reporting working (not idle) so turn reactions can settle later');
     } else if (spawnArgvNeedsWorkingSeed) {
       // First ready = true completion for quiescence argv adapters. Seed a
-      // working edge before idle/limited so daemon finishTurnReactions (gated
-      // on working→idle|limited) still flips card-off GoGoGo on cold-start
-      // one-shots — including when the terminal already shows a rate-limit
+      // working edge before idle/limited for the runtime status stream —
+      // including when the terminal already shows a rate-limit
       // banner (classify would otherwise collapse both seeds to limited).
       spawnArgvNeedsWorkingSeed = false;
       publishScreenStatus('working', { force: true });

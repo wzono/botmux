@@ -1,9 +1,10 @@
 /**
  * Two-phase turn reactions (auto-on for card-off sessions, i.e. streaming card disabled):
  *   - noteTurnReceived(ds, msgId): react 冲! (GoGoGo) the instant a user message
- *     is accepted for the session, tracked per-message in ds.pendingAckReactions.
- *   - finishTurnReactions(ds): when the worker next goes idle, flip every pending
- *     ✋ to ✅ (DONE) and clear the list.
+ *     is accepted for the session. Owned sessions persist exact turn state;
+ *     unowned compatibility ingress gets a fail-closed best-effort receipt.
+ *   - Only the durable exact terminal turns owned reactions into DONE or ERROR;
+ *     screen idle never proves completion.
  *
  * Binding the "received" reaction to the message (not a worker status edge) is
  * what makes type-ahead / busy-batched messages each get their own reaction —
@@ -78,7 +79,6 @@ import * as sessionStore from '../src/services/session-store.js';
 import { beginReplyTargetTurn } from '../src/core/reply-target.js';
 import {
   initWorkerPool,
-  __testOnly_finishTurnReactions as finishTurnReactions,
   __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -148,7 +148,6 @@ describe('two-phase turn reactions', () => {
     expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a).toMatchObject({
       version: 1, turnId: 'om_a', messageId: 'om_a', phase: 'processing',
     });
-    expect(ds.pendingAckReactions ?? []).toEqual([]);
     expect(ds.turnReceivedAtMs).toBeUndefined();
     getBot(APP).config.showReplyTiming = true;
     await noteTurnReceived(ds, 'om_b', undefined, undefined, 'om_actual_turn');
@@ -202,12 +201,9 @@ describe('two-phase turn reactions', () => {
 
   it('Plan B: a meeting-agent session reacts to plain user turns like any card-off session', async () => {
     registerWith(true);
-    const ds = makeDs({
-      pendingAckReactions: [{ messageId: 'om_old', reactionId: 'rid_old' }],
-    });
+    const ds = makeDs();
     // The vcMeetingReceiver marker is now pure delivery metadata. A plain user
-    // message (no stamped meeting @mention origin) is an ordinary turn, so it
-    // gets the ✋ on receipt and its pending ✋ settle to ✅ on idle.
+    // message remains a durable ordinary turn.
     ds.session.vcMeetingReceiver = {
       listenerAppId: 'listener-app',
       meetingId: 'meeting-1',
@@ -216,12 +212,10 @@ describe('two-phase turn reactions', () => {
     };
 
     await noteTurnReceived(ds, 'om_new');
-    await finishTurnReactions(ds);
 
-    // ✋ added on the new user message; the stale + new pending entries settle.
-    expect(mocks.addReaction).toHaveBeenCalled();
-    expect(mocks.removeReaction).toHaveBeenCalled();
-    expect(ds.pendingAckReactions).toEqual([]);
+    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_new', 'GoGoGo');
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_new)
+      .toMatchObject({ phase: 'processing', messageId: 'om_new' });
   });
 
   it('reacts 冲! (GoGoGo) on each accepted message and dedups by message id', async () => {
@@ -310,7 +304,6 @@ describe('two-phase turn reactions', () => {
     // Normal turn A is card-on → no ack reaction for it, even though the slot
     // currently belongs to substitute turn B.
     expect(mocks.addReaction).not.toHaveBeenCalled();
-    expect(ds.pendingAckReactions ?? []).toEqual([]);
   });
 
   it('a later non-substitute turn in the same session gets the streaming card back (no session latch)', async () => {
@@ -323,7 +316,6 @@ describe('two-phase turn reactions', () => {
     await noteTurnReceived(ds, 'om_b');
 
     expect(mocks.addReaction).not.toHaveBeenCalled();
-    expect(ds.pendingAckReactions ?? []).toEqual([]);
   });
 
   it('silentTurnReactions suppresses receipt reactions in card-off sessions', async () => {
@@ -333,7 +325,6 @@ describe('two-phase turn reactions', () => {
     await noteTurnReceived(ds, 'om_a');
 
     expect(mocks.addReaction).not.toHaveBeenCalled();
-    expect(ds.pendingAckReactions ?? []).toEqual([]);
     expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a).toMatchObject({ turnId: 'om_a' });
   });
 
@@ -346,7 +337,6 @@ describe('two-phase turn reactions', () => {
     await noteTurnReceived(ds, 'om_a');
 
     expect(mocks.addReaction).not.toHaveBeenCalled();
-    expect(ds.pendingAckReactions ?? []).toEqual([]);
   });
 
   it('skips non-message ids (doc-comment id / chat anchor cannot carry a reaction)', async () => {
@@ -355,7 +345,6 @@ describe('two-phase turn reactions', () => {
     await noteTurnReceived(ds, 'comment_123');
     await noteTurnReceived(ds, 'oc_chat');
     expect(mocks.addReaction).not.toHaveBeenCalled();
-    expect(ds.pendingAckReactions ?? []).toEqual([]);
     expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback).toMatchObject({
       comment_123: { turnId: 'comment_123', messageId: 'comment_123' },
       oc_chat: { turnId: 'oc_chat', messageId: 'oc_chat' },
@@ -1005,7 +994,6 @@ describe('two-phase turn reactions', () => {
 
     expect(mocks.addReaction).not.toHaveBeenCalled();
     expect(mocks.publishTurnCliIdentity).not.toHaveBeenCalled();
-    expect(ds.pendingAckReactions ?? []).toEqual([]);
   });
 
   it('commits terminal phase and reaction intent atomically before convergence', async () => {
@@ -1021,6 +1009,24 @@ describe('two-phase turn reactions', () => {
     const committed = sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_terminal;
     expect(committed).toMatchObject({ phase: 'completed' });
     expect(committed?.reactionIntent ?? committed?.reaction).toBeDefined();
+  });
+
+  it('projects an owned failed terminal to ERROR instead of DONE', async () => {
+    registerWith(true);
+    const ds = makeDs();
+    await noteTurnReceived(ds, 'om_owned_failed');
+    mocks.addReaction.mockClear();
+
+    applyLiveFeedbackTerminal(ds, {
+      turnId: 'om_owned_failed', status: 'failed', completedAtMs: Date.now(),
+    });
+    await feedbackReconciler.reconcile(ds, 'om_owned_failed');
+
+    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_owned_failed', 'rid_om_owned_failed');
+    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_owned_failed', 'ERROR');
+    expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_owned_failed', 'DONE');
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_owned_failed?.phase)
+      .toBe('failed');
   });
 
   it('contains terminal feedback commit failure without calling the reaction provider', async () => {
@@ -1041,7 +1047,7 @@ describe('two-phase turn reactions', () => {
       .toBe('processing');
   });
 
-  it('type-ahead: two messages while busy each get 冲! then both flip to ✅ at idle', async () => {
+  it('type-ahead: two messages settle independently from their exact terminals', async () => {
     registerWith(true);
     const ds = makeDs();
     // B arrives while A is still being processed — no second working edge, but
@@ -1056,7 +1062,7 @@ describe('two-phase turn reactions', () => {
     await feedbackReconciler.reconcile(ds, 'om_a');
     await feedbackReconciler.reconcile(ds, 'om_b');
 
-    // Each ✋ removed and replaced with ✅ DONE — neither message is left behind.
+    // Each exact terminal removes its own GoGoGo and creates DONE.
     expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
     expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_b', 'rid_om_b');
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'DONE');
@@ -1065,21 +1071,17 @@ describe('two-phase turn reactions', () => {
     expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_b?.phase).toBe('completed');
   });
 
-  it('silentTurnReactions clears pending received reactions without adding DONE', async () => {
+  it('silentTurnReactions keeps terminal convergence reaction-free', async () => {
     registerWith(true, { silentTurnReactions: true });
-    const ds = makeDs({
-      pendingAckReactions: [
-        { messageId: 'om_a', reactionId: 'rid_om_a' },
-        { messageId: 'om_b', reactionId: 'rid_om_b' },
-      ],
-    });
+    const ds = makeDs();
+    await noteTurnReceived(ds, 'om_a');
+    applyLiveFeedbackTerminal(ds, { turnId: 'om_a', status: 'completed', completedAtMs: Date.now() });
+    await feedbackReconciler.reconcile(ds, 'om_a');
 
-    await finishTurnReactions(ds);
-
-    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
-    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_b', 'rid_om_b');
+    expect(mocks.removeReaction).not.toHaveBeenCalled();
     expect(mocks.addReaction).not.toHaveBeenCalled();
-    expect(ds.pendingAckReactions).toEqual([]);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a?.phase)
+      .toBe('completed');
   });
 
   it('does not register an in-flight ✋ that a concurrent idle could DONE prematurely', async () => {
@@ -1093,11 +1095,9 @@ describe('two-phase turn reactions', () => {
 
     const notePromise = noteTurnReceived(ds, 'om_b'); // in flight, not yet awaited
 
-    // A previous turn's idle fires while addReaction(om_b) is still pending.
-    await finishTurnReactions(ds);
-    // om_b is NOT registered yet → no premature DONE, list stays empty.
+    // A terminal cannot happen before admission completes on the production
+    // owned path; while CREATE is pending, no terminal reaction is emitted.
     expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_b', 'DONE');
-    expect(ds.pendingAckReactions ?? []).toEqual([]);
 
     // addReaction resolves → only now does om_b persist its provider receipt.
     releaseB('rid_om_b');
@@ -1111,13 +1111,6 @@ describe('two-phase turn reactions', () => {
     expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_b', 'rid_om_b');
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_b', 'DONE');
     expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_b?.phase).toBe('completed');
-  });
-
-  it('finishTurnReactions with no pending acks is a no-op', async () => {
-    const ds = makeDs();
-    await finishTurnReactions(ds);
-    expect(mocks.removeReaction).not.toHaveBeenCalled();
-    expect(mocks.addReaction).not.toHaveBeenCalled();
   });
 
   it('custom emoji: bots.json overrides the received / done emoji_type', async () => {
@@ -1153,10 +1146,8 @@ describe('two-phase turn reactions', () => {
 });
 
 /**
- * Behavioral pin for PR #633 review P2: card-off finishTurnReactions requires a
- * working→idle edge. Argv cold-start (Pi/Gemini) must seed working before idle
- * (worker side); daemon-side, bare undefined→idle must NOT flip, while the
- * seeded working→idle sequence must.
+ * Screen status is a runtime hint, not a turn terminal. In particular, the
+ * bootstrap working→idle edge of a fresh `/th` worker must not settle reactions.
  */
 describe('turn reaction screen_update behavioral gate', () => {
   function makeFakeWorker() {
@@ -1172,8 +1163,13 @@ describe('turn reaction screen_update behavioral gate', () => {
 
   async function flush(): Promise<void> {
     await new Promise(resolve => setTimeout(resolve, 0));
-    // finishTurnReactions is fire-and-forget void; wait a tick for awaits
+    // Reaction transport is fire-and-forget; wait a tick for any provider calls.
     await new Promise(resolve => setTimeout(resolve, 0));
+  }
+
+  async function deliver(worker: EventEmitter, message: Record<string, unknown>): Promise<void> {
+    await Promise.all(worker.listeners('message').map(listener => listener.call(worker, message)));
+    await flush();
   }
 
   beforeEach(() => {
@@ -1188,6 +1184,7 @@ describe('turn reaction screen_update behavioral gate', () => {
       getSessionWorkingDir: () => '/repo',
       getActiveCount: () => 1,
       closeSession: vi.fn(),
+      onTurnTerminal: async (ds, terminal) => { applyLiveFeedbackTerminal(ds, terminal); },
     });
   });
 
@@ -1197,8 +1194,10 @@ describe('turn reaction screen_update behavioral gate', () => {
       worker,
       workerPort: 9999,
       lastScreenStatus: undefined,
-      pendingAckReactions: [{ messageId: 'om_a', reactionId: 'rid_om_a' }],
     });
+    await noteTurnReceived(ds, 'om_a');
+    mocks.addReaction.mockClear();
+    mocks.removeReaction.mockClear();
     __testOnly_setupWorkerHandlers(ds, worker);
 
     worker.emit('message', { type: 'screen_update', content: 'done?', status: 'idle' });
@@ -1206,28 +1205,76 @@ describe('turn reaction screen_update behavioral gate', () => {
 
     expect(mocks.removeReaction).not.toHaveBeenCalled();
     expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_a', 'DONE');
-    expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_a']);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a?.phase)
+      .toBe('processing');
   });
 
-  it('working→idle flips pending GoGoGo to DONE (argv seed / flushPending path)', async () => {
+  it('working→idle during `/th` startup does not settle a pending turn', async () => {
     const worker = makeFakeWorker();
     const ds = makeDs({
       worker,
       workerPort: 9999,
       lastScreenStatus: undefined,
-      pendingAckReactions: [{ messageId: 'om_a', reactionId: 'rid_om_a' }],
     });
+    await noteTurnReceived(ds, 'om_a');
+    mocks.addReaction.mockClear();
+    mocks.removeReaction.mockClear();
     __testOnly_setupWorkerHandlers(ds, worker);
 
-    // Mirrors markPromptReady seeding working then idle for quiescence argv CLIs.
+    // Mirrors the real `/th` race: CLI bootstrap publishes a transient
+    // working→idle before UserPromptSubmit starts the user's actual turn.
     worker.emit('message', { type: 'screen_update', content: 'busy', status: 'working' });
     await flush();
     worker.emit('message', { type: 'screen_update', content: 'ready', status: 'idle' });
     await flush();
 
+    expect(mocks.removeReaction).not.toHaveBeenCalled();
+    expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_a', 'DONE');
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a?.phase)
+      .toBe('processing');
+  });
+
+  it('validated completed terminal settles only its exact type-ahead turn to DONE', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerPort: 9999 });
+    await noteTurnReceived(ds, 'om_a');
+    await noteTurnReceived(ds, 'om_b');
+    mocks.addReaction.mockClear();
+    mocks.removeReaction.mockClear();
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    await deliver(worker, {
+      type: 'turn_terminal', sessionId: ds.session.sessionId,
+      turnId: 'om_a', status: 'completed', completedAtMs: Date.now(),
+    });
+
     expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'DONE');
-    expect(ds.pendingAckReactions).toEqual([]);
+    expect(mocks.removeReaction).not.toHaveBeenCalledWith(APP, 'om_b', 'rid_om_b');
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback).toMatchObject({
+      om_a: { phase: 'completed' },
+      om_b: { phase: 'processing', reaction: { id: 'rid_om_b', type: 'GoGoGo' } },
+    });
+  });
+
+  it('validated failed terminal settles its exact turn to ERROR', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerPort: 9999 });
+    await noteTurnReceived(ds, 'om_failed');
+    mocks.addReaction.mockClear();
+    mocks.removeReaction.mockClear();
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    await deliver(worker, {
+      type: 'turn_terminal', sessionId: ds.session.sessionId,
+      turnId: 'om_failed', status: 'failed', completedAtMs: Date.now(),
+    });
+
+    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_failed', 'rid_om_failed');
+    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_failed', 'ERROR');
+    expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_failed', 'DONE');
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_failed?.phase)
+      .toBe('failed');
   });
 
   it('working→limited does NOT DONE (rate limit is a blocked turn, not completion)', async () => {
@@ -1240,8 +1287,10 @@ describe('turn reaction screen_update behavioral gate', () => {
       worker,
       workerPort: 9999,
       lastScreenStatus: undefined,
-      pendingAckReactions: [{ messageId: 'om_a', reactionId: 'rid_om_a' }],
     });
+    await noteTurnReceived(ds, 'om_a');
+    mocks.addReaction.mockClear();
+    mocks.removeReaction.mockClear();
     __testOnly_setupWorkerHandlers(ds, worker);
 
     worker.emit('message', {
@@ -1266,7 +1315,8 @@ describe('turn reaction screen_update behavioral gate', () => {
 
     expect(mocks.removeReaction).not.toHaveBeenCalled();
     expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_a', 'DONE');
-    expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_a']);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a?.phase)
+      .toBe('processing');
   });
 
   it('limited→limited alone does not DONE (no working edge)', async () => {
@@ -1275,8 +1325,9 @@ describe('turn reaction screen_update behavioral gate', () => {
       worker,
       workerPort: 9999,
       lastScreenStatus: undefined,
-      pendingAckReactions: [{ messageId: 'om_a', reactionId: 'rid_om_a' }],
     });
+    await noteTurnReceived(ds, 'om_a');
+    mocks.addReaction.mockClear();
     __testOnly_setupWorkerHandlers(ds, worker);
 
     const limitedMsg = {
@@ -1297,7 +1348,8 @@ describe('turn reaction screen_update behavioral gate', () => {
     await flush();
 
     expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_a', 'DONE');
-    expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_a']);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a?.phase)
+      .toBe('processing');
   });
 });
 

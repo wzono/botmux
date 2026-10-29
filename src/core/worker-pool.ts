@@ -67,7 +67,7 @@ import {
 } from './initial-native-rename.js';
 import { effectiveReplyDelivery } from './reply-delivery.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
-import { updateMessage, deleteMessage, listChatMessages, listThreadMessages, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
+import { updateMessage, deleteMessage, listChatMessages, listThreadMessages, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildTurnTerminalFooterPatch, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type StreamCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
 import { cardMessageTitle, staleWorkingCardIds, streamingCardTitleClaimsWork } from './restored-card-status.js';
@@ -768,7 +768,6 @@ import { isSessionGroup, touchSessionGroup } from '../services/session-groups-st
 import { freezePrincipalLaneTurnBinding, readPrincipalLaneTurnBinding } from './principal-lane-turn.js';
 import { settlePrincipalLaneOutboundProvenance } from './principal-lane-outbound-provenance.js';
 import { hasPendingSessionTurns } from './session-turn-queue.js';
-import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { buildTerminalUrl, getTerminalProxyPort } from './terminal-url.js';
 import { prependBotmuxBin, resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 import { snapshotProcessIdentities } from './current-actor-attestation.js';
@@ -1554,12 +1553,6 @@ function silentTurnReactions(ds: DaemonSession): boolean {
   try {
     return getBot(ds.larkAppId).config.silentTurnReactions === true;
   } catch { return false; }
-}
-
-function doneReactionEmojiFor(ds: DaemonSession): string {
-  try {
-    return getBot(ds.larkAppId).config.doneReactionEmoji || DONE_REACTION_EMOJI_TYPE;
-  } catch { return DONE_REACTION_EMOJI_TYPE; }
 }
 
 /** Worker lifecycle readiness is independent from Web Terminal availability.
@@ -17168,21 +17161,12 @@ function setupWorkerHandlers(
             content: msg.content,
           });
           // Usage ledger: any settle-to-idle/limited edge records the delta.
-          // Turn reactions are stricter — only flip ✋→✅ after a real busy
-          // period (working/analyzing) that settles to IDLE. A limited settle
-          // is a blocked turn, not completion: DONE-ing ✋ on working→limited
-          // made users think the task finished while the CLI was stuck (the
-          // rate-limit notification below owns that attention instead).
-          // Cold-start starting→idle (or the first prompt-ready before the turn
-          // has gone working) must NOT DONE a message that is still about to be
-          // / just being processed. Grok card-off sessions hit this when the
-          // ready-gate settle fired idle ~seconds after GoGoGo while the CLI
-          // was still running the prompt.
+          // A screen idle only means the terminal looks ready for input. It is
+          // not evidence that any exact user turn completed, especially during
+          // `/th` cold start before UserPromptSubmit. Turn reactions therefore
+          // settle exclusively from the validated turn_terminal path below.
           if (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited') {
             recordUsageForDaemonSession(ds);
-            if (ds.lastScreenStatus === 'idle' && (prevStatus === 'working' || prevStatus === 'analyzing')) {
-              void finishTurnReactions(ds);
-            }
           }
           if (
             ds.lastScreenStatus === 'idle'
@@ -20613,49 +20597,6 @@ function shouldDropMismatchedHermesFinalOutput(
   return true;
 }
 
-/**
- * Turn-end half of the two-phase turn reactions (auto-on for card-off sessions,
- * i.e. streaming card disabled). The 冲! "received" reactions are added per-message at the daemon
- * acceptance point (`noteTurnReceived`); the screen_update handler calls this
- * only on working|analyzing → idle|limited (not cold-start starting→idle), to
- * flip every pending ✋ on this session to ✅ DONE and clear the list. When
- * silentTurnReactions is enabled after a ✋ has already landed, we only remove
- * that received reaction and do not add DONE. Binding the start to the message
- * (not a status edge) means type-ahead / busy-batched messages each get their
- * own reaction and all settle together here.
- *
- * Every Feishu call is best-effort — a failure only means a missing emoji, so it
- * must never throw into the status pipeline (callers invoke as `void`).
- */
-async function finishTurnReactions(ds: DaemonSession): Promise<void> {
-  const list = ds.pendingAckReactions;
-  if (!list || list.length === 0) return;
-  // Detach the batch first so a second idle edge can't double-flip it.
-  ds.pendingAckReactions = [];
-  // Plan B: a meeting agent is an ordinary chat-scope session. Pending ack
-  // reactions only ever exist for a real inbound user message (the ✋ is placed
-  // when that message arrives — transcript deliveries have no inbound message to
-  // react to), so a non-empty list here always belongs to a plain user turn and
-  // must settle to ✅ like any session. No VC special-case.
-  const silent = silentTurnReactions(ds);
-  const doneEmoji = doneReactionEmojiFor(ds);
-  for (const ack of list) {
-    if (ack.reactionId) {
-      try {
-        await removeReaction(ds.larkAppId, ack.messageId, ack.reactionId);
-      } catch (err: any) {
-        logger.debug(`[reaction] failed to remove received reaction ${ack.reactionId}: ${err?.message ?? err}`);
-      }
-    }
-    if (silent) continue;
-    try {
-      await addReaction(ds.larkAppId, ack.messageId, doneEmoji);
-    } catch (err: any) {
-      logger.debug(`[reaction] failed to add done reaction to ${ack.messageId}: ${err?.message ?? err}`);
-    }
-  }
-}
-
 /** Deliver a bridge `final_output` to Lark. The current worker generation pops
  *  the turn at emit time, while replacement recovery may replay it with the
  *  same provider key; the daemon owns bounded transient retries. After 3 attempts we log
@@ -21767,7 +21708,6 @@ export const __testOnly_deliverFinalOutput = deliverFinalOutput;
 export const __testOnly_setupWorkerHandlers = setupWorkerHandlers;
 export const __testOnly_reserveWorkerGeneration = reserveWorkerGeneration;
 export const __testOnly_bindPreparedGroupContextWorker = bindPreparedGroupContextWorker;
-export const __testOnly_finishTurnReactions = finishTurnReactions;
 export const __testOnly_retireTerminalizedCodexAppLedgerEntriesForRecovery = retireTerminalizedCodexAppLedgerEntriesForRecovery;
 
 // ─── Fork adopt worker ──────────────────────────────────────────────────────

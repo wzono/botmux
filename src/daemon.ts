@@ -4481,9 +4481,9 @@ export async function noteTurnReceived(
     syncReplyTargetState(ds, committed);
   } else if (!reactionSilent && triggerMessageId.startsWith('om_')) {
     // Compatibility-only synthetic sessions have no durable owner row. Keep
-    // their historical best-effort receipt (and its await boundary) without
-    // pretending it is restart-recoverable. Real daemon sessions always take
-    // the owned SessionStore branch above.
+    // their historical best-effort receipt without pretending it has trusted
+    // terminal ownership. It deliberately remains GoGoGo: no durable row means
+    // no safe turn/attempt/generation tuple from which to infer DONE or ERROR.
     try {
       await addReaction(
         ds.larkAppId, triggerMessageId,
@@ -4528,8 +4528,8 @@ export async function noteTurnReceived(
   // out via silentTurnReactions for low-noise observer scenarios.
   // React 冲! on the triggering message the instant it's accepted. Binding to the
   // message — not a worker status edge — means type-ahead / busy-batched messages
-  // each get their own ✋. `finishTurnReactions` flips every pending ✋ to ✅ when
-  // the worker next goes idle.
+  // each get their own ✋. Owned receipts settle only from the exact worker
+  // turn_terminal; unowned compatibility receipts fail closed at GoGoGo.
   // Plan B: a meeting agent is an ordinary chat-scope session that hosts plain
   // user turns. A plain user message should get the ✋→✅ progress reaction like
   // any card-off session. Only a stamped meeting @mention follow-up stays

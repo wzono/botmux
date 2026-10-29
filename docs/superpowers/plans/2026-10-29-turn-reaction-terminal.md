@@ -4,7 +4,7 @@
 
 **Goal:** Prevent `/th` startup idle from producing premature DONE and project DONE/ERROR only from the exact turn terminal.
 
-**Architecture:** Keep persisted real sessions on the existing turn-feedback reconciler. Narrow the legacy in-memory reaction list to unowned compatibility ingress, bind each entry to a `turnId`, remove screen-idle settlement, and settle one matching entry after the worker-pool's existing terminal ownership checks.
+**Architecture:** Keep persisted real sessions on the existing turn-feedback reconciler. Remove the legacy in-memory reaction list and screen-idle settlement. Unowned compatibility ingress may keep a best-effort GoGoGo receipt but fails closed without DONE/ERROR because it lacks trustworthy durable ownership.
 
 **Tech Stack:** TypeScript, Bun, Vitest, SessionStore, Lark message reactions.
 
@@ -32,30 +32,27 @@ Run: `rtk bun run test -- test/turn-reactions.test.ts`
 Expected: the idle test fails because current code adds DONE; terminal tests fail because
 the compatibility list is not settled from `turn_terminal`.
 
-### Task 2: Implement exact compatibility settlement
+### Task 2: Remove heuristic compatibility settlement
 
 **Files:**
 - Modify: `src/core/types.ts`
 - Modify: `src/daemon.ts`
 - Modify: `src/core/worker-pool.ts`
 
-- [ ] **Step 1: Bind compatibility reaction entries to turnId**
+- [ ] **Step 1: Remove the compatibility pending list**
 
-Change the entry type to `{ turnId, messageId, reactionId? }`. In the unowned
-compatibility admission branch, append the receipt only after CREATE succeeds and dedupe
-by exact turn/message.
+Delete `pendingAckReactions`. The unowned compatibility admission branch may keep its
+best-effort GoGoGo call, but it must not claim restart or terminal ownership.
 
-- [ ] **Step 2: Replace batch idle settlement with exact terminal settlement**
+- [ ] **Step 2: Remove screen-idle settlement**
 
-Remove the `finishTurnReactions` call from the screen-update idle edge. Replace it with
-`finishTurnReaction(ds, turnId, status)`, which removes only matching entries and creates
-DONE for completed or ERROR for non-completed terminal status.
+Remove the `finishTurnReactions` call and helper. Screen idle continues to update runtime
+usage/status but has no reaction side effect.
 
-- [ ] **Step 3: Invoke settlement inside the owned worker terminal path**
+- [ ] **Step 3: Retain the existing durable terminal path**
 
-Call the helper after the existing stale-worker and session identity checks and before the
-terminal callback. Duplicate terminals remain no-op because the matching list entry has
-already been removed.
+Do not add another terminal owner. The daemon callback already maps validated
+`turn_terminal` to completed/failed in the persisted reconciler, including DONE/ERROR.
 
 - [ ] **Step 4: Run the focused tests and verify GREEN**
 
