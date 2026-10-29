@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
+  createProcessDirectoryEnterProbe,
   probePathUsability,
   type DirectoryEnterProbe,
 } from '../src/core/path-usability.js';
@@ -93,6 +94,44 @@ describe('path usability', () => {
     });
   });
 
+  it('bounds the child probe time and output capture', () => {
+    const runner = vi.fn(() => ({
+      pid: 1,
+      output: [null, '1 2\n', ''],
+      stdout: '1 2\n',
+      stderr: '',
+      status: 0,
+      signal: null,
+    }));
+    expect(createProcessDirectoryEnterProbe(runner)(tempDir())).toEqual({
+      ok: true,
+      identity: { dev: '1', ino: '2' },
+    });
+    expect(runner).toHaveBeenCalledWith(expect.any(String), expect.any(Array), expect.objectContaining({
+      timeout: expect.any(Number),
+      maxBuffer: expect.any(Number),
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }));
+  });
+
+  it.each([
+    ['empty output', ''],
+    ['trailing data', '1 2\nextra'],
+    ['negative identity', '-1 2\n'],
+    ['non-numeric identity', 'dev ino\n'],
+  ])('fails closed on %s from the child protocol', (_name, stdout) => {
+    const probe = createProcessDirectoryEnterProbe(() => ({
+      pid: 1,
+      output: [null, stdout, ''],
+      stdout,
+      stderr: '',
+      status: 0,
+      signal: null,
+    }));
+    expect(probe(tempDir())).toEqual({ ok: false });
+  });
+
   it('detects replacement against the identity captured by validation', () => {
     const root = tempDir();
     const target = join(root, 'workspace');
@@ -104,6 +143,30 @@ describe('path usability', () => {
     rmSync(target, { recursive: true });
     renameSync(replacement, target);
     expect(probePathUsability(target, { expectedIdentity: first.identity })).toEqual({
+      ok: false,
+      normalizedPath: target,
+      reason: 'changed',
+    });
+  });
+
+  it('rejects an A-to-B-to-A swap when the child actually entered B', () => {
+    const root = tempDir();
+    const target = join(root, 'workspace');
+    const swapped = join(root, 'swapped');
+    mkdirSync(target);
+    mkdirSync(swapped);
+    const targetIdentity = probePathUsability(target);
+    const swappedIdentity = probePathUsability(swapped);
+    if (!targetIdentity.ok || !swappedIdentity.ok) throw new Error('unexpected initial probe failure');
+
+    const enterProbe: DirectoryEnterProbe = () => ({
+      ok: true,
+      identity: swappedIdentity.identity,
+    });
+    expect(probePathUsability(target, {
+      expectedIdentity: targetIdentity.identity,
+      enterProbe,
+    })).toEqual({
       ok: false,
       normalizedPath: target,
       reason: 'changed',

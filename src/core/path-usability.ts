@@ -1,6 +1,13 @@
-import { spawnSync } from 'node:child_process';
+import {
+  spawnSync,
+  type SpawnSyncOptionsWithStringEncoding,
+  type SpawnSyncReturns,
+} from 'node:child_process';
 import { statSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { createRequire } from 'node:module';
+import { basename, dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { resolveEntrySpawn } from './self-spawn.js';
 
 export interface PathIdentity {
   dev: string;
@@ -24,7 +31,7 @@ export type PathUsabilityResult =
   };
 
 export type DirectoryEnterProbeResult =
-  | { ok: true }
+  | { ok: true; identity: PathIdentity }
   | { ok: false; code?: string };
 
 /**
@@ -38,6 +45,12 @@ export interface PathUsabilityProbeOptions {
   expectedIdentity?: PathIdentity;
   enterProbe?: DirectoryEnterProbe;
 }
+
+type EnterProbeRunner = (
+  command: string,
+  args: readonly string[],
+  options: SpawnSyncOptionsWithStringEncoding,
+) => SpawnSyncReturns<string>;
 
 function identityOf(path: string): { identity: PathIdentity; isDirectory: boolean } {
   const stat = statSync(path, { bigint: true });
@@ -75,16 +88,37 @@ function failureForCode(
   };
 }
 
-const processDirectoryEnterProbe: DirectoryEnterProbe = normalizedPath => {
-  const child = spawnSync('/bin/sh', ['-c', 'exit 0'], {
-    cwd: normalizedPath,
-    stdio: 'ignore',
-    timeout: 5_000,
-  });
-  if (child.error) return { ok: false, code: errorCode(child.error) };
-  if (child.status !== 0) return { ok: false };
-  return { ok: true };
-};
+const ENTER_PROBE_OUTPUT_LIMIT = 128;
+const ENTER_PROBE_TIMEOUT_MS = 5_000;
+const ENTER_PROBE_OUTPUT = /^(0|[1-9]\d*) (0|[1-9]\d*)\n$/;
+
+export function createProcessDirectoryEnterProbe(
+  runner: EnterProbeRunner = spawnSync,
+): DirectoryEnterProbe {
+  return normalizedPath => {
+    const moduleDir = dirname(fileURLToPath(import.meta.url));
+    const sourceExecArgs = process.execArgv.map((arg, index, args) =>
+      args[index - 1] === '--import' && arg === 'tsx' ? createRequire(import.meta.url).resolve('tsx') : arg);
+    const entry = basename(moduleDir) === 'core' && basename(dirname(moduleDir)) === 'src'
+      ? { command: process.execPath, args: [...sourceExecArgs, resolve(moduleDir, '../path-usability-runner.ts')] }
+      : resolveEntrySpawn('path-usability-runner', resolve(moduleDir, '..'));
+    const child = runner(entry.command, entry.args, {
+      cwd: normalizedPath,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: ENTER_PROBE_TIMEOUT_MS,
+      maxBuffer: ENTER_PROBE_OUTPUT_LIMIT,
+    });
+    if (child.error) return { ok: false, code: errorCode(child.error) };
+    if (child.status !== 0 || child.signal !== null || !ENTER_PROBE_OUTPUT.test(child.stdout)) {
+      return { ok: false };
+    }
+    const [dev, ino] = child.stdout.trimEnd().split(' ');
+    return { ok: true, identity: { dev, ino } };
+  };
+}
+
+const processDirectoryEnterProbe = createProcessDirectoryEnterProbe();
 
 export function probePathUsability(
   path: string,
@@ -104,6 +138,10 @@ export function probePathUsability(
 
   const entered = (options.enterProbe ?? processDirectoryEnterProbe)(normalizedPath);
   if (!entered.ok) return failureForCode(normalizedPath, entered.code);
+  if (!sameIdentity(before.identity, entered.identity)
+    || (options.expectedIdentity && !sameIdentity(entered.identity, options.expectedIdentity))) {
+    return { ok: false, normalizedPath, reason: 'changed' };
+  }
 
   try {
     const after = identityOf(normalizedPath);
