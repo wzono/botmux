@@ -1064,10 +1064,15 @@ export interface WorkerPoolCallbacks {
     opts?: WorkerSessionReplyOptions,
   ) => Promise<string>;
   getSessionWorkingDir: (ds?: DaemonSession) => string;
+  /** Immediate pre-spawn policy gate. False means no worker process is created. */
+  authorizeWorkingDirLaunch?: (ds: DaemonSession) => boolean;
   /** forkWorker refused a start because the session's working directory is
    *  gone; tell the chat and offer recovery. Fired just before the
    *  {@link MissingWorkingDirError} is thrown, so callers need not reply. */
   onMissingWorkingDir?: (ds: DaemonSession, path: string, ctx: { turnId?: string }) => void;
+  /** Reject a worker generation whose observed launch cwd differs from policy. */
+  confirmWorkerReadyCwd?: (ds: DaemonSession, actualCwd: string | undefined) => boolean;
+  onWorkerReadyCwdMismatch?: (ds: DaemonSession, actualCwd: string | undefined) => void;
   getActiveCount: () => number;
   /** Prepare trigger-user CLI identity before a delayed raw-input turn. */
   prepareRawInputTurn?: (ds: DaemonSession, turnId: string) => void | Promise<void>;
@@ -14463,6 +14468,10 @@ export function forkWorker(
   // let the chat offer recovery (rebuild the worktree / switch directories).
   // Only re-attaching a backing session that is still alive goes ahead — that
   // CLI keeps running where it was and is not respawned.
+  if (cb.authorizeWorkingDirLaunch && !cb.authorizeWorkingDirLaunch(ds)) {
+    reportAdmission('rejected');
+    return false;
+  }
   const rawCwd = cb.getSessionWorkingDir(ds);
   const workingDirMissing = !!rawCwd && !existsSync(rawCwd);
   if (workingDirMissing && !opts.reattachLiveBackend) {
@@ -16245,6 +16254,16 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored ready from stale/transferring worker generation`);
           break;
         }
+        if (ds.groupWorkspaceLaunchGuard
+          && cb.confirmWorkerReadyCwd
+          && !cb.confirmWorkerReadyCwd(ds, msg.cwd)) {
+          logger.error(`[${t}] Worker ready cwd mismatch: requested=${ds.groupWorkspaceLaunchGuard.workingDir} actual=${msg.cwd ?? '(unavailable)'}`);
+          cb.onWorkerReadyCwdMismatch?.(ds, msg.cwd);
+          ds.groupWorkspaceLaunchGuard = undefined;
+          worker.kill('SIGTERM');
+          break;
+        }
+        ds.groupWorkspaceLaunchGuard = undefined;
         startupState.ready = true;
         startupState.onPreReadyExit = undefined;
         ds.workerReady = true;

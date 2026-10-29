@@ -100,6 +100,12 @@ export interface DaemonSession {
    * separate from workerPort because backends without a Web Terminal still
    * emit screen/idle/screenshot updates and support native local attach. */
   workerReady?: boolean;
+  /** Task9 launch-only fence; set by the daemon's immediate pre-spawn group probe
+   * and consumed by the matching worker-ready cwd confirmation. */
+  groupWorkspaceLaunchGuard?: {
+    workingDir: string;
+    identity?: { dev: string; ino: string };
+  };
   /** True while the CURRENT CLI generation's prompt is known idle/ready.
    *  Set by the worker's `prompt_ready` IPC; cleared on spawn / restart /
    *  `claude_exit` / worker retirement. Deliberately NOT cleared by the

@@ -1636,6 +1636,7 @@ export const messages: Record<string, string> = {
   'daemon.force_topic_ready': '💬 新话题已创建。请在话题内发送任务，也可以先用 /repo 选择项目。',
   'daemon.force_topic_started': '↪️ 已转入新话题，正在处理…',
   'daemon.force_topic_current_dir_missing': '⚠️ 当前群聊还没有可复用的工作目录。请先在普通群启动一个会话或使用 /oncall bind 绑定目录。',
+  'daemon.group_workspace_repair_required': '⚠️ 群工作目录 `{path}` 已不可访问，本会话未启动，绑定仍保留。请管理员在群顶层重新执行 `/repo` 修复，或用 `/repo unbind` 解除绑定。',
   // ─── 话题指令头（`[标题] /t /repo … /model … 正文`）的拒绝文案 ───────────
   // fail closed：任一项不合法就整条不生效，所以这条回复是用户唯一的反馈，
   // 必须指名道姓说清哪一项错了。

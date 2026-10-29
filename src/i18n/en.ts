@@ -1631,6 +1631,7 @@ export const messages: Record<string, string> = {
   'daemon.force_topic_ready': '💬 New topic created. Send a task in this topic, or use /repo first to choose a project.',
   'daemon.force_topic_started': '↪️ Moved into a new topic and started working…',
   'daemon.force_topic_current_dir_missing': '⚠️ This chat has no current working directory to reuse. Start a normal chat session first, or bind one with /oncall bind.',
+  'daemon.group_workspace_repair_required': '⚠️ The group workspace `{path}` is no longer accessible. This session was not started and the binding was preserved. Ask an administrator to repair it with a new top-level `/repo`, or use `/repo unbind`.',
   // ─── Topic directive header (`[title] /t /repo … /model … body`) rejections ──
   // Fail closed: one bad field voids the whole header, so this reply is the
   // user's only feedback and must name the offending field.

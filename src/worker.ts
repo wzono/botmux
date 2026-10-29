@@ -426,6 +426,7 @@ import {
   bareShellLaunchKind,
   bareShellLaunchGuidance,
   settleLaunchComm,
+  readCwd,
 } from './core/session-discovery.js';
 import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay } from './utils/timing.js';
@@ -29732,8 +29733,11 @@ process.on('message', async (raw: unknown) => {
           flushPending();
         }
 
+        const backendPid = backend?.getChildPid?.() ?? undefined;
+        const observedCwd = backendPid ? readCwd(backendPid) : undefined;
         send({
           type: 'ready',
+          ...(observedCwd ? { cwd: observedCwd } : {}),
           port,
           token: writeToken,
           viewToken,

@@ -9,8 +9,8 @@ import * as sessionStore from '../services/session-store.js';
 import { dashboardEventBus } from './dashboard-events.js';
 
 export type SessionWorkingDirMutation =
-  | { workingDir: string; source: 'group'; groupWorkspaceRevision: number }
-  | { workingDir: string; source: Exclude<SessionWorkingDirSource, 'group'>; groupWorkspaceRevision?: never };
+  | { workingDir: string; source: 'group'; groupWorkspaceRevision: number; groupWorkspaceDirectoryIdentity?: { dev: string; ino: string } }
+  | { workingDir: string; source: Exclude<SessionWorkingDirSource, 'group'>; groupWorkspaceRevision?: never; groupWorkspaceDirectoryIdentity?: never };
 
 const SESSION_WORKING_DIR_SOURCES = new Set<SessionWorkingDirSource>([
   'explicit', 'oncall-explicit', 'oncall-default-auto', 'group',
@@ -46,6 +46,9 @@ export function setSessionWorkingDirMetadata(session: Session, mutation: Session
   session.workingDir = mutation.workingDir;
   session.workingDirSource = mutation.source;
   session.groupWorkspaceRevision = mutation.source === 'group' ? mutation.groupWorkspaceRevision : undefined;
+  session.groupWorkspaceDirectoryIdentity = mutation.source === 'group'
+    ? mutation.groupWorkspaceDirectoryIdentity
+    : undefined;
   session.riffRepoDirs = undefined;
 }
 

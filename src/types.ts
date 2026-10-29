@@ -796,6 +796,8 @@ export interface Session {
   workingDirSource?: SessionWorkingDirSource;
   /** Present exactly when workingDirSource is group. */
   groupWorkspaceRevision?: number;
+  /** Directory identity captured from the authoritative group binding. */
+  groupWorkspaceDirectoryIdentity?: { dev: string; ino: string };
   webPort?: number;
   /** Agent-registered local Web preview for this session. The daemon accepts
    * only a reachable literal loopback target through the session-scoped CLI
@@ -2236,6 +2238,8 @@ export type WorkerToDaemon =
       replyAlreadySent?: boolean;
       turnId?: string;
       dispatchAttempt?: number;
+      /** Backend/CLI-process observed cwd after startup. Absent when unsupported. */
+      cwd?: string;
     }
   | { type: 'persistent_backend_target'; target?: PersistentBackendTarget }
   /** The exact inbound turn is now durably owned by this worker generation's

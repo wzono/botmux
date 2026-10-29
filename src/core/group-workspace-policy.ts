@@ -15,21 +15,73 @@ export type GroupWorkspaceRouteIntent =
   | { kind: 'set'; selection: string }
   | { kind: 'unbind' };
 
-export type GroupWorkspaceCwdSource = 'oncall-explicit' | 'group' | 'oncall-default-auto';
+export type GroupWorkspaceCwdSource =
+  | 'explicit'
+  | 'oncall-explicit'
+  | 'group'
+  | 'oncall-default-auto'
+  | 'bot-default';
 
-/** Resolve only the oncall/group layers; later tasks add session-wide provenance. */
+export type GroupWorkspaceLayer =
+  | { status: 'usable'; workingDir: string; revision: number; directoryIdentity?: { dev: string; ino: string } }
+  | { status: 'invalid' | 'inaccessible'; workingDir: string; revision: number }
+  | { status: 'unbound' }
+  | { status: 'store-unavailable' };
+
+export type GroupWorkspaceCwdResolution =
+  | { status: 'selected'; workingDir: string; source: GroupWorkspaceCwdSource; groupWorkspaceRevision?: number; groupWorkspaceDirectoryIdentity?: { dev: string; ino: string } }
+  | { status: 'invalid' | 'inaccessible'; workingDir: string; groupWorkspaceRevision: number }
+  | { status: 'store-unavailable' }
+  | { status: 'picker' };
+
+type OncallWorkspace = { workingDir: string; provenance?: 'oncall-explicit' | 'oncall-default-auto' };
+
+/** Complete new-session precedence. Group failures are terminal, never absence. */
 export function resolveGroupWorkspaceCwd(input: {
-  oncall?: { workingDir: string; provenance?: 'oncall-explicit' | 'oncall-default-auto' };
+  explicitWorkingDir?: string;
+  oncall?: OncallWorkspace;
+  group: GroupWorkspaceLayer;
+  botDefaultWorkingDir?: string;
+}): GroupWorkspaceCwdResolution;
+/** Compatibility seam for callers that resolve only the historical oncall/group layers. */
+export function resolveGroupWorkspaceCwd(input: {
+  oncall?: OncallWorkspace;
   groupWorkingDir?: string;
   groupWorkspaceRevision?: number;
-}): { workingDir: string; source: GroupWorkspaceCwdSource; groupWorkspaceRevision?: number } | undefined {
+}): { workingDir: string; source: Extract<GroupWorkspaceCwdSource, 'oncall-explicit' | 'group' | 'oncall-default-auto'>; groupWorkspaceRevision?: number } | undefined;
+export function resolveGroupWorkspaceCwd(input: {
+  explicitWorkingDir?: string;
+  oncall?: OncallWorkspace;
+  group?: GroupWorkspaceLayer;
+  groupWorkingDir?: string;
+  groupWorkspaceRevision?: number;
+  botDefaultWorkingDir?: string;
+}): GroupWorkspaceCwdResolution | { workingDir: string; source: Extract<GroupWorkspaceCwdSource, 'oncall-explicit' | 'group' | 'oncall-default-auto'>; groupWorkspaceRevision?: number } | undefined {
   const oncallIsExplicit = input.oncall && input.oncall.provenance !== 'oncall-default-auto';
-  if (oncallIsExplicit) return { workingDir: input.oncall!.workingDir, source: 'oncall-explicit' };
-  if (input.groupWorkingDir && Number.isSafeInteger(input.groupWorkspaceRevision)) {
-    return { workingDir: input.groupWorkingDir, source: 'group', groupWorkspaceRevision: input.groupWorkspaceRevision };
+  if (!input.group) {
+    if (oncallIsExplicit) return { workingDir: input.oncall!.workingDir, source: 'oncall-explicit' };
+    if (input.groupWorkingDir && Number.isSafeInteger(input.groupWorkspaceRevision)) {
+      return { workingDir: input.groupWorkingDir, source: 'group', groupWorkspaceRevision: input.groupWorkspaceRevision };
+    }
+    if (input.oncall) return { workingDir: input.oncall.workingDir, source: 'oncall-default-auto' };
+    return undefined;
   }
-  if (input.oncall) return { workingDir: input.oncall.workingDir, source: 'oncall-default-auto' };
-  return undefined;
+  if (input.explicitWorkingDir) return { status: 'selected', workingDir: input.explicitWorkingDir, source: 'explicit' };
+  if (oncallIsExplicit) return { status: 'selected', workingDir: input.oncall!.workingDir, source: 'oncall-explicit' };
+  if (input.group.status === 'usable') {
+    return {
+      status: 'selected', workingDir: input.group.workingDir, source: 'group',
+      groupWorkspaceRevision: input.group.revision,
+      groupWorkspaceDirectoryIdentity: input.group.directoryIdentity,
+    };
+  }
+  if (input.group.status === 'invalid' || input.group.status === 'inaccessible') {
+    return { status: input.group.status, workingDir: input.group.workingDir, groupWorkspaceRevision: input.group.revision };
+  }
+  if (input.group.status === 'store-unavailable') return { status: 'store-unavailable' };
+  if (input.oncall) return { status: 'selected', workingDir: input.oncall.workingDir, source: 'oncall-default-auto' };
+  if (input.botDefaultWorkingDir) return { status: 'selected', workingDir: input.botDefaultWorkingDir, source: 'bot-default' };
+  return { status: 'picker' };
 }
 
 export interface GroupWorkspaceRouteAuthority {

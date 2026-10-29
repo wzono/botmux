@@ -9,6 +9,7 @@ import {
   groupWorkspaceOperationKey,
 } from './services/group-workspace-store.js';
 import { GroupWorkspaceOperationStore } from './services/group-workspace-operation-store.js';
+import { probePathUsability, type PathIdentity } from './core/path-usability.js';
 import {
   GroupWorkspaceOperationCoordinator,
   executeGroupWorkspaceUnbind,
@@ -20252,54 +20253,125 @@ async function resolvePinnedWorkingDir(ctx: {
     oncallEntry = await maybeAutoBindDefaultOncall(ctx.larkAppId, ctx.chatId, ctx.chatType);
   }
   const group = ctx.chatType === 'group'
-    ? await groupWorkspaceStore.read(ctx.chatId)
-    : undefined;
-  const groupWorkingDir = group?.status === 'available' && group.record?.directory.kind === 'bound'
-    ? group.record.directory.workingDir
-    : undefined;
-  const workspaceCwd = resolveGroupWorkspaceCwd({
+    ? await groupWorkspaceStore.probeBoundDirectoryForConsumption(ctx.chatId)
+    : { status: 'available' as const, record: undefined };
+  const groupLayer = group.status === 'usable'
+    ? {
+        status: 'usable' as const,
+        workingDir: group.usability.normalizedPath,
+        revision: group.record.revision,
+        directoryIdentity: group.record.directoryIdentity ?? group.usability.identity,
+      }
+    : group.status === 'unusable'
+      ? {
+          status: group.usability.reason === 'inaccessible' ? 'inaccessible' as const : 'invalid' as const,
+          workingDir: group.record.directory.kind === 'bound' ? group.record.directory.workingDir : group.usability.normalizedPath,
+          revision: group.record.revision,
+        }
+      : group.status === 'store_unavailable'
+        ? { status: 'store-unavailable' as const }
+        : { status: 'unbound' as const };
+  // Bot defaults are evaluated only as the final selected layer; a broken group
+  // binding must remain visible and must never silently fall through to them.
+  const botDefaultWorkingDir = resolveBotDefaultWorkingDir(ctx.larkAppId);
+  const resolution = resolveGroupWorkspaceCwd({
     oncall: oncallEntry,
-    groupWorkingDir,
-    groupWorkspaceRevision: group?.status === 'available' ? group.record?.revision : undefined,
+    group: groupLayer,
+    botDefaultWorkingDir,
   });
-  const explicitOncallEntry = workspaceCwd?.source === 'oncall-explicit' ? oncallEntry : undefined;
-  // Resolve the bot default first so we know whether inheritance is only the
-  // ordinary last-resort fallback or must preempt an auto-created worktree.
-  const botDefaultWorkingDir = !workspaceCwd
-    ? resolveBotDefaultWorkingDir(ctx.larkAppId)
+  if (resolution.status !== 'selected' && resolution.status !== 'picker') {
+    const path = 'workingDir' in resolution ? resolution.workingDir : '';
+    await sessionReply(
+      ctx.anchor,
+      tr('daemon.group_workspace_repair_required', { path }, localeForBot(ctx.larkAppId)),
+      'text',
+      ctx.larkAppId,
+    ).catch(error => logger.warn(`[group-workspace] repair notice failed: ${error instanceof Error ? error.message : String(error)}`));
+    throw new Error(`group_workspace_${resolution.status}`);
+  }
+  const workspaceCwd = resolution.status === 'selected' && resolution.source !== 'bot-default'
+    ? resolution
     : undefined;
+  const resolvedBotDefaultWorkingDir = resolution.status === 'selected' && resolution.source === 'bot-default'
+    ? resolution.workingDir
+    : undefined;
+  const explicitOncallEntry = workspaceCwd?.source === 'oncall-explicit' ? oncallEntry : undefined;
   const preferPeerOverAutoWorktree = !workspaceCwd
-    && !!botDefaultWorkingDir
+    && !!resolvedBotDefaultWorkingDir
     && botAutoWorktreeEnabled(ctx.larkAppId);
   // Peer inheritance is normally the fallback after this bot's own default. When
   // that default would create a fresh worktree, however, "bot@bot 同目录拉起"
   // takes priority: a valid same-anchor peer suppresses auto-worktree for this
   // session. The per-bot gate is enforced inside findInheritablePeer.
-  const inheritedFrom = (!workspaceCwd && (!botDefaultWorkingDir || preferPeerOverAutoWorktree))
+  const inheritedFrom = (!workspaceCwd
+    && (resolution.status === 'selected' || resolution.status === 'picker')
+    && (!resolvedBotDefaultWorkingDir || preferPeerOverAutoWorktree))
     ? findInheritablePeer({
         scope: ctx.scope, anchor: ctx.anchor, chatId: ctx.chatId, chatType: ctx.chatType,
         selfAppId: ctx.larkAppId,
         botToBotSameDir: getBot(ctx.larkAppId).config.botToBotSameDir !== false,
       })
     : null;
-  const pinnedWorkingDir = workspaceCwd?.workingDir ?? inheritedFrom?.workingDir ?? botDefaultWorkingDir;
+  const pinnedWorkingDir = workspaceCwd?.workingDir ?? inheritedFrom?.workingDir ?? resolvedBotDefaultWorkingDir;
   const workingDirMutation: SessionWorkingDirMutation | undefined = workspaceCwd
     ? workspaceCwd.source === 'group'
-      ? { workingDir: workspaceCwd.workingDir, source: 'group', groupWorkspaceRevision: workspaceCwd.groupWorkspaceRevision! }
+      ? {
+          workingDir: workspaceCwd.workingDir,
+          source: 'group',
+          groupWorkspaceRevision: workspaceCwd.groupWorkspaceRevision!,
+          groupWorkspaceDirectoryIdentity: workspaceCwd.groupWorkspaceDirectoryIdentity,
+        }
       : { workingDir: workspaceCwd.workingDir, source: workspaceCwd.source }
     : inheritedFrom
       ? { workingDir: inheritedFrom.workingDir, source: 'legacy-unknown' }
-      : botDefaultWorkingDir
-        ? { workingDir: botDefaultWorkingDir, source: 'bot-default' }
+      : resolvedBotDefaultWorkingDir
+        ? { workingDir: resolvedBotDefaultWorkingDir, source: 'bot-default' }
         : undefined;
   // Only the bot-default winner opts into auto-worktree. A same-dir peer winner
   // keeps its exact workingDir and therefore suppresses worktree creation.
   const pinnedFromBotDefault = !workspaceCwd && !inheritedFrom && !!botDefaultWorkingDir;
-  return { pinnedWorkingDir, workingDirMutation, oncallEntry: explicitOncallEntry, inheritedFrom, pinnedFromBotDefault };
+  return { resolution, pinnedWorkingDir, workingDirMutation, oncallEntry: explicitOncallEntry, inheritedFrom, pinnedFromBotDefault };
 
 }
 
+function probeWorkspaceBeforeSpawn(path: string, expectedIdentity?: PathIdentity) {
+  return probePathUsability(path, expectedIdentity ? { expectedIdentity } : undefined);
+}
+
+function confirmWorkerReadyCwd(requested: string, actual: string, expectedIdentity?: PathIdentity): boolean {
+  const requestedProbe = probePathUsability(requested, expectedIdentity ? { expectedIdentity } : undefined);
+  const actualProbe = probePathUsability(actual, expectedIdentity ? { expectedIdentity } : undefined);
+  return requestedProbe.ok && actualProbe.ok
+    && requestedProbe.normalizedPath === actualProbe.normalizedPath
+    && requestedProbe.identity.dev === actualProbe.identity.dev
+    && requestedProbe.identity.ino === actualProbe.identity.ino;
+}
+
+function prepareGroupWorkspaceLaunch(ds: DaemonSession): boolean {
+  if (ds.session.workingDirSource !== 'group') {
+    ds.groupWorkspaceLaunchGuard = undefined;
+    return true;
+  }
+  const path = ds.session.workingDir ?? ds.workingDir;
+  const probe = path
+    ? probeWorkspaceBeforeSpawn(path, ds.session.groupWorkspaceDirectoryIdentity)
+    : undefined;
+  if (!probe?.ok) {
+    void sessionReply(
+      sessionAnchorId(ds),
+      tr('daemon.group_workspace_repair_required', { path: path ?? '' }, localeForBot(ds.larkAppId)),
+      'text',
+      ds.larkAppId,
+    );
+    return false;
+  }
+  ds.groupWorkspaceLaunchGuard = { workingDir: probe.normalizedPath, identity: probe.identity };
+  return true;
+}
+
 export const __testOnly_resolvePinnedWorkingDir = resolvePinnedWorkingDir;
+export const __testOnly_probeWorkspaceBeforeSpawn = probeWorkspaceBeforeSpawn;
+export const __testOnly_confirmWorkerReadyCwd = confirmWorkerReadyCwd;
 // Production message routes (function declarations hoist, so the references
 // are valid here). Exposed for route-level regression tests — e.g. asserting
 // that `/rename` in a fresh topic/thread does NOT pre-create a phantom session,
@@ -24222,6 +24294,7 @@ async function startInitialPassthroughSession(args: {
       type: resolvedSenderIsBot ? 'bot' as const : 'user' as const,
     }
     : undefined);
+  const resolution = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
   const rootIdForStore = scope === 'thread' ? anchor : messageId;
   const session = sessionStore.createSession(chatId, rootIdForStore, commandContent.substring(0, 50), chatType, undefined, { source: 'ordinary-feishu' });
   const now = Date.now();
@@ -24240,7 +24313,7 @@ async function startInitialPassthroughSession(args: {
   fillNativeTopicId(session, scope, parsed.threadId);
   sessionStore.updateSession(session);
 
-  const { pinnedWorkingDir, workingDirMutation, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+  const { pinnedWorkingDir, workingDirMutation, oncallEntry, inheritedFrom, pinnedFromBotDefault } = resolution;
   // Auto-worktree: register PENDING (router buffers, no force-fork) and build the
   // worktree off the critical path (see willAutoWorktree / runAutoWorktreeCommit).
   const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
@@ -26058,6 +26131,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       // thread-scope MUST anchor on the thread root or sessionAnchorId() will
       // disagree with activeSessions's key and downstream card buttons silently
       // break. Chat-scope keeps the inbound messageId as audit only.
+      const cwdResolution = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
       const cmdRootIdForStore = scope === 'thread' ? anchor : messageId;
       const session = sessionStore.createSession(chatId, cmdRootIdForStore, cmdContent.substring(0, 50), chatType, undefined, { source: cmd === '/adopt' ? 'external' : 'ordinary-feishu' });
       const now = Date.now();
@@ -26089,7 +26163,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       // spawn path" (see resolvePinnedWorkingDir) — skipping it here also left
       // that write undone for the whole life of the chat, since later turns
       // reuse this session and never re-enter a spawn path.
-      const { pinnedWorkingDir, workingDirMutation, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+      const { pinnedWorkingDir, workingDirMutation, pinnedFromBotDefault } = cwdResolution;
       // …EXCEPT when that dir would have triggered auto-worktree. There the bot
       // default is a worktree BASE, not a launch dir: the ordinary spawn paths
       // answer it with `pendingRepo` + a detached worktree build, which a daemon
@@ -28324,6 +28398,13 @@ async function handleThreadReplyAdmitted(
     // For thread-scope: rootMessageId = anchor (real thread root).
     // For chat-scope:   rootMessageId = the message_id that triggered this auto-create
     //                   (used as audit trail; routing key is chatId).
+    const cwdResolution = await resolvePinnedWorkingDir({
+      scope,
+      anchor,
+      chatId: autoCreateChatId,
+      chatType: autoCreateChatType,
+      larkAppId,
+    });
     const rootIdForStore = scope === 'thread' ? anchor : parsed.messageId;
     const session = sessionStore.createSession(autoCreateChatId, rootIdForStore, parsed.content.substring(0, 50), autoCreateChatType, undefined, { source: 'ordinary-feishu' });
     const now = Date.now();
@@ -28370,13 +28451,7 @@ async function handleThreadReplyAdmitted(
 
     // Use the same layered oncall / inherit / default lookup as handleNewTopic
     // so stale inherited peers are ignored consistently in both spawn paths.
-    const { pinnedWorkingDir, workingDirMutation, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({
-      scope,
-      anchor,
-      chatId: autoCreateChatId,
-      chatType: autoCreateChatType,
-      larkAppId,
-    });
+    const { pinnedWorkingDir, workingDirMutation, oncallEntry, inheritedFrom, pinnedFromBotDefault } = cwdResolution;
     const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
     // Now we know the message will spawn or pend a real session — resolve
     // sender (may await contact API budget) since every downstream branch
@@ -29802,6 +29877,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       // would be a phantom conversation that only exists to be renamed. Let
       // handleCommand's `!ds` branch reply no_active_session instead.
       if (chatId && slashDecision.sessionPolicy === 'precreate') {
+        const cwdResolution = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
         const session = sessionStore.createSession(chatId, anchor, cmdContent.substring(0, 50), chatType, undefined, { source: cmd === '/adopt' ? 'external' : 'ordinary-feishu' });
         const now = Date.now();
         if (chatType === 'p2p') {
@@ -29829,7 +29905,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
         // EVERY session-needing daemon command, not just `/repo`, and skip the
         // pin when it would have meant auto-worktree. This record becomes the
         // thread's real session.
-        const { pinnedWorkingDir, workingDirMutation, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+        const { pinnedWorkingDir, workingDirMutation, pinnedFromBotDefault } = cwdResolution;
         const cmdAutoWorktree = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
         const cmdPinnedWorkingDir = cmd === '/repo' || !cmdAutoWorktree ? pinnedWorkingDir : undefined;
         if (cmdPinnedWorkingDir && workingDirMutation) setSessionWorkingDirMetadata(session, workingDirMutation);
@@ -31538,6 +31614,22 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     sessionReply,
     onZeroPromptFinal: reportZeroPromptFinal,
     getSessionWorkingDir,
+    authorizeWorkingDirLaunch: prepareGroupWorkspaceLaunch,
+    confirmWorkerReadyCwd: (ds, actualCwd) => !!actualCwd
+      && !!ds.groupWorkspaceLaunchGuard
+      && confirmWorkerReadyCwd(
+        ds.groupWorkspaceLaunchGuard.workingDir,
+        actualCwd,
+        ds.groupWorkspaceLaunchGuard.identity,
+      ),
+    onWorkerReadyCwdMismatch(ds) {
+      void sessionReply(
+        sessionAnchorId(ds),
+        tr('daemon.group_workspace_repair_required', { path: getSessionWorkingDir(ds) }, localeForBot(ds.larkAppId)),
+        'text',
+        ds.larkAppId,
+      );
+    },
     onMissingWorkingDir(ds, path, ctx) {
       void publishWorkingDirRecovery(ds, path, { sessionReply, lastRepoScan }, ctx).catch(err => {
         logger.warn(`[${tag(ds)}] working-dir recovery notice failed: ${err instanceof Error ? err.message : String(err)}`);
