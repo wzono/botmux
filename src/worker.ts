@@ -9,6 +9,8 @@ import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath }
 import {claudeActionPrompt} from './services/claude-action-prompt.js';
 import { GOAL_ENV } from './workflows/v3/contract.js';
 import { supportsZeroPromptInjection } from './core/prompt-injection.js';
+import { probePathUsability } from './core/path-usability.js';
+import { awaitAuthoritativeWorkerCwd } from './core/worker-cwd-launch-guard.js';
 import { SCHEDULE_PROMPT_UNDELIVERED_ERROR_CODE } from './core/deferred-schedule-settlement.js';
 import { supportsTranscriptReplyDeliveryForBot } from './core/reply-delivery.js';
 import { TurnProgressNotice, progressNoticeIntervalMinutes } from './utils/turn-progress-notice.js';
@@ -20315,6 +20317,8 @@ async function spawnCli(
   if (proxyError) throw new Error(proxyError);
   const spawnGeneration = ++cliSpawnGeneration;
   const spawnStartedAtMs = Date.now();
+  let cwdGuardOutputPending = false;
+  const cwdGuardOutput: string[] = [];
   restartInterruptionScanBeforeMs = undefined;
   // Every spawn is a new CLI process that can show the picker again. Not all
   // respawns pass through killCli() (e.g. the retry after a crash-loop park),
@@ -22461,7 +22465,8 @@ async function spawnCli(
     : cfg.deferredScheduleRun && cliAdapter.findInitialPromptArgSubmission
       ? cliAdapter.captureInitialPromptArgSubmission?.() ?? null
       : null;
-  const deferInitialPrompt = shouldDeferInitialPromptForStartup({
+  const deferInitialPrompt = cfg.expectedWorkingDirIdentity !== undefined
+    || shouldDeferInitialPromptForStartup({
     hasStartupCommands: spawnHasStartupWork(cfg.startupCommands, cfg.initialNativeRename),
     adoptMode: cfg.adoptMode === true,
     passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
@@ -24722,6 +24727,7 @@ async function spawnCli(
         log('[program-status] relay entry not runnable from this install; launching CLI directly (no OSC 7501 handshake under tmux)');
       }
     }
+    cwdGuardOutputPending = cfg.expectedWorkingDirIdentity !== undefined;
     backend.spawn(spawnBin, spawnArgs, {
       cwd: spawnCwd,
       cols: PTY_COLS,
@@ -24780,6 +24786,50 @@ async function spawnCli(
   cliOutlivesWorker = cliSurvivesWorkerExit({ backendType: effectiveBackendType, persistentSessionName });
   const actuallyReattachedPersistent = 'isReattach' in backend
     && backend.isReattach === true;
+  // Group-bound launches carry an immutable directory identity on every init
+  // generation, including in-worker restarts. The backend must first create (or
+  // reattach) the real CLI process; only its authoritative /proc cwd can satisfy
+  // this gate. No pending business input, startup command, or ready hook is
+  // materialized before the gate succeeds.
+  if (cfg.expectedWorkingDirIdentity) {
+    const guardedBackend = backend;
+    guardedBackend.onData(data => {
+      if (backend !== guardedBackend) return;
+      if (cwdGuardOutputPending) cwdGuardOutput.push(data);
+      else onPtyData(data);
+    });
+    const cwdGuard = await awaitAuthoritativeWorkerCwd({
+      expectedWorkingDir: cfg.workingDir,
+      expectedIdentity: cfg.expectedWorkingDirIdentity,
+      getChildPid: () => guardedBackend === backend ? guardedBackend.getChildPid?.() : null,
+      readCwd,
+      probe: (path, expectedIdentity) => {
+        const result = probePathUsability(path, { expectedIdentity });
+        return result.ok;
+      },
+    });
+    if (!cwdGuard.ok) {
+      cwdGuardOutputPending = false;
+      try {
+        if (guardedBackend.destroySession) await guardedBackend.destroySession();
+        else guardedBackend.kill();
+      } catch (error) {
+        throw new Error(
+          `[workspace-cwd] refusing generation ${spawnGeneration}: ${cwdGuard.reason}; `
+          + `authoritative teardown failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      } finally {
+        if (backend === guardedBackend) backend = null;
+      }
+      throw new Error(
+        `[workspace-cwd] refusing generation ${spawnGeneration}: ${cwdGuard.reason}`
+        + `${cwdGuard.cwd ? ` (${cwdGuard.cwd})` : ''}`,
+      );
+    }
+    cwdGuardOutputPending = false;
+    for (const data of cwdGuardOutput.splice(0)) onPtyData(data);
+    log(`Workspace cwd validated for generation ${spawnGeneration}: ${cwdGuard.cwd}`);
+  }
   prepareDeploymentContinuationForSpawn(cfg, actuallyReattachedPersistent);
   // A NEW process resuming the same conversation — not a re-attach, whose CLI
   // never stopped: the transcript bridge's baseline reads what the previous
@@ -25503,10 +25553,12 @@ async function spawnCli(
     });
   }
 
-  observedBackend.onData((data) => {
-    if (backend !== observedBackend) return;
-    onPtyData(data);
-  });
+  if (!cfg.expectedWorkingDirIdentity) {
+    observedBackend.onData((data) => {
+      if (backend !== observedBackend) return;
+      onPtyData(data);
+    });
+  }
   if (observedBackend instanceof HerdrBackend) {
     const transcriptSettle = makeBridgeTranscriptSettle(
       () => bridgeHeadTurnAwaitingTerminal(),

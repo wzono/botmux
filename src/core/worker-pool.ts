@@ -7089,10 +7089,12 @@ export function requestSessionRestart(
       // fresh CLI instead of reattaching the old one and falsely reporting a
       // successful restart.
       destroyLivePaneBeforeRestart(ds);
-      forkWorker(ds, '', {
+      if (forkWorker(ds, '', {
         resume: ds.hasHistory,
         restartAttemptId: attemptId,
-      });
+      }) === false) {
+        throw new Error('worker restart refused before spawn');
+      }
     } catch (error) {
       start.failure = { error };
       // Rethrow: the coordinator settles this fresh attempt as `failed`.
@@ -14954,6 +14956,9 @@ export function forkWorker(
     chatType: ds.chatType,
     rootMessageId: sessionAnchorId(ds),
     workingDir: cwd,
+    ...(ds.groupWorkspaceLaunchGuard?.identity
+      ? { expectedWorkingDirIdentity: { ...ds.groupWorkspaceLaunchGuard.identity } }
+      : {}),
     cliId: agentCfg.cliId,
     cliRuntime: agentCfg.cliRuntime,
     cliPathOverride: agentCfg.cliPathOverride,

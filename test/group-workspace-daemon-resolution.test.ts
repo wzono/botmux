@@ -63,6 +63,31 @@ describe('group workspace resolution', () => {
     expect(resolveGroupWorkspaceCwd({ group, botDefaultWorkingDir: '/bot' })).toEqual({ status, ...(status === 'store-unavailable' ? {} : { workingDir: '/group', groupWorkspaceRevision: 1 }) });
   });
 
+  it.each([
+    { status: 'invalid' as const, workingDir: '/broken', revision: 1 },
+    { status: 'inaccessible' as const, workingDir: '/locked', revision: 2 },
+    { status: 'store-unavailable' as const },
+  ])('lets explicit repair intent bypass a broken group layer: %s', group => {
+    expect(resolveGroupWorkspaceCwd({
+      explicitWorkingDir: '/repair',
+      oncall: { workingDir: '/legacy' },
+      group,
+      botDefaultWorkingDir: '/bot',
+    })).toMatchObject({ status: 'selected', source: 'explicit', workingDir: '/repair' });
+  });
+
+  it('lets a deferred explicit repair route skip reading the broken group layer', async () => {
+    const { botRegistry, daemon } = await loadDaemon();
+    botRegistry.registerBot({ larkAppId: 'bot-b', larkAppSecret: 's', cliId: 'claude-code' });
+    writeFileSync(join(process.env.SESSION_DATA_DIR!, 'group-workspaces.json'), '{broken');
+
+    const result = await daemon.__testOnly_resolvePinnedWorkingDir({
+      scope: 'thread', anchor: CHAT, chatId: CHAT, chatType: 'group', larkAppId: 'bot-b',
+      explicitRepairIntent: true,
+    });
+    expect(result.resolution).toEqual({ status: 'picker' });
+  });
+
   it('lets Bot B consume Bot A binding and lets /th resolve without a peer', async () => {
     const { botRegistry, groupStore, daemon } = await loadDaemon();
     const workspace = dir('workspace');

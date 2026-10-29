@@ -2677,7 +2677,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) =
   // Revive it the same way the Feishu card restart does (forkWorker), so the
   // dashboard isn't a dead-end: a 409 here would leave NO working control to
   // bring the CLI back (the resume button only shows for closed sessions).
-  forkWorker(ds, '', ds.hasHistory);
+  if (forkWorker(ds, '', ds.hasHistory) === false) {
+    return jsonRes(res, 409, { ok: false, error: 'restart_refused' });
+  }
   postRestartNotice(ds, true);
   jsonRes(res, 200, { ok: true, sessionId: params.sessionId, cliId, revived: true });
   });
@@ -5485,8 +5487,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   // materializes its provider immediately inside resumeSession, so an optional
   // wake request only applies when that path did not already create a worker.
   const woke = wake && (!ds.worker || ds.worker.killed);
-  if (woke) {
-    forkWorker(ds, '', true);
+  if (woke && forkWorker(ds, '', true) === false) {
+    return jsonRes(res, 409, { ok: false, error: 'wake_refused' });
   }
 
   jsonRes(res, 200, {

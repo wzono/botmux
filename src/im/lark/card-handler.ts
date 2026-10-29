@@ -879,7 +879,7 @@ export async function commitRepoSelection(
       // the user can retry this exact selection without losing the first turn.
       const pendingTurnId = ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId;
       if (!emptyStart && pendingTurnId) await prepareTurn?.(ds, pendingTurnId);
-      forkWorker(
+      const accepted = forkWorker(
         ds,
         prompt,
         !emptyStart && !pendingRawInput && pendingTurnId ? {
@@ -887,6 +887,7 @@ export async function commitRepoSelection(
           ...(ds.pendingTrustedCaller ? { trustedCaller: ds.pendingTrustedCaller } : {}),
         } : false,
       );
+      if (accepted === false) return false;
       ds.pendingRepo = false;
       // A queued activation owns the route through its adapter-level ACK. Every
       // buffer below was synchronously folded into prompt N and is safe to clear;
@@ -1072,7 +1073,9 @@ export async function commitRepoSelection(
         current.lastScreenContent = undefined;
         current.lastScreenStatus = undefined;
         activeSessions.set(key, current);
-        forkWorker(current, '', false);
+        if (forkWorker(current, '', false) === false) {
+          return { ok: false as const, reason: 'start_refused' as const };
+        }
         // Brand-new CLI in a brand-new session record: the next real business
         // message is its new-topic first turn (same invariant as the pending path).
         markInitialUserTurnPending(current);
@@ -2506,8 +2509,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       // have reported success for a fork that never happened, with the
       // one-shot follow-up token already consumed and no retry affordance.
       else {
-        forkWorker(ds, cliInput, ds.hasHistory);
-        accepted = true;
+        accepted = forkWorker(ds, cliInput, ds.hasHistory);
       }
     } catch (err) {
       logger.warn(`[${tag(ds)}] /quote injection threw: ${err instanceof Error ? err.message : String(err)}`);
@@ -3387,8 +3389,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       try {
         if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, voiceInput);
         else {
-          forkWorker(ds, voiceInput, ds.hasHistory);
-          accepted = true;
+          accepted = forkWorker(ds, voiceInput, ds.hasHistory);
         }
       } catch (err) {
         logger.warn(
@@ -3854,8 +3855,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       try {
         if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput);
         else {
-          forkWorker(ds, retryInput, ds.hasHistory);
-          accepted = true;
+          accepted = forkWorker(ds, retryInput, ds.hasHistory);
         }
       } catch (err) {
         logger.warn(
@@ -3987,8 +3987,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       try {
         if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput);
         else {
-          forkWorker(ds, retryInput, ds.hasHistory);
-          accepted = true;
+          accepted = forkWorker(ds, retryInput, ds.hasHistory);
         }
       } catch (err) {
         logger.warn(

@@ -20232,6 +20232,10 @@ async function resolvePinnedWorkingDir(ctx: {
   chatType: 'group' | 'p2p';
   larkAppId: string;
   listenerWorkingDir?: string;
+  /** A route that will pin its own directory after this lookup (`/repo X`,
+   * `/th`/`/tw`, or an explicit topic-header repository). It must not touch an
+   * older group binding: that binding may be exactly what this route repairs. */
+  explicitRepairIntent?: boolean;
 }) {
   if (ctx.listenerWorkingDir) {
     const resolved = expandHome(ctx.listenerWorkingDir);
@@ -20252,9 +20256,11 @@ async function resolvePinnedWorkingDir(ctx: {
   if (!oncallEntry) {
     oncallEntry = await maybeAutoBindDefaultOncall(ctx.larkAppId, ctx.chatId, ctx.chatType);
   }
-  const group = ctx.chatType === 'group'
-    ? await groupWorkspaceStore.probeBoundDirectoryForConsumption(ctx.chatId)
-    : { status: 'available' as const, record: undefined };
+  const group = ctx.explicitRepairIntent
+    ? { status: 'available' as const, record: undefined }
+    : ctx.chatType === 'group'
+      ? await groupWorkspaceStore.probeBoundDirectoryForConsumption(ctx.chatId)
+      : { status: 'available' as const, record: undefined };
   const groupLayer = group.status === 'usable'
     ? {
         status: 'usable' as const,
@@ -23814,19 +23820,20 @@ function hasBufferedOpeningInput(ds: DaemonSession): boolean {
  * card-handler 的 commitRepoSelection）：空 prompt fork + markInitialUserTurnPending，
  * 用户下一条真消息才是这个会话的开场。
  */
-function forkReservedIdleSession(ds: DaemonSession): void {
-  forkWorker(ds, '', false);
+function forkReservedIdleSession(ds: DaemonSession): boolean {
+  if (forkWorker(ds, '', false) === false) return false;
   markInitialUserTurnPending(ds);
   ds.pendingTurnId = undefined;
   ds.initialStartPending = ds.session.queuedActivationPending === true;
   clearInitialStartBuffers(ds);
+  return true;
 }
 
 /** Raw slash-command cold starts type the raw command only after prompt_ready.
  * Buffer later same-anchor messages into the ordered follow-up payload carried
  * on that same raw_input IPC; a separate worker message could overtake the
  * command's text→Enter beat. */
-function forkReservedInitialRawSession(ds: DaemonSession, availableBots: AvailableBot[]): void {
+function forkReservedInitialRawSession(ds: DaemonSession, availableBots: AvailableBot[]): boolean {
   const hasBufferedInput =
     (ds.pendingPrompt?.trim().length ?? 0) > 0
     || (ds.pendingAttachments?.length ?? 0) > 0
@@ -23867,7 +23874,13 @@ function forkReservedInitialRawSession(ds: DaemonSession, availableBots: Availab
       || hasPendingSessionTurns(ds.session.sessionId));
   if (armRawActivationAck) ds.session.queued = true;
   try {
-    forkWorker(ds, '', false);
+    if (forkWorker(ds, '', false) === false) {
+      if (armRawActivationAck && ds.session.queued === true) {
+        ds.session.queued = false;
+        sessionStore.updateSession(ds.session);
+      }
+      return false;
+    }
   } catch (err) {
     // forkWorker's pre-init compensation restores its queued snapshot. This
     // synthetic marker belongs only to the raw ACK fence, not the Dashboard
@@ -23883,6 +23896,7 @@ function forkReservedInitialRawSession(ds: DaemonSession, availableBots: Availab
   // through that ACK so a follower cannot be sent between those two beats.
   ds.initialStartPending = ds.session.queuedActivationPending === true;
   clearInitialStartBuffers(ds);
+  return true;
 }
 
 async function replyInvalidWorkingDirs(
@@ -25405,6 +25419,12 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     chatType,
     larkAppId,
     listenerWorkingDir: messageListener?.workingDir,
+    explicitRepairIntent: !!forceTopic && (
+      forceTopicMode !== 'default'
+      || topicSpec?.workingDir !== undefined
+      || topicSpec?.worktree !== undefined
+      || topicSpec?.repoStartInDefaultDir === true
+    ),
   });
   // 指令头里的 `/repo X` 是**用户显式选仓**，与点选仓卡片上的项目按钮同义：钉目录、
   // 跳过卡片，并且不建 worktree —— auto-worktree 的触发条件是「没人选、目录来自 bot 自己的
@@ -26131,7 +26151,11 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       // thread-scope MUST anchor on the thread root or sessionAnchorId() will
       // disagree with activeSessions's key and downstream card buttons silently
       // break. Chat-scope keeps the inbound messageId as audit only.
-      const cwdResolution = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+      const cwdResolution = await resolvePinnedWorkingDir({
+        scope, anchor, chatId, chatType, larkAppId,
+        explicitRepairIntent: cmd === '/repo'
+          && commandContent.replace(/^\/repo\s*/i, '').trim().length > 0,
+      });
       const cmdRootIdForStore = scope === 'thread' ? anchor : messageId;
       const session = sessionStore.createSession(chatId, cmdRootIdForStore, cmdContent.substring(0, 50), chatType, undefined, { source: cmd === '/adopt' ? 'external' : 'ordinary-feishu' });
       const now = Date.now();

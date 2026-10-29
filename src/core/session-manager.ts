@@ -242,7 +242,7 @@ async function resumeRestoredPendingRepoSetup(
   ensureSessionWhiteboard(ds);
   if (setup.rawInput) {
     rememberLastCliInput(ds, setup.rawInput, setup.rawInput);
-    forkWorker(ds, '', { resume: false, turnId: setup.turnId });
+    if (forkWorker(ds, '', { resume: false, turnId: setup.turnId }) === false) return;
   } else {
     const bot = getBot(ds.larkAppId);
     const availableBots = await getAvailableBots(ds.larkAppId, ds.chatId);
@@ -274,7 +274,7 @@ async function resumeRestoredPendingRepoSetup(
       },
     );
     rememberLastCliInput(ds, setup.prompt, input);
-    forkWorker(ds, input, { resume: false, turnId: setup.turnId });
+    if (forkWorker(ds, input, { resume: false, turnId: setup.turnId }) === false) return;
   }
   logger.info(`[${ds.session.sessionId.substring(0, 8)}] Resumed durable pending repo opening without selectable projects`);
 }

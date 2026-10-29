@@ -3304,7 +3304,7 @@ export async function handleCommand(
             // markInitialUserTurnPending below.
             const emptyStart = !pendingRawInput && !hasBufferedInput;
             if (!emptyStart && pendingTurnId) await deps.prepareTurn?.(current, pendingTurnId);
-            forkWorker(
+            const accepted = forkWorker(
               current,
               pendingRawInput ? '' : (wrappedInput ?? ''),
               !emptyStart && !pendingRawInput && pendingTurnId ? {
@@ -3312,6 +3312,7 @@ export async function handleCommand(
                 ...(current.pendingTrustedCaller ? { trustedCaller: current.pendingTrustedCaller } : {}),
               } : false,
             );
+            if (accepted === false) return false;
             current.pendingRepo = false;
             current.pendingRepoCommitInFlight = true;
             // Queued activation ownership lasts through adapter submission.
@@ -3487,7 +3488,9 @@ export async function handleCommand(
                 sessionStore.updateSession(session);
                 current.hasHistory = false;
                 activeSessions.set(key, current);
-                forkWorker(current, '', false);
+                if (forkWorker(current, '', false) === false) {
+                  return { ok: false as const, reason: 'start_refused' as const };
+                }
                 // Brand-new CLI in a brand-new session record: it has never
                 // seen the botmux opening context either, so the next real
                 // business message is its new-topic first turn (same invariant
@@ -3821,8 +3824,7 @@ export async function handleCommand(
           if (ds.worker && !ds.worker.killed) {
             accepted = sendWorkerInput(ds, retryInput);
           } else {
-            forkWorker(ds, retryInput, ds.hasHistory);
-            accepted = true;
+            accepted = forkWorker(ds, retryInput, ds.hasHistory);
           }
         } catch (err) {
           logger.warn(`[${logTag}] /retry failed before acceptance: ${err instanceof Error ? err.message : String(err)}`);
@@ -6789,7 +6791,9 @@ export async function startCodexAppThreadSession(
     }
     current.session.adoptedFrom = undefined;
     sessionStore.updateSession(current.session);
-    forkWorker(current, '', true);
+    if (forkWorker(current, '', true) === false) {
+      return { status: 'start_refused' as const, anchor: sessionAnchorId(current) };
+    }
     return { status: 'switched' as const, anchor: sessionAnchorId(current) };
   });
   if (switched.status === 'gone') {
@@ -6801,6 +6805,10 @@ export async function startCodexAppThreadSession(
       switched.anchor,
       '当前 Codex App 仍有未结算消息，不能切换原生 thread；请等待本轮完成或先关闭会话。',
     );
+    return;
+  }
+  if (switched.status === 'start_refused') {
+    await sessionReply(switched.anchor, '会话启动被安全检查拒绝，原请求已保留；请修复工作目录后重试。');
     return;
   }
   await sessionReply(
@@ -7011,7 +7019,9 @@ export async function startResumeImportSession(
     // sandboxed, matching restore semantics). Mark history so this is a resume.
     current.hasHistory = true;
     sessionStore.updateSession(current.session);
-    forkWorker(current, '', true);
+    if (forkWorker(current, '', true) === false) {
+      return { status: 'start_refused' as const, anchor: sessionAnchorId(current) };
+    }
     return { status: 'resumed' as const, anchor: sessionAnchorId(current) };
   });
   if (resumed.status === 'gone') {
@@ -7023,6 +7033,10 @@ export async function startResumeImportSession(
       resumed.anchor,
       '当前 Codex App 仍有未结算消息，不能导入外部会话；请等待本轮完成或先关闭会话。',
     );
+    return;
+  }
+  if (resumed.status === 'start_refused') {
+    await sessionReply(resumed.anchor, '会话启动被安全检查拒绝，导入状态已保留；请修复工作目录后重试。');
     return;
   }
 
