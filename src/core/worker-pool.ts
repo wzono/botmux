@@ -16259,10 +16259,18 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored ready from stale/transferring worker generation`);
           break;
         }
-        if (ds.groupWorkspaceLaunchGuard
-          && cb.confirmWorkerReadyCwd
-          && !cb.confirmWorkerReadyCwd(ds, msg.cwd)) {
-          logger.error(`[${t}] Worker ready cwd mismatch: requested=${ds.groupWorkspaceLaunchGuard.workingDir} actual=${msg.cwd ?? '(unavailable)'}`);
+        const launchGuard = ds.groupWorkspaceLaunchGuard;
+        const remoteHostProof = msg.hostWorkingDirContract;
+        const readyBackendType = ds.initConfig?.backendType ?? ds.session.backendType;
+        const exactRemoteHostProof = (readyBackendType === 'riff' || readyBackendType === 'mojo')
+          && !!launchGuard?.identity
+          && remoteHostProof?.workingDir === launchGuard.workingDir
+          && remoteHostProof.identity.dev === launchGuard.identity.dev
+          && remoteHostProof.identity.ino === launchGuard.identity.ino;
+        if (launchGuard
+          && !exactRemoteHostProof
+          && (!cb.confirmWorkerReadyCwd || !cb.confirmWorkerReadyCwd(ds, msg.cwd))) {
+          logger.error(`[${t}] Worker ready cwd mismatch: requested=${launchGuard.workingDir} actual=${msg.cwd ?? '(unavailable)'}`);
           cb.onWorkerReadyCwdMismatch?.(ds, msg.cwd);
           ds.groupWorkspaceLaunchGuard = undefined;
           worker.kill('SIGTERM');

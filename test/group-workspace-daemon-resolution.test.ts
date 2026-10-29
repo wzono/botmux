@@ -7,6 +7,7 @@ import { resolveGroupWorkspaceCwd } from '../src/core/group-workspace-policy.js'
 import { __testOnly_setupWorkerHandlers, initWorkerPool, setActiveSessionsRegistry } from '../src/core/worker-pool.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import { registerBot } from '../src/bot-registry.js';
+import { init as initSessionStore } from '../src/services/session-store.js';
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
   class FakeClient { constructor(public opts: Record<string, unknown>) {} }
@@ -125,6 +126,42 @@ describe('group workspace resolution', () => {
     renameSync(replacement, workspace);
     expect(daemon.__testOnly_probeWorkspaceBeforeSpawn(workspace, initial.ok ? initial.identity : undefined))
       .toMatchObject({ ok: false, reason: 'changed' });
+  });
+
+  it.each(['riff', 'mojo'] as const)('accepts %s worker readiness with exact validated host contract proof and no child cwd', async backendType => {
+    initSessionStore(`bot-${backendType}`);
+    registerBot({ larkAppId: `bot-${backendType}`, larkAppSecret: 's', cliId: backendType });
+    const requested = dir(`requested-${backendType}`);
+    const identity = { dev: '11', ino: '22' };
+    const worker = new EventEmitter() as any;
+    worker.killed = false;
+    worker.send = vi.fn();
+    worker.kill = vi.fn();
+    worker.pid = 123;
+    worker.stdout = new EventEmitter();
+    worker.stderr = new EventEmitter();
+    const ds = {
+      session: { sessionId: `sid-${backendType}`, chatId: CHAT, rootMessageId: CHAT, status: 'active', createdAt: new Date(0).toISOString(),
+        larkAppId: `bot-${backendType}`, chatType: 'group', scope: 'chat', workingDir: requested, workingDirSource: 'group',
+        groupWorkspaceRevision: 1, workerGeneration: 0, backendType },
+      worker, workerPort: null, workerToken: null, larkAppId: `bot-${backendType}`, chatId: CHAT, chatType: 'group', scope: 'chat',
+      spawnedAt: 0, lastMessageAt: 0, hasHistory: false, workerGeneration: 0,
+      groupWorkspaceLaunchGuard: { workingDir: requested, identity },
+    } as DaemonSession;
+    initWorkerPool({
+      sessionReply: vi.fn(), getSessionWorkingDir: () => requested, getActiveCount: () => 1, closeSession: vi.fn(),
+      confirmWorkerReadyCwd: vi.fn(() => false),
+    } as any);
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    __testOnly_setupWorkerHandlers(ds, worker, undefined, 0);
+
+    worker.emit('message', {
+      type: 'ready', port: 0, token: '',
+      hostWorkingDirContract: { workingDir: requested, identity },
+    });
+
+    expect(worker.kill).not.toHaveBeenCalled();
+    expect(ds.workerReady).toBe(true);
   });
 
   it('rejects real worker readiness when the backend-observed cwd differs', async () => {

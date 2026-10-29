@@ -19282,6 +19282,15 @@ async function flushPending(): Promise<void> {
             inflightInputs.forget(item);
             pendingMessages.unshift(item);
             log('Retained definitely-unwritten input at queue head for retry');
+            if (writeBackend.validateWorkingDirBeforeBusinessInput) {
+              send({
+                type: 'user_notify',
+                message: `${effectiveBackendType === 'riff' ? 'Riff' : 'Mojo'} 工作目录绑定已变化，业务输入未发送；原消息已保留，请修复目录后重试。`,
+                turnId: item.turnId,
+                ...(item.dispatchAttempt !== undefined ? { dispatchAttempt: item.dispatchAttempt } : {}),
+              });
+              markPromptReady();
+            }
           }
         }
         if (deliveryQuarantine) break;
@@ -29811,9 +29820,11 @@ process.on('message', async (raw: unknown) => {
 
         const backendPid = backend?.getChildPid?.() ?? undefined;
         const observedCwd = backendPid ? readCwd(backendPid) : undefined;
+        const hostWorkingDirContract = backend?.validatedHostWorkingDirContract?.();
         send({
           type: 'ready',
           ...(observedCwd ? { cwd: observedCwd } : {}),
+          ...(hostWorkingDirContract ? { hostWorkingDirContract } : {}),
           port,
           token: writeToken,
           viewToken,

@@ -2240,6 +2240,11 @@ export type WorkerToDaemon =
       dispatchAttempt?: number;
       /** Backend/CLI-process observed cwd after startup. Absent when unsupported. */
       cwd?: string;
+      /** Fresh exact host-contract proof for deferred remote execution. */
+      hostWorkingDirContract?: {
+        workingDir: string;
+        identity: { dev: string; ino: string };
+      };
     }
   | { type: 'persistent_backend_target'; target?: PersistentBackendTarget }
   /** The exact inbound turn is now durably owned by this worker generation's

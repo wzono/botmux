@@ -17,4 +17,11 @@ export class HostWorkingDirContract {
     return expected === null
       || probePathUsability(expected.path, { expectedIdentity: expected.identity }).ok;
   }
+
+  validatedProof(): { workingDir: string; identity: PathIdentity } | undefined {
+    const expected = this.expected;
+    if (expected === null
+      || !probePathUsability(expected.path, { expectedIdentity: expected.identity }).ok) return undefined;
+    return { workingDir: expected.path, identity: { ...expected.identity } };
+  }
 }

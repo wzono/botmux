@@ -339,6 +339,15 @@ export interface SessionBackend {
    * before the worker dequeues business input. Omitted means startup requires
    * proof from a real child process cwd. */
   validateWorkingDirBeforeBusinessInput?(): boolean;
+  /** Queue one business input and resolve only when its serialized dispatch edge
+   * either begins remote I/O or rejects before dispatch. */
+  writeBusinessInput?(data: string): Promise<'submitted' | 'retryable_pre_dispatch_rejection'>;
+  /** Exact host contract proof, freshly validated for worker readiness. Remote
+   * backends use this instead of a child cwd; absence never proves readiness. */
+  validatedHostWorkingDirContract?(): {
+    workingDir: string;
+    identity: { dev: string; ino: string };
+  } | undefined;
   /** PID of the CLI process running inside the backend. */
   getChildPid?(): number | null;
   captureCurrentScreen?(): string;
