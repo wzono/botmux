@@ -134,9 +134,8 @@ import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
-import { initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
+import { coordinationModeIsPrimary, initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
 import { effortTaskFingerprint } from './services/codex-effort-task-state.js';
-import { coordinationModeIsPrimary } from './services/durable-coordination-runtime.js';
 import { closeLinkRefRuntime, initializeLinkRefRuntime } from './services/link-ref-runtime.js';
 import { startDurableInboxShadowConsumer } from './services/durable-inbox-shadow-consumer.js';
 import {
