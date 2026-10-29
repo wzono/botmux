@@ -141,13 +141,11 @@ describe('fresh cross-app administrator identity', () => {
 
   it('rejects a conversion whose tenant differs from its signing Bot', async () => {
     const registered = [{ larkAppId: 'cli_a', tenantKey: 'tenant-1', resolvedAllowedUsers: ['ou_app_a'] }];
-    const resolve = vi.fn(async (bot: BotAdminIdentityConfig) => {
-      expect(bot).toBe(registered[0]);
-      return { tenantKey: 'tenant-2', unionId: 'on_human' };
-    });
+    const resolve = vi.fn(async () => ({ tenantKey: 'tenant-2', unionId: 'on_human' }));
 
     await expect(loadFreshBotAdminUnionSnapshot({ registeredBots: registered, resolveAllowedUser: resolve }))
       .resolves.toBeUndefined();
+    expect(resolve).toHaveBeenCalledWith(expect.objectContaining(registered[0]), 'ou_app_a');
   });
 
   it('does not retain a removed administrator from a stale snapshot', async () => {
@@ -166,6 +164,26 @@ describe('fresh cross-app administrator identity', () => {
     });
     expect(canManageGroupWorkspace({ actor: human, freshSnapshot: fresh })).toBe(false);
     expect(canManageGroupWorkspace({ actor: replacement, freshSnapshot: fresh })).toBe(true);
+  });
+
+  it('fails closed when administrator config changes while identities are resolving', async () => {
+    const registered: BotAdminIdentityConfig[] = [
+      { larkAppId: 'cli_a', tenantKey: 'tenant-1', resolvedAllowedUsers: ['ou_revoked'] },
+    ];
+    let releaseResolution!: (identity: TenantHumanId) => void;
+    const resolution = new Promise<TenantHumanId>(resolve => { releaseResolution = resolve; });
+    const refresh = loadFreshBotAdminUnionSnapshot({
+      registeredBots: registered,
+      resolveAllowedUser: async () => resolution,
+    });
+
+    registered[0].resolvedAllowedUsers = ['ou_replacement'];
+    const replacementFingerprint = botAdminIdentityConfigFingerprint(registered);
+    releaseResolution(human);
+
+    const snapshot = await refresh;
+    expect(snapshot).toBeUndefined();
+    expect(snapshot?.configFingerprint === replacementFingerprint && snapshot.admins.includes(human)).toBe(false);
   });
 });
 

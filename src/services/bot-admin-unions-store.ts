@@ -102,6 +102,20 @@ export function botAdminIdentityConfigFingerprint(
   return createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
 }
 
+function snapshotIdentityConfigs(
+  registeredBots: readonly BotAdminIdentityConfig[],
+): readonly BotAdminIdentityConfig[] {
+  return Object.freeze(registeredBots.map(rawBot => {
+    const bot = normalizedIdentityConfig(rawBot);
+    return Object.freeze({
+      larkAppId: bot.larkAppId,
+      tenantKey: bot.tenantKey,
+      ...(bot.brand ? { brand: bot.brand } : {}),
+      resolvedAllowedUsers: Object.freeze(bot.allowedUsers),
+    });
+  }));
+}
+
 function tenantHumanKey(identity: TenantHumanId): string {
   return JSON.stringify([identity.tenantKey, identity.unionId]);
 }
@@ -120,11 +134,10 @@ async function computeFreshBotAdminUnions(
   const admins: TenantHumanId[] = [];
   const seen = new Set<string>();
   const orderedBots = [...registeredBots].sort((a, b) => a.larkAppId.localeCompare(b.larkAppId));
-  for (const rawBot of orderedBots) {
-    const bot = normalizedIdentityConfig(rawBot);
+  for (const bot of orderedBots) {
     if (!bot.larkAppId || !bot.tenantKey) return undefined;
-    for (const entry of bot.allowedUsers) {
-      const identity = await resolveAllowedUser(rawBot, entry);
+    for (const entry of bot.resolvedAllowedUsers) {
+      const identity = await resolveAllowedUser(bot, entry);
       if (!identity
         || !identity.tenantKey
         || !identity.unionId.startsWith('on_')
@@ -154,12 +167,15 @@ export async function loadFreshBotAdminUnionSnapshot(options: {
 }): Promise<FreshBotAdminUnionSnapshot | undefined> {
   const now = options.now?.() ?? Date.now();
   const ttlMs = options.ttlMs ?? DEFAULT_BOT_ADMIN_UNION_SNAPSHOT_TTL_MS;
-  const fingerprint = botAdminIdentityConfigFingerprint(options.registeredBots);
+  const identityConfigs = snapshotIdentityConfigs(options.registeredBots);
+  const fingerprint = botAdminIdentityConfigFingerprint(identityConfigs);
   if (options.snapshot?.configFingerprint === fingerprint
     && Number.isFinite(options.snapshot.expiresAt)
     && now < options.snapshot.expiresAt) return options.snapshot;
   try {
-    return await computeFreshBotAdminUnions(options.registeredBots, options.resolveAllowedUser, now, ttlMs);
+    const snapshot = await computeFreshBotAdminUnions(identityConfigs, options.resolveAllowedUser, now, ttlMs);
+    if (botAdminIdentityConfigFingerprint(options.registeredBots) !== fingerprint) return undefined;
+    return snapshot;
   } catch {
     return undefined;
   }
