@@ -9658,8 +9658,12 @@ async function relaySend(
     const base = `${id}-${randomBytes(4).toString('hex')}-${basename(p)}`;
     try { writeFileSync(join(relayDir, base), readFileSync(p)); out.push(base); } catch { /* skip unreadable */ }
   };
+  const images: string[] = [];
+  for (const p of argValues(rest, '--image', '--images')) {
+    copyOutboxAttachment(p, images);
+  }
   const attachments: string[] = [];
-  for (const p of argValues(rest, '--image', '--images', '--file', '--files')) {
+  for (const p of argValues(rest, '--file', '--files')) {
     copyOutboxAttachment(p, attachments);
   }
   const videos: string[] = [];
@@ -9701,6 +9705,7 @@ async function relaySend(
     preparedContentFile: preparedContentBase,
     cardFile: cardBase,
     completionProposalFile: completionProposalBase,
+    images,
     attachments,
     videos,
     videoCovers,
