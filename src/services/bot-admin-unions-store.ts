@@ -53,11 +53,19 @@ export interface BotAdminIdentityConfig {
   resolvedAllowedUsers: readonly string[];
 }
 
-/** Host-wide administrator snapshot usable by group-workspace authorization. */
+/**
+ * Host-wide administrator snapshot usable by group-workspace authorization.
+ * Snapshots expire after a short bounded interval even when configuration is unchanged.
+ */
 export interface FreshBotAdminUnionSnapshot {
   configFingerprint: string;
   admins: TenantHumanId[];
+  updatedAt: number;
+  expiresAt: number;
 }
+
+/** Default authorization snapshot lifetime: five minutes. */
+export const DEFAULT_BOT_ADMIN_UNION_SNAPSHOT_TTL_MS = 5 * 60_000;
 
 export type ResolveBotAllowedUser = (
   bot: BotAdminIdentityConfig,
@@ -106,6 +114,8 @@ function tenantHumanKey(identity: TenantHumanId): string {
 async function computeFreshBotAdminUnions(
   registeredBots: readonly BotAdminIdentityConfig[],
   resolveAllowedUser: ResolveBotAllowedUser,
+  updatedAt: number,
+  ttlMs: number,
 ): Promise<FreshBotAdminUnionSnapshot | undefined> {
   const admins: TenantHumanId[] = [];
   const seen = new Set<string>();
@@ -129,6 +139,8 @@ async function computeFreshBotAdminUnions(
   return {
     configFingerprint: botAdminIdentityConfigFingerprint(registeredBots),
     admins,
+    updatedAt,
+    expiresAt: updatedAt + ttlMs,
   };
 }
 
@@ -136,11 +148,18 @@ export async function loadFreshBotAdminUnionSnapshot(options: {
   registeredBots: readonly BotAdminIdentityConfig[];
   snapshot?: FreshBotAdminUnionSnapshot;
   resolveAllowedUser: ResolveBotAllowedUser;
+  now?: () => number;
+  /** Snapshot lifetime; defaults to {@link DEFAULT_BOT_ADMIN_UNION_SNAPSHOT_TTL_MS}. */
+  ttlMs?: number;
 }): Promise<FreshBotAdminUnionSnapshot | undefined> {
+  const now = options.now?.() ?? Date.now();
+  const ttlMs = options.ttlMs ?? DEFAULT_BOT_ADMIN_UNION_SNAPSHOT_TTL_MS;
   const fingerprint = botAdminIdentityConfigFingerprint(options.registeredBots);
-  if (options.snapshot?.configFingerprint === fingerprint) return options.snapshot;
+  if (options.snapshot?.configFingerprint === fingerprint
+    && Number.isFinite(options.snapshot.expiresAt)
+    && now < options.snapshot.expiresAt) return options.snapshot;
   try {
-    return await computeFreshBotAdminUnions(options.registeredBots, options.resolveAllowedUser);
+    return await computeFreshBotAdminUnions(options.registeredBots, options.resolveAllowedUser, now, ttlMs);
   } catch {
     return undefined;
   }

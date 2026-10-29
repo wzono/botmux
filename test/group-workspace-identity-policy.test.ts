@@ -27,11 +27,15 @@ describe('fresh cross-app administrator identity', () => {
     const snapshot = await loadFreshBotAdminUnionSnapshot({
       registeredBots: bots(),
       resolveAllowedUser: resolve,
+      now: () => 1_000,
+      ttlMs: 5_000,
     });
 
     expect(snapshot).toEqual({
       configFingerprint: botAdminIdentityConfigFingerprint(bots()),
       admins: [human],
+      updatedAt: 1_000,
+      expiresAt: 6_000,
     });
     expect(resolve).toHaveBeenCalledTimes(2);
   });
@@ -66,15 +70,27 @@ describe('fresh cross-app administrator identity', () => {
     const current: FreshBotAdminUnionSnapshot = {
       configFingerprint: botAdminIdentityConfigFingerprint(registered),
       admins: [human],
+      updatedAt: 1_000,
+      expiresAt: 2_000,
     };
     const resolve = vi.fn(async () => human);
 
-    await expect(loadFreshBotAdminUnionSnapshot({ registeredBots: registered, snapshot: current, resolveAllowedUser: resolve }))
-      .resolves.toBe(current);
+    await expect(loadFreshBotAdminUnionSnapshot({
+      registeredBots: registered,
+      snapshot: current,
+      resolveAllowedUser: resolve,
+      now: () => 1_500,
+    })).resolves.toBe(current);
     expect(resolve).not.toHaveBeenCalled();
 
     const stale: FreshBotAdminUnionSnapshot = { ...current, configFingerprint: 'stale' };
-    const refreshed = await loadFreshBotAdminUnionSnapshot({ registeredBots: registered, snapshot: stale, resolveAllowedUser: resolve });
+    const refreshed = await loadFreshBotAdminUnionSnapshot({
+      registeredBots: registered,
+      snapshot: stale,
+      resolveAllowedUser: resolve,
+      now: () => 1_000,
+      ttlMs: 1_000,
+    });
     expect(refreshed).toEqual(current);
     expect(refreshed).not.toBe(stale);
     expect(resolve.mock.calls.map(([bot]) => bot.larkAppId)).toEqual(['cli_a', 'cli_b']);
@@ -90,6 +106,8 @@ describe('fresh cross-app administrator identity', () => {
     const stale: FreshBotAdminUnionSnapshot = {
       configFingerprint: 'stale',
       admins: [human],
+      updatedAt: 1_000,
+      expiresAt: 2_000,
     };
     const resolve = vi.fn(async () => {
       throw new Error('conversion unavailable');
@@ -97,6 +115,28 @@ describe('fresh cross-app administrator identity', () => {
 
     await expect(loadFreshBotAdminUnionSnapshot({ registeredBots: bots(), snapshot: stale, resolveAllowedUser: resolve }))
       .resolves.toBeUndefined();
+  });
+
+  it('fails closed when an expired matching snapshot cannot be refreshed', async () => {
+    const registered = bots();
+    const expired: FreshBotAdminUnionSnapshot = {
+      configFingerprint: botAdminIdentityConfigFingerprint(registered),
+      admins: [human],
+      updatedAt: 1_000,
+      expiresAt: 2_000,
+    };
+    const resolve = vi.fn(async () => {
+      throw new Error('conversion unavailable');
+    });
+
+    await expect(loadFreshBotAdminUnionSnapshot({
+      registeredBots: registered,
+      snapshot: expired,
+      resolveAllowedUser: resolve,
+      now: () => 2_000,
+      ttlMs: 1_000,
+    })).resolves.toBeUndefined();
+    expect(resolve).toHaveBeenCalled();
   });
 
   it('rejects a conversion whose tenant differs from its signing Bot', async () => {
@@ -115,6 +155,8 @@ describe('fresh cross-app administrator identity', () => {
     const stale: FreshBotAdminUnionSnapshot = {
       configFingerprint: 'old-config',
       admins: [human],
+      updatedAt: 1_000,
+      expiresAt: 2_000,
     };
     const replacement = { tenantKey: 'tenant-1', unionId: 'on_replacement' };
     const fresh = await loadFreshBotAdminUnionSnapshot({
@@ -131,6 +173,8 @@ describe('group workspace manager policy', () => {
   const freshSnapshot: FreshBotAdminUnionSnapshot = {
     configFingerprint: 'current',
     admins: [human],
+    updatedAt: 1_000,
+    expiresAt: 2_000,
   };
 
   it('matches canonical identity by tenant and union id', () => {
