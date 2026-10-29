@@ -117,6 +117,16 @@ export interface GroupWorkspaceUnbindDependencies {
   afterBoundary?(boundary: 'commit_before_readback' | 'readback_before_convergence' | 'convergence_before_persisted_readback'): Promise<void>;
 }
 
+const GROUP_WORKSPACE_UNBIND_NO_SESSION_ID = 'group-workspace-unbind';
+
+export function isPreparedNoSessionUnbindJournal(journal: RepoGroupOperationJournal): boolean {
+  return journal.phase === 'prepared'
+    && journal.kind === 'unbind'
+    && journal.sessionId === GROUP_WORKSPACE_UNBIND_NO_SESSION_ID
+    && journal.expectedSessionGeneration === 0
+    && journal.targetWorkingDir === '/';
+}
+
 export async function executeGroupWorkspaceUnbind(
   request: { sourceEventId: string; chatId: string; actor: TenantHumanId; originMessageId?: string },
   dependencies: GroupWorkspaceUnbindDependencies,
@@ -136,12 +146,15 @@ export async function executeGroupWorkspaceUnbind(
       operationKey, sourceEventId: request.sourceEventId, kind: 'unbind',
       payloadDigest: canonicalGroupOperationPayloadDigest({
         ...intent, expectedRevision: current.revision, authorized: true, now: 0,
-      }), chatId: request.chatId, sessionId: 'group-workspace-unbind', expectedSessionGeneration: 0,
+      }), chatId: request.chatId, sessionId: GROUP_WORKSPACE_UNBIND_NO_SESSION_ID, expectedSessionGeneration: 0,
       expectedGroupRevision: current.revision, targetWorkingDir: '/', actor: request.actor,
       phase: 'prepared', updatedAt: dependencies.now(),
     });
     if (prepared.status === 'store_unavailable') return { status: 'store_unavailable' };
     if (prepared.status === 'protocol_conflict') return { status: 'protocol_conflict' };
+    journal = prepared.journal;
+  }
+  if (isPreparedNoSessionUnbindJournal(journal)) {
     const advanced = await dependencies.journalStore.transition(operationKey, 'session_committed', {
       sessionGenerationAfter: 0, updatedAt: dependencies.now(),
     });

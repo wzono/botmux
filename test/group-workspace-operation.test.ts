@@ -3,7 +3,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { TenantHumanId } from '../src/services/bot-admin-unions-store.js';
-import { groupWorkspaceOperationKey } from '../src/services/group-workspace-store.js';
+import {
+  canonicalGroupOperationPayloadDigest,
+  GroupWorkspaceStore,
+  groupWorkspaceOperationKey,
+} from '../src/services/group-workspace-store.js';
+import { atomicWriteFileSync } from '../src/utils/atomic-write.js';
 import {
   GroupWorkspaceOperationStore,
   type RepoGroupOperationJournal,
@@ -11,6 +16,7 @@ import {
 import {
   GroupWorkspaceOperationCoordinator,
   executeGroupWorkspaceUnbind,
+  isPreparedNoSessionUnbindJournal,
   type GroupCommitReceipt,
   type GroupCommitResult,
   type GroupWorkspaceOperationDependencies,
@@ -224,6 +230,114 @@ describe('executeGroupWorkspaceUnbind', () => {
     });
     await expect(h.journalStore.getByIntent(h.request.sourceEventId, 'unbind')).resolves.toMatchObject({
       status: 'found', journal: { phase: 'group_committed', groupRevisionAfter: 3 },
+    });
+  });
+
+  it('restarts from a persistent prepared unbind and performs exactly one group mutation', async () => {
+    const dataDir = dir();
+    const journalStore = new GroupWorkspaceOperationStore(dataDir);
+    const groupStore = new GroupWorkspaceStore(dataDir);
+    const sourceEventId = 'group-workspace-text-source-v1:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    const operationKey = groupWorkspaceOperationKey(sourceEventId, 'unbind');
+    const intent = { kind: 'unbind' as const, chatId: BASE.chatId, sourceEventId, actor: ACTOR };
+    expect(await journalStore.prepare({
+      operationKey, sourceEventId, kind: 'unbind',
+      payloadDigest: canonicalGroupOperationPayloadDigest({
+        ...intent, expectedRevision: 0, authorized: true, now: 0,
+      }),
+      chatId: BASE.chatId, sessionId: 'group-workspace-unbind', expectedSessionGeneration: 0,
+      expectedGroupRevision: 0, targetWorkingDir: '/', actor: ACTOR, phase: 'prepared', updatedAt: 1,
+    })).toMatchObject({ status: 'created' });
+
+    let mutations = 0;
+    const result = await executeGroupWorkspaceUnbind({ sourceEventId, chatId: BASE.chatId, actor: ACTOR }, {
+      journalStore: new GroupWorkspaceOperationStore(dataDir),
+      readReceipt: key => groupStore.readReceipt(key),
+      readCurrentRevision: async () => { throw new Error('prepared replay must use frozen revision'); },
+      mutate: async input => { mutations += 1; return groupStore.mutate(input); },
+      now: () => 10,
+    });
+
+    expect(result).toEqual({ status: 'group_committed', groupRevision: 1 });
+    expect(mutations).toBe(1);
+    await expect(new GroupWorkspaceStore(dataDir).readReceipt(operationKey)).resolves.toMatchObject({
+      status: 'found', receipt: { kind: 'unbind', outcome: 'committed', resultingRevision: 1 },
+    });
+    await expect(new GroupWorkspaceOperationStore(dataDir).get(operationKey)).resolves.toMatchObject({
+      status: 'found', journal: { phase: 'group_committed', sessionGenerationAfter: 0, groupRevisionAfter: 1 },
+    });
+  });
+
+  it.each([
+    ['set operation', { kind: 'set' }],
+    ['real session', { sessionId: 'session-1' }],
+    ['nonzero generation', { expectedSessionGeneration: 1 }],
+    ['non-sentinel target', { targetWorkingDir: '/repo/X' }],
+    ['non-prepared phase', { phase: 'session_committed', sessionGenerationAfter: 0 }],
+  ] as const)('never classifies a %s as a prepared no-session unbind', (_case, patch) => {
+    const candidate = {
+      ...journal(), kind: 'unbind' as const,
+      operationKey: groupWorkspaceOperationKey(BASE.sourceEventId, 'unbind'),
+      sessionId: 'group-workspace-unbind', expectedSessionGeneration: 0, targetWorkingDir: '/',
+      ...patch,
+    } as RepoGroupOperationJournal;
+    expect(isPreparedNoSessionUnbindJournal(candidate)).toBe(false);
+  });
+
+  it('classifies only the prepared unbind sentinel as no-session', () => {
+    expect(isPreparedNoSessionUnbindJournal({
+      ...journal(), kind: 'unbind', operationKey: groupWorkspaceOperationKey(BASE.sourceEventId, 'unbind'),
+      sessionId: 'group-workspace-unbind', expectedSessionGeneration: 0, targetWorkingDir: '/',
+    })).toBe(true);
+  });
+
+  it.each(['before_write', 'after_write'] as const)
+  ('fails closed when the prepared transition write fails %s and a later restart recovers', async failure => {
+    const dataDir = dir();
+    const sourceEventId = failure === 'before_write'
+      ? 'group-workspace-text-source-v1:sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
+      : 'group-workspace-text-source-v1:sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd';
+    const operationKey = groupWorkspaceOperationKey(sourceEventId, 'unbind');
+    const intent = { kind: 'unbind' as const, chatId: BASE.chatId, sourceEventId, actor: ACTOR };
+    const seed = new GroupWorkspaceOperationStore(dataDir);
+    await seed.prepare({
+      operationKey, sourceEventId, kind: 'unbind',
+      payloadDigest: canonicalGroupOperationPayloadDigest({
+        ...intent, expectedRevision: 0, authorized: true, now: 0,
+      }),
+      chatId: BASE.chatId, sessionId: 'group-workspace-unbind', expectedSessionGeneration: 0,
+      expectedGroupRevision: 0, targetWorkingDir: '/', actor: ACTOR, phase: 'prepared', updatedAt: 1,
+    });
+    let writes = 0;
+    const failingStore = new GroupWorkspaceOperationStore(dataDir, {
+      writer: (path, data, options) => {
+        writes += 1;
+        if (failure === 'after_write') atomicWriteFileSync(path, data, options);
+        throw new Error('transition write failed');
+      },
+    });
+    const groupStore = new GroupWorkspaceStore(dataDir);
+    let mutations = 0;
+    const dependencies = {
+      journalStore: failingStore,
+      readReceipt: (key: string) => groupStore.readReceipt(key),
+      readCurrentRevision: async () => ({ status: 'available' as const, revision: 0 }),
+      mutate: async (input: any) => { mutations += 1; return groupStore.mutate(input); },
+      now: () => 10,
+    };
+
+    await expect(executeGroupWorkspaceUnbind({ sourceEventId, chatId: BASE.chatId, actor: ACTOR }, dependencies))
+      .resolves.toEqual({ status: 'unknown' });
+    expect(writes).toBe(1);
+    expect(mutations).toBe(0);
+
+    const recovered = await executeGroupWorkspaceUnbind({ sourceEventId, chatId: BASE.chatId, actor: ACTOR }, {
+      ...dependencies, journalStore: new GroupWorkspaceOperationStore(dataDir),
+    });
+    expect(recovered).toEqual({ status: 'group_committed', groupRevision: 1 });
+    expect(mutations).toBe(1);
+    await expect(new GroupWorkspaceOperationStore(dataDir).listUnresolved()).resolves.toEqual({
+      status: 'available', journals: [],
     });
   });
 });
