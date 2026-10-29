@@ -36,14 +36,29 @@ describe('fresh cross-app administrator identity', () => {
     expect(resolve).toHaveBeenCalledTimes(2);
   });
 
-  it('fingerprints every registered bot identity config deterministically', () => {
-    const original = bots();
-    expect(botAdminIdentityConfigFingerprint([...original].reverse()))
-      .toBe(botAdminIdentityConfigFingerprint(original));
+  it('fingerprints every identity-relevant config field while ignoring collection order', () => {
+    const original: BotAdminIdentityConfig[] = [
+      { larkAppId: 'cli_a', tenantKey: 'tenant-1', brand: 'alpha', resolvedAllowedUsers: ['ou_a1', 'ou_a2'] },
+      { larkAppId: 'cli_b', tenantKey: 'tenant-2', brand: 'beta', resolvedAllowedUsers: ['ou_b1'] },
+    ];
+    const baseline = botAdminIdentityConfigFingerprint(original);
+    const variants: Array<[string, BotAdminIdentityConfig[]]> = [
+      ['larkAppId', [{ ...original[0], larkAppId: 'cli_changed' }, original[1]]],
+      ['tenantKey', [{ ...original[0], tenantKey: 'tenant-changed' }, original[1]]],
+      ['brand', [{ ...original[0], brand: 'changed' }, original[1]]],
+      ['resolvedAllowedUsers', [{ ...original[0], resolvedAllowedUsers: ['ou_a1', 'ou_changed'] }, original[1]]],
+      ['Bot addition', [...original, { larkAppId: 'cli_c', tenantKey: 'tenant-3', resolvedAllowedUsers: ['ou_c1'] }]],
+      ['Bot removal', [original[0]]],
+    ];
+
+    expect(botAdminIdentityConfigFingerprint([...original].reverse())).toBe(baseline);
     expect(botAdminIdentityConfigFingerprint([
-      original[0],
-      { ...original[1], resolvedAllowedUsers: ['ou_removed_admin'] },
-    ])).not.toBe(botAdminIdentityConfigFingerprint(original));
+      { ...original[0], resolvedAllowedUsers: [...original[0].resolvedAllowedUsers].reverse() },
+      original[1],
+    ])).toBe(baseline);
+    for (const [field, variant] of variants) {
+      expect(botAdminIdentityConfigFingerprint(variant), field).not.toBe(baseline);
+    }
   });
 
   it('reuses only an exact current fingerprint and otherwise recomputes through every signing app', async () => {
@@ -68,6 +83,30 @@ describe('fresh cross-app administrator identity', () => {
   it('makes authorization unavailable if any allowed user cannot be conclusively converted', async () => {
     const resolve = vi.fn(async (bot: BotAdminIdentityConfig) => bot.larkAppId === 'cli_a' ? human : undefined);
     await expect(loadFreshBotAdminUnionSnapshot({ registeredBots: bots(), resolveAllowedUser: resolve }))
+      .resolves.toBeUndefined();
+  });
+
+  it('makes authorization unavailable when stale-snapshot recomputation throws', async () => {
+    const stale: FreshBotAdminUnionSnapshot = {
+      configFingerprint: 'stale',
+      admins: [human],
+    };
+    const resolve = vi.fn(async () => {
+      throw new Error('conversion unavailable');
+    });
+
+    await expect(loadFreshBotAdminUnionSnapshot({ registeredBots: bots(), snapshot: stale, resolveAllowedUser: resolve }))
+      .resolves.toBeUndefined();
+  });
+
+  it('rejects a conversion whose tenant differs from its signing Bot', async () => {
+    const registered = [{ larkAppId: 'cli_a', tenantKey: 'tenant-1', resolvedAllowedUsers: ['ou_app_a'] }];
+    const resolve = vi.fn(async (bot: BotAdminIdentityConfig) => {
+      expect(bot).toBe(registered[0]);
+      return { tenantKey: 'tenant-2', unionId: 'on_human' };
+    });
+
+    await expect(loadFreshBotAdminUnionSnapshot({ registeredBots: registered, resolveAllowedUser: resolve }))
       .resolves.toBeUndefined();
   });
 

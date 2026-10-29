@@ -76,7 +76,8 @@ function normalizedIdentityConfig(bot: BotAdminIdentityConfig): {
     brand: bot.brand?.trim() ?? '',
     allowedUsers: bot.resolvedAllowedUsers
       .map(entry => (typeof entry === 'string' ? entry.trim() : ''))
-      .filter(Boolean),
+      .filter(Boolean)
+      .sort(),
   };
 }
 
@@ -138,7 +139,11 @@ export async function loadFreshBotAdminUnionSnapshot(options: {
 }): Promise<FreshBotAdminUnionSnapshot | undefined> {
   const fingerprint = botAdminIdentityConfigFingerprint(options.registeredBots);
   if (options.snapshot?.configFingerprint === fingerprint) return options.snapshot;
-  return computeFreshBotAdminUnions(options.registeredBots, options.resolveAllowedUser);
+  try {
+    return await computeFreshBotAdminUnions(options.registeredBots, options.resolveAllowedUser);
+  } catch {
+    return undefined;
+  }
 }
 
 function dirPath(dataDir: string): string {
