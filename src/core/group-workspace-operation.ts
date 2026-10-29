@@ -1,0 +1,283 @@
+import type { TenantHumanId } from '../services/bot-admin-unions-store.js';
+import type { GroupOperationKind } from '../services/group-workspace-store.js';
+import type {
+  GroupWorkspaceOperationStore,
+  RepoGroupOperationJournal,
+} from '../services/group-workspace-operation-store.js';
+
+export type GroupCommitResult =
+  | { status: 'committed'; resultingRevision: number }
+  | { status: 'conflict'; currentRevision: number }
+  | { status: 'store_unavailable' }
+  | { status: 'unknown' };
+
+export type GroupReceiptLookupResult =
+  | { status: 'found'; receipt: Exclude<GroupCommitResult, { status: 'unknown' }> }
+  | { status: 'missing' }
+  | { status: 'store_unavailable' };
+
+export interface GroupWorkspaceOperationRequest {
+  operationKey: string;
+  sourceEventId: string;
+  /** Task 5 coordinates the session-to-group set saga; unbind is wired separately in Task 6. */
+  kind: Extract<GroupOperationKind, 'set'>;
+  payloadDigest: string;
+  chatId: string;
+  sessionId: string;
+  actor: TenantHumanId;
+}
+
+export type GroupWorkspaceOperationResult =
+  | { status: 'group_committed'; journal: RepoGroupOperationJournal; groupRevision: number }
+  | { status: 'conflict'; journal: RepoGroupOperationJournal; currentRevision?: number }
+  | { status: 'store_unavailable'; journal?: RepoGroupOperationJournal }
+  | { status: 'unknown'; journal?: RepoGroupOperationJournal }
+  | { status: 'protocol_conflict'; journal?: RepoGroupOperationJournal };
+
+export interface GroupWorkspaceOperationDependencies {
+  journalStore: GroupWorkspaceOperationStore;
+  now(): number;
+  lookupGroupReceipt(operationKey: string): Promise<GroupReceiptLookupResult>;
+  /** Under the group-store lock, read receipt then exact current-record proof; never writes. */
+  reconcileUnknownGroupResult(journal: RepoGroupOperationJournal): Promise<GroupCommitResult | undefined>;
+  readCurrentGroupRevision(chatId: string): Promise<
+    | { status: 'available'; revision: number }
+    | { status: 'store_unavailable' }
+  >;
+  resolveCanonicalTarget(request: GroupWorkspaceOperationRequest): Promise<
+    | { status: 'resolved'; workingDir: string }
+    | { status: 'store_unavailable' }
+  >;
+  readSession(sessionId: string): Promise<
+    | { status: 'available'; generation: number; workingDir: string }
+    | { status: 'store_unavailable' }
+  >;
+  switchSession(input: {
+    sessionId: string;
+    expectedGeneration: number;
+    targetWorkingDir: string;
+  }): Promise<
+    | { status: 'committed'; generation: number }
+    | { status: 'store_unavailable' }
+    | { status: 'unknown' }
+  >;
+  commitGroup(input: RepoGroupOperationJournal): Promise<GroupCommitResult>;
+  convergeSession(input: {
+    sessionId: string;
+    expectedGeneration: number;
+    source: 'explicit' | 'group';
+    groupRevision?: number;
+  }): Promise<void>;
+  afterBoundary?(boundary:
+    | 'prepared_before_switch'
+    | 'session_persisted_before_advance'
+    | 'group_committed_before_convergence'
+    | 'receipt_before_response'
+  ): Promise<void>;
+}
+
+function sameIntent(journal: RepoGroupOperationJournal, request: GroupWorkspaceOperationRequest): boolean {
+  return journal.operationKey === request.operationKey
+    && journal.sourceEventId === request.sourceEventId
+    && journal.kind === request.kind
+    && journal.payloadDigest === request.payloadDigest
+    && journal.chatId === request.chatId
+    && journal.sessionId === request.sessionId
+    && journal.actor.tenantKey === request.actor.tenantKey
+    && journal.actor.unionId === request.actor.unionId;
+}
+
+export class GroupWorkspaceOperationCoordinator {
+  constructor(private readonly dependencies: GroupWorkspaceOperationDependencies) {}
+
+  async execute(request: GroupWorkspaceOperationRequest): Promise<GroupWorkspaceOperationResult> {
+    if (request.kind !== 'set') return { status: 'protocol_conflict' };
+    // Receipt/journal lookup is deliberately first. It must precede target resolution,
+    // current revision reads, or any session side effect.
+    const receiptLookup = await this.dependencies.lookupGroupReceipt(request.operationKey);
+    if (receiptLookup.status === 'store_unavailable') return { status: 'unknown' };
+    const existing = await this.dependencies.journalStore.get(request.operationKey);
+    if (existing.status === 'store_unavailable') return { status: 'store_unavailable' };
+    if (existing.status === 'found' && !sameIntent(existing.journal, request)) {
+      return { status: 'protocol_conflict', journal: existing.journal };
+    }
+    if (receiptLookup.status === 'found') {
+      return this.convergeReceipt(existing.status === 'found' ? existing.journal : undefined, receiptLookup.receipt);
+    }
+
+    let journal: RepoGroupOperationJournal;
+    if (existing.status === 'found') journal = existing.journal;
+    else {
+      const revision = await this.dependencies.readCurrentGroupRevision(request.chatId);
+      if (revision.status === 'store_unavailable') return { status: 'store_unavailable' };
+      const target = await this.dependencies.resolveCanonicalTarget(request);
+      if (target.status === 'store_unavailable') return { status: 'store_unavailable' };
+      const session = await this.dependencies.readSession(request.sessionId);
+      if (session.status === 'store_unavailable') return { status: 'store_unavailable' };
+      journal = {
+        ...request,
+        expectedSessionGeneration: session.generation,
+        expectedGroupRevision: revision.revision,
+        targetWorkingDir: target.workingDir,
+        phase: 'prepared',
+        updatedAt: this.dependencies.now(),
+      };
+      const prepared = await this.dependencies.journalStore.prepare(journal);
+      if (prepared.status === 'store_unavailable') return { status: 'store_unavailable' };
+      if (prepared.status === 'protocol_conflict') return { status: 'protocol_conflict', journal: prepared.journal };
+      journal = prepared.journal;
+    }
+
+    return this.advance(journal);
+  }
+
+  async recover(journal: RepoGroupOperationJournal): Promise<GroupWorkspaceOperationResult> {
+    return this.advance(journal);
+  }
+
+  private async advance(journal: RepoGroupOperationJournal): Promise<GroupWorkspaceOperationResult> {
+    const receiptLookup = await this.dependencies.lookupGroupReceipt(journal.operationKey);
+    if (receiptLookup.status === 'store_unavailable') return { status: 'unknown', journal };
+    if (receiptLookup.status === 'found') return this.convergeReceipt(journal, receiptLookup.receipt);
+    if (journal.phase === 'unknown') {
+      const readback = await this.dependencies.reconcileUnknownGroupResult(journal);
+      if (!readback) return { status: 'unknown', journal };
+      if (readback.status !== 'committed') return { status: 'unknown', journal };
+      await this.dependencies.convergeSession({
+        sessionId: journal.sessionId,
+        expectedGeneration: journal.sessionGenerationAfter ?? journal.expectedSessionGeneration + 1,
+        source: 'group',
+        groupRevision: readback.resultingRevision,
+      });
+      return { status: 'group_committed', journal, groupRevision: readback.resultingRevision };
+    }
+    if (journal.phase === 'group_committed') {
+      await this.dependencies.convergeSession({
+        sessionId: journal.sessionId,
+        expectedGeneration: journal.sessionGenerationAfter!,
+        source: 'group',
+        groupRevision: journal.groupRevisionAfter!,
+      });
+      return { status: 'group_committed', journal, groupRevision: journal.groupRevisionAfter! };
+    }
+    if (journal.phase === 'conflict') return { status: 'conflict', journal };
+    if (journal.phase === 'store_unavailable') return { status: 'store_unavailable', journal };
+
+    if (journal.phase === 'prepared') {
+      await this.dependencies.afterBoundary?.('prepared_before_switch');
+      const session = await this.dependencies.readSession(journal.sessionId);
+      if (session.status === 'store_unavailable') return this.markUnknown(journal);
+      const expectedAfter = journal.expectedSessionGeneration + 1;
+      if (session.generation === journal.expectedSessionGeneration) {
+        if (session.workingDir === journal.targetWorkingDir) return this.markUnknown(journal);
+        const switched = await this.dependencies.switchSession({
+          sessionId: journal.sessionId,
+          expectedGeneration: journal.expectedSessionGeneration,
+          targetWorkingDir: journal.targetWorkingDir,
+        });
+        if (switched.status === 'unknown') return this.markUnknown(journal);
+        if (switched.status === 'store_unavailable') return { status: 'store_unavailable', journal };
+        journal = { ...journal, sessionGenerationAfter: switched.generation };
+        await this.dependencies.afterBoundary?.('session_persisted_before_advance');
+      } else if (session.generation === expectedAfter && session.workingDir === journal.targetWorkingDir) {
+        journal = { ...journal, sessionGenerationAfter: session.generation };
+      } else {
+        return this.markUnknown(journal);
+      }
+      const advanced = await this.dependencies.journalStore.transition(journal.operationKey, 'session_committed', {
+        sessionGenerationAfter: journal.sessionGenerationAfter,
+        updatedAt: this.dependencies.now(),
+      });
+      if (advanced.status !== 'updated') return { status: 'unknown', journal };
+      journal = advanced.journal;
+    }
+
+    const groupResult = await this.dependencies.commitGroup(journal);
+    if (groupResult.status === 'unknown') return this.markUnknown(journal);
+    await this.dependencies.afterBoundary?.('group_committed_before_convergence');
+    if (groupResult.status === 'committed') {
+      const receiptReadback = await this.dependencies.lookupGroupReceipt(journal.operationKey);
+      if (receiptReadback.status !== 'found'
+        || receiptReadback.receipt.status !== 'committed'
+        || receiptReadback.receipt.resultingRevision !== groupResult.resultingRevision) {
+        return this.markUnknown(journal);
+      }
+      const advanced = await this.dependencies.journalStore.transition(journal.operationKey, 'group_committed', {
+        groupRevisionAfter: groupResult.resultingRevision,
+        updatedAt: this.dependencies.now(),
+      });
+      if (advanced.status !== 'updated') return this.markUnknown(journal);
+      const completed = advanced.journal;
+      await this.dependencies.convergeSession({
+        sessionId: completed.sessionId,
+        expectedGeneration: completed.sessionGenerationAfter!,
+        source: 'group',
+        groupRevision: groupResult.resultingRevision,
+      });
+      await this.dependencies.afterBoundary?.('receipt_before_response');
+      return { status: 'group_committed', journal: completed, groupRevision: groupResult.resultingRevision };
+    }
+
+    await this.dependencies.convergeSession({
+      sessionId: journal.sessionId,
+      expectedGeneration: journal.sessionGenerationAfter!,
+      source: 'explicit',
+    });
+    const phase = groupResult.status;
+    const advanced = await this.dependencies.journalStore.transition(journal.operationKey, phase, {
+      updatedAt: this.dependencies.now(),
+    });
+    const terminal = advanced.status === 'updated' ? advanced.journal : journal;
+    return phase === 'conflict'
+      ? { status: phase, journal: terminal, currentRevision: groupResult.currentRevision }
+      : { status: phase, journal: terminal };
+  }
+
+  private async convergeReceipt(
+    journal: RepoGroupOperationJournal | undefined,
+    receipt: GroupCommitResult,
+  ): Promise<GroupWorkspaceOperationResult> {
+    if (!journal) return receipt.status === 'unknown' ? { status: 'unknown' } : { status: 'store_unavailable' };
+    if (receipt.status === 'unknown') return this.markUnknown(journal);
+    if (receipt.status === 'committed') {
+      let completed = journal;
+      if (journal.phase === 'session_committed') {
+        const advanced = await this.dependencies.journalStore.transition(journal.operationKey, 'group_committed', {
+          groupRevisionAfter: receipt.resultingRevision,
+          updatedAt: this.dependencies.now(),
+        });
+        if (advanced.status === 'updated') completed = advanced.journal;
+      }
+      await this.dependencies.convergeSession({
+        sessionId: completed.sessionId,
+        expectedGeneration: completed.sessionGenerationAfter ?? completed.expectedSessionGeneration + 1,
+        source: 'group',
+        groupRevision: receipt.resultingRevision,
+      });
+      return { status: 'group_committed', journal: completed, groupRevision: receipt.resultingRevision };
+    }
+    await this.dependencies.convergeSession({
+      sessionId: journal.sessionId,
+      expectedGeneration: journal.sessionGenerationAfter ?? journal.expectedSessionGeneration + 1,
+      source: 'explicit',
+    });
+    const phase = receipt.status;
+    if (journal.phase === 'session_committed') {
+      await this.dependencies.journalStore.transition(journal.operationKey, phase, { updatedAt: this.dependencies.now() });
+    }
+    return phase === 'conflict'
+      ? { status: phase, journal, currentRevision: receipt.currentRevision }
+      : { status: phase, journal };
+  }
+
+  private async markUnknown(journal: RepoGroupOperationJournal): Promise<GroupWorkspaceOperationResult> {
+    if (journal.phase !== 'unknown') {
+      const advanced = await this.dependencies.journalStore.transition(journal.operationKey, 'unknown', {
+        sessionGenerationAfter: journal.sessionGenerationAfter,
+        updatedAt: this.dependencies.now(),
+      });
+      if (advanced.status === 'updated') journal = advanced.journal;
+    }
+    return { status: 'unknown', journal };
+  }
+}
