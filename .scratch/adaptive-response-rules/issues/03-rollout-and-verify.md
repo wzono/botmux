@@ -4,9 +4,9 @@
 
 **Blocked by:** 02: 扩展到全席与未来席位.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
-**Release gate:** Ticket 01 与 Ticket 02 的实现审查已通过，但本 ticket 尚未取得全量发布授权；不得部署。
+**Release gate:** Ticket 01 与 Ticket 02 的实现审查已通过；用户已授权固定候选 `1b9028e` 交 DevOps 合入 dev、加入 manifest 并全量发布。任何回滚仍需用户再次确认。
 
 - [ ] 发布提交固定已验收版本、影响面、风险、授权、生效验证和恢复点。
 - [ ] 发布前保存每个受影响 team、profile 和群覆盖的旧值、哈希与更新时间。
