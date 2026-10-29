@@ -4,23 +4,32 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { findRealToolBinary } from '../src/core/cli-identity.js';
+import { createHash } from 'node:crypto';
+import { resolveLarkTestCli } from './helpers/lark-test-cli.js';
 import { larkToolBindingPath, larkToolChildEnv, prepareLarkToolEnv, type LarkToolBinding } from '../src/core/lark-tool-binding.js';
 import { readRequestBodyJson } from './helpers/read-request-body.js';
 import { parseLarkToolInvocation, larkToolExecutionArgs } from '../src/core/lark-tool-command.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 
-const realCli = findRealToolBinary('lark-cli', process.env.PATH);
+const realCli = resolveLarkTestCli();
+const cliDigest = realCli ? createHash('sha256').update(readFileSync(realCli)).digest('hex') : undefined;
+const verifyCli = () => resolveLarkTestCli({ ...process.env, BOTMUX_TEST_LARK_CLI: realCli!, BOTMUX_TEST_LARK_CLI_SHA256: cliDigest });
 const canIsolateNetwork = process.platform === 'linux' && spawnSync('bwrap', [
   '--unshare-net', '--ro-bind', '/', '/', '--', '/bin/true',
 ], { stdio: 'ignore', timeout: 5000 }).status === 0;
+if (process.env.BOTMUX_TEST_REQUIRE_LARK_CLI === '1' && !canIsolateNetwork) {
+  throw new Error('required lark-cli contract needs working bwrap network isolation');
+}
 describe.skipIf(!realCli)('installed lark-cli command contract (fake credentials)', () => {
   let root: string, binding: LarkToolBinding, server: ReturnType<typeof createServer>, port: number, requests: string[];
   let credentialTypeOverride: string | undefined;
   beforeEach(async () => {
+    verifyCli();
     root = mkdtempSync(join(tmpdir(), 'real-lark-contract-')); requests = [];
     credentialTypeOverride = undefined;
-    binding = prepareLarkToolEnv({ env: { PATH: process.env.PATH }, dataDir: root, sessionId: 'contract', appId: 'cli_contract' });
+    // Build the normal isolated binding without resolving the host's business wrapper.
+    binding = prepareLarkToolEnv({ env: { PATH: process.env.PATH }, effectivePath: '', dataDir: root, sessionId: 'contract', appId: 'cli_contract' });
+    binding.realBinary = realCli!;
     server = createServer(async (req, res) => {
       const parsed = await readRequestBodyJson<{ mode: string }>(req);
       if (!parsed) { res.writeHead(400).end(); return; }
@@ -36,7 +45,11 @@ describe.skipIf(!realCli)('installed lark-cli command contract (fake credentials
     mkdirSync(join(root, 'home')); binding.ipcPort = port;
     writeFileSync(larkToolBindingPath(root, 'contract'), JSON.stringify(binding), { mode: 0o600 });
   });
-  afterEach(async () => { await new Promise<void>(r => server.close(() => r())); rmSync(root, { recursive: true, force: true }); });
+  afterEach(async () => {
+    if (server?.listening) await new Promise<void>(r => server.close(() => r()));
+    if (root) rmSync(root, { recursive: true, force: true });
+    verifyCli();
+  });
   function run(args: string[]) {
     return new Promise<{ code: number | null; out: string; err: string }>((resolveResult, reject) => {
       const child = spawnTsScript(resolve('src/lark-tool-runner.ts'), ['--binding', larkToolBindingPath(root, 'contract'), '--', ...args], {
