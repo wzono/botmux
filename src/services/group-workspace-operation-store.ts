@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
 import type { TenantHumanId } from './bot-admin-unions-store.js';
-import type { GroupOperationKind } from './group-workspace-store.js';
+import { groupWorkspaceOperationKey, type GroupOperationKind } from './group-workspace-store.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLock } from '../utils/file-lock.js';
 
@@ -36,6 +36,7 @@ export interface RepoGroupOperationJournal {
 interface OperationRegistry {
   schemaVersion: 1;
   operations: Record<string, RepoGroupOperationJournal>;
+  sourceIndex: Record<string, string>;
 }
 
 export type OperationReadResult =
@@ -61,7 +62,15 @@ export interface GroupWorkspaceOperationStoreOptions {
 }
 
 function emptyRegistry(): OperationRegistry {
-  return { schemaVersion: SCHEMA_VERSION, operations: Object.create(null) as Record<string, RepoGroupOperationJournal> };
+  return {
+    schemaVersion: SCHEMA_VERSION,
+    operations: Object.create(null) as Record<string, RepoGroupOperationJournal>,
+    sourceIndex: Object.create(null) as Record<string, string>,
+  };
+}
+
+function sourceIndexKey(sourceEventId: string, kind: GroupOperationKind): string {
+  return JSON.stringify([sourceEventId, kind]);
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -87,6 +96,7 @@ function validateJournal(value: unknown, key: string): asserts value is RepoGrou
     || value.operationKey !== key || typeof value.operationKey !== 'string' || !value.operationKey
     || typeof value.sourceEventId !== 'string' || !value.sourceEventId
     || (value.kind !== 'set' && value.kind !== 'unbind')
+    || value.operationKey !== groupWorkspaceOperationKey(value.sourceEventId as string, value.kind as GroupOperationKind)
     || typeof value.payloadDigest !== 'string' || !value.payloadDigest
     || typeof value.chatId !== 'string' || !value.chatId
     || typeof value.sessionId !== 'string' || !value.sessionId
@@ -115,13 +125,28 @@ function readRegistry(path: string): OperationRegistry {
     throw error;
   }
   const value: unknown = JSON.parse(raw);
-  if (!isObject(value) || value.schemaVersion !== SCHEMA_VERSION || !isObject(value.operations)) {
+  if (!isObject(value) || value.schemaVersion !== SCHEMA_VERSION
+    || !isObject(value.operations)
+    || (value.sourceIndex !== undefined && !isObject(value.sourceIndex))) {
     throw new Error('invalid group workspace operation store schema');
   }
   for (const [key, operation] of Object.entries(value.operations)) validateJournal(operation, key);
+  const expectedIndex = Object.create(null) as Record<string, string>;
+  for (const operation of Object.values(value.operations)) {
+    const item = operation as RepoGroupOperationJournal;
+    const indexKey = sourceIndexKey(item.sourceEventId, item.kind);
+    if (expectedIndex[indexKey]) throw new Error(`duplicate group workspace operation source: ${indexKey}`);
+    expectedIndex[indexKey] = item.operationKey;
+  }
+  const sourceIndex = (value.sourceIndex ?? expectedIndex) as Record<string, unknown>;
+  if (Object.keys(sourceIndex).length !== Object.keys(expectedIndex).length
+    || Object.entries(expectedIndex).some(([key, operationKey]) => sourceIndex[key] !== operationKey)) {
+    throw new Error('invalid group workspace operation source index');
+  }
   return {
     schemaVersion: SCHEMA_VERSION,
     operations: Object.assign(Object.create(null), value.operations) as Record<string, RepoGroupOperationJournal>,
+    sourceIndex: Object.assign(Object.create(null), sourceIndex) as Record<string, string>,
   };
 }
 
@@ -169,6 +194,22 @@ export class GroupWorkspaceOperationStore {
     }
   }
 
+  async getByIntent(sourceEventId: string, kind: GroupOperationKind): Promise<OperationReadResult> {
+    try {
+      mkdirSync(dirname(this.path), { recursive: true });
+      return await withFileLock(this.path, async () => {
+        const registry = readRegistry(this.path);
+        const operationKey = registry.sourceIndex[sourceIndexKey(sourceEventId, kind)];
+        const journal = operationKey ? registry.operations[operationKey] : undefined;
+        return journal
+          ? { status: 'found' as const, journal: structuredClone(journal) }
+          : { status: 'missing' as const };
+      }, { maxWaitMs: this.lockTimeoutMs });
+    } catch {
+      return { status: 'store_unavailable' };
+    }
+  }
+
   async prepare(journal: RepoGroupOperationJournal): Promise<OperationPrepareResult> {
     try {
       validateJournal(journal, journal.operationKey);
@@ -190,6 +231,7 @@ export class GroupWorkspaceOperationStore {
             : { status: 'protocol_conflict' as const, journal: structuredClone(sourceReuse) };
         }
         registry.operations[journal.operationKey] = structuredClone(journal);
+        registry.sourceIndex[sourceIndexKey(journal.sourceEventId, journal.kind)] = journal.operationKey;
         this.write(registry);
         return { status: 'created' as const, journal: structuredClone(journal) };
       }, { maxWaitMs: this.lockTimeoutMs });
@@ -211,6 +253,32 @@ export class GroupWorkspaceOperationStore {
         const existing = registry.operations[operationKey];
         if (!existing) return { status: 'missing' as const };
         if (!mayTransition(existing.phase, phase)) {
+          return { status: 'invalid_transition' as const, journal: structuredClone(existing) };
+        }
+        const updated: RepoGroupOperationJournal = { ...existing, ...patch, phase };
+        validateJournal(updated, operationKey);
+        registry.operations[operationKey] = updated;
+        this.write(registry);
+        return { status: 'updated' as const, journal: structuredClone(updated) };
+      }, { maxWaitMs: this.lockTimeoutMs });
+    } catch {
+      return { status: 'store_unavailable' };
+    }
+  }
+
+  async convergeReceipt(
+    operationKey: string,
+    phase: Extract<RepoGroupOperationPhase, 'group_committed' | 'conflict' | 'store_unavailable'>,
+    patch: Pick<RepoGroupOperationJournal, 'updatedAt'>
+      & Partial<Pick<RepoGroupOperationJournal, 'groupRevisionAfter'>>,
+  ): Promise<OperationTransitionResult> {
+    try {
+      mkdirSync(dirname(this.path), { recursive: true });
+      return await withFileLock(this.path, async () => {
+        const registry = readRegistry(this.path);
+        const existing = registry.operations[operationKey];
+        if (!existing) return { status: 'missing' as const };
+        if (existing.phase !== 'unknown') {
           return { status: 'invalid_transition' as const, journal: structuredClone(existing) };
         }
         const updated: RepoGroupOperationJournal = { ...existing, ...patch, phase };

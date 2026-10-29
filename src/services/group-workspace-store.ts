@@ -326,7 +326,7 @@ function validateReceipt(value: unknown, key: string): asserts value is GroupOpe
   }
 }
 
-function readRegistry(path: string): GroupWorkspaceRegistry {
+function parseRegistry(path: string): GroupWorkspaceRegistry {
   let raw: string;
   try {
     raw = readFileSync(path, 'utf8');
@@ -343,11 +343,14 @@ function readRegistry(path: string): GroupWorkspaceRegistry {
   }
   for (const [key, value] of Object.entries(parsed.records)) validateRecord(value, key);
   for (const [key, value] of Object.entries(parsed.receipts)) validateReceipt(value, key);
-  const registry: GroupWorkspaceRegistry = {
+  return {
     schemaVersion: SCHEMA_VERSION,
     records: toNullMap(parsed.records as Record<string, GroupWorkspaceRecord>),
     receipts: toNullMap(parsed.receipts as Record<string, GroupOperationReceipt>),
   };
+}
+
+function validateRegistryHistory(registry: GroupWorkspaceRegistry): void {
   const committedByChatRevision = new Map<string, GroupOperationReceipt>();
   for (const receipt of Object.values(registry.receipts)) {
     if (receipt.outcome !== 'committed') continue;
@@ -375,6 +378,11 @@ function readRegistry(path: string): GroupWorkspaceRegistry {
       throw new Error(`latest group workspace receipt disagrees with record: ${record.chatId}`);
     }
   }
+}
+
+function readRegistry(path: string): GroupWorkspaceRegistry {
+  const registry = parseRegistry(path);
+  validateRegistryHistory(registry);
   return registry;
 }
 
@@ -463,6 +471,88 @@ export class GroupWorkspaceStore {
     return usability.ok
       ? { status: 'usable', record, usability }
       : { status: 'unusable', record, usability };
+  }
+
+  async reconcileExactOperation(input: GroupWorkspaceMutation): Promise<GroupWorkspaceMutationResult> {
+    if (!validMutation(input)) return { outcome: 'store_unavailable' };
+    const operationKey = groupWorkspaceOperationKey(input.sourceEventId, input.kind);
+    const payloadDigest = canonicalGroupOperationPayloadDigest(input);
+    try {
+      mkdirSync(resolve(this.path, '..'), { recursive: true });
+      return await withFileLock(this.path, async () => {
+        const registry = parseRegistry(this.path);
+        const existing = own(registry.receipts, operationKey);
+        if (existing) {
+          if (existing.payloadDigest !== payloadDigest || existing.chatId !== input.chatId
+            || !sameActor(existing.actor, input.actor)) {
+            return { outcome: 'protocol_conflict' as const, existingReceipt: structuredClone(existing) };
+          }
+          validateRegistryHistory(registry);
+          try {
+            this.durabilityReestablisher(this.path);
+          } catch {
+            return { outcome: 'unknown' as const };
+          }
+          return { outcome: existing.outcome, receipt: structuredClone(existing) };
+        }
+        const current = own(registry.records, input.chatId);
+        const target = input.kind === 'set'
+          ? { kind: 'bound' as const, workingDir: canonicalWorkingDir(input.requestedWorkingDir) }
+          : { kind: 'unbound' as const };
+        const exact = current
+          && current.revision === input.expectedRevision + 1
+          && JSON.stringify(current.directory) === JSON.stringify(target)
+          && sameActor(current.updatedBy, input.actor)
+          && current.updatedAt === input.now;
+        if (!exact) return { outcome: 'store_unavailable' as const };
+        const receipt: GroupOperationReceipt = {
+          operationKey,
+          sourceEventId: input.sourceEventId,
+          ...(input.originMessageId ? { originMessageId: input.originMessageId } : {}),
+          kind: input.kind,
+          payloadDigest,
+          chatId: input.chatId,
+          outcome: 'committed',
+          resultingRevision: current.revision,
+          resultingDirectory: structuredClone(current.directory),
+          actor: { ...input.actor },
+          completedAt: input.now,
+          expectedRevision: input.expectedRevision,
+          ...(input.kind === 'set' && input.expectedSessionGeneration !== undefined
+            ? { expectedSessionGeneration: input.expectedSessionGeneration }
+            : {}),
+          ...(input.kind === 'set' ? { canonicalTargetWorkingDir: target.workingDir } : {}),
+        };
+        registry.receipts[operationKey] = receipt;
+        validateRegistryHistory(registry);
+        try {
+          this.writer(this.path, `${JSON.stringify(registry, null, 2)}\n`, {
+            mode: 0o600, durable: true, followTargetSymlink: false,
+          });
+        } catch {
+          let readback: GroupWorkspaceRegistry;
+          try {
+            readback = readRegistry(this.path);
+          } catch {
+            return { outcome: 'unknown' as const };
+          }
+          const durableReceipt = own(readback.receipts, operationKey);
+          if (!durableReceipt || durableReceipt.payloadDigest !== payloadDigest
+            || durableReceipt.chatId !== input.chatId || !sameActor(durableReceipt.actor, input.actor)) {
+            return { outcome: 'unknown' as const };
+          }
+          try {
+            this.durabilityReestablisher(this.path);
+          } catch {
+            return { outcome: 'unknown' as const };
+          }
+          return { outcome: durableReceipt.outcome, receipt: structuredClone(durableReceipt) };
+        }
+        return { outcome: 'committed', receipt: structuredClone(receipt) };
+      }, { maxWaitMs: this.lockTimeoutMs });
+    } catch {
+      return { outcome: 'store_unavailable' };
+    }
   }
 
   async mutate(input: GroupWorkspaceMutation): Promise<GroupWorkspaceMutationResult> {

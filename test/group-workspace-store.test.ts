@@ -405,6 +405,72 @@ describe('GroupWorkspaceStore', () => {
     expect(result).toEqual({ outcome: 'unknown' });
   });
 
+  it('atomically establishes a missing receipt from an exact current-record proof without incrementing revision', async () => {
+    const dir = dataDir();
+    const path = join(dir, 'group-workspaces.json');
+    const sourceEventId = textSource('om_exact_proof');
+    const input = setInput({ sourceEventId, workingDir: '/tmp/exact', expectedRevision: 0, now: 100 });
+    writeFileSync(path, JSON.stringify({
+      schemaVersion: 1,
+      records: {
+        [CHAT]: {
+          chatId: CHAT, revision: 1, directory: { kind: 'bound', workingDir: '/tmp/exact' },
+          updatedAt: 100, updatedBy: U,
+        },
+      },
+      receipts: {},
+    }));
+
+    await expect(createStore(dir).reconcileExactOperation(input)).resolves.toMatchObject({
+      outcome: 'committed', receipt: { resultingRevision: 1, operationKey: groupWorkspaceOperationKey(sourceEventId, 'set') },
+    });
+    await expect(createStore(dir).read(CHAT)).resolves.toMatchObject({ status: 'available', record: { revision: 1 } });
+  });
+
+  it('reconciles an ambiguous atomic proof-receipt write without duplicating revision', async () => {
+    const dir = dataDir();
+    const path = join(dir, 'group-workspaces.json');
+    const sourceEventId = textSource('om_exact_ambiguous');
+    const input = setInput({ sourceEventId, workingDir: '/tmp/exact', expectedRevision: 0, now: 100 });
+    writeFileSync(path, JSON.stringify({
+      schemaVersion: 1,
+      records: { [CHAT]: { chatId: CHAT, revision: 1, directory: { kind: 'bound', workingDir: '/tmp/exact' }, updatedAt: 100, updatedBy: U } },
+      receipts: {},
+    }));
+    let writes = 0;
+    const store = createStore(dir, {
+      writer: (target, data) => {
+        writes += 1;
+        atomicWriteFileSync(target, data, { mode: 0o600, durable: true, followTargetSymlink: false });
+        throw new Error('lost result after durable rename');
+      },
+    });
+    await expect(store.reconcileExactOperation(input)).resolves.toMatchObject({ outcome: 'committed', receipt: { resultingRevision: 1 } });
+    await expect(store.reconcileExactOperation(input)).resolves.toMatchObject({ outcome: 'committed', receipt: { resultingRevision: 1 } });
+    expect(writes).toBe(1);
+    await expect(createStore(dir).read(CHAT)).resolves.toMatchObject({ status: 'available', record: { revision: 1 } });
+  });
+
+  it('does not establish a receipt when the current record is not exact proof of the operation', async () => {
+    const dir = dataDir();
+    const path = join(dir, 'group-workspaces.json');
+    const sourceEventId = textSource('om_inexact_proof');
+    writeFileSync(path, JSON.stringify({
+      schemaVersion: 1,
+      records: {
+        [CHAT]: {
+          chatId: CHAT, revision: 1, directory: { kind: 'bound', workingDir: '/tmp/other' },
+          updatedAt: 100, updatedBy: U,
+        },
+      },
+      receipts: {},
+    }));
+    await expect(createStore(dir).reconcileExactOperation(setInput({
+      sourceEventId, workingDir: '/tmp/exact', expectedRevision: 0, now: 100,
+    }))).resolves.toEqual({ outcome: 'store_unavailable' });
+    expect(JSON.parse(readFileSync(path, 'utf8')).receipts).toEqual({});
+  });
+
   it('returns store_unavailable when the cross-process lock cannot be acquired', async () => {
     const dir = dataDir();
     writeFileSync(join(dir, 'group-workspaces.json.lock'), String(process.pid));
