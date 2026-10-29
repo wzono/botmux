@@ -185,6 +185,43 @@ describe('fresh cross-app administrator identity', () => {
     expect(snapshot).toBeUndefined();
     expect(snapshot?.configFingerprint === replacementFingerprint && snapshot.admins.includes(human)).toBe(false);
   });
+
+  it('starts snapshot freshness when deferred identity resolution completes', async () => {
+    const ttlMs = 1_000;
+    let clock = 1_000;
+    let releaseResolution!: (identity: TenantHumanId) => void;
+    const resolution = new Promise<TenantHumanId>(resolve => { releaseResolution = resolve; });
+    const refresh = loadFreshBotAdminUnionSnapshot({
+      registeredBots: [{ larkAppId: 'cli_a', tenantKey: 'tenant-1', resolvedAllowedUsers: ['ou_deferred'] }],
+      resolveAllowedUser: async () => resolution,
+      now: () => clock,
+      ttlMs,
+    });
+
+    clock += ttlMs;
+    releaseResolution(human);
+
+    const snapshot = await refresh;
+    expect(snapshot).toMatchObject({ updatedAt: clock, expiresAt: clock + ttlMs });
+    expect(snapshot!.expiresAt).toBeGreaterThan(clock);
+  });
+
+  it('fails closed when the clock moves backward during identity resolution', async () => {
+    let clock = 2_000;
+    let releaseResolution!: (identity: TenantHumanId) => void;
+    const resolution = new Promise<TenantHumanId>(resolve => { releaseResolution = resolve; });
+    const refresh = loadFreshBotAdminUnionSnapshot({
+      registeredBots: [{ larkAppId: 'cli_a', tenantKey: 'tenant-1', resolvedAllowedUsers: ['ou_deferred'] }],
+      resolveAllowedUser: async () => resolution,
+      now: () => clock,
+      ttlMs: 1_000,
+    });
+
+    clock = 1_000;
+    releaseResolution(human);
+
+    await expect(refresh).resolves.toBeUndefined();
+  });
 });
 
 describe('group workspace manager policy', () => {

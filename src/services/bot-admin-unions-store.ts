@@ -128,9 +128,7 @@ function tenantHumanKey(identity: TenantHumanId): string {
 async function computeFreshBotAdminUnions(
   registeredBots: readonly BotAdminIdentityConfig[],
   resolveAllowedUser: ResolveBotAllowedUser,
-  updatedAt: number,
-  ttlMs: number,
-): Promise<FreshBotAdminUnionSnapshot | undefined> {
+): Promise<Pick<FreshBotAdminUnionSnapshot, 'configFingerprint' | 'admins'> | undefined> {
   const admins: TenantHumanId[] = [];
   const seen = new Set<string>();
   const orderedBots = [...registeredBots].sort((a, b) => a.larkAppId.localeCompare(b.larkAppId));
@@ -152,8 +150,6 @@ async function computeFreshBotAdminUnions(
   return {
     configFingerprint: botAdminIdentityConfigFingerprint(registeredBots),
     admins,
-    updatedAt,
-    expiresAt: updatedAt + ttlMs,
   };
 }
 
@@ -173,9 +169,19 @@ export async function loadFreshBotAdminUnionSnapshot(options: {
     && Number.isFinite(options.snapshot.expiresAt)
     && now < options.snapshot.expiresAt) return options.snapshot;
   try {
-    const snapshot = await computeFreshBotAdminUnions(identityConfigs, options.resolveAllowedUser, now, ttlMs);
+    const resolved = await computeFreshBotAdminUnions(identityConfigs, options.resolveAllowedUser);
     if (botAdminIdentityConfigFingerprint(options.registeredBots) !== fingerprint) return undefined;
-    return snapshot;
+    const completedAt = options.now?.() ?? Date.now();
+    const expiresAt = completedAt + ttlMs;
+    if (!resolved
+      || !Number.isFinite(now)
+      || !Number.isFinite(completedAt)
+      || completedAt < now
+      || !Number.isFinite(ttlMs)
+      || ttlMs <= 0
+      || !Number.isFinite(expiresAt)
+      || expiresAt <= completedAt) return undefined;
+    return { ...resolved, updatedAt: completedAt, expiresAt };
   } catch {
     return undefined;
   }
