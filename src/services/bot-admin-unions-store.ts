@@ -39,6 +39,108 @@ export interface BotAdminUnions {
   owner?: string;
 }
 
+/** Stable human identity across Lark applications, scoped to one tenant. */
+export interface TenantHumanId {
+  tenantKey: string;
+  unionId: string;
+}
+
+/** The identity-relevant part of one registered Bot configuration. */
+export interface BotAdminIdentityConfig {
+  larkAppId: string;
+  tenantKey: string;
+  brand?: string;
+  resolvedAllowedUsers: readonly string[];
+}
+
+/** Host-wide administrator snapshot usable by group-workspace authorization. */
+export interface FreshBotAdminUnionSnapshot {
+  configFingerprint: string;
+  admins: TenantHumanId[];
+}
+
+export type ResolveBotAllowedUser = (
+  bot: BotAdminIdentityConfig,
+  allowedUser: string,
+) => Promise<TenantHumanId | undefined>;
+
+function normalizedIdentityConfig(bot: BotAdminIdentityConfig): {
+  larkAppId: string;
+  tenantKey: string;
+  brand: string;
+  allowedUsers: string[];
+} {
+  return {
+    larkAppId: bot.larkAppId.trim(),
+    tenantKey: bot.tenantKey.trim(),
+    brand: bot.brand?.trim() ?? '',
+    allowedUsers: bot.resolvedAllowedUsers
+      .map(entry => (typeof entry === 'string' ? entry.trim() : ''))
+      .filter(Boolean),
+  };
+}
+
+/** Deterministic fingerprint of every registered Bot's identity boundary. */
+export function botAdminIdentityConfigFingerprint(
+  registeredBots: readonly BotAdminIdentityConfig[],
+): string {
+  const normalized = registeredBots
+    .map(normalizedIdentityConfig)
+    .sort((a, b) => a.larkAppId.localeCompare(b.larkAppId)
+      || a.tenantKey.localeCompare(b.tenantKey)
+      || a.brand.localeCompare(b.brand)
+      || JSON.stringify(a.allowedUsers).localeCompare(JSON.stringify(b.allowedUsers)));
+  return createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
+}
+
+function tenantHumanKey(identity: TenantHumanId): string {
+  return JSON.stringify([identity.tenantKey, identity.unionId]);
+}
+
+/**
+ * Convert all configured administrator entries through the Bot application that
+ * signs them. One unresolved or tenant-inconsistent entry invalidates the whole
+ * result; a partial administrator union is never authorization evidence.
+ */
+async function computeFreshBotAdminUnions(
+  registeredBots: readonly BotAdminIdentityConfig[],
+  resolveAllowedUser: ResolveBotAllowedUser,
+): Promise<FreshBotAdminUnionSnapshot | undefined> {
+  const admins: TenantHumanId[] = [];
+  const seen = new Set<string>();
+  const orderedBots = [...registeredBots].sort((a, b) => a.larkAppId.localeCompare(b.larkAppId));
+  for (const rawBot of orderedBots) {
+    const bot = normalizedIdentityConfig(rawBot);
+    if (!bot.larkAppId || !bot.tenantKey) return undefined;
+    for (const entry of bot.allowedUsers) {
+      const identity = await resolveAllowedUser(rawBot, entry);
+      if (!identity
+        || !identity.tenantKey
+        || !identity.unionId.startsWith('on_')
+        || identity.tenantKey !== bot.tenantKey) return undefined;
+      const key = tenantHumanKey(identity);
+      if (!seen.has(key)) {
+        seen.add(key);
+        admins.push({ tenantKey: identity.tenantKey, unionId: identity.unionId });
+      }
+    }
+  }
+  return {
+    configFingerprint: botAdminIdentityConfigFingerprint(registeredBots),
+    admins,
+  };
+}
+
+export async function loadFreshBotAdminUnionSnapshot(options: {
+  registeredBots: readonly BotAdminIdentityConfig[];
+  snapshot?: FreshBotAdminUnionSnapshot;
+  resolveAllowedUser: ResolveBotAllowedUser;
+}): Promise<FreshBotAdminUnionSnapshot | undefined> {
+  const fingerprint = botAdminIdentityConfigFingerprint(options.registeredBots);
+  if (options.snapshot?.configFingerprint === fingerprint) return options.snapshot;
+  return computeFreshBotAdminUnions(options.registeredBots, options.resolveAllowedUser);
+}
+
 function dirPath(dataDir: string): string {
   return join(dataDir, 'bot-admin-unions');
 }
