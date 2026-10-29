@@ -80,6 +80,7 @@ import type { Readable } from 'node:stream';
 import { locateOnPath } from '../cli/registry.js';
 import { buildWrappedLaunch } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
+import { HostWorkingDirContract } from './host-working-dir-contract.js';
 import type {
     SessionBackend,
     SessionAbortDestroyResult,
@@ -342,6 +343,7 @@ export class MojoBackend implements SessionBackend {
      * an explicit bots.json override remains authoritative.
      */
     private spawnOpts: SpawnOpts | null = null;
+    private readonly hostWorkingDirContract = new HostWorkingDirContract();
     /**
      * Resolved launch PREFIX from BotConfig.wrapperCli (e.g. `env VAR=x mojo`,
      * a ttadk gateway). The worker resolves the prefix into a real bin + args and
@@ -419,6 +421,7 @@ export class MojoBackend implements SessionBackend {
         // once per turn — but the spawn contract is still where the worker hands
         // over the authoritative cwd/env, so keep them for buildEnv()/runTurn().
         this.spawnOpts = opts;
+        this.hostWorkingDirContract.capture(opts);
 
         // FAIL CLOSED on a launch prefix we did not ask for.
         //
@@ -635,6 +638,10 @@ export class MojoBackend implements SessionBackend {
         return this.isolatedWorkspace;
     }
 
+    validateWorkingDirBeforeBusinessInput(): boolean {
+        return this.hostWorkingDirContract.matches();
+    }
+
     write(data: string): boolean {
         if (this.killed || this.closing || this.shutdownDetaching) return false;
         if (this.containmentUnrecorded) {
@@ -658,7 +665,10 @@ export class MojoBackend implements SessionBackend {
         // and a second message arriving before the first init event would fork a
         // duplicate session (cliSessionId still null).
         this.writeChain = this.writeChain
-            .then(() => (this.killed || this.closing) ? undefined : this.runTurnWithBusyRetry(text, turnLiveJwt))
+            .then(() => {
+                if (this.killed || this.closing) return undefined;
+                return this.runTurnWithBusyRetry(text, turnLiveJwt);
+            })
             .catch((err: unknown) => {
                 logger.warn(`[mojo] turn failed: ${String(err)}`);
                 this.emitLine(`❌ mojo 执行失败：${this.fmtErr(err)}`, 'err');

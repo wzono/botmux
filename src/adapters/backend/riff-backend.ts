@@ -15,6 +15,7 @@ import { escapeXmlTagLikeTokens } from '../../utils/xml.js';
 import { detectImageFormat } from '../../core/attachment-image-format.js';
 import { shellQuote } from '../../core/cli-launch-mode.js';
 import type { RiffHostBinding } from '../../services/riff-host-tools.js';
+import { HostWorkingDirContract } from './host-working-dir-contract.js';
 
 /**
  * Fallback system prompt injected into every riff task when no explicit
@@ -1062,6 +1063,7 @@ export class RiffBackend implements SessionBackend {
    *  arriving before the first task-execute HTTP returns would see
    *  currentTaskId === null and create a duplicate task. */
   private writeChain: Promise<void> = Promise.resolve();
+  private readonly hostWorkingDirContract = new HostWorkingDirContract();
 
   constructor(config: RiffBackendConfig, sessionId: string) {
     this.config = config;
@@ -1233,9 +1235,14 @@ export class RiffBackend implements SessionBackend {
     return readBytecloudKeychainJwt(home, env);
   }
 
-  spawn(_bin: string, _args: string[], _opts: SpawnOpts): void {
+  spawn(_bin: string, _args: string[], opts: SpawnOpts): void {
+    this.hostWorkingDirContract.capture(opts);
     logger.info(`[riff] spawn (ignoring bin/args, using config: ${this.config.baseUrl})`);
     // No actual process to spawn. Task creation happens on first write().
+  }
+
+  validateWorkingDirBeforeBusinessInput(): boolean {
+    return this.hostWorkingDirContract.matches();
   }
 
   write(data: string): boolean {
@@ -1255,6 +1262,9 @@ export class RiffBackend implements SessionBackend {
       .then(async () => {
         // closing 也要在链内复查：write 可能在 close 之前就排进了队列。
         if (this.killed || this.closing) return;
+        // The worker performs the backend's authoritative host-contract check at
+        // the write edge, before dequeueing the business input. Riff exposes no
+        // metadata-only bootstrap: task-execute itself is the first remote call.
         // Route by task lineage only: task-follow-up is exactly the "continue
         // the conversation after the parent finished" API, so a completed task
         // (taskDone) must still route to followUp — spinning up a fresh task

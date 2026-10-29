@@ -16008,6 +16008,10 @@ function adapterInputHandle(target: SessionBackend): PtyHandle {
     : target;
 }
 
+function writeBackendWorkingDirRejected(target: SessionBackend): boolean {
+  return target.validateWorkingDirBeforeBusinessInput?.() === false;
+}
+
 function adoptComposerConflict(target: SessionBackend): string | undefined {
   if (target instanceof OrcaBackend) {
     const state = target.inspectDraftSync();
@@ -18502,6 +18506,16 @@ async function flushPending(): Promise<void> {
       if (activeTurnBlocks(pendingMessages[0]!)) break;
       if (traexAutoModelRuntimeEligible()
         && !(await admitTraexAutoModelPendingInput(pendingMessages[0]!))) break;
+      const nextItem = pendingMessages[0]!;
+      if (writeBackendWorkingDirRejected(backend)) {
+        send({
+          type: 'user_notify',
+          message: `${effectiveBackendType === 'riff' ? 'Riff' : 'Mojo'} 工作目录绑定已变化，业务输入未发送；原消息已保留，请修复目录后重试。`,
+          turnId: nextItem.turnId,
+          ...(nextItem.dispatchAttempt !== undefined ? { dispatchAttempt: nextItem.dispatchAttempt } : {}),
+        });
+        break;
+      }
       const item = freshnessInputQueue.takeNormal();
       if (!item) break;
       attachDeferredPluginSkillCatalog(item);
@@ -19262,7 +19276,13 @@ async function flushPending(): Promise<void> {
         // and continually replaces their deferred confirmation timer. Only the
         // adapter's explicit safe non-submission disposition permits retry.
         if (!recoveryFailureReason && codexAppSafeNonSubmission) {
-          requeueUnsubmittedQueuedActivation(item);
+          if (item.queuedActivationToken) {
+            requeueUnsubmittedQueuedActivation(item);
+          } else {
+            inflightInputs.forget(item);
+            pendingMessages.unshift(item);
+            log('Retained definitely-unwritten input at queue head for retry');
+          }
         }
         if (deliveryQuarantine) break;
       } else if (item.queuedActivationToken) {
@@ -24730,6 +24750,9 @@ async function spawnCli(
     cwdGuardOutputPending = cfg.expectedWorkingDirIdentity !== undefined;
     backend.spawn(spawnBin, spawnArgs, {
       cwd: spawnCwd,
+      ...(cfg.expectedWorkingDirIdentity
+        ? { expectedWorkingDirIdentity: cfg.expectedWorkingDirIdentity }
+        : {}),
       cols: PTY_COLS,
       rows: PTY_ROWS,
       env: childEnv as Record<string, string>,
@@ -24791,7 +24814,8 @@ async function spawnCli(
   // reattach) the real CLI process; only its authoritative /proc cwd can satisfy
   // this gate. No pending business input, startup command, or ready hook is
   // materialized before the gate succeeds.
-  if (cfg.expectedWorkingDirIdentity) {
+  if (cfg.expectedWorkingDirIdentity
+    && !backend.validateWorkingDirBeforeBusinessInput) {
     const guardedBackend = backend;
     guardedBackend.onData(data => {
       if (backend !== guardedBackend) return;
