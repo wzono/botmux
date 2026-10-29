@@ -170,6 +170,56 @@ describe('Codex App clean prompt sidecar', () => {
     expect(built.content).not.toContain('<chat_mode>');
   });
 
+  it('keeps Codex App structured wire free of the contract when zero prompt injection is requested', () => {
+    const opening = buildNewTopicCliInput(
+      'raw opening', 'sid-zero-opening', 'codex-app', undefined, undefined, undefined,
+      undefined, undefined, undefined, 'en', undefined,
+      { larkAppId: 'zero-app', chatId: 'oc_zero', promptInjection: 'none' },
+    );
+    const followUp = buildFollowUpCliInput('raw follow-up', 'sid-zero-followup', {
+      cliId: 'codex-app', locale: 'en', larkAppId: 'zero-app', chatId: 'oc_zero', promptInjection: 'none',
+    });
+
+    for (const built of [opening, followUp]) {
+      expect(built.content).not.toContain('<botmux_response_style>');
+      const wire = JSON.stringify(built.codexAppInput);
+      expect(wire).not.toContain('botmux_response_style');
+      expect(wire).not.toContain('<botmux_response_style>');
+    }
+  });
+
+  it('delivers the adaptive response contract through Codex App clean input on opening and follow-up', () => {
+    const opening = buildNewTopicCliInput(
+      '开始处理', 'sid-style-opening', 'codex-app', undefined, undefined, undefined,
+      undefined, undefined, undefined, 'zh', undefined,
+      { larkAppId: 'style-app', chatId: 'oc_style' },
+    );
+    const followUp = buildFollowUpCliInput('继续处理', 'sid-style-followup', {
+      cliId: 'codex-app', locale: 'zh', larkAppId: 'style-app', chatId: 'oc_style',
+    });
+
+    for (const built of [opening, followUp]) {
+      const styleEntries = Object.entries(built.codexAppInput?.additionalContext ?? {})
+        .filter(([key]) => key.startsWith('botmux_response_style'))
+        .map(([, entry]) => entry);
+      expect(styleEntries.length).toBeGreaterThan(0);
+      expect(styleEntries.every(entry => entry.kind === 'application')).toBe(true);
+      expect(styleEntries.map(entry => entry.value).join('')).toContain('<botmux_response_style>');
+    }
+  });
+
+  it('delivers the adaptive response contract through the service-user envelope on opening and follow-up', () => {
+    const opening = buildNewTopicCliInput('开始处理', 'sid-ebsd-opening', 'ebsd', undefined, undefined, undefined, undefined, undefined, undefined, 'zh');
+    const followUp = buildFollowUpCliInput('继续处理', 'sid-ebsd-followup', { cliId: 'ebsd', locale: 'zh' }).content;
+
+    expect(opening.content).toContain('BotMux service user message');
+    expect(opening.content).toContain('<botmux_response_style>');
+    expect(opening.content.indexOf('<botmux_response_style>')).toBeLessThan(opening.content.indexOf('开始处理'));
+    expect(followUp).toContain('BotMux service user message');
+    expect(followUp).toContain('<botmux_response_style>');
+    expect(followUp.indexOf('<botmux_response_style>')).toBeLessThan(followUp.indexOf('继续处理'));
+  });
+
   it('builds the same split for a follow-up and excludes the legacy reminder from hidden context', () => {
     const built = buildFollowUpCliInput('继续看一下', 'sid-2', {
       cliId: 'codex-app',

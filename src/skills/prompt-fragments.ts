@@ -373,6 +373,10 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   // ───────────────────── stage: 每条新消息 (followup) ──────────────────────
 
   { key: 'ai.followup.reminder', block: 'followup', stage: 'followup', label: '续轮提醒（默认）', kind: 'editable' },
+  {
+    key: 'ai.response_style.contract', block: 'followup', stage: 'new', stages: ['followup'],
+    label: '全局自适应回复规则', kind: 'editable',
+  },
   { key: 'ai.followup.feishu_safe_emphasis', block: 'followup', stage: 'followup', label: '飞书安全强调格式', kind: 'editable' },
   {
     key: 'ai.followup.reminder_hook', block: 'followup', stage: 'followup', kind: 'editable',
