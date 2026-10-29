@@ -135,6 +135,12 @@ import { hasProtectedSessionMutationOwnership } from '../../core/session-mutatio
 import { persistPendingRepoCardMessageId } from '../../core/pending-repo-journal.js';
 import { runDetachedBotTurnAdmission, withBotTurnMutation, tryWithBotTurnMutation } from '../../core/bot-turn-mutation-gate.js';
 import { isSharedAdoptSession } from '../../core/shared-adopt.js';
+import {
+  authorizeGroupWorkspaceRoute,
+  classifyGroupWorkspaceCardRoute,
+  type GroupWorkspaceRouteAuthority,
+  type GroupWorkspaceRouteIntent,
+} from '../../core/group-workspace-policy.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -189,6 +195,9 @@ export interface CardHandlerDeps {
     payload?: string;
     sig?: string;
   }) => Promise<{ ok: true; chatId: string; run: () => Promise<unknown> } | { ok: false; reason: string }>;
+  /** Task-4 authorization/classification seam; the operation saga is wired later. */
+  resolveGroupWorkspaceRouteAuthority?: GroupWorkspaceCardRouteDeps['resolveAuthority'];
+  handleGroupWorkspaceRoute?: GroupWorkspaceCardRouteDeps['handleRoute'];
 }
 
 /**
@@ -291,6 +300,62 @@ export async function resolveCardOperatorUnionId(
   } catch {
     return { openId };
   }
+}
+
+export interface GroupWorkspaceCardRouteInput {
+  repoKey?: string;
+  selection?: string;
+  chatId: string;
+  callbackChatId?: string;
+  rootId?: string;
+  chatType: 'group' | 'p2p';
+  cardMessageId?: string;
+  currentRepoCardMessageId?: string;
+  operatorOpenId?: string;
+  operatorUnionId?: string;
+  tenantKey?: string;
+  actionId?: string;
+}
+
+export interface GroupWorkspaceCardRouteDeps {
+  resolveAuthority: (input: GroupWorkspaceCardRouteInput) => Promise<GroupWorkspaceRouteAuthority | undefined>;
+  handleRoute: (route: GroupWorkspaceRouteIntent & {
+    source: 'card'; chatId: string; actor: import('../../services/bot-admin-unions-store.js').TenantHumanId;
+    originMessageId: string; actionId: string;
+  }) => Promise<void> | void;
+  canRunGenericCardAction: () => boolean;
+}
+
+/** Narrow card counterpart of the text pre-gate seam. It performs no saga/store write. */
+export async function tryDispatchGroupWorkspaceCardRoute(
+  input: GroupWorkspaceCardRouteInput,
+  deps: GroupWorkspaceCardRouteDeps,
+): Promise<{ status: 'dispatched' | 'switch_denied' | 'not_authorized' | 'not_applicable'; toast?: string }> {
+  const intent = classifyGroupWorkspaceCardRoute(input);
+  if (!intent) {
+    deps.canRunGenericCardAction();
+    return { status: 'not_applicable' };
+  }
+  const authority = await deps.resolveAuthority(input);
+  if (!authorizeGroupWorkspaceRoute(authority)) {
+    deps.canRunGenericCardAction();
+    return { status: 'not_authorized' };
+  }
+  if (intent.kind === 'set' && !authority.canSwitchSession) {
+    return {
+      status: 'switch_denied',
+      toast: '你有群目录管理权限，但没有接收机器人的会话切换权限；本次未切换会话，也未写入群目录。',
+    };
+  }
+  await deps.handleRoute({
+    ...intent,
+    source: 'card',
+    chatId: input.chatId,
+    actor: authority.actor,
+    originMessageId: input.cardMessageId!,
+    actionId: input.actionId!,
+  });
+  return { status: 'dispatched' };
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -5364,6 +5429,34 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         content: t('card.repo.toast_stale_picker', undefined, localeForBot(targetDs.larkAppId)),
       },
     };
+  }
+
+  // A top-level regular-group picker may use the same stable-human pre-gate as
+  // text `/repo`. Exact current-card capability was proven above. The dedicated
+  // route owns the action completely; non-matches retain the existing gate.
+  if (deps.resolveGroupWorkspaceRouteAuthority && deps.handleGroupWorkspaceRoute && larkAppId) {
+    const groupRoute = await tryDispatchGroupWorkspaceCardRoute({
+      repoKey,
+      selection: selectedPath,
+      chatId: targetDs.chatId,
+      callbackChatId: data.context?.open_chat_id,
+      rootId,
+      chatType: targetDs.chatType,
+      cardMessageId,
+      currentRepoCardMessageId: targetDs.repoCardMessageId,
+      operatorOpenId,
+      operatorUnionId: data.operator?.union_id,
+      tenantKey: (data as CardActionData & { tenant_key?: string }).tenant_key,
+      actionId: data.event_id ?? data.header?.event_id ?? data.event?.event_id,
+    }, {
+      resolveAuthority: deps.resolveGroupWorkspaceRouteAuthority,
+      handleRoute: deps.handleGroupWorkspaceRoute,
+      canRunGenericCardAction: () => false,
+    });
+    if (groupRoute.status === 'dispatched') return;
+    if (groupRoute.status === 'switch_denied') {
+      return { toast: { type: 'error', content: groupRoute.toast } };
+    }
   }
 
   // 权限边界：pendingRepo（首次选 repo 才能 spawn）放行「会话发起人 或 canOperate」，
