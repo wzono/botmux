@@ -8,8 +8,10 @@
 |------|------|
 | `/repo` | 仓库待选时用默认 workingDir 启动；会话进行中则弹项目选择卡片 |
 | `/repo <N>` | 切换到上次扫描的第 N 个项目 |
-| `/repo <路径\|项目名>` | 直接指定路径或 workingDir 下的一级项目名 |
-| `/cd <路径>` | 切换工作目录并重启 CLI 进程 |
+| `/repo <路径\|项目名>` | 直接指定路径或 workingDir 下的一级项目名；在普通群顶层还会把目录绑定为本机所有 Bot 共享的群目录 |
+| `/repo show` | 查看会话、显式 oncall、自动 defaultOncall、群目录、Bot 默认目录的优先级与群 revision/健康状态 |
+| `/repo unbind` | 普通群顶层解除本机群目录绑定；保留 revision、历史收据与群目录管理名单 |
+| `/cd <路径>` | 显式切换当前会话目录并重启 CLI；该会话不再自动跟随之后的群目录更新 |
 | `/status` | 查看会话信息（运行时间、终端地址等） |
 | `/lane status` | 查看本人的独立 principal lane，包括分支、worktree、脏状态和未推送提交数（复用现有 bot 级 XPI 开关启用 principal lane 时可用） |
 | `/lane close` | 安全关闭本人的独立 principal lane：有运行中/排队任务或未提交文件时拒绝，回收前先推送未发布提交，且不会自动合并或删除分支 |
@@ -53,6 +55,16 @@
 ![当前群活跃话题会话卡片](/img/sessions-command-card.png)
 
 裸 `/t` 的选仓/固定目录分支见[会话与话题模型](/session-model)。
+
+### 普通群共享工作目录
+
+普通群顶层的 `/repo <路径|项目名|编号>` 在当前会话安全切换成功后，会把规范化目录写入当前宿主机的群级绑定。同一 `SESSION_DATA_DIR` 下的其他 Bot 以及 daemon 重启后新建的群会话、`/th` 都会使用它；该绝对路径不会同步到其他机器。目录优先级是：当前会话/指令显式目录 > 人工 `oncallChats` 覆盖 > 群目录 > 自动 `defaultOncall` 或 Bot 默认目录 > 选仓卡。自动生成的 `defaultOncall` 仍提供 oncall 授权，但不会遮蔽群目录；历史无来源的 oncall 配置按人工覆盖兼容。
+
+- `/repo show` 展示各层来源、最终选择、群 revision、健康状态与管理名单；`/repo unbind` 只解除普通群顶层绑定，不切当前会话，也不重置 revision、收据或管理名单。
+- 管理权限按同租户 `union_id` 在本机各 Bot 间归一化。配置了非空 `workspaceManagers` 时，它完全替代默认 Bot 管理员并在解绑后保留；身份、租户或最新配置指纹无法验证时拒绝写入，不降级为接收 Bot 的普通选仓。
+- 每条顶层 `/repo` 用原始飞书消息建立持久收据。跨 Bot 重投、重启恢复或不同 delivery attempt 会返回同一结果，不会重复切会话或增加 revision；同一原始消息被改成不同选仓意图会拒绝。
+- 话题内 `/repo` 仅影响该话题；`/repo wt` 创建的 worktree 与 `/repo here` 都不会改群绑定。群绑定目录失效、不可进入或启动前发生替换时会 fail closed，不回退到默认目录；用新的顶层 `/repo` 修复或 `/repo unbind` 解除。
+- 只有来源仍为 `group` 的普通群本地 PTY 会话会在下一条业务消息的安全空闲边界跟随新 revision：先停止并确认旧 worker 退出，再在新目录启动且校验 ready cwd。繁忙、等待输入、远程/adopt、显式 `/cd`、oncall、worktree 与历史未知来源不会被强切。
 
 指令头的几条指令：
 
