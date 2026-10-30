@@ -34,7 +34,7 @@
 
 ## 总体不变量
 
-1. **先准入，后占位/租约/attempting/发送。** 任何业务输入在 Turn Admission 返回 `admitted` 前，不得取得业务 lease、把 durable head 标为 attempting、调用 `sendWorkerInput`/`forkWorker` 或 backend `writeBusinessInput`。
+1. **先准入，后业务占位/租约/attempting/发送。** 任何业务输入在 Turn Admission 签发 `BusinessSubmitPermit` 前，不得取得业务 lease、把 durable head 标为 attempting、调用 business submit 或 backend `writeBusinessInput`。唯一更早允许的 worker 创建必须持 `BlankBootstrapPermit` 且 payload 为零。
 2. **一次解析，多点证明。** Resolver 产生的 `WorkspaceIdentity` 是本 turn/session 的冻结目标；消费点只复验，不自行重算或回退。
 3. **故障不是“无绑定”。** group store、identity probe、authority 或 backend proof 不可用时 fail closed。
 4. **目录身份而非路径字符串。** 相同 path 但 `{dev, ino}` 改变即不同目录。
@@ -48,28 +48,47 @@
 新增 `src/core/turn-admission.ts`，唯一公开入口：
 
 ```ts
-type TurnKind = 'management' | 'business' | 'terminal_bytes' | 'output_delivery';
+type TurnKind = 'management' | 'business' | 'control_reply' | 'terminal_bytes' | 'output_delivery';
+type BlankBootstrapPermit = Opaque<{
+  permitId: string; sessionId: string; turnId: string; reservedGeneration: number;
+  target: WorkspaceIdentity; groupRevision?: number; expiresAt: number;
+}>;
+type BusinessSubmitPermit = Opaque<{
+  permitId: string; bootstrapPermitId: string; sessionId: string; turnId: string;
+  workerGeneration: number; workspace: WorkspaceIdentity; groupRevision?: number; expiresAt: number;
+}>;
+type ControlReplyPermit = Opaque<{
+  permitId: string; sessionId: string; originalTurnId: string;
+  wait: { kind: 'ask'; askId: string } | { kind: 'approval'; approvalId: string };
+  expectedGeneration: number; workspace: WorkspaceIdentity; groupRevision?: number; expiresAt: number;
+}>;
 type TurnAdmissionResult =
-  | { status: 'admitted'; session: DaemonSession; workspace: WorkspaceConsumptionProof }
+  | { status: 'bootstrap_permitted'; session: DaemonSession; permit: BlankBootstrapPermit }
+  | { status: 'admitted'; session: DaemonSession; permit: BusinessSubmitPermit }
+  | { status: 'control_reply_admitted'; session: DaemonSession; permit: ControlReplyPermit }
   | { status: 'deferred'; reason: 'busy' | 'fifo_owned' | 'needs_user' | 'startup_recovery' }
   | { status: 'rejected'; reason: WorkspaceFailure | 'unsupported_backend' | 'stale_owner' };
 
 async function admitTurn(request: TurnAdmissionRequest): Promise<TurnAdmissionResult>;
 ```
 
-`admitTurn` 在既有 `withBotTurnAdmission`（或 failed-turn recovery 的更强 `withBotTurnMutation`）内部运行，并按固定顺序：
+`admitTurn` 在既有 `withBotTurnAdmission`（或 failed-turn recovery 的更强 `withBotTurnMutation`）内部运行。已有 worker 时按 `恢复/解析 session → Resolver → 必要的 follow → identity/backend proof → BusinessSubmitPermit` 执行；无 worker 时不得先声称业务已 admitted，而必须走下述两阶段准入。调用方取得 `BusinessSubmitPermit` 后才可领取 principal/XPI lease、改变 durable head、提交业务输入。
 
-1. 分类 management/business；
-2. 恢复或解析 session；
-3. 调用 Workspace Resolver；
-4. 若 group-sourced session 落后，持 admission/FIFO owner 执行 follow；
-5. 复验 workspace identity 与 backend effective-context capability；
-6. 返回 proof；调用方随后才可领取细粒度 principal/XPI lease、改变 durable head、send/fork。
+### 两阶段冷启动准入（AR-01）
+
+1. admission 在共享持久 permit store 中预留 `reservedGeneration`，CAS 写入 `BlankBootstrapPermit(state=issued)`；permit 绑定 session/turn/冻结 target identity/group revision，短期过期且只能消费一次。
+2. `forkWorkerBlank(permit)` 只能创建 **zero business input** worker；worker/backend 不得持有 opening prompt、queue payload 或可自动 flush 的业务 pending input。消费 permit 时 CAS 为 `spawning`，重复消费只观察同一 generation。
+3. worker 报告实际 generation、cwd identity 和 backend effective-context proof。只有实际 generation 等于预留值且所有 proof 匹配，admission 才 CAS 为 `ready_proven`，签发独立 `BusinessSubmitPermit(state=issued)`。
+4. `submitBusinessInput` 原子消费 business permit 为 `consumed` 后恰好一次提交 opening；因此不存在 `admitted → fork → ready → admitted` 循环，也不存在 blank spawn 夹带业务。
+5. permit 状态与失败原因持久化：`issued → spawning → ready_proven → consumed`；`spawn_failed | ready_timeout | identity_mismatch | backend_mismatch | expired | cancelled` 为终态。启动恢复按 permit/session/generation/worker proof 采用同一 worker或安全退役；终态、过期或不确定状态不得重新 fork/投递，须显式重新 admission。FIFO owner 在整个 bootstrap-to-submit logical turn 内保持，后来的 business turn 只能等待或观察终态。
+
+`BlankBootstrapPermit` 不能传给任何 business API，`BusinessSubmitPermit` 也不能创建 worker。`forkWorkerBlank`、ready proof、business submit 的 API 类型和运行时 CAS 共同守边界。
 
 ### management 与 business 分类
 
 - `management`：`/repo show`、授权失败回复、repo picker 展示、`/repo unbind` 的 group-only CAS、关闭/暂停/rename 等不向 CLI 提交用户业务内容的动作。它们不触发 follow，但修改 cwd/session/group 的动作仍走各自 mutation/saga gate。
 - `business`：普通消息、listener 生成 prompt、external trigger、Dashboard create/start 的 opening prompt、Dashboard trigger/chat、`/queue` payload、principal-lane/XPI durable head、scheduler task、failed-turn retry/fresh、automatic continuation/recovery 中将再次送入 CLI 的内容。
+- `control_reply`（AR-02）：只恢复一个已经持久化为 `needs_user` 的原 turn。`ControlReplyPermit` 必须同时匹配 `originalTurnId`、精确 `askId` 或 `approvalId`、原 worker `expectedGeneration`、原冻结 workspace identity/revision、等待状态及回答者/审批者权限。它可以单独越过该原 turn 的 `needs_user` gate，但只能调用 `resumeOriginalTurnReply`，不能进入 `sendWorkerInput`、`forkWorker`、queue/lease/attempting，也不能建立新 turn 或触发 follow。permit 单次消费并记录 reply digest；重复相同回答只读取 receipt，错误 ID、错误 generation、stale/expired permit、workspace identity/revision 不符或原 turn 已 terminal 一律拒绝。群绑定在等待期间变更时，原 turn仍在原 workspace 完成；它 terminal 后，任何新业务 turn必须重新解析并跟随当前 group revision。
 - `terminal_bytes`：不是离散 turn；若 session 是 group source 且 revision/identity 未证明为 current，worker terminal WS 必须拒绝写入并要求先通过 resume/follow。
 - `output_delivery`：model→Lark/Dashboard 输出，不进 admission。
 
@@ -77,7 +96,7 @@ async function admitTurn(request: TurnAdmissionRequest): Promise<TurnAdmissionRe
 
 | ingress | 当前链 | 修订适配点 | 业务发送前要求 |
 |---|---|---|---|
-| 普通 new topic | `dispatchHumanMessageViaHandlers → handleNewTopic → handleNewTopicAdmitted` | `handleNewTopicAdmitted` 在 session side effect 前调用 `admitTurn` | proof 后 `forkWorker` |
+| 普通 new topic | `dispatchHumanMessageViaHandlers → handleNewTopic → handleNewTopicAdmitted` | `handleNewTopicAdmitted` 在业务 side effect 前调用 `admitTurn` | 无 worker：blank permit→zero-payload fork→ready proof→business permit→opening；有 worker：business permit→submit |
 | thread/existing | `handleThreadReply → handleThreadReplyAdmitted` | 替换局部 follow 检查为 `admitTurn` | proof 后 queue/send/fork |
 | realtime/polled listener | 最终汇入普通 handlers | 无独立 resolver；携带 origin adapter | 同普通消息 |
 | external trigger | `triggerSessionTurn → triggerSessionTurnAdmitted` | trigger adapter 在 `beginAsyncTrigger`、lease、send/fork 前调用 | store error 禁止 fallback |
@@ -87,12 +106,13 @@ async function admitTurn(request: TurnAdmissionRequest): Promise<TurnAdmissionRe
 | XPI | `driveNextXpiSharedCwdTurn` | workspace admission 先于 exact XPI lease/attempting | 失败保留 queue/lease 未取 |
 | scheduler | callback → `executeScheduledTask` | 现有 bot gate 内、session send/fork 前 admission | 目标 identity 不一致拒绝 |
 | failed-turn recovery | `recoverFailedTurn`（mutation gate） | 使用 `admitTurnUnderMutation`，不嵌套 shared gate | receipt attempting 前完成 |
-| ordinary continuation | worker-pool recovery send/fork | 已 admitted logical turn仅可重放同 proof；generation 变化则重新 admission | 禁止跨 generation 沿用 proof |
+| Ask/approval reply | card/text answer → wait registry → original turn resume | 验证 exact-turn `ControlReplyPermit`；只恢复原 turn | 不得开始新 turn/follow；terminal 后按当前 group 重新准入 |
+| ordinary continuation | worker-pool recovery send/fork | 已 admitted logical turn仅可重放同 permit；generation 变化则重新 admission | 禁止跨 generation 沿用 permit |
 | startup saga/follow recovery | boot barrier | recovery 自身是 management；不得发送业务内容 | barrier 完成后开 ingress |
 | terminal WS | proxy → worker `cp.write` | 加 `canAcceptTerminalBytes` fence | stale group session 拒绝 |
 | durable output send | `/durable-send` | `output_delivery`，明确不适用 | 无业务 admission |
 
-任何新增调用 `sendWorkerInput`、`forkWorker`、backend `writeBusinessInput` 或 durable head `attempting` 的生产节点，必须接受不可伪造、绑定 `{sessionId, workerGeneration, WorkspaceIdentity, turnId}` 的 `WorkspaceConsumptionProof`；结构测试只检查 API 依赖，行为测试证明拒绝绕过。
+任何新增调用 `sendWorkerInput`、business submit、backend `writeBusinessInput` 或 durable head `attempting` 的生产节点，必须接受不可伪造的 `BusinessSubmitPermit`；permit 除 `{sessionId, workerGeneration, WorkspaceIdentity, turnId}` 外还绑定可选 group revision，并且只在该 turn 内单次有效，群 revision 改变后不得给另一 turn复用。blank `forkWorker` 只接受 `BlankBootstrapPermit`；Ask/approval resume 只接受 `ControlReplyPermit`。三类 permit 在类型与运行时均不可互换；结构测试只检查 API 依赖，行为测试证明拒绝绕过、过期与重放。
 
 ## B. Async Workspace Resolver / Consumption
 
@@ -157,9 +177,11 @@ identity 必须贯穿：target resolve/probe → prepared → session switch →
 2. v1 group bound record：对 path 做一次 probe；成功后生成 v2 identity；失败则保留 v1 文件并 quarantine，管理员修复前不消费。
 3. v1 set journal/receipt 只有 path：未终态操作不能安全补 identity，标记 `migration_blocked_identity_missing`，不重放 switch/CAS；已终态 receipt 可由当前 record identity补齐，但必须证明 revision/target/actor 一致。
 4. v1 follow journal：若 phase 为 prepared 且旧 worker仍可证明未退出，可 probe 并升级；其它 phase 无 identity 则 quarantine，禁止 spawn。
-5. legacy session：group source 且可由同 revision group record证明时补 identity；否则降为 `legacy-unknown` 并禁止自动 follow，不猜测。
-6. 迁移以 sibling v2 temp + fsync + rename 发布；原 v1 文件保留为 `.v1.rollback`，migration manifest 记录 hash。SQLite session migration在事务内写 v2，导出只读 rollback snapshot。
-7. forward rollback：旧 binary 看到 v2 必须 fail closed，不能重写；运维回滚代码时继续保留 v2、journal、receipt、session 数据，通过显式 migrator 生成 v1 兼容副本，绝不删除审计文件。
+5. legacy session：只有确实没有历史 provenance 的 session 才可标为 `legacy-unknown`。任何已知 `source=group` 的 record/session 若 revision、record、inode 或 workspace identity proof 失败，必须持久化 `{kind:'known_group_identity_unprovable', expectedIdentity, expectedRevision, detail}` quarantine，保留 group provenance，禁止业务、follow 和 executable fallback，绝不降级成 legacy unknown。`/repo show` 必须展示 discriminated reason 与 expected identity/revision。只有显式 repair operation 在重新校验 authority、当前 group record 和新 identity proof 后，写 superseding receipt/事件并 CAS 清除旧 quarantine；重启继续显示/阻止，不能靠读取失败自动清除。
+6. 迁移由 `SESSION_DATA_DIR/workspace-migration-manifest.json` 的宿主机级 coordinator 管理。manifest 含 `batchId`、schema epoch、writer owner/lease/fencing token、源/目标版本、每个 store 的 backup path/source checksum/target checksum/publish point 和 phase：`prepared → per_store_staged → per_store_verified → published → complete`。相关 store writer 每次写入都必须校验 manifest epoch/fence；未持最新 fence 的 daemon（包括迁移前旧 daemon）不得写 group JSON、operation JSON、follow/session SQLite 或适用的 admin snapshot。
+7. coordinator 先取得 host-wide writer fence 并阻断所有 daemon ingress，再按 group JSON、operation JSON、follow/session SQLite、admin snapshot（若该批 schema 触达）的固定顺序 stage+fsync+checksum verify；每个 store 的 publish point 单独记入 manifest。`published` 仅表示所有 required stores 已到同一 epoch，之后才可置 `complete` 并开放 ingress。任何 daemon 启动先读取 manifest：在 `prepared/staged/verified` 可安全 rollback 到 checksummed backups；已有 publish point 时只能按 manifest resume 完成剩余 publish，不能把混合 epoch 当完整状态。恢复后再次逐 store verify 才开放 ingress。
+8. 兼容矩阵是协议的一部分：新 binary 对 v1 只能在持 host fence 的 coordinator 中迁移；旧 binary 必须认识 migration fence/version marker 并 fail closed。若部署中的旧版本不认识 fence，前置条件是 supervisor 证明全 fleet quiesced 且禁止旧版本重启，再签发 batch；否则不得迁移。未来版本、混合 epoch、fence 丢失一律不开 daemon ingress。
+9. 原 v1 文件保留为 batch-scoped rollback backup，SQLite 导出只读 rollback snapshot；forward rollback 通过显式 migrator 在 host fence 下生成独立 v1 兼容副本，绝不删除 v2、journal、receipt、manifest 或审计事件。
 
 ## Saga、follow 与启动恢复
 
@@ -169,9 +191,16 @@ operation recovery 不依赖原事件重投。无法证明 switched/not-switched
 
 follow 每个 phase 使用 `next = structuredClone(current)`，CAS 持久化成功后才发布内存；旧 worker 未确认退出不得 spawn。`spawned` 恢复只在 pid/generation/identity proof 匹配时采用；否则先持久化 rebase generation，再 spawn 一次。
 
-## 同 canonical source 并发
+## 同 canonical source 并发与跨 daemon executor lease（AR-03）
 
-首次同源同 kind 同 semantic intent 的两个请求可并发解析，但只有 journal-lock winner 可冻结 target/revision/generation/identity。loser 在 lock 内按 request-intent digest 采用 winner journal，随后 single-flight join 同一 operation promise/receipt；不得因 winner 已推进 phase 返回 `protocol_conflict` 或 `unknown`。同 source 不同 intent/kind 仍 protocol conflict。
+首次同源同 kind 同 semantic intent 的两个请求可并发解析，但只有 journal-lock winner 可冻结 target/revision/generation/identity。采用 frozen journal 与取得副作用执行权是两件事：共享 operation store 还必须为每个 source operation 保存 `{executorOwnerId, leaseEpoch, fencingToken, leaseExpiresAt}`。
+
+- daemon 通过 store CAS acquire/renew executor lease；每次 renew、steal 都递增 epoch/fencing token。只有当前未过期 owner 可推进，但 **所有** journal/receipt/session/group 写以及 switch/retire/spawn 请求都必须携带 token，并由 effect sink 对 `operationId + fencingToken` 做原子检查；旧 token 即使晚到也不能产生副作用或提交。
+- lease 未过期时其他 daemon 是 observer，只能读取 journal/receipt、等待 durable 通知或超时重读，绝不执行 switch/spawn/CAS；进程内 promise 仅作性能优化，不是 authority。
+- lease 到期后 contender 可 CAS steal 新 epoch。新 owner 在执行前根据 receipts/journal/session/worker generation+identity proof 收敛；无法证明旧 effect 未发生时 quarantine，而不是重复执行。已成功 effect 的 durable receipt 允许新 owner继续下一 phase。
+- owner crash/restart 不保留隐式权力；restart 后必须重新 acquire。慢 owner在 lease 被 steal 后的所有迟到写与 effect 均被 fencing token 拒绝。
+
+同 source loser 在 lock 内按 request-intent digest 采用 winner journal，然后作为 observer 读取同一 terminal receipt；不得因 winner 已推进 phase 返回 `protocol_conflict` 或 `unknown`。同 source 不同 intent/kind 仍 protocol conflict。
 
 ## Remote backend 有效上下文证明
 

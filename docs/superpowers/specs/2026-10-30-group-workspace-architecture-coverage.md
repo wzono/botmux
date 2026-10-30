@@ -2,7 +2,7 @@
 
 ## 使用规则
 
-本文件固定在实现基线 `85fa2fdd9ed135967281b85138474bcc488e5275`。当前实现为 **NO-GO**；所有 P1 状态均为 `deferred-to-redesign`，表示已进入重设计任务，**不表示已修复或批准**。证据行号对应固定基线；实现变更后以函数名与行为测试重新定位。
+本文件固定在实现基线 `85fa2fdd9ed135967281b85138474bcc488e5275`。当前实现为 **NO-GO**；原 17-P1 状态均为 `deferred-to-redesign`，表示已进入重设计任务，**不表示实现已修复或批准**。R1 架构 blocker AR-01..AR-05 的文档状态为 `fixed`，仅表示规格、计划和验证序列已补齐。证据行号对应固定基线；实现变更后以函数名与行为测试重新定位。
 
 审查预算：新架构 R1 全量；R2 仅复核 R1 blocker 及触达边界；R3 终态。arbiter 为原始需求决策 owner。
 
@@ -28,6 +28,16 @@
 | P1-16 | principal-lane/XPI durable FIFO head pending，group已更新 | 期望 follow 在 lease/attempting 前；实际 driver 先 attempting/send | durable turn 在旧 cwd 执行 | `daemon.ts:21172-21213,21899-21999` | AC-09, AC-12 | driver 调统一 admission，失败保留 head 且不取 lease | T1,T9 | deferred-to-redesign |
 | P1-17 | `/queue task` 时 session落后 | 期望 admission/follow 后才 accepted；实际直接 `submitQueuedMessage` 可先返回 accepted | 用户认为已接收但 cwd 未迁移 | `command-handler.ts:1972-1995`; `daemon.ts:6284-6351` | AC-09, AC-12 | 复用外层 proof；submit API 强制 proof token | T1,T9 | deferred-to-redesign |
 
+## R1 architecture blocker ledger
+
+| ID | status | fixed contract | planned task / verification |
+|---|---|---|---|
+| AR-01 | fixed | durable two-phase `BlankBootstrapPermit → zero-payload fork/ready proof → BusinessSubmitPermit`; no admitted/fork cycle; expiry/failure/restart are explicit states | T1; no-worker `/th`/Dashboard/trigger traces, pre-ready payload rejection, mismatch/timeout/crash/duplicate tests |
+| AR-02 | fixed | typed exact-turn `ControlReplyPermit` binds original turn, Ask/approval ID, generation, frozen identity/revision and authority; it only resumes `needs_user` and cannot start/fork a turn | T9; duplicate, stale/wrong ID, wrong generation/identity, terminal replay and next-turn-current-group tests |
+| AR-03 | fixed | shared-store executor owner+lease epoch+fencing token; loser only observes receipts; every effect/write fenced; process promise is not authority | T5; two OS processes, live slow owner, expiry steal, crash/restart and stale late-write/effect tests |
+| AR-04 | fixed | host-wide `SESSION_DATA_DIR` migration manifest/coordinator with writer fence/epoch, batch phases, checksummed backups, per-store publish points, startup resume/rollback and version compatibility; ingress opens only at one verified epoch | T6,T11; two-daemon writer overlap, every JSON/SQLite/manifest crash boundary, old/new/future/mixed epoch tests |
+| AR-05 | fixed | known-group identity proof failure persists discriminated quarantine with expected identity/revision; never becomes executable `legacy-unknown`; explicit authorized repair supersedes with new proof | T6,T7; old revision/unreadable/inode failure restart+show tests and authorized/unauthorized repair tests |
+
 ## P2 backlog
 
 | ID | backlog | disposition |
@@ -45,7 +55,7 @@
 
 | acceptance item | affected behavior | required caller/callee nodes | original issue IDs | revised contract | verification evidence/result |
 |---|---|---|---|---|---|
-| AC-01 | 普通群 Bot A set 后 Bot B new chat 使用 X | `event-dispatcher.dispatchHumanMessageViaHandlers → daemon.handleNewTopic/handleNewTopicAdmitted → admitTurn → resolveWorkspace/consumeWorkspace → worker-pool.forkWorker` | P1-14 | A+B+D | planned `group-workspace-turn-admission-e2e`; current result NO-GO |
+| AC-01 | 普通群 Bot A set 后 Bot B new chat 使用 X | `event-dispatcher.dispatchHumanMessageViaHandlers → daemon.handleNewTopic/handleNewTopicAdmitted → admitTurn → turnPermitStore.issueBlank → workerPool.forkWorkerBlank(zero payload) → ready/identity/backend proof → turnPermitStore.issueBusiness → submitOpening` | P1-14, AR-01 | A+B+D two-phase permit | planned no-worker admission/restart E2E; current result NO-GO |
 | AC-01 | `/th` 使用 X | `handleNewTopicAdmitted` topic-header path → resolver → create/session spawn | P1-14 | B+D | planned cross-Bot `/th` restart test; current partial v1 evidence |
 | AC-01 | external trigger new/existing 使用 X | `dashboard/trigger-api.dispatchTriggerRequest → dashboard-ipc-server POST /api/trigger → triggerSessionTurn/triggerSessionTurnAdmitted → admitTurn` | P1-11,P1-12 | A+B | planned store-fault/new/existing trigger matrix; current NO-GO |
 | AC-01 | Dashboard create/start/resume 使用 X | `dashboard.ts POST create → dashboard-ipc-server spawn/start/resume → spawnDashboardSession/activateQueuedSession/resumeSession → admitTurn` | P1-13 | A+B | planned Dashboard real IPC test; current NO-GO |
@@ -57,10 +67,10 @@
 | AC-04 | prepared 后 revoke + commit fresh check | `operation coordinator → revalidateWorkspaceCommit → group store mutate` | P1-04,P1-08 | C | controlled config change at both boundaries planned |
 | AC-04 | recognized denial 不落 legacy | `route-runtime → event-dispatcher/card-handler` | P1-09 | C | `recognized_denied` consumes text/card planned |
 | AC-05 | historical replay/frozen identity | `operation-store.prepare/adopt → coordinator → session switch → group store` | P1-07,P1-14 | D | M1/M2/replay with inode replacement planned |
-| AC-05 | same-source concurrent winner adoption | `GroupWorkspaceOperationStore.prepareOrAdopt → coordinator single-flight` | P1-10 | D | barrier-controlled two-delivery test planned |
+| AC-05 | same-source concurrent winner adoption and unique executor | `GroupWorkspaceOperationStore.prepareOrAdopt → ExecutorLeaseStore.acquire/renew/steal → fenced coordinator effects/writes`; observer daemon reads journal/receipt only | P1-10, AR-03 | D + durable executor lease | planned two-OS-process slow-owner/crash/steal/stale-token suite |
 | AC-06 | monotonic revision/tombstone/ACL | `GroupWorkspaceStore.mutate/reconcileExactOperation` | — | D v2 preserves v1 semantics | existing store tests + v2 migration roundtrip planned |
 | AC-07 | saga crash boundaries/boot convergence | `operation-store.listRecoverable → coordinator.recover → session convergence → boot barrier` | P1-04,P1-05,P1-06,P1-07,P1-14 | A+C+D | restart without source redelivery and fault matrix planned |
-| AC-08 | explicit `/cd`/IPC 不跟随；legacy unknown | `session-cwd codec → session-store row → resolver/follow eligibility` | P1-06,P1-14 | B+D | session v1/v2 migration, resume and explicit-race tests planned |
+| AC-08 | explicit `/cd`/IPC 不跟随；true legacy unknown；known-group proof failure quarantine/repair | `session-cwd codec → migration coordinator → session-store quarantine → resolver/follow eligibility → explicit repair CAS` | P1-06,P1-14, AR-05 | B+D discriminated provenance | old revision/unreadable/inode failure restart+show and repair tests planned |
 | AC-09 | ordinary existing business turn safe follow | `handleThreadReplyAdmitted → admitTurn → runGroupWorkspaceSessionFollow → send/fork` | P1-06 | A+D | two local PTY families retained + persist-failure test planned |
 | AC-09 | `/queue` | `command-handler.handleCommand → submitQueuedMessage(proof) → sendWorkerInput` | P1-17 | A | deferred/rejected must not accepted test planned |
 | AC-09 | principal lane | `handlePrincipalLaneLiveMessage → handleThreadReply → driveNextPrincipalLaneTurn → admitTurn → lease/send` | P1-16 | A | durable head remains pending on follow failure planned |
@@ -68,26 +78,31 @@
 | AC-09 | scheduler | `scheduler.tick/runTaskNow → daemon execute callback → executeScheduledTask → admitTurn → send/fork` | P1-16 (shared bypass class) | A+B | schedule existing/new group session test planned |
 | AC-09 | listener realtime/backfill | `evaluateMessageListener.../poll → dispatchHumanMessageViaHandlers → ordinary adapter` | P1-16 (shared bypass class) | A | both origins reach same admission spy planned |
 | AC-09 | failed-turn recovery | `dashboard-ipc-server → recoverFailedTurn → withBotTurnMutation → admitTurnUnderMutation → send/fork` | P1-05,P1-16 | A | stronger-gate no-deadlock and proof-before-receipt test planned |
-| AC-09 | ordinary continuation/recovery | `ordinary-turn-recovery/worker-pool → proof generation check → send/fork` | P1-05 | A | stale generation proof rejected planned |
+| AC-09 | Ask/approval exact-turn control reply | `text/card answer → wait registry → admitControlReply(originalTurnId,askId|approvalId) → validate generation+frozen identity/revision+authority → resumeOriginalTurnReply` | AR-02 | A typed control permit | duplicate/stale/wrong-id/wrong-generation/terminal replay and next-turn-follow-current tests planned |
+| AC-09 | ordinary continuation/recovery | `ordinary-turn-recovery/worker-pool → business permit generation/identity/revision check → submit or re-admit` | P1-05, AR-01 | A | stale permit rejected; bootstrap crash resumes without duplicate planned |
 | AC-09 | Riff output/effective repo | `worker.spawnCli/flushPending → RiffBackend validated proof/createTask/followUp/onData` | P1-01 | A+B backend proof | actual output wiring + primary repo mismatch planned |
 | AC-09 | Mojo override/isolation/cloud | `worker.flushPending → MojoBackend.realWorkingDir/resolveCwd/runTurn` | P1-01,P1-15 | A+B backend proof | override rejected; isolation proof; cloud unknown→unsupported planned |
 | AC-10 | path access/inode/store failure no fallback | `resolveWorkspace → path probe → consumeWorkspace → spawn/ready/backend submit` | P1-11,P1-14,P1-15 | B+D | revoke/unmount/replace/store corrupt matrix planned |
 | AC-10 | terminal WS stale group fence | `terminal-proxy → worker WS message → canAcceptTerminalBytes` | P1-16 (input bypass class) | A terminal_bytes rule | semantic scope confirmed; stale group bytes rejected planned |
 | AC-10 | output delivery excluded | `dashboard-ipc-server durable-send → durableSessionSendHandler` | — | A output_delivery rule | contract test: no turn admission, no business input |
 | AC-11 | profile rewrite independent | `bot config publisher` vs `group-workspaces.json` | P1-03,P1-08 | C+D | existing independence test + fingerprint refresh planned |
-| AC-11 | group store v1→v2/backward rollback | group store migrator/read codec | P1-14 | D | byte-preserved `.v1.rollback`, hash manifest, v2 read test planned |
-| AC-11 | operation receipt/journal v1→v2 | operation migrator/recovery | P1-05,P1-10,P1-14 | D | unresolved no-identity quarantine; terminal exact adoption planned |
-| AC-11 | follow journal/session row v1→v2 | session-store migration + follow recovery | P1-06,P1-14 | D | transaction rollback, future-version fail-closed planned |
-| AC-11 | forward rollback old binary behavior | v2 files + explicit downgrade exporter | P1-05,P1-14 | D | old reader refuses/refrains from rewrite; files retained planned |
+| AC-11 | host-wide migration batch and group store v1→v2 | `SESSION_DATA_DIR manifest → writer fence/epoch → group JSON stage/verify/publish point` | P1-14, AR-04 | D migration coordinator | two-daemon overlap and every group publish crash boundary planned |
+| AC-11 | operation receipt/journal v1→v2 | `migration coordinator → operation JSON stage/verify/publish point → recovery` | P1-05,P1-10,P1-14, AR-04 | D | unresolved identity quarantine; terminal adoption; partial publish resume planned |
+| AC-11 | follow journal/session row v1→v2 | `migration coordinator → follow/session SQLite transaction+publish point → follow recovery` | P1-06,P1-14, AR-04,AR-05 | D | transaction boundary crash, known-group quarantine and mixed-epoch ingress block planned |
+| AC-11 | admin snapshot/version compatibility/forward rollback | `migration coordinator → relevant admin snapshot publish → fleet version gate → explicit downgrade exporter` | P1-05,P1-14, AR-04 | D | old/new/future version, fleet quiescence, retained backups/manifest tests planned |
 | AC-12 | command router/repo card/thread/worktree/oncall regression | `command-router`, `command-handler`, `event-dispatcher`, `card-handler` | P1-02,P1-09 | A+C | existing oracle/schema/card suites + route parity planned |
-| AC-12 | every `sendWorkerInput` production caller | daemon call sites incl ask, principal, XPI, approvals, normal; trigger/session-manager scheduler | P1-12,P1-16,P1-17 | A proof-token callee contract | compile-time/API negative tests + behavior per ingress planned |
-| AC-12 | every `forkWorker` production caller | ordinary, trigger, Dashboard, scheduler, resume/recovery, principal/XPI | P1-12,P1-13,P1-16 | A proof-token or management-only spawn mode | caller inventory gate planned; unknown provider internals marked below |
+| AC-12 | every business submit production caller | daemon normal, principal, XPI, queue, trigger/session-manager/scheduler | P1-12,P1-16,P1-17, AR-01 | A `BusinessSubmitPermit` callee contract | wrong permit/expiry/replay API negatives + per-ingress behavior planned |
+| AC-12 | Ask/approval response callers | text/card Ask answers and approval callbacks only | AR-02 | A `ControlReplyPermit → resumeOriginalTurnReply` | cannot call new-turn/fork/business APIs; duplicate/stale matrix planned |
+| AC-12 | every worker creation caller | ordinary, trigger, Dashboard, scheduler, resume/recovery, principal/XPI | P1-12,P1-13,P1-16, AR-01 | A `BlankBootstrapPermit` zero-payload fork only | caller inventory plus no-opening-before-ready gate planned |
 | AC-12 | unknown external provider cwd semantics | Riff service remote pathname; Mojo cloud sandbox pathname | P1-15 | B backend effective-context proof | **unknown** until provider returns identity; design outcome is fail closed |
 
 ## Call-chain completeness notes
 
 - `withBotTurnAdmission` remains the bot-wide concurrency primitive; it is not by itself workspace admission.
-- principal-lane and XPI leases remain narrower resource gates and occur **after** workspace admission.
+- principal-lane and XPI leases remain narrower resource gates and occur **after** `BusinessSubmitPermit` issuance.
+- blank bootstrap、business submit、exact-turn control reply 是互不兼容的 typed permits；Ask/approval 只恢复原 turn。
+- process-local single-flight/promise 不是 operation authority；跨 daemon authority 只来自共享 store 的 live executor lease/fencing token。
+- migration manifest 未到 `complete` 且 required stores 未验证同一 epoch 时，所有 daemon ingress 和普通 writers 保持关闭。
 - failed-turn recovery retains `withBotTurnMutation`; it invokes a non-reentrant adapter rather than nesting a shared gate.
 - Dashboard terminal bytes are covered by a stale-workspace fence, not modeled as one turn per keystroke.
 - scheduler and realtime/polled listeners already converge toward known paths, but still receive explicit matrix rows to prevent future divergence.
