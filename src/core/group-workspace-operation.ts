@@ -128,7 +128,7 @@ export function createGroupWorkspaceSetCoordinator(options: {
     reconcileUnknownGroupReceipt: async journal => {
       const result = await options.groupStore.reconcileExactOperation({
         kind: 'set', chatId: journal.chatId, sourceEventId: journal.sourceEventId,
-        requestedWorkingDir: journal.targetWorkingDir, expectedRevision: journal.expectedGroupRevision,
+        requestedWorkingDir: journal.targetWorkingDir!, expectedRevision: journal.expectedGroupRevision,
         expectedSessionGeneration: journal.expectedSessionGeneration, actor: journal.actor,
         authorized: true, directoryValid: true, now: journal.updatedAt,
       });
@@ -150,7 +150,7 @@ export function createGroupWorkspaceSetCoordinator(options: {
       const result = await options.groupStore.mutate({
         kind: 'set', chatId: journal.chatId, sourceEventId: journal.sourceEventId,
         ...(options.originMessageId ? { originMessageId: options.originMessageId } : {}),
-        requestedWorkingDir: journal.targetWorkingDir, expectedRevision: journal.expectedGroupRevision,
+        requestedWorkingDir: journal.targetWorkingDir!, expectedRevision: journal.expectedGroupRevision,
         expectedSessionGeneration: journal.expectedSessionGeneration, actor: journal.actor,
         authorized: true, directoryValid: true, now: options.now(),
       });
@@ -205,7 +205,7 @@ export function isPreparedNoSessionUnbindJournal(journal: RepoGroupOperationJour
     && journal.kind === 'unbind'
     && journal.sessionId === GROUP_WORKSPACE_UNBIND_NO_SESSION_ID
     && journal.expectedSessionGeneration === 0
-    && journal.targetWorkingDir === '/';
+    && journal.target.kind === 'absent';
 }
 
 export async function executeGroupWorkspaceUnbind(
@@ -231,7 +231,7 @@ export async function executeGroupWorkspaceUnbind(
       payloadDigest: canonicalGroupOperationPayloadDigest({
         ...intent, expectedRevision: current.revision, authorized: true, now: 0,
       }), chatId: request.chatId, sessionId: GROUP_WORKSPACE_UNBIND_NO_SESSION_ID, expectedSessionGeneration: 0,
-      expectedGroupRevision: current.revision, targetWorkingDir: '/', actor: request.actor,
+      expectedGroupRevision: current.revision, target: { kind: 'absent' }, actor: request.actor,
       phase: 'prepared', updatedAt: dependencies.now(),
     });
     if (prepared.status === 'store_unavailable') return { status: 'store_unavailable' };
@@ -334,6 +334,7 @@ export class GroupWorkspaceOperationCoordinator {
         ...canonicalRequest, payloadDigest,
         expectedSessionGeneration: session.generation,
         expectedGroupRevision: revision.revision,
+        target: { kind: 'workspace', identity: target.workspaceIdentity },
         targetWorkingDir: target.workingDir, targetWorkspaceIdentity: target.workspaceIdentity,
         phase: 'prepared',
         updatedAt: this.dependencies.now(),
@@ -375,7 +376,7 @@ export class GroupWorkspaceOperationCoordinator {
         const switched = await this.dependencies.switchSession({
           sessionId: journal.sessionId,
           expectedGeneration: journal.expectedSessionGeneration,
-          targetWorkingDir: journal.targetWorkingDir,
+          targetWorkingDir: journal.targetWorkingDir!,
         });
         if (switched.status === 'unknown') return this.markUnknown(journal);
         if (switched.status === 'store_unavailable') return { status: 'store_unavailable', journal };

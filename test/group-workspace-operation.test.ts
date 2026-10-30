@@ -31,6 +31,7 @@ const BASE = {
     expectedRevision: 2, actor: ACTOR, authorized: true, directoryValid: true, now: 0,
   }), chatId: 'chat-1', sessionId: 'session-1',
   expectedSessionGeneration: 4, expectedGroupRevision: 2,
+  target: { kind: 'workspace' as const, identity: { path: '/repo/X', dev: '1', ino: '2' } },
   targetWorkingDir: '/repo/X', targetWorkspaceIdentity: { path: '/repo/X', dev: '1', ino: '2' }, actor: ACTOR,
 };
 
@@ -253,7 +254,8 @@ describe('executeGroupWorkspaceUnbind', () => {
         ...intent, expectedRevision: 0, authorized: true, now: 0,
       }),
       chatId: BASE.chatId, sessionId: 'group-workspace-unbind', expectedSessionGeneration: 0,
-      expectedGroupRevision: 0, targetWorkingDir: '/', actor: ACTOR, phase: 'prepared', updatedAt: 1,
+      expectedGroupRevision: 0, target: { kind: 'absent' }, targetWorkingDir: undefined, targetWorkspaceIdentity: undefined,
+      actor: ACTOR, phase: 'prepared', updatedAt: 1,
     })).toMatchObject({ status: 'created' });
 
     let mutations = 0;
@@ -279,13 +281,14 @@ describe('executeGroupWorkspaceUnbind', () => {
     ['set operation', { kind: 'set' }],
     ['real session', { sessionId: 'session-1' }],
     ['nonzero generation', { expectedSessionGeneration: 1 }],
-    ['non-sentinel target', { targetWorkingDir: '/repo/X' }],
+    ['workspace target', { target: { kind: 'workspace', identity: BASE.targetWorkspaceIdentity } }],
     ['non-prepared phase', { phase: 'session_committed', sessionGenerationAfter: 0 }],
   ] as const)('never classifies a %s as a prepared no-session unbind', (_case, patch) => {
     const candidate = {
       ...journal(), kind: 'unbind' as const,
       operationKey: groupWorkspaceOperationKey(BASE.sourceEventId, 'unbind'),
-      sessionId: 'group-workspace-unbind', expectedSessionGeneration: 0, targetWorkingDir: '/',
+      sessionId: 'group-workspace-unbind', expectedSessionGeneration: 0,
+      target: { kind: 'absent' as const }, targetWorkingDir: undefined, targetWorkspaceIdentity: undefined,
       ...patch,
     } as RepoGroupOperationJournal;
     expect(isPreparedNoSessionUnbindJournal(candidate)).toBe(false);
@@ -294,7 +297,8 @@ describe('executeGroupWorkspaceUnbind', () => {
   it('classifies only the prepared unbind sentinel as no-session', () => {
     expect(isPreparedNoSessionUnbindJournal({
       ...journal(), kind: 'unbind', operationKey: groupWorkspaceOperationKey(BASE.sourceEventId, 'unbind'),
-      sessionId: 'group-workspace-unbind', expectedSessionGeneration: 0, targetWorkingDir: '/',
+      sessionId: 'group-workspace-unbind', expectedSessionGeneration: 0,
+      target: { kind: 'absent' as const }, targetWorkingDir: undefined, targetWorkspaceIdentity: undefined,
     })).toBe(true);
   });
 
@@ -316,7 +320,8 @@ describe('executeGroupWorkspaceUnbind', () => {
         ...intent, expectedRevision: 0, authorized: true, now: 0,
       }),
       chatId: BASE.chatId, sessionId: 'group-workspace-unbind', expectedSessionGeneration: 0,
-      expectedGroupRevision: 0, targetWorkingDir: '/', actor: ACTOR, phase: 'prepared', updatedAt: 1,
+      expectedGroupRevision: 0, target: { kind: 'absent' }, targetWorkingDir: undefined, targetWorkspaceIdentity: undefined,
+      actor: ACTOR, phase: 'prepared', updatedAt: 1,
     });
     let writes = 0;
     const failingStore = new GroupWorkspaceOperationStore(dataDir, {

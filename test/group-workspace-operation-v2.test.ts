@@ -11,7 +11,7 @@ const sourceEventId = 'group-workspace-text-source-v1:sha256:bbbbbbbbbbbbbbbbbbb
 const journal: any = { operationKey: groupWorkspaceOperationKey(sourceEventId, 'set'),
   sourceEventId, kind: 'set',
   requestIntentDigest: 'intent', payloadDigest: 'payload', chatId: 'chat', sessionId: 'session', expectedSessionGeneration: 1,
-  expectedGroupRevision: 0, targetWorkingDir: identity.path, targetWorkspaceIdentity: identity, actor: { tenantKey: 'tenant', unionId: 'on_user' }, phase: 'prepared', updatedAt: 1 };
+  expectedGroupRevision: 0, target: { kind: 'workspace', identity }, targetWorkingDir: identity.path, targetWorkspaceIdentity: identity, actor: { tenantKey: 'tenant', unionId: 'on_user' }, phase: 'prepared', updatedAt: 1 };
 const dir = () => mkdtempSync(join(tmpdir(), 'operation-v2-'));
 
 describe('same-source winner and executor lease', () => {

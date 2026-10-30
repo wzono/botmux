@@ -19,6 +19,10 @@ export type RepoGroupOperationPhase =
   | 'store_unavailable'
   | 'unknown';
 
+export type RepoGroupOperationTarget =
+  | { kind: 'workspace'; identity: WorkspaceIdentity }
+  | { kind: 'absent' };
+
 export interface RepoGroupOperationJournal {
   operationKey: string;
   sourceEventId: string;
@@ -29,7 +33,8 @@ export interface RepoGroupOperationJournal {
   sessionId: string;
   expectedSessionGeneration: number;
   expectedGroupRevision: number;
-  targetWorkingDir: string;
+  target: RepoGroupOperationTarget;
+  targetWorkingDir?: string;
   targetWorkspaceIdentity?: WorkspaceIdentity;
   actor: TenantHumanId;
   phase: RepoGroupOperationPhase;
@@ -117,10 +122,16 @@ function validateJournal(value: unknown, key: string): asserts value is RepoGrou
     || typeof value.sessionId !== 'string' || !value.sessionId
     || !validNonnegativeInteger(value.expectedSessionGeneration)
     || !validNonnegativeInteger(value.expectedGroupRevision)
-    || typeof value.targetWorkingDir !== 'string' || !isAbsolute(value.targetWorkingDir)
-    || (value.kind === 'set' && (!isWorkspaceIdentity(value.targetWorkspaceIdentity)
-      || value.targetWorkspaceIdentity.path !== value.targetWorkingDir))
-    || (value.kind === 'unbind' && value.targetWorkspaceIdentity !== undefined)
+    || (value.kind === 'set' && (!isObject(value.target) || value.target.kind !== 'workspace'
+      || !isWorkspaceIdentity(value.target.identity)
+      || typeof value.targetWorkingDir !== 'string' || !isAbsolute(value.targetWorkingDir)
+      || !isWorkspaceIdentity(value.targetWorkspaceIdentity)
+      || value.targetWorkspaceIdentity.path !== value.targetWorkingDir
+      || value.target.identity.path !== value.targetWorkingDir
+      || value.target.identity.dev !== value.targetWorkspaceIdentity.dev
+      || value.target.identity.ino !== value.targetWorkspaceIdentity.ino))
+    || (value.kind === 'unbind' && (!isObject(value.target) || value.target.kind !== 'absent'
+      || value.targetWorkingDir !== undefined || value.targetWorkspaceIdentity !== undefined))
     || !isActor(value.actor)
     || !PHASES.has(value.phase as RepoGroupOperationPhase)
     || !Number.isFinite(value.updatedAt)
