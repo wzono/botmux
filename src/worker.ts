@@ -23014,6 +23014,9 @@ async function spawnCli(
   // Shim paths and the identity-file locator must reach the tool shell together.
   // Use cfg.sessionId, not the native CLI resume id: the daemon publishes the
   // identity under the Botmux session id. No credential is passed here.
+  if (cfg.cliId === 'traex' && !cfg.adoptMode && effectiveResume && effectiveCliSessionId) {
+    noteTraexResumeTargetLeftInDefaultHome(effectiveCliSessionId);
+  }
   const identityShellEnv: Record<string, string> = {
     BOTMUX_SESSION_ID: cfg.sessionId,
     BOTMUX_CHAT_ID: cfg.chatId,
@@ -23052,9 +23055,6 @@ async function spawnCli(
       const dir = identityShellEnv.BOTMUX_IDENTITY_BIN;
       identityShellEnv.PATH = [dir, ...effectivePath.split(':').filter(path => path !== dir)].join(':');
     }
-  }
-  if (cfg.cliId === 'traex' && !cfg.adoptMode && effectiveResume && effectiveCliSessionId) {
-    noteTraexResumeTargetLeftInDefaultHome(effectiveCliSessionId);
   }
   const args = cliAdapter.buildArgs({
     sessionId: effectiveAdapterSessionId,
