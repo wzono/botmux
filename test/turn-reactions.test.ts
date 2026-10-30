@@ -78,6 +78,7 @@ import {
 } from '../src/daemon.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { beginReplyTargetTurn } from '../src/core/reply-target.js';
+import { cancelDeploymentContinuation } from '../src/services/deployment-continuation.js';
 import {
   initWorkerPool,
   __testOnly_setupWorkerHandlers,
@@ -295,6 +296,60 @@ describe('two-phase turn reactions', () => {
       .toBe('completed');
     expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_restored_terminal', 'rid_om_restored_terminal');
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_restored_terminal', 'DONE');
+  });
+
+  it.each([false, true])('production terminal decorator forwards the exact tuple once (owned=%s)', async owned => {
+    const durableOwner = makeDs();
+    const ds = owned ? durableOwner : {
+      ...durableOwner,
+      session: structuredClone(durableOwner.session),
+    } as DaemonSession;
+    const terminal = {
+      turnId: 'om_forwarded_terminal', status: 'completed' as const, completedAtMs: Date.now(),
+    };
+    const context = { workerGeneration: 7 };
+    const next = vi.fn(async () => undefined);
+
+    await createTurnFeedbackWorkerCallbacks(next).onTurnTerminal!(ds, terminal, context);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(next).toHaveBeenCalledWith(ds, terminal, context);
+  });
+
+  it.each([
+    ['matching generation and turn', 3, 'om_checkpoint', 'cancelled'],
+    ['wrong generation', 4, 'om_checkpoint', 'running'],
+    ['wrong turn', 3, 'om_other', 'running'],
+  ] as const)('production terminal composition retires deployment continuation for %s', async (
+    _label, workerGeneration, terminalTurnId, expectedState,
+  ) => {
+    const ds = makeDs();
+    Object.assign(ds.session, {
+      larkAppId: APP, cliId: 'codex', backendType: 'tmux', cliSessionId: 'native-checkpoint',
+    });
+    ds.session.deploymentContinuation = {
+      state: 'running', turnId: 'om_checkpoint', nativeSessionId: 'native-checkpoint',
+      caller: { senderType: 'user', requestLarkAppId: APP, requestUserOpenId: 'ou_checkpoint' },
+      workerGeneration: 3, consumedAt: Date.now(),
+    };
+    sessionStore.updateDeploymentContinuation(ds.session);
+    const productionNext = async (target: DaemonSession, terminal: { turnId: string }, context: { workerGeneration: number }) => {
+      if (target.session.deploymentContinuation?.state !== 'cancelled'
+        && target.session.deploymentContinuation?.workerGeneration === context.workerGeneration) {
+        cancelDeploymentContinuation(
+          target.session,
+          previous => sessionStore.updateDeploymentContinuation(target.session, previous),
+          terminal.turnId,
+        );
+      }
+    };
+
+    await createTurnFeedbackWorkerCallbacks(productionNext).onTurnTerminal!(ds, {
+      turnId: terminalTurnId, status: 'completed', completedAtMs: Date.now(),
+    }, { workerGeneration });
+
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.deploymentContinuation?.state)
+      .toBe(expectedState);
   });
 
   it.each([true, false])('unified replies retain the independent status-card reaction gate (off=%s)', async statusOff => {
