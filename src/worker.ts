@@ -19137,6 +19137,7 @@ async function flushPending(): Promise<void> {
           item.turnId,
           item.dispatchAttempt,
           item.durablePrimaryInbox,
+          { controlDispatchId: item.controlDispatchId, controlReplyDigest: item.controlReplyDigest },
         );
       }
       const queuedPostSubmitNativeTitle = result?.submitted !== false
@@ -29066,6 +29067,7 @@ function acknowledgeTurnInputCommitted(
   turnId?: string,
   dispatchAttempt?: number,
   durablePrimaryInbox?: true,
+  control?: { controlDispatchId?: string; controlReplyDigest?: string },
 ): void {
   if (!turnId) return;
   ordinaryImTurnDedupe.commit(turnId);
@@ -29074,6 +29076,8 @@ function acknowledgeTurnInputCommitted(
     turnId,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     ...(durablePrimaryInbox ? { durablePrimaryInbox: true } : {}),
+    ...(control?.controlDispatchId ? { controlDispatchId: control.controlDispatchId } : {}),
+    ...(control?.controlReplyDigest ? { controlReplyDigest: control.controlReplyDigest } : {}),
   });
 }
 
@@ -30106,6 +30110,8 @@ process.on('message', async (raw: unknown) => {
           codexAppDispatchId: msg.codexAppDispatchId,
           ...(msg.codexAppSteerable ? { codexAppSteerable: true } : {}),
           ...(msg.atMostOnce ? { atMostOnce: true } : {}),
+          ...(msg.controlDispatchId ? { controlDispatchId: msg.controlDispatchId } : {}),
+          ...(msg.controlReplyDigest ? { controlReplyDigest: msg.controlReplyDigest } : {}),
           queuedActivationToken: msg.queuedActivationToken,
           replyTurnId: msg.replyTurnId,
           vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
@@ -30127,6 +30133,7 @@ process.on('message', async (raw: unknown) => {
               msg.turnId,
               msg.dispatchAttempt,
               msg.durablePrimaryInbox,
+              { controlDispatchId: msg.controlDispatchId, controlReplyDigest: msg.controlReplyDigest },
             );
           }
         } else if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');

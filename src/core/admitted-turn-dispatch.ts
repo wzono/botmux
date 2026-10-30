@@ -64,6 +64,7 @@ export function frozenSessionWorkspace(ds: DaemonSession): { workspace: Workspac
 export function authoritativeWorkerWorkspaceIdentity(ds: DaemonSession): WorkspaceIdentity | undefined {
   const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
   const remote = ds.lastWorkerReadyHostWorkingDirContract;
+  if (backendType === 'remote-runner') return undefined;
   if (backendType === 'riff' || backendType === 'mojo') {
     if (!remote) return undefined;
     const actual = exactIdentity(remote.workingDir);

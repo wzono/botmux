@@ -7,6 +7,7 @@ function restoredSession(): DaemonSession {
     session: {
       sessionId: 'restored', workerGeneration: 4,
       dispatchInputReceipts: { turn: { workerGeneration: 4, receivedAt: '2026-10-30T00:00:00.000Z' } },
+      controlDispatchReceipts: { control: { replyDigest: 'answer', workerGeneration: 4, committedAt: '2026-10-30T00:00:00.000Z' } },
     },
     worker: { killed: false } as never,
     workerGeneration: 4,
@@ -36,6 +37,24 @@ describe('startup turn permit reconciliation harness', () => {
     expect(reconcile).toHaveBeenCalledTimes(1);
   });
 
+  it('does not accept an old generic original-turn receipt as control ACK', async () => {
+    const session = restoredSession();
+    session.session.controlDispatchReceipts = undefined;
+    const reconcileControl = vi.fn(async (_permit, _digest, evidence) => {
+      expect(evidence.acknowledged).toBe(false);
+      return { status: 'ambiguous' as const };
+    });
+    await reconcileTurnPermitDispatches([session], {
+      listDispatching: async () => [], reconcileBusinessDispatch: async () => ({ status: 'rejected' as const }),
+      listDispatchingControls: async () => [{ permit: {
+        permitId: 'control', controlDispatchId: 'control', sessionId: 'restored', originalTurnId: 'turn', wait: { kind: 'ask', askId: 'ask' },
+        expectedGeneration: 4, workspace: { path: '/repo', dev: '1', ino: '2' }, expiresAt: Date.now() + 1000,
+      } as never, replyDigest: 'answer', retryUsed: false }],
+      reconcileControlReplyDispatch: reconcileControl,
+    });
+    expect(reconcileControl).not.toHaveBeenCalled();
+  });
+
   it('reconciles a crash-window control dispatch from the restored worker ACK', async () => {
     const session = restoredSession();
     const reconcileControl = vi.fn(async (_permit, _digest, evidence) => {
@@ -45,7 +64,7 @@ describe('startup turn permit reconciliation harness', () => {
     await reconcileTurnPermitDispatches([session], {
       listDispatching: async () => [], reconcileBusinessDispatch: async () => ({ status: 'rejected' as const }),
       listDispatchingControls: async () => [{ permit: {
-        permitId: 'control', sessionId: 'restored', originalTurnId: 'turn', wait: { kind: 'ask', askId: 'ask' },
+        permitId: 'control', controlDispatchId: 'control', sessionId: 'restored', originalTurnId: 'turn', wait: { kind: 'ask', askId: 'ask' },
         expectedGeneration: 4, workspace: { path: '/repo', dev: '1', ino: '2' }, expiresAt: Date.now() + 1000,
       } as never, replyDigest: 'answer', retryUsed: false }],
       reconcileControlReplyDispatch: reconcileControl,

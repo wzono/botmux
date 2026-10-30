@@ -95,11 +95,10 @@ describe('central admitted turn dispatch', () => {
       issuePermit: async () => (trace.push('permit'), ({ permitId: 'c', sessionId: 's', originalTurnId: 'original', wait: { kind: 'ask', askId: 'a' }, expectedGeneration: 4, workspace, expiresAt: Date.now() + 1000 } as never)),
       beginDispatch: async () => (trace.push('dispatching'), 'acquired'),
       resume: async permit => (trace.push(`resume:${permit.originalTurnId}`), true),
-      acknowledge: async () => { trace.push('delivered'); },
       abort: async () => { trace.push('abort'); },
     });
     expect(result).toBe(true);
-    expect(trace).toEqual(['auth', 'permit', 'dispatching', 'resume:original', 'delivered']);
+    expect(trace).toEqual(['auth', 'permit', 'dispatching', 'resume:original']);
   });
 
   it('never dispatches a control permit when fresh authorization fails', async () => {
@@ -109,7 +108,6 @@ describe('central admitted turn dispatch', () => {
       issuePermit: async () => undefined,
       beginDispatch,
       resume: async () => true,
-      acknowledge: async () => {},
       abort: async () => {},
     })).toBeUndefined();
     expect(beginDispatch).not.toHaveBeenCalled();
@@ -122,7 +120,6 @@ describe('central admitted turn dispatch', () => {
       issuePermit: async () => ({ permitId: 'c', sessionId: 's', originalTurnId: 'original', wait: { kind: 'ask', askId: 'a' }, expectedGeneration: 4, workspace, expiresAt: Date.now() + 1000 } as never),
       beginDispatch: async () => 'acquired',
       resume: async () => false,
-      acknowledge: async () => { trace.push('delivered'); },
       abort: async () => { trace.push('abort'); },
     })).toBe(false);
     expect(trace).toEqual(['abort']);

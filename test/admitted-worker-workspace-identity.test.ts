@@ -27,6 +27,17 @@ describe('authoritative existing-worker workspace identity', () => {
     expect(identity).toEqual({ path: realpathSync(actual), ...expected.identity });
   });
 
+  it('fails closed for remote-runner because broker cwd is not provider workspace proof', () => {
+    const root = mkdtempSync(join(tmpdir(), 'admitted-remote-runner-'));
+    const proof = probePathUsability(root);
+    expect(proof.ok).toBe(true);
+    if (!proof.ok) throw new Error('expected usable path');
+    expect(authoritativeWorkerWorkspaceIdentity({
+      session: { sessionId: 's', backendType: 'remote-runner' }, initConfig: { backendType: 'remote-runner' },
+      lastWorkerReadyCwd: root,
+    } as never)).toBeUndefined();
+  });
+
   it('requires an authoritative host contract for remote execution backends', () => {
     const root = mkdtempSync(join(tmpdir(), 'admitted-remote-workspace-'));
     expect(authoritativeWorkerWorkspaceIdentity({

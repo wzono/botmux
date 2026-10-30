@@ -1295,8 +1295,9 @@ export async function reconcileTurnPermitDispatches(
   for (const pending of await store.listDispatchingControls()) {
     const ds = sessionsById.get(pending.permit.sessionId);
     if (!ds) continue;
-    const receipt = ds.session.dispatchInputReceipts?.[pending.permit.originalTurnId];
-    const acknowledged = receipt?.workerGeneration === pending.permit.expectedGeneration;
+    const receipt = ds.session.controlDispatchReceipts?.[pending.permit.controlDispatchId];
+    const acknowledged = receipt?.workerGeneration === pending.permit.expectedGeneration
+      && receipt.replyDigest === pending.replyDigest;
     const sameGenerationAlive = !!ds.worker && !ds.worker.killed
       && ds.workerGeneration === pending.permit.expectedGeneration
       && ds.session.workerGeneration === pending.permit.expectedGeneration;
@@ -13095,6 +13096,8 @@ export function sendWorkerInput(
      * onto an auto-restarted CLI after a crash+terminalize (turn-level PR #71).
      * The dormant-fork path rides `atMostOnce` on the fork init instead. */
     atMostOnce?: true;
+    controlDispatchId?: string;
+    controlReplyDigest?: string;
     /** Recovery from a poisoned-history image 400: the worker rewrites the
      *  session transcript (drops undersized image blocks), respawns with
      *  --resume, and this turn is delivered only after the fresh CLI is ready. */
@@ -13269,6 +13272,8 @@ export function sendWorkerInput(
     ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
     ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
     ...(opts.atMostOnce ? { atMostOnce: true } : {}),
+    ...(opts.controlDispatchId ? { controlDispatchId: opts.controlDispatchId } : {}),
+    ...(opts.controlReplyDigest ? { controlReplyDigest: opts.controlReplyDigest } : {}),
     ...(opts.purgeUndersizedImages ? { purgeUndersizedImages: true as const } : {}),
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(trustedController ? { trustedController } : {}),
@@ -16277,6 +16282,23 @@ function setupWorkerHandlers(
         // Compatibility/fallback: a commit also proves receipt if the earlier
         // receipt ACK was delayed or dropped on the reverse IPC channel.
         completeOrdinaryImDelivery(ds, msg.turnId, workerGeneration);
+        if (msg.controlDispatchId && msg.controlReplyDigest) {
+          const receipts = ds.session.controlDispatchReceipts ??= {};
+          receipts[msg.controlDispatchId] = {
+            replyDigest: msg.controlReplyDigest,
+            committedAt: new Date().toISOString(),
+            workerGeneration,
+          };
+          if (Object.keys(receipts).length > 128) delete receipts[Object.keys(receipts)[0]!];
+          sessionStore.updateSession(ds.session);
+          void productionTurnPermitStore.acknowledgeControlReplyByDispatch({
+            controlDispatchId: msg.controlDispatchId,
+            replyDigest: msg.controlReplyDigest,
+            workerGeneration,
+          }).catch(err => logger.warn(
+            `[${t}] durable control ACK failed: ${err instanceof Error ? err.message : String(err)}`,
+          ));
+        }
         const permitAckKey = businessPermitAckKey(ds.session.sessionId, msg.turnId, workerGeneration);
         const permitStore = activeBusinessPermitStores.get(permitAckKey) ?? productionTurnPermitStore;
         void permitStore.acknowledgeBusinessDelivery({

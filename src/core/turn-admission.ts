@@ -8,9 +8,9 @@ declare const businessBrand: unique symbol;
 declare const controlBrand: unique symbol;
 export type BlankBootstrapPermit = Readonly<{ permitId: string; sessionId: string; turnId: string; reservedGeneration: number; target: WorkspaceIdentity; groupRevision?: number; expiresAt: number; [blankBrand]: true }>;
 export type BusinessSubmitPermit = Readonly<{ permitId: string; bootstrapPermitId: string; sessionId: string; turnId: string; workerGeneration: number; workspace: WorkspaceIdentity; groupRevision?: number; expiresAt: number; [businessBrand]: true }>;
-export type ControlReplyPermit = Readonly<{ permitId: string; sessionId: string; originalTurnId: string; wait: { kind: 'ask'; askId: string } | { kind: 'approval'; approvalId: string }; expectedGeneration: number; workspace: WorkspaceIdentity; groupRevision?: number; expiresAt: number; [controlBrand]: true }>;
+export type ControlReplyPermit = Readonly<{ permitId: string; controlDispatchId: string; sessionId: string; originalTurnId: string; wait: { kind: 'ask'; askId: string } | { kind: 'approval'; approvalId: string }; expectedGeneration: number; workspace: WorkspaceIdentity; groupRevision?: number; expiresAt: number; [controlBrand]: true }>;
 export type BlankBootstrapPermitInput = Omit<BlankBootstrapPermit, 'permitId' | typeof blankBrand>;
-export type ControlReplyPermitInput = Omit<ControlReplyPermit, 'permitId' | typeof controlBrand>;
+export type ControlReplyPermitInput = Omit<ControlReplyPermit, 'permitId' | 'controlDispatchId' | typeof controlBrand>;
 
 export type WorkspaceAdmissionFailure = 'store_unavailable' | 'invalid_dir' | 'inaccessible' | 'identity_changed';
 export type TurnAdmissionResult =
@@ -121,7 +121,6 @@ export async function resumeAdmittedControlReply<T>(input: {
   issuePermit(): Promise<ControlReplyPermit | undefined>;
   beginDispatch(permit: ControlReplyPermit): Promise<'acquired' | 'observing' | 'delivered' | 'rejected'>;
   resume(permit: ControlReplyPermit): Promise<T>;
-  acknowledge(permit: ControlReplyPermit): Promise<void>;
   abort(permit: ControlReplyPermit): Promise<void>;
 }): Promise<T | undefined> {
   if (!await input.authorizeFresh()) return undefined;
@@ -132,7 +131,6 @@ export async function resumeAdmittedControlReply<T>(input: {
   if (dispatch !== 'acquired') return undefined;
   const result = await resumeOriginalTurnReply(permit, () => input.resume(permit));
   if (result === false) await input.abort(permit);
-  else await input.acknowledge(permit);
   return result;
 }
 

@@ -272,8 +272,29 @@ describe('durable turn permits', () => {
     expect((await store.abortControlReplyDispatch(permit, 'answer')).status).toBe('retry');
     expect((await store.beginControlReplyDispatch(permit, 'answer', proof)).status).toBe('acquired');
     expect((await store.abortControlReplyDispatch(permit, 'answer')).status).toBe('ambiguous');
-    expect((await new TurnPermitStore(dataDir, { now: () => 101 }).acknowledgeControlReply(permit, 'answer')).status).toBe('delivered');
+    const restarted = new TurnPermitStore(dataDir, { now: () => 101 });
+    expect((await restarted.acknowledgeControlReplyByDispatch({
+      controlDispatchId: permit.controlDispatchId, replyDigest: 'wrong', workerGeneration: 4,
+    })).status).toBe('rejected');
+    expect((await restarted.acknowledgeControlReplyByDispatch({
+      controlDispatchId: permit.controlDispatchId, replyDigest: 'answer', workerGeneration: 5,
+    })).status).toBe('rejected');
+    expect((await restarted.acknowledgeControlReplyByDispatch({
+      controlDispatchId: permit.controlDispatchId, replyDigest: 'answer', workerGeneration: 4,
+    })).status).toBe('delivered');
   });
+  it('persists ambiguous control reconciliation after retry is exhausted', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'turn-permit-'));
+    const store = new TurnPermitStore(dataDir, { now: () => 100 });
+    const permit = await store.issueControlReply({ sessionId: 's1', originalTurnId: 'original', wait: { kind: 'ask', askId: 'ask-1' }, expectedGeneration: 4, workspace: identity, expiresAt: 200 });
+    const proof = { sessionId: 's1', originalTurnId: 'original', wait: { kind: 'ask' as const, askId: 'ask-1' }, workerGeneration: 4, workspace: identity, originalState: 'needs_user' as const, authorized: true };
+    await store.beginControlReplyDispatch(permit, 'answer', proof);
+    await store.abortControlReplyDispatch(permit, 'answer');
+    await store.beginControlReplyDispatch(permit, 'answer', proof);
+    expect((await store.reconcileControlReplyDispatch(permit, 'answer', { acknowledged: false, safeToRetry: false })).status).toBe('ambiguous');
+    expect((await new TurnPermitStore(dataDir, { now: () => 101 }).beginControlReplyDispatch(permit, 'answer', proof)).status).toBe('rejected');
+  });
+
   it('requires typed permits at attempting and control-resume callees', async () => {
     const store = new TurnPermitStore(mkdtempSync(join(tmpdir(), 'turn-permit-')), { now: () => 100 });
     const blank = await store.issueBlank({ ...base, reservedGeneration: 4 });

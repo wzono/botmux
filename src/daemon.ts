@@ -9760,11 +9760,9 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
             return dispatch.status === 'acquired' || dispatch.status === 'observing'
               || dispatch.status === 'delivered' ? dispatch.status : 'rejected';
           },
-          resume: async () => sendWorkerInput(askSession, input, turnId, { atMostOnce: true,
+          resume: async permit => sendWorkerInput(askSession, input, turnId, { atMostOnce: true,
+            controlDispatchId: permit.controlDispatchId, controlReplyDigest: replyDigest,
             trustedCaller, ...(steerable ? { codexAppSteerable: true as const } : {}) }),
-          acknowledge: async permit => {
-            await centralTurnPermitStore.acknowledgeControlReply(permit, replyDigest);
-          },
           abort: async permit => {
             await centralTurnPermitStore.abortControlReplyDispatch(permit, replyDigest);
           },

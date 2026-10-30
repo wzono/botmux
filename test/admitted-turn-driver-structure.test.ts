@@ -35,7 +35,7 @@ describe('central admitted business driver structure', () => {
     expect(daemon).toContain('resumeAdmittedControlReply');
     expect(daemon).toContain('issueControlReply');
     expect(daemon).toContain('beginControlReplyDispatch');
-    expect(daemon).toContain('acknowledgeControlReply');
+    expect(daemon).toContain('controlDispatchId: permit.controlDispatchId');
     expect(daemon).toContain('abortControlReplyDispatch');
     expect(daemon).not.toContain('codex-async-answer-${randomUUID()}');
   });
