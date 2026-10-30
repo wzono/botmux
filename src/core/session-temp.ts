@@ -446,6 +446,7 @@ export async function cleanupSessionTempDir(dataDir: string, sessionId: string):
   let cache: string;
   try { cache = realpathSync(sessionTempCacheRoot()); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error; }
+  await retireSessionTempPath(sessionTempDir(dataDir, sessionId));
   await retireSessionTempPath(sessionTempDir(dataDir, sessionId, cache));
   await retireSessionTempPath(join(cache, sessionTempProfile(dataDir, 16), sessionTempSegment(sessionId)));
   for (const path of legacySessionTempDirs(dataDir, sessionId)) await retireSessionTempPath(path);
