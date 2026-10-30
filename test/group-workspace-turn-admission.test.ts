@@ -213,6 +213,19 @@ describe('durable turn permits', () => {
     });
     expect((await retry.store.beginBusinessDispatch(retry.permit, 'digest-retry-startup')).status).toBe('rejected');
   });
+  it('never grants startup retry when the restored session is absent', async () => {
+    const store = new TurnPermitStore(mkdtempSync(join(tmpdir(), 'turn-permit-')), { now: () => 100 });
+    const blank = await store.issueBlank({ ...base, turnId: 'not-restored', reservedGeneration: 4 });
+    await store.beginSpawn(blank);
+    const issued = await store.proveReady(blank, { actualGeneration: 4, cwd: identity, backend: identity });
+    if (issued.status !== 'issued') throw new Error('expected business permit');
+    await store.beginBusinessDispatch(issued.permit, 'digest-not-restored');
+    await reconcileTurnPermitDispatches({
+      pending: await store.listDispatching(), sessions: [],
+      reconcile: (permit, evidence) => store.reconcileBusinessDispatch(permit, evidence),
+    });
+    expect((await store.beginBusinessDispatch(issued.permit, 'digest-not-restored')).status).toBe('observing');
+  });
   it('repairs a post-restart dispatch from a late exact ACK after live-generation reconcile', async () => {
     const store = new TurnPermitStore(mkdtempSync(join(tmpdir(), 'turn-permit-')), { now: () => 100 });
     const blank = await store.issueBlank({ ...base, turnId: 'late-ack', reservedGeneration: 4 });
@@ -228,30 +241,38 @@ describe('durable turn permits', () => {
     expect((await store.acknowledgeBusinessDelivery({ sessionId: 's1', turnId: 'late-ack', workerGeneration: 4 })).status).toBe('delivered');
     expect((await store.acknowledgeBusinessDelivery({ sessionId: 's1', turnId: 'late-ack', workerGeneration: 5 })).status).toBe('rejected');
   });
-  it('binds one-shot control replies to the original wait and frozen workspace', async () => {
+  it('binds control dispatch and delivery ACK to the original wait and frozen workspace', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'turn-permit-'));
     const store = new TurnPermitStore(dataDir, { now: () => 100 });
     const permit = await store.issueControlReply({
       sessionId: 's1', originalTurnId: 'original', wait: { kind: 'ask', askId: 'ask-1' },
       expectedGeneration: 4, workspace: identity, groupRevision: 3, expiresAt: 200,
     });
-    expect((await store.consumeControlReply(permit, 'answer-a', {
+    expect((await store.beginControlReplyDispatch(permit, 'answer-a', {
       sessionId: 's1', originalTurnId: 'original', wait: { kind: 'ask', askId: 'wrong' },
       workerGeneration: 4, workspace: identity, groupRevision: 3, originalState: 'needs_user', authorized: true,
     })).status).toBe('rejected');
-    const consumed = await store.consumeControlReply(permit, 'answer-a', {
-      sessionId: 's1', originalTurnId: 'original', wait: { kind: 'ask', askId: 'ask-1' },
-      workerGeneration: 4, workspace: identity, groupRevision: 3, originalState: 'needs_user', authorized: true,
-    });
-    expect(consumed.status).toBe('consumed');
-    expect((await store.consumeControlReply(permit, 'answer-a', {
-      sessionId: 's1', originalTurnId: 'original', wait: { kind: 'ask', askId: 'ask-1' },
-      workerGeneration: 4, workspace: identity, groupRevision: 3, originalState: 'needs_user', authorized: true,
-    })).status).toBe('duplicate');
-    expect((await store.consumeControlReply(permit, 'answer-b', {
-      sessionId: 's1', originalTurnId: 'original', wait: { kind: 'ask', askId: 'ask-1' },
-      workerGeneration: 4, workspace: identity, groupRevision: 3, originalState: 'needs_user', authorized: true,
-    })).status).toBe('rejected');
+    const proof = {
+      sessionId: 's1', originalTurnId: 'original', wait: { kind: 'ask' as const, askId: 'ask-1' },
+      workerGeneration: 4, workspace: identity, groupRevision: 3, originalState: 'needs_user' as const, authorized: true,
+    };
+    expect((await store.beginControlReplyDispatch(permit, 'answer-a', proof)).status).toBe('acquired');
+    expect((await store.beginControlReplyDispatch(permit, 'answer-a', proof)).status).toBe('observing');
+    expect((await store.beginControlReplyDispatch(permit, 'answer-b', proof)).status).toBe('rejected');
+    expect((await store.acknowledgeControlReply(permit, 'answer-a')).status).toBe('delivered');
+    expect((await new TurnPermitStore(dataDir, { now: () => 101 }).beginControlReplyDispatch(permit, 'answer-a', proof)).status).toBe('delivered');
+  });
+
+  it('reissues a synchronously refused control reply exactly once and accepts a late ACK after restart', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'turn-permit-'));
+    const store = new TurnPermitStore(dataDir, { now: () => 100 });
+    const permit = await store.issueControlReply({ sessionId: 's1', originalTurnId: 'original', wait: { kind: 'ask', askId: 'ask-1' }, expectedGeneration: 4, workspace: identity, expiresAt: 200 });
+    const proof = { sessionId: 's1', originalTurnId: 'original', wait: { kind: 'ask' as const, askId: 'ask-1' }, workerGeneration: 4, workspace: identity, originalState: 'needs_user' as const, authorized: true };
+    expect((await store.beginControlReplyDispatch(permit, 'answer', proof)).status).toBe('acquired');
+    expect((await store.abortControlReplyDispatch(permit, 'answer')).status).toBe('retry');
+    expect((await store.beginControlReplyDispatch(permit, 'answer', proof)).status).toBe('acquired');
+    expect((await store.abortControlReplyDispatch(permit, 'answer')).status).toBe('ambiguous');
+    expect((await new TurnPermitStore(dataDir, { now: () => 101 }).acknowledgeControlReply(permit, 'answer')).status).toBe('delivered');
   });
   it('requires typed permits at attempting and control-resume callees', async () => {
     const store = new TurnPermitStore(mkdtempSync(join(tmpdir(), 'turn-permit-')), { now: () => 100 });

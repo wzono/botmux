@@ -423,6 +423,7 @@ import { createCliAdapterSync } from './adapters/cli/registry.js';
 import {
   initWorkerPool,
   setActiveSessionsRegistry,
+  reconcileTurnPermitDispatches,
   forkWorker,
   forkAdoptWorker,
   forkWorkerBlank,
@@ -9742,10 +9743,10 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
             ...(frozen.groupRevision === undefined ? {} : { groupRevision: frozen.groupRevision }),
             expiresAt: Date.now() + 60_000,
           }),
-          consume: async permit => {
+          beginDispatch: async permit => {
             const current = frozenSessionWorkspace(askSession);
-            const consumed = current && isCurrent()
-              ? await centralTurnPermitStore.consumeControlReply(permit, replyDigest, {
+            const dispatch = current && isCurrent()
+              ? await centralTurnPermitStore.beginControlReplyDispatch(permit, replyDigest, {
                   sessionId: askSession.session.sessionId,
                   originalTurnId: turnId,
                   wait: { kind: 'ask', askId: asyncInput.itemId },
@@ -9756,11 +9757,17 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
                   authorized: true,
                 })
               : { status: 'rejected' as const };
-            return consumed.status === 'consumed' || consumed.status === 'duplicate'
-              ? consumed.status : 'rejected';
+            return dispatch.status === 'acquired' || dispatch.status === 'observing'
+              || dispatch.status === 'delivered' ? dispatch.status : 'rejected';
           },
           resume: async () => sendWorkerInput(askSession, input, turnId, { atMostOnce: true,
             trustedCaller, ...(steerable ? { codexAppSteerable: true as const } : {}) }),
+          acknowledge: async permit => {
+            await centralTurnPermitStore.acknowledgeControlReply(permit, replyDigest);
+          },
+          abort: async permit => {
+            await centralTurnPermitStore.abortControlReplyDispatch(permit, replyDigest);
+          },
         });
         if (resumed !== true) return false;
         beginNewTurn(askSession, '异步提问答复', turnId);
@@ -33676,6 +33683,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // between the restart and a session's next wake — which would otherwise let that
   // session adopt the NEW control plane as its original identity.
   migrateMojoSessionIdentities(activeSessions);
+
+  // Reconcile only after every persisted session and restored worker generation
+  // is visible, and before any IPC/Lark ingress can accept a new turn.
+  await reconcileTurnPermitDispatches(activeSessions.values());
 
   // Now that activeSessions is populated, release the forward-followup flush
   // barrier. Persisted seeds were loaded into the buffer at dispatcher startup

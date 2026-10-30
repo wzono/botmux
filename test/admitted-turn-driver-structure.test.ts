@@ -34,7 +34,9 @@ describe('central admitted business driver structure', () => {
   it('async Ask answer resumes the exact original turn through a control permit', () => {
     expect(daemon).toContain('resumeAdmittedControlReply');
     expect(daemon).toContain('issueControlReply');
-    expect(daemon).toContain('consumeControlReply');
+    expect(daemon).toContain('beginControlReplyDispatch');
+    expect(daemon).toContain('acknowledgeControlReply');
+    expect(daemon).toContain('abortControlReplyDispatch');
     expect(daemon).not.toContain('codex-async-answer-${randomUUID()}');
   });
 });
