@@ -33119,10 +33119,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           executeUnbind: async request => {
             return executeGroupWorkspaceUnbind({
               sourceEventId: request.sourceEventId, chatId: request.chatId, actor: request.actor,
+              authorityFingerprint: route.authorityFingerprint,
               ...(route.originMessageId ? { originMessageId: route.originMessageId } : {}),
             }, {
               journalStore: groupWorkspaceOperationStore,
               now: Date.now,
+              revalidateAuthority: async journal => ({
+                status: await groupWorkspaceRouteRuntime.revalidateAuthority({
+                  chatId: journal.chatId,
+                  actor: journal.actor,
+                  authorityFingerprint: journal.authorityFingerprint ?? '',
+                }) ? 'authorized' : 'unauthorized',
+              }),
               readReceipt: operationKey => groupWorkspaceStore.readReceipt(operationKey),
               readCurrentRevision: async chatId => {
                 const current = await groupWorkspaceStore.read(chatId);

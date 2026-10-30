@@ -361,8 +361,10 @@ describe('durable replay details', () => {
     writeFileSync(path, JSON.stringify(registry));
 
     const operationStore = new GroupWorkspaceOperationStore(dataDir);
-    await executeGroupWorkspaceUnbind({ sourceEventId: textSource('om_unbind'), chatId: CHAT, actor: ACTOR }, {
+    await executeGroupWorkspaceUnbind({ sourceEventId: textSource('om_unbind'), chatId: CHAT, actor: ACTOR,
+      authorityFingerprint: 'authority-v1' }, {
       journalStore: operationStore,
+      revalidateAuthority: async () => ({ status: 'authorized' }),
       readReceipt: key => store.readReceipt(key),
       readCurrentRevision: async () => ({ status: 'available', revision: 1 }),
       mutate: mutation => store.mutate(mutation),

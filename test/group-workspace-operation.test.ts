@@ -205,6 +205,7 @@ describe('executeGroupWorkspaceUnbind', () => {
     const deps = {
       journalStore,
       now: () => 100,
+      revalidateAuthority: async () => ({ status: 'authorized' as const }),
       readCurrentRevision: async () => ({ status: 'available' as const, revision }),
       readReceipt: async (key: string) => receipts.has(key)
         ? { status: 'found' as const, receipt: receipts.get(key) }
@@ -222,7 +223,7 @@ describe('executeGroupWorkspaceUnbind', () => {
       },
       afterBoundary: async (boundary: string) => { if (boundary === crashAt) throw new Error(boundary); },
     };
-    const request = { sourceEventId, chatId: BASE.chatId, actor: ACTOR };
+    const request = { sourceEventId, chatId: BASE.chatId, actor: ACTOR, authorityFingerprint: 'authority-v1' };
     return { deps, request, journalStore };
   }
 
@@ -237,6 +238,22 @@ describe('executeGroupWorkspaceUnbind', () => {
     await expect(h.journalStore.getByIntent(h.request.sourceEventId, 'unbind')).resolves.toMatchObject({
       status: 'found', journal: { phase: 'group_committed', groupRevisionAfter: 3 },
     });
+  });
+
+  it('freezes authority and terminalizes revocation immediately before the group mutation', async () => {
+    const h = unbindHarness();
+    let checks = 0;
+    h.deps.revalidateAuthority = async journal => {
+      expect(journal.authorityFingerprint).toBe('authority-v1');
+      checks += 1;
+      return { status: 'unauthorized' as const };
+    };
+    await expect(executeGroupWorkspaceUnbind(h.request, h.deps)).resolves.toEqual({ status: 'unauthorized' });
+    expect(checks).toBe(1);
+    await expect(h.journalStore.getByIntent(h.request.sourceEventId, 'unbind')).resolves.toMatchObject({
+      status: 'found', journal: { phase: 'unauthorized', authorityFingerprint: 'authority-v1' },
+    });
+    expect((await h.deps.readReceipt(groupWorkspaceOperationKey(h.request.sourceEventId, 'unbind'))).status).toBe('missing');
   });
 
   it('restarts from a persistent prepared unbind and performs exactly one group mutation', async () => {
@@ -256,12 +273,14 @@ describe('executeGroupWorkspaceUnbind', () => {
       }),
       chatId: BASE.chatId, sessionId: 'group-workspace-unbind', expectedSessionGeneration: 0,
       expectedGroupRevision: 0, target: { kind: 'absent' }, targetWorkingDir: undefined, targetWorkspaceIdentity: undefined,
-      actor: ACTOR, phase: 'prepared', updatedAt: 1,
+      actor: ACTOR, authorityFingerprint: 'authority-v1', phase: 'prepared', updatedAt: 1,
     })).toMatchObject({ status: 'created' });
 
     let mutations = 0;
-    const result = await executeGroupWorkspaceUnbind({ sourceEventId, chatId: BASE.chatId, actor: ACTOR }, {
+    const result = await executeGroupWorkspaceUnbind({ sourceEventId, chatId: BASE.chatId, actor: ACTOR,
+      authorityFingerprint: 'authority-v1' }, {
       journalStore: new GroupWorkspaceOperationStore(dataDir),
+      revalidateAuthority: async () => ({ status: 'authorized' }),
       readReceipt: key => groupStore.readReceipt(key),
       readCurrentRevision: async () => { throw new Error('prepared replay must use frozen revision'); },
       mutate: async input => { mutations += 1; return groupStore.mutate(input); },
@@ -322,7 +341,7 @@ describe('executeGroupWorkspaceUnbind', () => {
       }),
       chatId: BASE.chatId, sessionId: 'group-workspace-unbind', expectedSessionGeneration: 0,
       expectedGroupRevision: 0, target: { kind: 'absent' }, targetWorkingDir: undefined, targetWorkspaceIdentity: undefined,
-      actor: ACTOR, phase: 'prepared', updatedAt: 1,
+      actor: ACTOR, authorityFingerprint: 'authority-v1', phase: 'prepared', updatedAt: 1,
     });
     let writes = 0;
     const failingStore = new GroupWorkspaceOperationStore(dataDir, {
@@ -336,18 +355,21 @@ describe('executeGroupWorkspaceUnbind', () => {
     let mutations = 0;
     const dependencies = {
       journalStore: failingStore,
+      revalidateAuthority: async () => ({ status: 'authorized' as const }),
       readReceipt: (key: string) => groupStore.readReceipt(key),
       readCurrentRevision: async () => ({ status: 'available' as const, revision: 0 }),
       mutate: async (input: any) => { mutations += 1; return groupStore.mutate(input); },
       now: () => 10,
     };
 
-    await expect(executeGroupWorkspaceUnbind({ sourceEventId, chatId: BASE.chatId, actor: ACTOR }, dependencies))
+    await expect(executeGroupWorkspaceUnbind({ sourceEventId, chatId: BASE.chatId, actor: ACTOR,
+      authorityFingerprint: 'authority-v1' }, dependencies))
       .resolves.toEqual({ status: 'unknown' });
     expect(writes).toBe(1);
     expect(mutations).toBe(0);
 
-    const recovered = await executeGroupWorkspaceUnbind({ sourceEventId, chatId: BASE.chatId, actor: ACTOR }, {
+    const recovered = await executeGroupWorkspaceUnbind({ sourceEventId, chatId: BASE.chatId, actor: ACTOR,
+      authorityFingerprint: 'authority-v1' }, {
       ...dependencies, journalStore: new GroupWorkspaceOperationStore(dataDir),
     });
     expect(recovered).toEqual({ status: 'group_committed', groupRevision: 1 });

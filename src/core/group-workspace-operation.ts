@@ -235,6 +235,7 @@ export type GroupWorkspaceUnbindResult =
 
 export interface GroupWorkspaceUnbindDependencies {
   journalStore: GroupWorkspaceOperationStore;
+  revalidateAuthority(journal: RepoGroupOperationJournal): Promise<{ status: 'authorized' | 'unauthorized' }>;
   readReceipt(operationKey: string): Promise<
     | { status: 'found'; receipt: import('../services/group-workspace-store.js').GroupOperationReceipt }
     | { status: 'missing' | 'store_unavailable' }
@@ -256,7 +257,7 @@ export function isPreparedNoSessionUnbindJournal(journal: RepoGroupOperationJour
 }
 
 export async function executeGroupWorkspaceUnbind(
-  request: { sourceEventId: string; chatId: string; actor: TenantHumanId; originMessageId?: string },
+  request: { sourceEventId: string; chatId: string; actor: TenantHumanId; authorityFingerprint: string; originMessageId?: string },
   dependencies: GroupWorkspaceUnbindDependencies,
 ): Promise<GroupWorkspaceUnbindResult> {
   const operationKey = groupWorkspaceOperationKey(request.sourceEventId, 'unbind');
@@ -266,7 +267,8 @@ export async function executeGroupWorkspaceUnbind(
   if (prior.status === 'store_unavailable') return { status: 'store_unavailable' };
   let journal = prior.status === 'found' ? prior.journal : undefined;
   if (journal && (journal.chatId !== request.chatId || journal.actor.tenantKey !== request.actor.tenantKey
-    || journal.actor.unionId !== request.actor.unionId)) return { status: 'protocol_conflict' };
+    || journal.actor.unionId !== request.actor.unionId
+    || journal.authorityFingerprint !== request.authorityFingerprint)) return { status: 'protocol_conflict' };
   if (!journal) {
     const current = await dependencies.readCurrentRevision(request.chatId);
     if (current.status === 'store_unavailable') return { status: 'store_unavailable' };
@@ -279,7 +281,7 @@ export async function executeGroupWorkspaceUnbind(
         ...intent, expectedRevision: current.revision, authorized: true, now: 0,
       }), chatId: request.chatId, sessionId: GROUP_WORKSPACE_UNBIND_NO_SESSION_ID, expectedSessionGeneration: 0,
       expectedGroupRevision: current.revision, target: { kind: 'absent' }, actor: request.actor,
-      phase: 'prepared', updatedAt: dependencies.now(),
+      authorityFingerprint: request.authorityFingerprint, phase: 'prepared', updatedAt: dependencies.now(),
     });
     if (prepared.status === 'store_unavailable') return { status: 'store_unavailable' };
     if (prepared.status === 'protocol_conflict') return { status: 'protocol_conflict' };
@@ -297,6 +299,12 @@ export async function executeGroupWorkspaceUnbind(
   let receipt = receiptLookup.status === 'found' ? receiptLookup.receipt : undefined;
   if (!receipt) {
     if (journal.phase !== 'session_committed') return { status: 'unknown' };
+    if ((await dependencies.revalidateAuthority(journal)).status !== 'authorized') {
+      const denied = await dependencies.journalStore.transition(operationKey, 'unauthorized', {
+        updatedAt: dependencies.now(),
+      });
+      return denied.status === 'updated' ? { status: 'unauthorized' } : { status: 'unknown' };
+    }
     const mutation = { ...intent, expectedRevision: journal.expectedGroupRevision, authorized: true, now: dependencies.now() };
     const result = await dependencies.mutate(mutation);
     if (result.outcome === 'protocol_conflict') return { status: 'protocol_conflict' };
