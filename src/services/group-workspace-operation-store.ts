@@ -293,10 +293,10 @@ export class GroupWorkspaceOperationStore {
       & Partial<Pick<RepoGroupOperationJournal, 'sessionGenerationAfter' | 'groupRevisionAfter'>>,
     assertFence?: () => Promise<boolean>,
   ): Promise<OperationTransitionResult> {
-    if (assertFence && !(await assertFence())) return { status: 'store_unavailable' };
     try {
       mkdirSync(dirname(this.path), { recursive: true });
       return await withFileLock(this.path, async () => {
+        if (assertFence && !(await assertFence())) return { status: 'store_unavailable' as const };
         const registry = readRegistry(this.path);
         const existing = registry.operations[operationKey];
         if (!existing) return { status: 'missing' as const };

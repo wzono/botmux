@@ -61,16 +61,13 @@ export function createGroupWorkspaceRouteRuntime(options: {
   now?: () => number;
 }) {
   let snapshot: FreshBotAdminUnionSnapshot | undefined;
-  let verifiedTenantKey: string | undefined;
 
   const resolveAuthority = async (
     input: GroupWorkspaceAuthorityInput,
   ): Promise<GroupWorkspaceRouteAuthorityResult> => {
     const envelopeUnionId = input.senderUnionId ?? input.operatorUnionId;
     const actorOpenId = input.senderOpenId ?? input.operatorOpenId;
-    const callbackTenantKey = input.tenantKey?.trim();
-    if (callbackTenantKey) verifiedTenantKey = callbackTenantKey;
-    const tenantKey = callbackTenantKey ?? verifiedTenantKey;
+    const tenantKey = input.tenantKey?.trim();
     if (input.humanProvenance !== true
       || !tenantKey
       || !actorOpenId

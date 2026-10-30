@@ -52,6 +52,7 @@ export type AdmittedBusinessTurnDependencies = {
     actualGeneration: number; cwd: WorkspaceIdentity; backend: WorkspaceIdentity;
   }): Promise<BusinessSubmitPermit | undefined>;
   abortBlank?(permit: BlankBootstrapPermit, phase: 'pre_fork' | 'forked_unproven'): Promise<void>;
+  abortBusiness?(permit: BusinessSubmitPermit, outcome: 'refused' | 'threw'): Promise<void>;
   acquireResource?(permit: BusinessSubmitPermit): Promise<boolean>;
   markAttempting?(permit: BusinessSubmitPermit): Promise<boolean>;
   submit(permit: BusinessSubmitPermit): Promise<boolean>;
@@ -86,18 +87,36 @@ export async function dispatchAdmittedBusinessTurn(input: {
       await deps.abortBlank?.(blank, 'pre_fork');
       return false;
     }
-    const proof = await deps.awaitBlankReady(blank);
+    let proof: Awaited<ReturnType<AdmittedBusinessTurnDependencies['awaitBlankReady']>>;
+    try {
+      proof = await deps.awaitBlankReady(blank);
+    } catch (error) {
+      await deps.abortBlank?.(blank, 'forked_unproven');
+      throw error;
+    }
     if (!proof) {
       await deps.abortBlank?.(blank, 'forked_unproven');
       return false;
     }
-    permit = await deps.proveBlankReady(blank, proof);
+    try {
+      permit = await deps.proveBlankReady(blank, proof);
+    } catch (error) {
+      await deps.abortBlank?.(blank, 'forked_unproven');
+      throw error;
+    }
     if (!permit) await deps.abortBlank?.(blank, 'forked_unproven');
   }
   if (!permit) return false;
   if (deps.acquireResource && !await deps.acquireResource(permit)) return false;
   if (deps.markAttempting && !await markBusinessAttempting(permit, () => deps.markAttempting!(permit!))) return false;
-  return deps.submit(permit);
+  try {
+    const submitted = await deps.submit(permit);
+    if (!submitted) await deps.abortBusiness?.(permit, 'refused');
+    return submitted;
+  } catch {
+    await deps.abortBusiness?.(permit, 'threw');
+    return false;
+  }
 }
 
 export async function markBusinessAttempting<T>(

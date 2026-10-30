@@ -9765,7 +9765,10 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
             return dispatch.status === 'acquired' || dispatch.status === 'observing'
               || dispatch.status === 'delivered' ? dispatch.status : 'rejected';
           },
-          resume: async permit => sendWorkerInput(askSession, input, turnId, { atMostOnce: true,
+          // The original turn remains the authorization authority, while the
+          // control delivery gets its own worker dedupe key. Reusing turnId here
+          // lets an ordinary-turn receipt suppress the later async answer.
+          resume: async permit => sendWorkerInput(askSession, input, permit.controlDispatchId, { atMostOnce: true,
             controlDispatchId: permit.controlDispatchId, controlReplyDigest: replyDigest,
             trustedCaller, ...(steerable ? { codexAppSteerable: true as const } : {}) }),
           abort: async permit => {

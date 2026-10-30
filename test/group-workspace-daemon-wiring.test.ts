@@ -166,7 +166,7 @@ describe('production group-workspace route dependency assembly', () => {
     expect(dispatchRepo).not.toHaveBeenCalled();
   });
 
-  it('reuses a signed text tenant mapping for an authentic card callback without synthetic tenant data', async () => {
+  it('fails closed for a tenant-less callback even after a signed text event', async () => {
     const ds = liveSession();
     const runtime = createGroupWorkspaceRouteRuntime({
       larkAppId: APP, activeSessions: new Map([[`${APP}:${CHAT}`, ds]]), sessionKey: (chatId, appId) => `${appId}:${chatId}`,
@@ -178,7 +178,7 @@ describe('production group-workspace route dependency assembly', () => {
     await expect(runtime.resolveAuthority({ chatId: CHAT, senderOpenId: 'ou_user', senderUnionId: ACTOR.unionId,
       tenantKey: ACTOR.tenantKey, humanProvenance: true })).resolves.toMatchObject({ status: 'authorized' });
     await expect(runtime.resolveAuthority({ chatId: CHAT, operatorOpenId: 'ou_user', operatorUnionId: ACTOR.unionId,
-      humanProvenance: true })).resolves.toMatchObject({ status: 'authorized', actor: ACTOR });
+      humanProvenance: true })).resolves.toEqual({ status: 'recognized_denied', reason: 'identity_unavailable' });
   });
 
   it('keeps unbind on the authenticated no-write seam', async () => {

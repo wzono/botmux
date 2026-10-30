@@ -92,6 +92,29 @@ describe('same-source winner and executor lease', () => {
     expect(readFileSync(effectFile, 'utf8')).toBe('new-owner\n');
   });
 
+  it('holds the journal lock while validating the fencing token', async () => {
+    const dataDir = dir();
+    const firstStore = new GroupWorkspaceOperationStore(dataDir);
+    const secondStore = new GroupWorkspaceOperationStore(dataDir);
+    await firstStore.prepare(journal);
+    let enterFence!: () => void;
+    const entered = new Promise<void>(resolve => { enterFence = resolve; });
+    let releaseFence!: () => void;
+    const release = new Promise<void>(resolve => { releaseFence = resolve; });
+    const first = firstStore.transition(journal.operationKey, 'session_committed', {
+      sessionGenerationAfter: 2, updatedAt: 2,
+    }, async () => { enterFence(); await release; return true; });
+    await entered;
+    let secondSettled = false;
+    const second = secondStore.transition(journal.operationKey, 'unknown', { updatedAt: 3 })
+      .finally(() => { secondSettled = true; });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(secondSettled).toBe(false);
+    releaseFence();
+    expect((await first).status).toBe('updated');
+    expect((await second).status).toBe('updated');
+  });
+
   it('renew increments epoch and restart identity has no implicit authority', async () => {
     const leases = new OperationExecutorLeaseStore(dir(), { now: () => 10 });
     const first = await leases.acquire(journal.operationKey, 'daemon-boot-1', 5); if (first.status !== 'acquired') throw new Error('lease');

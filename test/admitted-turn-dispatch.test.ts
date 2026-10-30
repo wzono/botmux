@@ -124,4 +124,46 @@ describe('central admitted turn dispatch', () => {
     })).toBe(false);
     expect(trace).toEqual(['abort']);
   });
+
+  it.each(['false', 'throw'] as const)('rearms a business permit when IPC submission returns %s', async outcome => {
+    const abort = vi.fn(async () => {});
+    const accepted = await dispatchAdmittedBusinessTurn({ sessionId: 's', turnId: 't', dependencies: {
+      hasLiveWorker: () => true,
+      freezeWorkspace: async () => ({ workspace, groupRevision: 3 }),
+      currentWorkerGeneration: () => 4,
+      proveExistingWorkerReady: async () => true,
+      issueExistingBusiness: async () => business,
+      reserveWorkerGeneration: () => 5,
+      issueBlank: async () => { throw new Error('cold only'); },
+      forkBlank: async () => false,
+      awaitBlankReady: async () => undefined,
+      proveBlankReady: async () => undefined,
+      submit: async () => {
+        if (outcome === 'throw') throw new Error('ipc closed');
+        return false;
+      },
+      abortBusiness: abort,
+    } });
+    expect(accepted).toBe(false);
+    expect(abort).toHaveBeenCalledWith(business, outcome === 'throw' ? 'threw' : 'refused');
+  });
+
+  it('aborts a blank permit when cold-start readiness throws', async () => {
+    const abort = vi.fn(async () => {});
+    await expect(dispatchAdmittedBusinessTurn({ sessionId: 's', turnId: 't', dependencies: {
+      hasLiveWorker: () => false,
+      freezeWorkspace: async () => ({ workspace }),
+      currentWorkerGeneration: () => undefined,
+      proveExistingWorkerReady: async () => false,
+      issueExistingBusiness: async () => undefined,
+      reserveWorkerGeneration: () => 4,
+      issueBlank: async input => ({ ...input, permitId: 'blank' } as never),
+      forkBlank: async () => true,
+      awaitBlankReady: async () => { throw new Error('ready probe failed'); },
+      proveBlankReady: async () => undefined,
+      abortBlank: abort,
+      submit: async () => true,
+    } })).rejects.toThrow('ready probe failed');
+    expect(abort).toHaveBeenCalledWith(expect.objectContaining({ permitId: 'blank' }), 'forked_unproven');
+  });
 });

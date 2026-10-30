@@ -110,7 +110,7 @@ export async function dispatchAdmittedBusinessTurn(input: {
   payload: string | CliTurnPayload;
   options: BusinessTurnSubmitOptions;
   boundary: AdmittedTurnWorkerBoundary;
-  permitStore: Pick<TurnPermitStore, 'issueBlank' | 'proveReady' | 'issueBusiness' | 'abortBootstrap'>;
+  permitStore: Pick<TurnPermitStore, 'issueBlank' | 'proveReady' | 'issueBusiness' | 'abortBootstrap' | 'abortBusinessDispatch'>;
   retireUnproven?(ds: DaemonSession, reservedGeneration: number): Promise<boolean>;
   resource?: AdmittedBusinessResource;
 }): Promise<boolean> {
@@ -154,6 +154,7 @@ export async function dispatchAdmittedBusinessTurn(input: {
           orphanRetired: retired,
         });
       },
+      abortBusiness: permit => input.permitStore.abortBusinessDispatch(permit, payloadDigest(input.payload)).then(() => undefined),
       ...(input.resource?.acquire ? { acquireResource: input.resource.acquire } : {}),
       ...(input.resource?.markAttempting ? { markAttempting: input.resource.markAttempting } : {}),
       submit: permit => input.boundary.submit(
