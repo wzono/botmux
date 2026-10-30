@@ -321,7 +321,7 @@ export interface GroupWorkspaceCardRouteDeps {
   resolveAuthority: (input: GroupWorkspaceCardRouteInput) => Promise<import('../../core/group-workspace-policy.js').GroupWorkspaceRouteAuthorityResult | undefined>;
   handleRoute: (route: GroupWorkspaceRouteIntent & {
     source: 'card'; chatId: string; actor: import('../../services/bot-admin-unions-store.js').TenantHumanId;
-    actorOpenId?: string; originMessageId: string; actionId: string;
+    authorityFingerprint: string; actorOpenId?: string; originMessageId: string; actionId: string;
   }) => Promise<void> | void;
   canRunGenericCardAction: () => boolean;
 }
@@ -355,6 +355,7 @@ export async function tryDispatchGroupWorkspaceCardRoute(
     source: 'card',
     chatId: input.chatId,
     actor: authority.actor,
+    authorityFingerprint: authority.configFingerprint,
     actorOpenId: input.operatorOpenId,
     originMessageId: input.cardMessageId!,
     actionId: input.actionId!,

@@ -6,7 +6,7 @@ import type {
   TenantHumanId,
 } from '../services/bot-admin-unions-store.js';
 import { loadFreshBotAdminUnionSnapshot } from '../services/bot-admin-unions-store.js';
-import type { GroupWorkspaceRouteAuthorityResult, GroupWorkspaceRouteIntent } from './group-workspace-policy.js';
+import { canManageGroupWorkspace, type GroupWorkspaceRouteAuthorityResult, type GroupWorkspaceRouteIntent } from './group-workspace-policy.js';
 
 interface WorkspaceAclRead {
   status: 'available' | 'store_unavailable';
@@ -34,6 +34,7 @@ export type GroupWorkspaceProductionRoute = GroupWorkspaceRouteIntent & {
   source: 'text' | 'card';
   chatId: string;
   actor: TenantHumanId;
+  authorityFingerprint: string;
   actorOpenId?: string;
   messageId?: string;
   originMessageId?: string;
@@ -110,6 +111,23 @@ export function createGroupWorkspaceRouteRuntime(options: {
     };
   };
 
+  const revalidateAuthority = async (route: Pick<GroupWorkspaceProductionRoute, 'chatId' | 'actor' | 'authorityFingerprint'>): Promise<boolean> => {
+    const registered = options.registeredBots(route.actor.tenantKey);
+    const fresh = await loadFreshBotAdminUnionSnapshot({
+      registeredBots: registered,
+      resolveAllowedUser: options.resolveAllowedUser,
+      now: options.now,
+      ttlMs: 1,
+    });
+    if (!fresh || fresh.configFingerprint !== route.authorityFingerprint) return false;
+    const workspace = await options.readWorkspace(route.chatId);
+    return workspace.status === 'available' && canManageGroupWorkspace({
+      actor: route.actor,
+      freshSnapshot: fresh,
+      workspaceManagers: workspace.record?.workspaceManagers,
+    });
+  };
+
   const handleRoute = async (route: GroupWorkspaceProductionRoute): Promise<void> => {
     const session = options.activeSessions.get(options.sessionKey(route.chatId, options.larkAppId));
     if (options.executeGroupWorkspaceRoute) {
@@ -142,5 +160,5 @@ export function createGroupWorkspaceRouteRuntime(options: {
     });
   };
 
-  return { resolveAuthority, handleRoute };
+  return { resolveAuthority, revalidateAuthority, handleRoute };
 }

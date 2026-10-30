@@ -2457,7 +2457,7 @@ export interface GroupWorkspaceTextRouteDeps {
   resolveAuthority: (input: GroupWorkspaceTextRouteInput) => Promise<import('../../core/group-workspace-policy.js').GroupWorkspaceRouteAuthorityResult | undefined>;
   handleRoute: (route: GroupWorkspaceRouteIntent & {
     source: 'text'; chatId: string; actor: import('../../services/bot-admin-unions-store.js').TenantHumanId;
-    actorOpenId?: string; messageId?: string;
+    authorityFingerprint: string; actorOpenId?: string; messageId?: string;
   }) => Promise<void> | void;
   canRunGenericCommand: () => boolean;
   replyDenied: (message: string) => Promise<void> | void;
@@ -2494,6 +2494,7 @@ export async function tryDispatchGroupWorkspaceTextRoute(
     source: 'text',
     chatId: input.chatId,
     actor: authority.actor,
+    authorityFingerprint: authority.configFingerprint,
     actorOpenId: input.senderOpenId,
     messageId: input.messageId,
   });

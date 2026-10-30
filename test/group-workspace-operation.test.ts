@@ -21,6 +21,7 @@ import {
   type GroupCommitResult,
   type GroupWorkspaceOperationDependencies,
 } from '../src/core/group-workspace-operation.js';
+import { OperationExecutorLeaseStore } from '../src/services/operation-executor-lease-store.js';
 
 const ACTOR: TenantHumanId = { tenantKey: 'tenant-a', unionId: 'on_user' };
 const SOURCE_EVENT_ID = 'group-workspace-text-source-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -362,6 +363,31 @@ describe('GroupWorkspaceOperationCoordinator', () => {
     const h = harness();
     await expect(h.coordinator.execute({ ...REQUEST, kind: 'unbind' } as any)).resolves.toMatchObject({ status: 'protocol_conflict' });
     expect(h.switches).toBe(0);
+  });
+
+  it('revalidates fresh authority immediately before switch and group CAS, terminalizing revocation', async () => {
+    const h = harness();
+    const dependencies = (h.coordinator as any).dependencies;
+    let checks = 0;
+    dependencies.revalidateAuthority = async () => ({
+      status: ++checks === 1 ? 'authorized' : 'unauthorized',
+    });
+    await expect(h.coordinator.execute(REQUEST)).resolves.toMatchObject({ status: 'unauthorized' });
+    expect(checks).toBe(2);
+    expect(h.switches).toBe(1);
+    expect(h.commits).toBe(0);
+    expect(h.calls).toContain('converge:explicit:none');
+    await expect(h.store.get(BASE.operationKey)).resolves.toMatchObject({ journal: { phase: 'unauthorized' } });
+  });
+
+  it('does not switch when fresh authority was revoked after preparation', async () => {
+    const h = harness();
+    const dependencies = (h.coordinator as any).dependencies;
+    dependencies.revalidateAuthority = async () => ({ status: 'unauthorized' });
+    await expect(h.coordinator.execute(REQUEST)).resolves.toMatchObject({ status: 'unauthorized' });
+    expect(h.switches).toBe(0);
+    expect(h.commits).toBe(0);
+    await expect(h.store.get(BASE.operationKey)).resolves.toMatchObject({ journal: { phase: 'unauthorized' } });
   });
 
   it('freezes the complete journal before any session side effect', async () => {

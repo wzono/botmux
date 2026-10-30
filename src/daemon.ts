@@ -9,6 +9,7 @@ import {
   groupWorkspaceOperationKey,
 } from './services/group-workspace-store.js';
 import { GroupWorkspaceOperationStore } from './services/group-workspace-operation-store.js';
+import { OperationExecutorLeaseStore } from './services/operation-executor-lease-store.js';
 import { probePathUsability, type PathIdentity } from './core/path-usability.js';
 import {
   createGroupWorkspaceSetCoordinator,
@@ -7326,6 +7327,8 @@ setCardClickTurnPoster((larkAppId, body) => cardClickTurns.post(larkAppId, body)
 
 const groupWorkspaceStore = new GroupWorkspaceStore(config.session.dataDir);
 const groupWorkspaceOperationStore = new GroupWorkspaceOperationStore(config.session.dataDir);
+const groupWorkspaceExecutorLeaseStore = new OperationExecutorLeaseStore(config.session.dataDir);
+const groupWorkspaceExecutorOwner = `${process.pid}:${randomUUID()}`;
 const groupWorkspaceRouteRuntimes = new Map<string, ReturnType<typeof createGroupWorkspaceRouteRuntime>>();
 
 const cardDeps: CardHandlerDeps = {
@@ -33038,6 +33041,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               journalStore: groupWorkspaceOperationStore,
               groupStore: groupWorkspaceStore,
               now: Date.now,
+              authorityFingerprint: route.authorityFingerprint,
+              revalidateAuthority: async journal => ({
+                status: await groupWorkspaceRouteRuntime.revalidateAuthority({
+                  chatId: journal.chatId,
+                  actor: journal.actor,
+                  authorityFingerprint: journal.authorityFingerprint ?? '',
+                }) ? 'authorized' : 'unauthorized',
+              }),
+              executorLeaseStore: groupWorkspaceExecutorLeaseStore,
+              executorOwner: groupWorkspaceExecutorOwner,
               ...(route.originMessageId ? { originMessageId: route.originMessageId } : {}),
               resolveCanonicalTarget: async () => {
                 const resolved = resolveGroupWorkspaceRepoSelection(
@@ -33058,7 +33071,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               },
               switchSession: async input => {
                 const before = ds.workerGeneration ?? 0;
-                if (before !== input.expectedGeneration
+                const lease = await groupWorkspaceExecutorLeaseStore.assertCurrent(
+                  groupWorkspaceOperationKey(request.sourceEventId, 'set'),
+                  { owner: groupWorkspaceExecutorOwner, leaseEpoch: 0,
+                    fencingToken: input.fencingToken ?? -1, leaseExpiresAt: Number.MAX_SAFE_INTEGER },
+                );
+                if (lease.status !== 'current' || before !== input.expectedGeneration
                   || activeSessions.get(sessionKey(ds.chatId, cfg.larkAppId)) !== ds) {
                   return { status: 'unknown' };
                 }
@@ -33096,6 +33114,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               operationKey: groupWorkspaceOperationKey(request.sourceEventId, 'set'),
               sourceEventId: request.sourceEventId, kind: 'set', requestIntentDigest,
               chatId: request.chatId, sessionId: sessionKey(request.chatId, cfg.larkAppId), actor: request.actor,
+              authorityFingerprint: route.authorityFingerprint,
             });
             return result.status === 'group_committed'
               ? { status: 'group_committed', groupRevision: result.groupRevision }

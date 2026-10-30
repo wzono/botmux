@@ -37,6 +37,8 @@ export interface RepoGroupOperationJournal {
   targetWorkingDir?: string;
   targetWorkspaceIdentity?: WorkspaceIdentity;
   actor: TenantHumanId;
+  /** Frozen authorization configuration fingerprint; required by production operations. */
+  authorityFingerprint?: string;
   phase: RepoGroupOperationPhase;
   sessionGenerationAfter?: number;
   groupRevisionAfter?: number;
@@ -140,8 +142,8 @@ function validateJournal(value: unknown, key: string): asserts value is RepoGrou
     || (value.phase === 'prepared' && (value.sessionGenerationAfter !== undefined || value.groupRevisionAfter !== undefined))
     || (value.phase === 'session_committed' && value.sessionGenerationAfter === undefined)
     || (value.phase === 'group_committed' && (value.sessionGenerationAfter === undefined || value.groupRevisionAfter === undefined))
-    || ((value.phase === 'conflict' || value.phase === 'invalid_dir' || value.phase === 'unauthorized'
-      || value.phase === 'store_unavailable') && value.sessionGenerationAfter === undefined)) {
+    || ((value.phase === 'conflict' || value.phase === 'invalid_dir' || value.phase === 'store_unavailable')
+      && value.sessionGenerationAfter === undefined)) {
     throw new Error(`invalid group workspace operation journal: ${key}`);
   }
 }
@@ -189,11 +191,12 @@ function sameFrozenIntent(left: RepoGroupOperationJournal, right: RepoGroupOpera
     && left.chatId === right.chatId
     && left.sessionId === right.sessionId
     && left.actor.tenantKey === right.actor.tenantKey
-    && left.actor.unionId === right.actor.unionId;
+    && left.actor.unionId === right.actor.unionId
+    && left.authorityFingerprint === right.authorityFingerprint;
 }
 
 function mayTransition(from: RepoGroupOperationPhase, to: RepoGroupOperationPhase): boolean {
-  if (from === 'prepared') return to === 'session_committed' || to === 'unknown';
+  if (from === 'prepared') return to === 'session_committed' || to === 'unauthorized' || to === 'unknown';
   if (from === 'session_committed') {
     return to === 'group_committed' || to === 'conflict' || to === 'invalid_dir' || to === 'unauthorized'
       || to === 'store_unavailable' || to === 'unknown';
@@ -289,7 +292,9 @@ export class GroupWorkspaceOperationStore {
     phase: RepoGroupOperationPhase,
     patch: Pick<RepoGroupOperationJournal, 'updatedAt'>
       & Partial<Pick<RepoGroupOperationJournal, 'sessionGenerationAfter' | 'groupRevisionAfter'>>,
+    assertFence?: () => Promise<boolean>,
   ): Promise<OperationTransitionResult> {
+    if (assertFence && !(await assertFence())) return { status: 'store_unavailable' };
     try {
       mkdirSync(dirname(this.path), { recursive: true });
       return await withFileLock(this.path, async () => {

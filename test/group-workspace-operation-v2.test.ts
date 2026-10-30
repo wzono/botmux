@@ -2,6 +2,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import { GroupWorkspaceOperationStore } from '../src/services/group-workspace-operation-store.js';
 import { OperationExecutorLeaseStore } from '../src/services/operation-executor-lease-store.js';
 import { groupWorkspaceOperationKey } from '../src/services/group-workspace-store.js';
@@ -35,6 +36,48 @@ describe('same-source winner and executor lease', () => {
     const forgedOldToken = { ...first.lease, owner: 'owner-b', leaseExpiresAt: 99 };
     expect((await leases.assertCurrent(journal.operationKey, forgedOldToken)).status).toBe('stale_fence');
   });
+  it('uses a real shared store across two OS processes and rejects the slow old owner late effect', async () => {
+    const dataDir = dir();
+    const moduleUrl = new URL('../src/services/operation-executor-lease-store.js', import.meta.url).href;
+    const childSource = `
+      import { OperationExecutorLeaseStore } from ${JSON.stringify(moduleUrl)};
+      const dataDir = process.env.TEST_DATA_DIR; const owner = process.env.TEST_OWNER; const delay = process.env.TEST_DELAY;
+      const store = new OperationExecutorLeaseStore(dataDir);
+      const acquired = await store.acquire('shared-op', owner, 80);
+      process.stdout.write(JSON.stringify(acquired) + '\\n');
+      await new Promise(resolve => setTimeout(resolve, Number(delay)));
+      process.stdout.write(JSON.stringify(await store.assertCurrent('shared-op', acquired.lease)) + '\\n');
+    `;
+    const run = (owner: string, delay: number) => {
+      let firstResolve!: () => void;
+      const first = new Promise<void>(resolve => { firstResolve = resolve; });
+      const done = new Promise<string[]>((resolve, reject) => {
+        const child = spawnTsEvalWithRepoImports(childSource, {
+          cwd: process.cwd(), env: { ...process.env, TEST_DATA_DIR: dataDir, TEST_OWNER: owner, TEST_DELAY: String(delay) },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        const lines: string[] = []; let stderr = '';
+        child.stdout!.on('data', chunk => {
+          lines.push(...String(chunk).trim().split('\n').filter(Boolean));
+          if (lines.length > 0) firstResolve();
+        });
+        child.stderr!.on('data', chunk => { stderr += String(chunk); });
+        child.on('error', reject);
+        child.on('exit', code => code === 0 ? resolve(lines) : reject(new Error(stderr)));
+      });
+      return { first, done };
+    };
+    const oldOwner = run('old-owner', 300);
+    await oldOwner.first;
+    await new Promise(resolve => setTimeout(resolve, 110));
+    const newOwner = run('new-owner', 0);
+    const [oldLines, newLines] = await Promise.all([oldOwner.done, newOwner.done]);
+    expect(JSON.parse(oldLines[0]!)).toMatchObject({ status: 'acquired', lease: { fencingToken: 1 } });
+    expect(JSON.parse(newLines[0]!)).toMatchObject({ status: 'acquired', lease: { fencingToken: 2 } });
+    expect(JSON.parse(oldLines[1]!)).toEqual({ status: 'stale_fence' });
+    expect(JSON.parse(newLines[1]!)).toEqual({ status: 'current' });
+  });
+
   it('renew increments epoch and restart identity has no implicit authority', async () => {
     const leases = new OperationExecutorLeaseStore(dir(), { now: () => 10 });
     const first = await leases.acquire(journal.operationKey, 'daemon-boot-1', 5); if (first.status !== 'acquired') throw new Error('lease');
