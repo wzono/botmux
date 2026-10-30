@@ -50,6 +50,15 @@ function harness(opts: HarnessOptions = {}) {
 }
 
 describe('group workspace pre-turn worker follow', () => {
+  it('uses the committed record identity for a newer revision without re-probing mutable path state', () => {
+    const workspaceIdentity = { path: '/x2', dev: '7', ino: '9' };
+    expect(resolveGroupWorkspaceFollowTarget({
+      currentRevision: 1,
+      group: { status: 'available', record: {
+        revision: 2, directory: { kind: 'bound', workingDir: '/x2' }, workspaceIdentity,
+      } },
+    })).toEqual({ kind: 'follow', target: { workingDir: '/x2', revision: 2, workspaceIdentity } });
+  });
   it.each(['prepared', 'old_exited', 'persisted', 'spawned'] as const)(
     'keeps the durable %s target authoritative after the group is unbound',
     phase => {

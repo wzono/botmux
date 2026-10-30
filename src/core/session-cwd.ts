@@ -42,6 +42,7 @@ type GroupWorkspaceReadForFollow =
   | { status: 'available'; record?: {
     revision: number;
     directory: { kind: 'unbound' } | { kind: 'bound'; workingDir: string };
+    workspaceIdentity?: WorkspaceIdentity;
   } };
 
 export type GroupWorkspaceFollowTargetResolution =
@@ -73,6 +74,7 @@ export function resolveGroupWorkspaceFollowTarget(input: {
   return { kind: 'follow', target: {
     workingDir: record.directory.workingDir,
     revision: record.revision,
+    workspaceIdentity: record.workspaceIdentity,
   } };
 }
 

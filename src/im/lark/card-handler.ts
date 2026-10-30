@@ -215,7 +215,7 @@ export interface CardHandlerDeps {
 export interface CardActionData {
   event_id?: string;
   uuid?: string;
-  header?: { event_id?: string };
+  header?: { event_id?: string; tenant_key?: string };
   event?: { event_id?: string };
   operator?: {
     open_id?: string;
@@ -5454,9 +5454,10 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       currentRepoCardMessageId: targetDs.repoCardMessageId,
       operatorOpenId,
       operatorUnionId: data.operator?.union_id,
-      // The receiving app is transport-authenticated; its runtime supplies the
-      // verified app→tenant mapping. Never read tenant identity from card data.
-      tenantKey: undefined,
+      // The callback header is signed by Lark together with the receiving app.
+      // Never accept the mutable action value (or a flattened synthetic field)
+      // as tenant authority.
+      tenantKey: data.header?.tenant_key,
       actionId: data.event_id ?? data.header?.event_id ?? data.event?.event_id,
       // Card callbacks expose an SDK-verified human operator envelope rather than sender_type.
       humanProvenance: !!operatorOpenId,

@@ -336,9 +336,12 @@ describe('group workspace production card route', () => {
       canSwitchSession: true,
     }));
     const event = {
-      event_id: 'evt_exact', tenant_key: 'tenant-1', operator: { open_id: 'ou_bot_b', union_id: 'on_admin' },
-      action: { option: '/repos/alpha', value: { key: 'repo_switch', root_id: CHAT_ID } },
-      context: { open_message_id: 'om_card', open_chat_id: CHAT_ID },
+      header: { event_id: 'evt_exact', tenant_key: 'tenant-1' },
+      event: {
+        operator: { open_id: 'ou_bot_b', union_id: 'on_admin' },
+        action: { option: '/repos/alpha', value: { key: 'repo_switch', root_id: CHAT_ID } },
+        context: { open_message_id: 'om_card', open_chat_id: CHAT_ID },
+      },
     };
     await handleCardAction(event, {
       activeSessions, sessionReply: vi.fn(async () => 'om_reply'), lastRepoScan: new Map(),
@@ -346,7 +349,7 @@ describe('group workspace production card route', () => {
       handleGroupWorkspaceRoute: handleRoute,
     }, APP_ID);
     expect(resolveAuthority).toHaveBeenCalledWith(expect.objectContaining({
-      chatId: CHAT_ID, callbackChatId: CHAT_ID, actionId: 'evt_exact', operatorUnionId: 'on_admin',
+      chatId: CHAT_ID, callbackChatId: CHAT_ID, actionId: 'evt_exact', operatorUnionId: 'on_admin', tenantKey: 'tenant-1',
     }));
     expect(handleRoute).toHaveBeenCalledWith(expect.objectContaining({
       kind: 'set', source: 'card', chatId: CHAT_ID, selection: '/repos/alpha',
@@ -361,9 +364,12 @@ describe('group workspace production card route', () => {
     ds.session.rootMessageId = CHAT_ID;
     const handleRoute = vi.fn(async () => undefined);
     await handleCardAction({
-      event_id: 'evt_unbind', tenant_key: 'tenant-1', operator: { open_id: 'ou_bot_b', union_id: 'on_admin' },
-      action: { value: { key: 'group_workspace_unbind', root_id: CHAT_ID } },
-      context: { open_message_id: 'om_card', open_chat_id: CHAT_ID },
+      header: { event_id: 'evt_unbind', tenant_key: 'tenant-1' },
+      event: {
+        operator: { open_id: 'ou_bot_b', union_id: 'on_admin' },
+        action: { value: { key: 'group_workspace_unbind', root_id: CHAT_ID } },
+        context: { open_message_id: 'om_card', open_chat_id: CHAT_ID },
+      },
     }, {
       activeSessions: new Map([[sessionKey(CHAT_ID, APP_ID), ds]]),
       sessionReply: vi.fn(async () => 'om_reply'), lastRepoScan: new Map(),
