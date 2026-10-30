@@ -169,17 +169,15 @@ export async function reconcileTurnPermitDispatches(input: {
   const sessions = new Map([...input.sessions].map(session => [session.sessionId, session]));
   for (const pending of input.pending) {
     const session = sessions.get(pending.permit.sessionId);
-    if (!session) continue;
-    const receipt = session.dispatchInputReceipts?.[pending.permit.turnId];
+    const receipt = session?.dispatchInputReceipts?.[pending.permit.turnId];
     const ack = receipt?.workerGeneration === pending.permit.workerGeneration
       ? { sessionId: pending.permit.sessionId, turnId: pending.permit.turnId, workerGeneration: receipt.workerGeneration }
       : undefined;
     const sameGenerationAlive = session?.workerAlive === true
       && session.workerGeneration === pending.permit.workerGeneration;
-    if (sameGenerationAlive && !ack) continue;
     await input.reconcile(pending.permit, {
       ...(ack ? { ack } : {}),
-      safeToRetry: !pending.retryUsed && !sameGenerationAlive,
+      safeToRetry: !pending.retryUsed && !!session && !sameGenerationAlive,
     });
   }
 }

@@ -1294,17 +1294,15 @@ export async function reconcileTurnPermitDispatches(
   const sessionsById = new Map(restored.map(ds => [ds.session.sessionId, ds]));
   for (const pending of await store.listDispatchingControls()) {
     const ds = sessionsById.get(pending.permit.sessionId);
-    if (!ds) continue;
-    const receipt = ds.session.controlDispatchReceipts?.[pending.permit.controlDispatchId];
+    const receipt = ds?.session.controlDispatchReceipts?.[pending.permit.controlDispatchId];
     const acknowledged = receipt?.workerGeneration === pending.permit.expectedGeneration
       && receipt.replyDigest === pending.replyDigest;
-    const sameGenerationAlive = !!ds.worker && !ds.worker.killed
+    const sameGenerationAlive = !!ds?.worker && !ds.worker.killed
       && ds.workerGeneration === pending.permit.expectedGeneration
       && ds.session.workerGeneration === pending.permit.expectedGeneration;
-    if (sameGenerationAlive && !acknowledged) continue;
     await store.reconcileControlReplyDispatch(pending.permit, pending.replyDigest, {
       acknowledged,
-      safeToRetry: !pending.retryUsed && !sameGenerationAlive,
+      safeToRetry: !pending.retryUsed && !!ds && !sameGenerationAlive,
     });
   }
 }

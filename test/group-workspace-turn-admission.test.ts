@@ -128,6 +128,23 @@ describe('durable turn permits', () => {
     expect(second.permitId).not.toBe(first.permitId);
   });
 
+  it('releases a terminal spawn failure only after exact-generation orphan proof', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'turn-permit-'));
+    const store = new TurnPermitStore(dataDir, { now: () => 100 });
+    const first = await store.issueBlank({ ...base, reservedGeneration: 4 });
+    await store.beginSpawn(first);
+    await store.failBootstrap(first, 'spawn_failed');
+    expect((await store.abortBootstrap(first, {
+      phase: 'forked_unproven', observedGeneration: 4, orphanRetired: false,
+    })).status).toBe('orphan_unproven');
+    expect(await store.issueBlank({ ...base, reservedGeneration: 5 })).toEqual(first);
+    expect((await store.abortBootstrap(first, {
+      phase: 'forked_unproven', observedGeneration: 4, orphanRetired: true,
+    })).status).toBe('aborted');
+    const reissued = await store.issueBlank({ ...base, reservedGeneration: 5 });
+    expect(reissued.permitId).not.toBe(first.permitId);
+  });
+
   it('fails closed on expiry, mismatched proof and terminal failure', async () => {
     let now = 100; const store = new TurnPermitStore(mkdtempSync(join(tmpdir(), 'turn-permit-')), { now: () => now });
     const blank = await store.issueBlank({ ...base, reservedGeneration: 4 });
@@ -213,7 +230,7 @@ describe('durable turn permits', () => {
     });
     expect((await retry.store.beginBusinessDispatch(retry.permit, 'digest-retry-startup')).status).toBe('rejected');
   });
-  it('never grants startup retry when the restored session is absent', async () => {
+  it('marks startup dispatch ambiguous when the restored session is absent', async () => {
     const store = new TurnPermitStore(mkdtempSync(join(tmpdir(), 'turn-permit-')), { now: () => 100 });
     const blank = await store.issueBlank({ ...base, turnId: 'not-restored', reservedGeneration: 4 });
     await store.beginSpawn(blank);
@@ -224,7 +241,7 @@ describe('durable turn permits', () => {
       pending: await store.listDispatching(), sessions: [],
       reconcile: (permit, evidence) => store.reconcileBusinessDispatch(permit, evidence),
     });
-    expect((await store.beginBusinessDispatch(issued.permit, 'digest-not-restored')).status).toBe('observing');
+    expect((await store.beginBusinessDispatch(issued.permit, 'digest-not-restored')).status).toBe('rejected');
   });
   it('repairs a post-restart dispatch from a late exact ACK after live-generation reconcile', async () => {
     const store = new TurnPermitStore(mkdtempSync(join(tmpdir(), 'turn-permit-')), { now: () => 100 });

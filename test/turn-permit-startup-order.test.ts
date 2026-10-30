@@ -57,7 +57,7 @@ describe('startup turn permit reconciliation harness', () => {
     expect(reconcile).toHaveBeenCalledTimes(1);
   });
 
-  it('does not accept an old generic original-turn receipt as control ACK', async () => {
+  it('marks a live same-generation control dispatch without exact ACK ambiguous', async () => {
     const session = restoredSession();
     session.session.controlDispatchReceipts = undefined;
     const reconcileControl = vi.fn(async (_permit, _digest, evidence) => {
@@ -72,7 +72,26 @@ describe('startup turn permit reconciliation harness', () => {
       } as never, replyDigest: 'answer', retryUsed: false }],
       reconcileControlReplyDispatch: reconcileControl,
     });
-    expect(reconcileControl).not.toHaveBeenCalled();
+    expect(reconcileControl).toHaveBeenCalledWith(expect.anything(), 'answer', {
+      acknowledged: false, safeToRetry: false,
+    });
+  });
+
+  it('reconciles a dispatch whose restored session is missing as ambiguous', async () => {
+    const reconcile = vi.fn(async (_permit, evidence) => {
+      expect(evidence).toEqual({ safeToRetry: false });
+      return { status: 'ambiguous' as const };
+    });
+    await reconcileTurnPermitDispatches([], {
+      listDispatching: async () => [{ permit: {
+        permitId: 'business', bootstrapPermitId: 'blank', sessionId: 'missing', turnId: 'turn',
+        workerGeneration: 4, workspace: { path: '/repo', dev: '1', ino: '2' }, expiresAt: Date.now() + 1000,
+      } as never, payloadDigest: 'digest', retryUsed: false }],
+      reconcileBusinessDispatch: reconcile,
+      listDispatchingControls: async () => [],
+      reconcileControlReplyDispatch: async () => ({ status: 'rejected' as const }),
+    });
+    expect(reconcile).toHaveBeenCalledTimes(1);
   });
 
   it('reconciles a crash-window control dispatch from the restored worker ACK', async () => {
