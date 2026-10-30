@@ -2,7 +2,16 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { classifyTurn, runExistingWorkerAdmission, runBlankBootstrapAdmission } from '../src/core/turn-admission.js';
+import {
+  admitTurn,
+  admitTurnUnderMutation,
+  classifyTurn,
+  markBusinessAttempting,
+  resumeOriginalTurnReply,
+  reconcileTurnPermitDispatches,
+  runExistingWorkerAdmission,
+  runBlankBootstrapAdmission,
+} from '../src/core/turn-admission.js';
 import { TurnPermitStore } from '../src/services/turn-permit-store.js';
 
 const identity = { path: '/repo/x', dev: '1', ino: '2' };
@@ -52,6 +61,21 @@ describe('unified turn admission', () => {
     });
     expect(trace).toEqual(['resolve', 'reserve_generation', 'persist_blank_permit', 'blank_fork(zero_payload)', 'ready_generation', 'cwd_identity_proof', 'backend_proof', 'persist_business_permit', 'submit_once']);
   });
+  it('returns discriminated production admission outcomes under the shared gate', async () => {
+    const trace: string[] = [];
+    const admitted = await admitTurn({
+      runUnderAdmission: async run => { trace.push('gate'); return run(); },
+      admitUnderMutation: async () => ({ status: 'rejected', reason: 'unsupported_backend' }),
+    });
+    expect(admitted).toEqual({ status: 'rejected', reason: 'unsupported_backend' });
+    expect(trace).toEqual(['gate']);
+  });
+  it('does not reacquire the shared gate under an existing mutation', async () => {
+    const result = await admitTurnUnderMutation({
+      admitUnderMutation: async () => ({ status: 'deferred', reason: 'busy' }),
+    });
+    expect(result).toEqual({ status: 'deferred', reason: 'busy' });
+  });
 });
 
 describe('durable turn permits', () => {
@@ -88,5 +112,108 @@ describe('durable turn permits', () => {
     const business = await store.proveReady(blank, { actualGeneration: 4, cwd: identity, backend: identity });
     if (business.status !== 'issued') throw new Error('expected business permit');
     expect((await store.consumeBusiness({ ...business.permit, workerGeneration: 9 }, 'digest')).status).toBe('rejected');
+  });
+  it('delivers only after an exact session, turn and generation worker ACK', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'turn-permit-'));
+    const store = new TurnPermitStore(dataDir, { now: () => 100 });
+    const blank = await store.issueBlank({ ...base, reservedGeneration: 4 });
+    expect((await store.beginSpawn(blank)).status).toBe('acquired');
+    const issued = await store.proveReady(blank, { actualGeneration: 4, cwd: identity, backend: identity });
+    if (issued.status !== 'issued') throw new Error('expected business permit');
+    expect((await store.beginBusinessDispatch(issued.permit, 'digest-a')).status).toBe('acquired');
+    expect((await store.acknowledgeBusinessDelivery({ sessionId: 'other', turnId: 't1', workerGeneration: 4 })).status).toBe('rejected');
+    expect((await store.acknowledgeBusinessDelivery({ sessionId: 's1', turnId: 't1', workerGeneration: 5 })).status).toBe('rejected');
+    expect((await store.acknowledgeBusinessDelivery({ sessionId: 's1', turnId: 't1', workerGeneration: 4 })).status).toBe('delivered');
+    expect((await new TurnPermitStore(dataDir, { now: () => 101 }).beginBusinessDispatch(issued.permit, 'digest-a')).status).toBe('delivered');
+  });
+  it('reconciles persisted ACKs, safe retry, and ambiguity after restart', async () => {
+    const make = async (turnId: string) => {
+      const store = new TurnPermitStore(mkdtempSync(join(tmpdir(), 'turn-permit-')), { now: () => 100 });
+      const blank = await store.issueBlank({ ...base, turnId, reservedGeneration: 4 });
+      await store.beginSpawn(blank);
+      const issued = await store.proveReady(blank, { actualGeneration: 4, cwd: identity, backend: identity });
+      if (issued.status !== 'issued') throw new Error('expected business permit');
+      await store.beginBusinessDispatch(issued.permit, `digest-${turnId}`);
+      return { store, permit: issued.permit };
+    };
+    const acknowledged = await make('acked');
+    expect((await acknowledged.store.reconcileBusinessDispatch(acknowledged.permit, {
+      ack: { sessionId: 's1', turnId: 'acked', workerGeneration: 4 }, safeToRetry: false,
+    })).status).toBe('delivered');
+    const retryable = await make('retry');
+    expect((await retryable.store.reconcileBusinessDispatch(retryable.permit, { safeToRetry: true })).status).toBe('retry');
+    expect((await retryable.store.beginBusinessDispatch(retryable.permit, 'digest-retry')).status).toBe('acquired');
+    expect((await retryable.store.reconcileBusinessDispatch(retryable.permit, { safeToRetry: true })).status).toBe('ambiguous');
+    const ambiguous = await make('ambiguous');
+    expect((await ambiguous.store.reconcileBusinessDispatch(ambiguous.permit, { safeToRetry: false })).status).toBe('ambiguous');
+    expect((await ambiguous.store.beginBusinessDispatch(ambiguous.permit, 'digest-ambiguous')).status).toBe('rejected');
+  });
+  it('startup reconciliation adopts persisted ACK or grants only one safe retry', async () => {
+    const make = async (turnId: string) => {
+      const store = new TurnPermitStore(mkdtempSync(join(tmpdir(), 'turn-permit-')), { now: () => 100 });
+      const blank = await store.issueBlank({ ...base, turnId, reservedGeneration: 4 });
+      await store.beginSpawn(blank);
+      const issued = await store.proveReady(blank, { actualGeneration: 4, cwd: identity, backend: identity });
+      if (issued.status !== 'issued') throw new Error('expected business permit');
+      await store.beginBusinessDispatch(issued.permit, `digest-${turnId}`);
+      return { store, permit: issued.permit };
+    };
+    const acked = await make('acked-startup');
+    await reconcileTurnPermitDispatches({
+      pending: await acked.store.listDispatching(),
+      sessions: [{ sessionId: 's1', workerGeneration: 4, workerAlive: false, dispatchInputReceipts: { 'acked-startup': { workerGeneration: 4 } } }],
+      reconcile: (permit, evidence) => acked.store.reconcileBusinessDispatch(permit, evidence),
+    });
+    expect((await acked.store.beginBusinessDispatch(acked.permit, 'digest-acked-startup')).status).toBe('delivered');
+    const retry = await make('retry-startup');
+    await reconcileTurnPermitDispatches({
+      pending: await retry.store.listDispatching(),
+      sessions: [{ sessionId: 's1', workerGeneration: 5, workerAlive: false }],
+      reconcile: (permit, evidence) => retry.store.reconcileBusinessDispatch(permit, evidence),
+    });
+    expect((await retry.store.beginBusinessDispatch(retry.permit, 'digest-retry-startup')).status).toBe('acquired');
+    await reconcileTurnPermitDispatches({
+      pending: await retry.store.listDispatching(),
+      sessions: [{ sessionId: 's1', workerGeneration: 5, workerAlive: false }],
+      reconcile: (permit, evidence) => retry.store.reconcileBusinessDispatch(permit, evidence),
+    });
+    expect((await retry.store.beginBusinessDispatch(retry.permit, 'digest-retry-startup')).status).toBe('rejected');
+  });
+  it('binds one-shot control replies to the original wait and frozen workspace', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'turn-permit-'));
+    const store = new TurnPermitStore(dataDir, { now: () => 100 });
+    const permit = await store.issueControlReply({
+      sessionId: 's1', originalTurnId: 'original', wait: { kind: 'ask', askId: 'ask-1' },
+      expectedGeneration: 4, workspace: identity, groupRevision: 3, expiresAt: 200,
+    });
+    expect((await store.consumeControlReply(permit, 'answer-a', {
+      sessionId: 's1', originalTurnId: 'original', wait: { kind: 'ask', askId: 'wrong' },
+      workerGeneration: 4, workspace: identity, groupRevision: 3, originalState: 'needs_user', authorized: true,
+    })).status).toBe('rejected');
+    const consumed = await store.consumeControlReply(permit, 'answer-a', {
+      sessionId: 's1', originalTurnId: 'original', wait: { kind: 'ask', askId: 'ask-1' },
+      workerGeneration: 4, workspace: identity, groupRevision: 3, originalState: 'needs_user', authorized: true,
+    });
+    expect(consumed.status).toBe('consumed');
+    expect((await store.consumeControlReply(permit, 'answer-a', {
+      sessionId: 's1', originalTurnId: 'original', wait: { kind: 'ask', askId: 'ask-1' },
+      workerGeneration: 4, workspace: identity, groupRevision: 3, originalState: 'needs_user', authorized: true,
+    })).status).toBe('duplicate');
+    expect((await store.consumeControlReply(permit, 'answer-b', {
+      sessionId: 's1', originalTurnId: 'original', wait: { kind: 'ask', askId: 'ask-1' },
+      workerGeneration: 4, workspace: identity, groupRevision: 3, originalState: 'needs_user', authorized: true,
+    })).status).toBe('rejected');
+  });
+  it('requires typed permits at attempting and control-resume callees', async () => {
+    const store = new TurnPermitStore(mkdtempSync(join(tmpdir(), 'turn-permit-')), { now: () => 100 });
+    const blank = await store.issueBlank({ ...base, reservedGeneration: 4 });
+    await store.beginSpawn(blank);
+    const business = await store.proveReady(blank, { actualGeneration: 4, cwd: identity, backend: identity });
+    if (business.status !== 'issued') throw new Error('expected business permit');
+    const trace: string[] = [];
+    expect(await markBusinessAttempting(business.permit, async () => { trace.push('attempting'); return true; })).toBe(true);
+    const control = await store.issueControlReply({ sessionId: 's1', originalTurnId: 'original', wait: { kind: 'approval', approvalId: 'approval-1' }, expectedGeneration: 4, workspace: identity, groupRevision: 3, expiresAt: 200 });
+    expect(await resumeOriginalTurnReply(control, async () => { trace.push('resume'); return true; })).toBe(true);
+    expect(trace).toEqual(['attempting', 'resume']);
   });
 });

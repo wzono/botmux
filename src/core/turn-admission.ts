@@ -6,9 +6,75 @@ export type TurnOrigin = 'ordinary' | 'listener' | 'trigger' | 'dashboard_openin
 declare const blankBrand: unique symbol;
 declare const businessBrand: unique symbol;
 declare const controlBrand: unique symbol;
-export type BlankBootstrapPermit = Readonly<{ permitId: string; sessionId: string; turnId: string; reservedGeneration: number; target: WorkspaceIdentity; groupRevision?: number; expiresAt: number; [blankBrand]?: never }>;
-export type BusinessSubmitPermit = Readonly<{ permitId: string; bootstrapPermitId: string; sessionId: string; turnId: string; workerGeneration: number; workspace: WorkspaceIdentity; groupRevision?: number; expiresAt: number; [businessBrand]?: never }>;
-export type ControlReplyPermit = Readonly<{ permitId: string; sessionId: string; originalTurnId: string; wait: { kind: 'ask'; askId: string } | { kind: 'approval'; approvalId: string }; expectedGeneration: number; workspace: WorkspaceIdentity; groupRevision?: number; expiresAt: number; [controlBrand]?: never }>;
+export type BlankBootstrapPermit = Readonly<{ permitId: string; sessionId: string; turnId: string; reservedGeneration: number; target: WorkspaceIdentity; groupRevision?: number; expiresAt: number; [blankBrand]: true }>;
+export type BusinessSubmitPermit = Readonly<{ permitId: string; bootstrapPermitId: string; sessionId: string; turnId: string; workerGeneration: number; workspace: WorkspaceIdentity; groupRevision?: number; expiresAt: number; [businessBrand]: true }>;
+export type ControlReplyPermit = Readonly<{ permitId: string; sessionId: string; originalTurnId: string; wait: { kind: 'ask'; askId: string } | { kind: 'approval'; approvalId: string }; expectedGeneration: number; workspace: WorkspaceIdentity; groupRevision?: number; expiresAt: number; [controlBrand]: true }>;
+export type BlankBootstrapPermitInput = Omit<BlankBootstrapPermit, 'permitId' | typeof blankBrand>;
+export type ControlReplyPermitInput = Omit<ControlReplyPermit, 'permitId' | typeof controlBrand>;
+
+export type WorkspaceAdmissionFailure = 'store_unavailable' | 'invalid_dir' | 'inaccessible' | 'identity_changed';
+export type TurnAdmissionResult =
+  | { status: 'bootstrap_permitted'; sessionId: string; permit: BlankBootstrapPermit }
+  | { status: 'admitted'; sessionId: string; permit: BusinessSubmitPermit }
+  | { status: 'control_reply_admitted'; sessionId: string; permit: ControlReplyPermit }
+  | { status: 'deferred'; reason: 'busy' | 'fifo_owned' | 'needs_user' | 'startup_recovery' }
+  | { status: 'rejected'; reason: WorkspaceAdmissionFailure | 'unsupported_backend' | 'stale_owner' };
+
+export async function admitTurnUnderMutation(input: {
+  admitUnderMutation(): Promise<TurnAdmissionResult>;
+}): Promise<TurnAdmissionResult> {
+  return input.admitUnderMutation();
+}
+
+export async function admitTurn(input: {
+  runUnderAdmission<T>(run: () => Promise<T>): Promise<T>;
+  admitUnderMutation(): Promise<TurnAdmissionResult>;
+}): Promise<TurnAdmissionResult> {
+  return input.runUnderAdmission(() => admitTurnUnderMutation(input));
+}
+
+export async function markBusinessAttempting<T>(
+  _permit: BusinessSubmitPermit,
+  mark: () => Promise<T>,
+): Promise<T> {
+  return mark();
+}
+
+export async function resumeOriginalTurnReply<T>(
+  _permit: ControlReplyPermit,
+  resume: () => Promise<T>,
+): Promise<T> {
+  return resume();
+}
+
+export async function reconcileTurnPermitDispatches(input: {
+  pending: Array<{ permit: BusinessSubmitPermit; retryUsed: boolean }>;
+  sessions: Iterable<{
+    sessionId: string;
+    workerGeneration?: number;
+    workerAlive: boolean;
+    dispatchInputReceipts?: Record<string, { workerGeneration: number }>;
+  }>;
+  reconcile(
+    permit: BusinessSubmitPermit,
+    evidence: { ack?: { sessionId: string; turnId: string; workerGeneration: number }; safeToRetry: boolean },
+  ): Promise<unknown>;
+}): Promise<void> {
+  const sessions = new Map([...input.sessions].map(session => [session.sessionId, session]));
+  for (const pending of input.pending) {
+    const session = sessions.get(pending.permit.sessionId);
+    const receipt = session?.dispatchInputReceipts?.[pending.permit.turnId];
+    const ack = receipt?.workerGeneration === pending.permit.workerGeneration
+      ? { sessionId: pending.permit.sessionId, turnId: pending.permit.turnId, workerGeneration: receipt.workerGeneration }
+      : undefined;
+    const sameGenerationAlive = session?.workerAlive === true
+      && session.workerGeneration === pending.permit.workerGeneration;
+    await input.reconcile(pending.permit, {
+      ...(ack ? { ack } : {}),
+      safeToRetry: !pending.retryUsed && !sameGenerationAlive,
+    });
+  }
+}
 
 export function classifyTurn(input: { origin: TurnOrigin }): TurnKind {
   if (input.origin === 'repo_show' || input.origin === 'repo_unbind_without_cli') return 'management';

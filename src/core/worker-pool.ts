@@ -199,8 +199,8 @@ import { beginFinalOutputDelivery, waitForTurnFinalOutputDeliveryDrain } from '.
 import { createTurnResultRuntime, setTurnResultRuntime } from './turn-result-runtime.js';
 import { TurnResultStore } from '../services/turn-result-store.js';
 import type { TurnResult, TurnDeliveryReceipt } from '../services/turn-result.js';
-import type { BlankBootstrapPermit, BusinessSubmitPermit } from './turn-admission.js';
-import type { TurnPermitStore } from '../services/turn-permit-store.js';
+import { reconcileTurnPermitDispatches as reconcilePersistedTurnPermitDispatches, type BlankBootstrapPermit, type BusinessSubmitPermit } from './turn-admission.js';
+import { TurnPermitStore } from '../services/turn-permit-store.js';
 import { turnResultEnabled, turnResultBinding, turnResultSessionEligible, observeTurnResultTerminal, observeTurnResultDelivery } from './turn-result-session.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
@@ -211,6 +211,10 @@ const restartCoordinator = new RestartCoordinator();
 const hostPressureWarningsLogged = new Set<string>();
 const lifecycleRetiringWorkers = new WeakMap<DaemonSession, Set<ChildProcess>>();
 const transferRetiringWorkers = new WeakSet<ChildProcess>();
+const productionTurnPermitStore = new TurnPermitStore(config.session.dataDir);
+const activeBusinessPermitStores = new Map<string, Pick<TurnPermitStore, 'acknowledgeBusinessDelivery'>>();
+const businessPermitAckKey = (sessionId: string, turnId: string, workerGeneration: number) =>
+  JSON.stringify([sessionId, turnId, workerGeneration]);
 
 type WorkerIpcBootstrapState = {
   ready: boolean;
@@ -1270,6 +1274,26 @@ const pendingRemoteWorkerCloses = new Map<string, {
 
 export function setActiveSessionsRegistry(m: Map<string, DaemonSession> | undefined): void {
   activeSessionsRegistry = m;
+  if (!m) return;
+  void reconcileTurnPermitDispatches([...m.values()]).catch(err => logger.error(
+    `[turn-admission] startup dispatch reconciliation failed: ${err instanceof Error ? err.message : String(err)}`,
+  ));
+}
+
+export async function reconcileTurnPermitDispatches(
+  sessions: Iterable<DaemonSession>,
+  store: Pick<TurnPermitStore, 'listDispatching' | 'reconcileBusinessDispatch'> = productionTurnPermitStore,
+): Promise<void> {
+  await reconcilePersistedTurnPermitDispatches({
+    pending: await store.listDispatching(),
+    sessions: [...sessions].map(ds => ({
+      sessionId: ds.session.sessionId,
+      workerGeneration: ds.session.workerGeneration,
+      workerAlive: !!ds.worker && !ds.worker.killed && ds.workerGeneration === ds.session.workerGeneration,
+      dispatchInputReceipts: ds.session.dispatchInputReceipts,
+    })),
+    reconcile: (permit, evidence) => store.reconcileBusinessDispatch(permit, evidence),
+  });
 }
 
 export function listActiveSessions(): DaemonSession[] {
@@ -15451,7 +15475,7 @@ export function forkWorker(
 export async function forkWorkerBlank(
   ds: DaemonSession,
   permit: BlankBootstrapPermit,
-  permitStore: Pick<TurnPermitStore, 'beginSpawn'>,
+  permitStore: Pick<TurnPermitStore, 'beginSpawn'> = productionTurnPermitStore,
 ): Promise<boolean> {
   if (permit.sessionId !== ds.session.sessionId) return false;
   const transition = await permitStore.beginSpawn(permit);
@@ -15465,14 +15489,18 @@ export async function submitBusinessInput(
   payload: string | CliTurnPayload,
   permit: BusinessSubmitPermit,
   payloadDigest: string,
-  permitStore: Pick<TurnPermitStore, 'consumeBusiness'>,
+  permitStore: Pick<TurnPermitStore, 'consumeBusiness' | 'acknowledgeBusinessDelivery'> = productionTurnPermitStore,
 ): Promise<boolean> {
   if (permit.sessionId !== ds.session.sessionId
     || permit.workerGeneration !== (ds.session.workerGeneration ?? 0)) return false;
   const dispatch = await permitStore.consumeBusiness(permit, payloadDigest);
   if (dispatch.status === 'duplicate') return true;
-  if (dispatch.status !== 'dispatching') return false;
-  return sendWorkerInput(ds, payload, permit.turnId);
+  if (dispatch.status !== 'acquired') return false;
+  const key = businessPermitAckKey(permit.sessionId, permit.turnId, permit.workerGeneration);
+  activeBusinessPermitStores.set(key, permitStore);
+  const accepted = sendWorkerInput(ds, payload, permit.turnId);
+  if (!accepted) activeBusinessPermitStores.delete(key);
+  return accepted;
 }
 
 export function clearStuckWarningAuthority(ds: DaemonSession): void {
@@ -16211,6 +16239,19 @@ function setupWorkerHandlers(
         // Compatibility/fallback: a commit also proves receipt if the earlier
         // receipt ACK was delayed or dropped on the reverse IPC channel.
         completeOrdinaryImDelivery(ds, msg.turnId, workerGeneration);
+        const permitAckKey = businessPermitAckKey(ds.session.sessionId, msg.turnId, workerGeneration);
+        const permitStore = activeBusinessPermitStores.get(permitAckKey);
+        if (permitStore) {
+          void permitStore.acknowledgeBusinessDelivery({
+            sessionId: ds.session.sessionId,
+            turnId: msg.turnId,
+            workerGeneration,
+          }).then(result => {
+            if (result.status === 'delivered') activeBusinessPermitStores.delete(permitAckKey);
+          }).catch(err => logger.warn(
+            `[${t}] durable business ACK failed: ${err instanceof Error ? err.message : String(err)}`,
+          ));
+        }
         // An input ACK proves acceptance, not a new execution. Codex can emit
         // it after transcript failure while awaiting submit confirmation. Keep
         // that HTTP terminal and its failed UI closed to late/repeated ACKs.
