@@ -4304,6 +4304,39 @@ export function createTurnFeedbackWorkerCallbacks(
   return { onTurnTerminal: withOwnedTurnFeedbackTerminal(next) };
 }
 
+/** First production terminal lifecycle step after feedback projection. Keeping
+ * this in an executable seam lets the daemon assembly and behavior tests share
+ * the exact deployment-continuation retirement logic. */
+export function handleProductionTurnTerminalLifecycle(
+  ds: DaemonSession,
+  terminal: Pick<Extract<WorkerToDaemon, { type: 'turn_terminal' }>, 'turnId'>,
+  context: { workerGeneration: number },
+): void {
+  if (ds.session.deploymentContinuation?.state === 'cancelled'
+    || ds.session.deploymentContinuation?.workerGeneration !== context.workerGeneration) return;
+  try {
+    cancelDeploymentContinuation(
+      ds.session,
+      previous => sessionStore.updateDeploymentContinuation(ds.session, previous),
+      terminal.turnId,
+    );
+  } catch (error) {
+    logger.error(
+      `[restart] Could not retire task checkpoint: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+/** Exact production callback factory used by startDaemon and behavior tests. */
+export function createProductionTurnFeedbackWorkerCallbacks(
+  next?: NonNullable<WorkerPoolCallbacks['onTurnTerminal']>,
+): Pick<WorkerPoolCallbacks, 'onTurnTerminal'> {
+  return createTurnFeedbackWorkerCallbacks(async (ds, terminal, context) => {
+    handleProductionTurnTerminalLifecycle(ds, terminal, context);
+    await next?.(ds, terminal, context);
+  });
+}
+
 const capacitySidebandRuntime = createCapacitySidebandRuntime(binding => {
   const ds = findActiveBySessionId(binding.sessionId);
   const persisted = ds?.session.turnFeedback?.[binding.turnId]?.capacityBinding;
@@ -32197,12 +32230,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       })) throw new Error('capacity_sideband_binding_conflict');
       consumerCapacitySidebandRetry?.();
     },
-    ...createTurnFeedbackWorkerCallbacks(async (ds, terminal, context) => {
-      if (ds.session.deploymentContinuation?.state !== 'cancelled'
-        && ds.session.deploymentContinuation?.workerGeneration === context.workerGeneration) {
-        try { cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous), terminal.turnId); }
-        catch (error) { logger.error(`[restart] Could not retire task checkpoint: ${error instanceof Error ? error.message : String(error)}`); }
-      }
+    ...createProductionTurnFeedbackWorkerCallbacks(async (ds, terminal, context) => {
       const originalFailedCaller = failedTurnCaller(ds, terminal.turnId);
       const originalFailedSilent = isSilentScheduledTurn(ds, terminal.turnId);
       // Queue ACKs do not prove consumption. Only a matching completed native

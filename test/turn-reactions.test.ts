@@ -73,12 +73,12 @@ import {
   noteTurnReceived,
   handleOwnedTurnFeedbackTerminal,
   createTurnFeedbackWorkerCallbacks,
+  createProductionTurnFeedbackWorkerCallbacks,
   __testOnly_applyLiveTurnFeedbackTerminal as applyLiveFeedbackTerminal,
   __testOnly_turnFeedbackReconciler as feedbackReconciler,
 } from '../src/daemon.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { beginReplyTargetTurn } from '../src/core/reply-target.js';
-import { cancelDeploymentContinuation } from '../src/services/deployment-continuation.js';
 import {
   initWorkerPool,
   __testOnly_setupWorkerHandlers,
@@ -333,18 +333,7 @@ describe('two-phase turn reactions', () => {
       workerGeneration: 3, consumedAt: Date.now(),
     };
     sessionStore.updateDeploymentContinuation(ds.session);
-    const productionNext = async (target: DaemonSession, terminal: { turnId: string }, context: { workerGeneration: number }) => {
-      if (target.session.deploymentContinuation?.state !== 'cancelled'
-        && target.session.deploymentContinuation?.workerGeneration === context.workerGeneration) {
-        cancelDeploymentContinuation(
-          target.session,
-          previous => sessionStore.updateDeploymentContinuation(target.session, previous),
-          terminal.turnId,
-        );
-      }
-    };
-
-    await createTurnFeedbackWorkerCallbacks(productionNext).onTurnTerminal!(ds, {
+    await createProductionTurnFeedbackWorkerCallbacks().onTurnTerminal!(ds, {
       turnId: terminalTurnId, status: 'completed', completedAtMs: Date.now(),
     }, { workerGeneration });
 
