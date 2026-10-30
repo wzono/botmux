@@ -44,7 +44,7 @@ function exactIdentity(path: string): WorkspaceIdentity | undefined {
   return { path: proof.normalizedPath, ...proof.identity };
 }
 
-function sessionWorkspace(ds: DaemonSession): { workspace: WorkspaceIdentity; groupRevision?: number } | undefined {
+export function frozenSessionWorkspace(ds: DaemonSession): { workspace: WorkspaceIdentity; groupRevision?: number } | undefined {
   const path = ds.session.workingDir ?? ds.workingDir;
   if (!path) return undefined;
   const actual = exactIdentity(path);
@@ -78,7 +78,7 @@ async function waitForExactReady(ds: DaemonSession, permit: BlankBootstrapPermit
     const generation = ds.workerGeneration ?? ds.session.workerGeneration;
     if (generation && generation > permit.reservedGeneration) return undefined;
     if (generation === permit.reservedGeneration && ds.workerReady === true && ds.cliReady === true) {
-      const frozen = sessionWorkspace(ds);
+      const frozen = frozenSessionWorkspace(ds);
       const backend = workerBackendIdentity(ds);
       if (!frozen || !backend) return undefined;
       return { actualGeneration: generation, cwd: frozen.workspace, backend };
@@ -98,7 +98,7 @@ export async function dispatchAdmittedBusinessTurn(input: {
   permitStore: Pick<TurnPermitStore, 'issueBlank' | 'proveReady' | 'issueBusiness'>;
   resource?: AdmittedBusinessResource;
 }): Promise<boolean> {
-  const frozen = sessionWorkspace(input.ds);
+  const frozen = frozenSessionWorkspace(input.ds);
   if (!frozen) return false;
   return dispatchWithPermit({
     sessionId: input.ds.session.sessionId,
@@ -111,7 +111,7 @@ export async function dispatchAdmittedBusinessTurn(input: {
       proveExistingWorkerReady: async generation =>
         generation === (input.ds.workerGeneration ?? input.ds.session.workerGeneration)
         && input.ds.workerReady === true && input.ds.cliReady === true
-        && !!sessionWorkspace(input.ds) && !!workerBackendIdentity(input.ds),
+        && !!frozenSessionWorkspace(input.ds) && !!workerBackendIdentity(input.ds),
       issueExistingBusiness: async request => input.permitStore.issueBusiness({
         ...request, expiresAt: Date.now() + PERMIT_TTL_MS,
       }),

@@ -246,7 +246,8 @@ import {
   validateCodexAppManagedSendOrigin,
 } from './utils/codex-app-dispatch-ledger.js';
 import { hasProtectedSessionMutationOwnership } from './core/session-mutation-guard.js';
-import { dispatchAdmittedBusinessTurn } from './core/admitted-turn-dispatch.js';
+import { dispatchAdmittedBusinessTurn, frozenSessionWorkspace } from './core/admitted-turn-dispatch.js';
+import { resumeAdmittedControlReply } from './core/turn-admission.js';
 import { TurnPermitStore } from './services/turn-permit-store.js';
 import { delay } from './utils/timing.js';
 import { BoundedMap } from './utils/bounded-map.js';
@@ -9675,7 +9676,8 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
         // Never send an old card's answer into a replacement runner, another
         // native thread or another principal's active session after this await.
         if (!isCurrent() || (asyncCaller && by !== asyncCaller)) return false;
-        const turnId = `codex-async-answer-${randomUUID()}`;
+        const turnId = asyncOriginTurn;
+        if (!turnId || !asyncGeneration) return false;
         const bot = getBot(askSession.larkAppId);
         askSession.session.quoteTargetId = asyncOriginMessageId;
         askSession.session.quoteTargetSenderOpenId = by;
@@ -9723,8 +9725,43 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
         });
         const steerable = steerTarget !== undefined && input.codexAppInput !== undefined;
         if (steerable) input.codexAppInput = { ...input.codexAppInput!, steerTargetTurnId: steerTarget };
-        if (!sendWorkerInput(askSession, input, turnId, { atMostOnce: true,
-          trustedCaller, ...(steerable ? { codexAppSteerable: true as const } : {}) })) return false;
+        const frozen = frozenSessionWorkspace(askSession);
+        if (!frozen) return false;
+        const replyDigest = createHash('sha256').update(text).digest('hex');
+        const resumed = await resumeAdmittedControlReply({
+          authorizeFresh: async () => evaluateAskAnswerTalk(
+            askSession.larkAppId, askSession.chatId, by, askSession.chatType, actor,
+          ),
+          issuePermit: () => centralTurnPermitStore.issueControlReply({
+            sessionId: askSession.session.sessionId,
+            originalTurnId: turnId,
+            wait: { kind: 'ask', askId: asyncInput.itemId },
+            expectedGeneration: asyncGeneration,
+            workspace: frozen.workspace,
+            ...(frozen.groupRevision === undefined ? {} : { groupRevision: frozen.groupRevision }),
+            expiresAt: Date.now() + 60_000,
+          }),
+          consume: async permit => {
+            const current = frozenSessionWorkspace(askSession);
+            const consumed = current && isCurrent()
+              ? await centralTurnPermitStore.consumeControlReply(permit, replyDigest, {
+                  sessionId: askSession.session.sessionId,
+                  originalTurnId: turnId,
+                  wait: { kind: 'ask', askId: asyncInput.itemId },
+                  workerGeneration: askSession.session.workerGeneration ?? 0,
+                  workspace: current.workspace,
+                  ...(current.groupRevision === undefined ? {} : { groupRevision: current.groupRevision }),
+                  originalState: 'needs_user',
+                  authorized: true,
+                })
+              : { status: 'rejected' as const };
+            return consumed.status === 'consumed' || consumed.status === 'duplicate'
+              ? consumed.status : 'rejected';
+          },
+          resume: async () => sendWorkerInput(askSession, input, turnId, { atMostOnce: true,
+            trustedCaller, ...(steerable ? { codexAppSteerable: true as const } : {}) }),
+        });
+        if (resumed !== true) return false;
         beginNewTurn(askSession, '异步提问答复', turnId);
         rememberLastCliInput(askSession, text, input);
         markSessionActivity(askSession);
@@ -22068,6 +22105,43 @@ async function driveNextXpiSharedCwdTurn(
 export const __testOnly_driveNextXpiSharedCwdTurn = driveNextXpiSharedCwdTurn;
 export const __testOnly_forkReservedInitialSession = forkReservedInitialSession;
 
+/** Ordinary cold/new-message adapter. The opening envelope is frozen before a
+ * zero-payload bootstrap, then submitted exactly once through the central
+ * business-permit boundary after real ready + prompt_ready + cwd/backend proof. */
+async function dispatchReservedInitialSession(
+  ds: DaemonSession,
+  availableBots: AvailableBot[],
+  trustedCaller: TrustedCaller | undefined,
+  options: import('./core/admitted-turn-dispatch.js').BusinessTurnSubmitOptions,
+): Promise<boolean> {
+  trustedCaller ??= ds.pendingTrustedCaller;
+  const turnId = ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId;
+  if (!turnId) return false;
+  const userPrompt = ds.pendingPrompt ?? '';
+  const input = buildReservedInitialInput(ds, availableBots);
+  if (trustedCaller) input.trustedCaller = trustedCaller;
+  const accepted = await dispatchAdmittedBusinessTurn({
+    ds,
+    turnId,
+    payload: input,
+    options: {
+      ...options,
+      resume: options.resume,
+      ...(trustedCaller ? { trustedCaller } : {}),
+    },
+    boundary: centralTurnWorkerBoundary,
+    permitStore: centralTurnPermitStore,
+  });
+  if (!accepted) return false;
+  rememberLastCliInput(ds, userPrompt, input);
+  if (trustedCaller) setActiveInteractiveTurn(ds, turnId, trustedCaller);
+  ds.pendingTurnId = undefined;
+  ds.initialStartPending = (ds.session.queuedActivationTail?.length ?? 0) > 0
+    || hasPendingSessionTurns(ds.session.sessionId);
+  clearInitialStartBuffers(ds);
+  return true;
+}
+
 /** Fork an ordinary opening turn and release its route reservation. There is
  * deliberately no await between the final buffered-input snapshot, fork, and
  * release: a later handler either buffers before this block or observes the
@@ -25922,11 +25996,13 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
     // (5th arg) is the reply anchor so provenance holds on session-group births.
     await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    const primaryAdmission = durablePrimaryWorkerAdmission(ctx, ds, replyAnchorId);
-    forkReservedInitialSession(ds, availableBots, trustedCaller, primaryAdmission?.options);
-    primaryAdmission?.markForkReturned();
-    await primaryAdmission?.waitIfMarginal();
-    // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
+    if (!await dispatchReservedInitialSession(ds, availableBots, trustedCaller, {
+      resume: false,
+      ...(ctx.durablePrimaryDispatch
+        ? { dispatchAttempt: ctx.durablePrimaryDispatch.attempt, durablePrimaryInbox: true as const }
+        : {}),
+    })) return;
+    // 中央适配器已在 real ready + prompt_ready 证明后恰好一次提交开场。
     markIngressAdmitted(ctx);
     const reason = oncallEntry
       ? `oncall-bound chat ${chatId}`
@@ -28802,11 +28878,13 @@ async function handleThreadReplyAdmitted(
       ensureSessionWhiteboard(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-      const primaryAdmission = durablePrimaryWorkerAdmission(ctx, newDs, parsed.messageId);
-      forkReservedInitialSession(newDs, availableBots, threadTrustedCaller, primaryAdmission?.options);
-      primaryAdmission?.markForkReturned();
-      await primaryAdmission?.waitIfMarginal();
-      // fork 成功即开场已交给 CLI；fork 抛错则开场只存在于内存，保持重发提示。
+      if (!await dispatchReservedInitialSession(newDs, availableBots, threadTrustedCaller, {
+        resume: false,
+        ...(ctx.durablePrimaryDispatch
+          ? { dispatchAttempt: ctx.durablePrimaryDispatch.attempt, durablePrimaryInbox: true as const }
+          : {}),
+      })) return;
+      // 中央适配器已在 real ready + prompt_ready 证明后恰好一次提交开场。
       markIngressAdmitted(ctx);
       const reason = oncallEntry
         ? `oncall-bound chat ${autoCreateChatId}`
@@ -28868,10 +28946,12 @@ async function handleThreadReplyAdmitted(
       ensureSessionWhiteboard(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
       await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-      const primaryAdmission = durablePrimaryWorkerAdmission(ctx, newDs, parsed.messageId);
-      forkReservedInitialSession(newDs, availableBots, threadTrustedCaller, primaryAdmission?.options);
-      primaryAdmission?.markForkReturned();
-      await primaryAdmission?.waitIfMarginal();
+      if (!await dispatchReservedInitialSession(newDs, availableBots, threadTrustedCaller, {
+        resume: false,
+        ...(ctx.durablePrimaryDispatch
+          ? { dispatchAttempt: ctx.durablePrimaryDispatch.attempt, durablePrimaryInbox: true as const }
+          : {}),
+      })) return;
     }
 
     return;

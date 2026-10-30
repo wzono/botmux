@@ -17,12 +17,24 @@ function functionBody(source: string, name: string): string {
 describe('central admitted business driver structure', () => {
   const daemon = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
   // 源码结构护栏(K3)：逐个 driver 必须只经 permit adapter，避免任一条生产路径旁路。
-  it.each(['submitQueuedMessage', 'driveNextPrincipalLaneTurn', 'driveNextXpiSharedCwdTurn'])
-  ('%s cannot bypass typed business permits', name => {
+  it.each([
+    'submitQueuedMessage',
+    'driveNextPrincipalLaneTurn',
+    'driveNextXpiSharedCwdTurn',
+    'dispatchReservedInitialSession',
+  ])('%s cannot bypass typed business permits', name => {
     const body = functionBody(daemon, name);
     expect(body).toContain('dispatchAdmittedBusinessTurn');
     expect(body).not.toMatch(/\bsendWorkerInput\s*\(/);
     expect(body).not.toMatch(/\bforkWorker\s*\(/);
     expect(body).not.toMatch(/\bforkAdoptWorker\s*\(/);
+  });
+
+  // 源码结构护栏(K3)：异步 Ask 生产回复只能恢复原 turn，不能重新派生业务 turn。
+  it('async Ask answer resumes the exact original turn through a control permit', () => {
+    expect(daemon).toContain('resumeAdmittedControlReply');
+    expect(daemon).toContain('issueControlReply');
+    expect(daemon).toContain('consumeControlReply');
+    expect(daemon).not.toContain('codex-async-answer-${randomUUID()}');
   });
 });
