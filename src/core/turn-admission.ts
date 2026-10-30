@@ -51,6 +51,7 @@ export type AdmittedBusinessTurnDependencies = {
   proveBlankReady(permit: BlankBootstrapPermit, proof: {
     actualGeneration: number; cwd: WorkspaceIdentity; backend: WorkspaceIdentity;
   }): Promise<BusinessSubmitPermit | undefined>;
+  abortBlank?(permit: BlankBootstrapPermit, phase: 'pre_fork' | 'forked_unproven'): Promise<void>;
   acquireResource?(permit: BusinessSubmitPermit): Promise<boolean>;
   markAttempting?(permit: BusinessSubmitPermit): Promise<boolean>;
   submit(permit: BusinessSubmitPermit): Promise<boolean>;
@@ -81,10 +82,17 @@ export async function dispatchAdmittedBusinessTurn(input: {
       ...(frozen.groupRevision === undefined ? {} : { groupRevision: frozen.groupRevision }),
       expiresAt: Date.now() + (input.permitTtlMs ?? 60_000),
     });
-    if (!await deps.forkBlank(blank)) return false;
+    if (!await deps.forkBlank(blank)) {
+      await deps.abortBlank?.(blank, 'pre_fork');
+      return false;
+    }
     const proof = await deps.awaitBlankReady(blank);
-    if (!proof) return false;
+    if (!proof) {
+      await deps.abortBlank?.(blank, 'forked_unproven');
+      return false;
+    }
     permit = await deps.proveBlankReady(blank, proof);
+    if (!permit) await deps.abortBlank?.(blank, 'forked_unproven');
   }
   if (!permit) return false;
   if (deps.acquireResource && !await deps.acquireResource(permit)) return false;

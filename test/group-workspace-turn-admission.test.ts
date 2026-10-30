@@ -94,6 +94,40 @@ describe('durable turn permits', () => {
     expect(await restarted.beginBusinessDispatch(business.permit, 'digest-a')).toMatchObject({ status: 'delivered', receipt: { payloadDigest: 'digest-a', downstreamReceiptId: 'turn:t1' } });
     expect((await restarted.beginBusinessDispatch(business.permit, 'digest-b')).status).toBe('rejected');
   });
+  it('reissues only after a CAS-bound pre-fork abort across restart', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'turn-permit-'));
+    const store = new TurnPermitStore(dataDir, { now: () => 100 });
+    const first = await store.issueBlank({ ...base, reservedGeneration: 4 });
+    expect((await store.beginSpawn(first)).status).toBe('acquired');
+    const restarted = new TurnPermitStore(dataDir, { now: () => 101 });
+    expect((await restarted.abortBootstrap(first, {
+      phase: 'pre_fork', observedGeneration: 3, orphanRetired: true,
+    })).status).toBe('aborted');
+    const second = await restarted.issueBlank({ ...base, reservedGeneration: 5 });
+    expect(second.permitId).not.toBe(first.permitId);
+    expect(second.reservedGeneration).toBe(5);
+    expect((await restarted.beginSpawn(second)).status).toBe('acquired');
+    expect((await restarted.abortBootstrap(first, {
+      phase: 'pre_fork', observedGeneration: 3, orphanRetired: true,
+    })).status).toBe('rejected');
+  });
+
+  it('requires orphan-generation retirement before reissuing a forked unproven bootstrap', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'turn-permit-'));
+    const store = new TurnPermitStore(dataDir, { now: () => 100 });
+    const first = await store.issueBlank({ ...base, reservedGeneration: 4 });
+    await store.beginSpawn(first);
+    expect((await store.abortBootstrap(first, {
+      phase: 'forked_unproven', observedGeneration: 4, orphanRetired: false,
+    })).status).toBe('orphan_unproven');
+    expect(await store.issueBlank({ ...base, reservedGeneration: 5 })).toEqual(first);
+    expect((await new TurnPermitStore(dataDir, { now: () => 101 }).abortBootstrap(first, {
+      phase: 'forked_unproven', observedGeneration: 4, orphanRetired: true,
+    })).status).toBe('aborted');
+    const second = await store.issueBlank({ ...base, reservedGeneration: 5 });
+    expect(second.permitId).not.toBe(first.permitId);
+  });
+
   it('fails closed on expiry, mismatched proof and terminal failure', async () => {
     let now = 100; const store = new TurnPermitStore(mkdtempSync(join(tmpdir(), 'turn-permit-')), { now: () => now });
     const blank = await store.issueBlank({ ...base, reservedGeneration: 4 });

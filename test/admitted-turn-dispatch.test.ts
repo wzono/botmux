@@ -45,6 +45,31 @@ describe('central admitted turn dispatch', () => {
     expect(trace).toEqual(['reserve', 'blank-permit', 'fork:t', 'ready+prompt_ready', 'business-permit', 'submit']);
   });
 
+  it.each([
+    ['fork rejection', 'pre_fork'],
+    ['readiness timeout', 'forked_unproven'],
+    ['proof rejection', 'forked_unproven'],
+  ] as const)('aborts a cold permit after %s with the exact lifecycle phase', async (kind, phase) => {
+    const abort = vi.fn(async () => {});
+    const accepted = await dispatchAdmittedBusinessTurn({ sessionId: 's', turnId: 't', dependencies: {
+      hasLiveWorker: () => false,
+      freezeWorkspace: async () => ({ workspace }),
+      currentWorkerGeneration: () => undefined,
+      proveExistingWorkerReady: async () => false,
+      issueExistingBusiness: async () => undefined,
+      reserveWorkerGeneration: () => 4,
+      issueBlank: async input => ({ ...input, permitId: 'blank' } as never),
+      forkBlank: async () => kind !== 'fork rejection',
+      awaitBlankReady: async () => kind === 'readiness timeout'
+        ? undefined : { actualGeneration: 4, cwd: workspace, backend: workspace },
+      proveBlankReady: async () => kind === 'proof rejection' ? undefined : business,
+      abortBlank: abort,
+      submit: async () => true,
+    } });
+    expect(accepted).toBe(false);
+    expect(abort).toHaveBeenCalledWith(expect.objectContaining({ permitId: 'blank' }), phase);
+  });
+
   it('authorizes control reply before consuming and resumes only the original turn', async () => {
     const trace: string[] = [];
     const result = await resumeAdmittedControlReply({

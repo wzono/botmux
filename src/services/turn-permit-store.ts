@@ -6,7 +6,7 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLock } from '../utils/file-lock.js';
 
 const FILE = 'turn-permits.json';
-type Failure = 'spawn_failed' | 'ready_timeout' | 'identity_mismatch' | 'backend_mismatch' | 'expired' | 'cancelled' | 'generation_mismatch' | 'ambiguous';
+type Failure = 'spawn_failed' | 'ready_timeout' | 'identity_mismatch' | 'backend_mismatch' | 'expired' | 'cancelled' | 'generation_mismatch' | 'ambiguous' | 'orphan_unproven';
 type DeliveryAck = { sessionId: string; turnId: string; workerGeneration: number };
 type DeliveryReceipt = { payloadDigest: string; dispatchingAt: number; deliveredAt: number; downstreamReceiptId: string };
 type Entry = { blank: BlankBootstrapPermit; state: 'issued' | 'spawning' | 'ready_proven' | 'dispatching' | 'delivered' | Failure; business?: BusinessSubmitPermit; dispatch?: { payloadDigest: string; dispatchingAt: number; retryUsed?: true }; receipt?: DeliveryReceipt };
@@ -27,7 +27,26 @@ export class TurnPermitStore {
   async issueBlank(input: BlankBootstrapPermitInput): Promise<BlankBootstrapPermit> { return this.locked(r => { const key = turnKey(input); const id = r.turns[key]; if (id) return structuredClone(r.entries[id].blank); const blank = { ...input, permitId: randomUUID() } as BlankBootstrapPermit; r.entries[blank.permitId] = { blank, state: 'issued' }; r.turns[key] = blank.permitId; return structuredClone(blank); }); }
   private matches(a: BlankBootstrapPermit, b: BlankBootstrapPermit) { return a.permitId === b.permitId && a.sessionId === b.sessionId && a.turnId === b.turnId && a.reservedGeneration === b.reservedGeneration && a.expiresAt === b.expiresAt && a.groupRevision === b.groupRevision && sameIdentity(a.target, b.target); }
   async beginSpawn(permit: BlankBootstrapPermit): Promise<{ status: 'acquired' | 'observing' | Failure | 'ready_proven' | 'dispatching' | 'delivered' | 'rejected' }> { return this.locked(r => { const e = r.entries[permit.permitId]; if (!e || !this.matches(e.blank, permit)) return { status: 'rejected' }; if (this.now() >= e.blank.expiresAt && (e.state === 'issued' || e.state === 'spawning')) { e.state = 'expired'; return { status: 'expired' }; } if (e.state === 'issued') { e.state = 'spawning'; return { status: 'acquired' }; } if (e.state === 'spawning') return { status: 'observing' }; return { status: e.state }; }); }
-  async failBootstrap(permit: BlankBootstrapPermit, failure: Exclude<Failure, 'identity_mismatch' | 'backend_mismatch' | 'generation_mismatch' | 'expired'>) { return this.locked(r => { const e = r.entries[permit.permitId]; if (!e || !this.matches(e.blank, permit)) return { status: 'rejected' as const }; if (e.state === 'issued' || e.state === 'spawning') e.state = failure; return { status: e.state }; }); }
+  async failBootstrap(permit: BlankBootstrapPermit, failure: Exclude<Failure, 'identity_mismatch' | 'backend_mismatch' | 'generation_mismatch' | 'expired' | 'orphan_unproven'>) { return this.locked(r => { const e = r.entries[permit.permitId]; if (!e || !this.matches(e.blank, permit)) return { status: 'rejected' as const }; if (e.state === 'issued' || e.state === 'spawning') e.state = failure; return { status: e.state }; }); }
+  async abortBootstrap(permit: BlankBootstrapPermit, proof: {
+    phase: 'pre_fork' | 'forked_unproven'; observedGeneration: number; orphanRetired: boolean;
+  }): Promise<{ status: 'aborted' | 'orphan_unproven' | 'rejected' }> {
+    return this.locked(r => {
+      const key = turnKey(permit);
+      const e = r.entries[permit.permitId];
+      if (!e || r.turns[key] !== permit.permitId || !this.matches(e.blank, permit)
+        || (e.state !== 'issued' && e.state !== 'spawning' && e.state !== 'orphan_unproven')
+        || proof.observedGeneration > permit.reservedGeneration) return { status: 'rejected' as const };
+      if (proof.phase === 'forked_unproven' && !proof.orphanRetired) {
+        e.state = 'orphan_unproven';
+        return { status: 'orphan_unproven' as const };
+      }
+      if (!proof.orphanRetired) return { status: 'rejected' as const };
+      e.state = 'cancelled';
+      delete r.turns[key];
+      return { status: 'aborted' as const };
+    });
+  }
   async issueBusiness(input: { sessionId: string; turnId: string; workerGeneration: number; workspace: WorkspaceIdentity; groupRevision?: number; expiresAt: number }): Promise<BusinessSubmitPermit | undefined> { return this.locked(r => { const key = turnKey(input); const existingId = r.turns[key]; if (existingId) { const existing = r.entries[existingId]?.business; return existing && existing.workerGeneration === input.workerGeneration && sameIdentity(existing.workspace, input.workspace) && existing.groupRevision === input.groupRevision ? structuredClone(existing) : undefined; } const blank = { permitId: randomUUID(), sessionId: input.sessionId, turnId: input.turnId, reservedGeneration: input.workerGeneration, target: input.workspace, ...(input.groupRevision === undefined ? {} : { groupRevision: input.groupRevision }), expiresAt: input.expiresAt } as BlankBootstrapPermit; const business = { permitId: randomUUID(), bootstrapPermitId: blank.permitId, sessionId: input.sessionId, turnId: input.turnId, workerGeneration: input.workerGeneration, workspace: input.workspace, ...(input.groupRevision === undefined ? {} : { groupRevision: input.groupRevision }), expiresAt: input.expiresAt } as BusinessSubmitPermit; r.entries[blank.permitId] = { blank, state: 'ready_proven', business }; r.turns[key] = blank.permitId; return structuredClone(business); }); }
   async proveReady(permit: BlankBootstrapPermit, proof: { actualGeneration: number; cwd: WorkspaceIdentity; backend: WorkspaceIdentity }): Promise<{ status: 'issued'; permit: BusinessSubmitPermit } | { status: Failure | 'rejected' }> { return this.locked(r => { const e = r.entries[permit.permitId]; if (!e || !this.matches(e.blank, permit)) return { status: 'rejected' }; if (e.business) return { status: 'issued', permit: structuredClone(e.business) }; if (this.now() >= e.blank.expiresAt) { e.state = 'expired'; return { status: 'expired' }; } if (proof.actualGeneration !== e.blank.reservedGeneration) { e.state = 'generation_mismatch'; return { status: e.state }; } if (!sameIdentity(proof.cwd, e.blank.target)) { e.state = 'identity_mismatch'; return { status: e.state }; } if (!sameIdentity(proof.backend, e.blank.target)) { e.state = 'backend_mismatch'; return { status: e.state }; } e.state = 'ready_proven'; e.business = { permitId: randomUUID(), bootstrapPermitId: e.blank.permitId, sessionId: e.blank.sessionId, turnId: e.blank.turnId, workerGeneration: proof.actualGeneration, workspace: e.blank.target, ...(e.blank.groupRevision === undefined ? {} : { groupRevision: e.blank.groupRevision }), expiresAt: e.blank.expiresAt } as BusinessSubmitPermit; return { status: 'issued', permit: structuredClone(e.business) }; }); }
   private matchesBusiness(entry: Entry | undefined, permit: BusinessSubmitPermit): entry is Entry & { business: BusinessSubmitPermit } { return !!entry?.business && JSON.stringify(entry.business) === JSON.stringify(permit); }

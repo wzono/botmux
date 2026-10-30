@@ -95,7 +95,8 @@ export async function dispatchAdmittedBusinessTurn(input: {
   payload: string | CliTurnPayload;
   options: BusinessTurnSubmitOptions;
   boundary: AdmittedTurnWorkerBoundary;
-  permitStore: Pick<TurnPermitStore, 'issueBlank' | 'proveReady' | 'issueBusiness'>;
+  permitStore: Pick<TurnPermitStore, 'issueBlank' | 'proveReady' | 'issueBusiness' | 'abortBootstrap'>;
+  retireUnproven?(ds: DaemonSession, reservedGeneration: number): Promise<boolean>;
   resource?: AdmittedBusinessResource;
 }): Promise<boolean> {
   const frozen = frozenSessionWorkspace(input.ds);
@@ -122,6 +123,17 @@ export async function dispatchAdmittedBusinessTurn(input: {
       proveBlankReady: async (permit, proof) => {
         const result = await input.permitStore.proveReady(permit, proof);
         return result.status === 'issued' ? result.permit : undefined;
+      },
+      abortBlank: async (permit, phase) => {
+        const currentGeneration = input.ds.workerGeneration ?? input.ds.session.workerGeneration ?? 0;
+        const retired = phase === 'pre_fork'
+          ? currentGeneration < permit.reservedGeneration
+          : await input.retireUnproven?.(input.ds, permit.reservedGeneration) === true;
+        await input.permitStore.abortBootstrap(permit, {
+          phase,
+          observedGeneration: currentGeneration,
+          orphanRetired: retired,
+        });
       },
       ...(input.resource?.acquire ? { acquireResource: input.resource.acquire } : {}),
       ...(input.resource?.markAttempting ? { markAttempting: input.resource.markAttempting } : {}),

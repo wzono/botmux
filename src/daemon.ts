@@ -6355,6 +6355,7 @@ async function submitQueuedMessage(
     ds, turnId: message.messageId, payload: input,
     options: { resume: ds.hasHistory, notifyRejection: false, trustedCaller },
     boundary: centralTurnWorkerBoundary, permitStore: centralTurnPermitStore,
+    retireUnproven: current => retireWorkerForReplacement(current),
   })) { rollbackReplyContext(); return false; }
   ds.session.lastCallerOpenId = message.senderId;
   beginNewTurn(ds, text, message.messageId);
@@ -21260,6 +21261,7 @@ async function driveNextPrincipalLaneTurn(ds: DaemonSession): Promise<boolean> {
       },
       boundary: centralTurnWorkerBoundary,
       permitStore: centralTurnPermitStore,
+      retireUnproven: current => retireWorkerForReplacement(current),
       resource: {
         markAttempting: async permit => {
           ensurePrincipalLaneInboundTurnBinding(ds, head.turnId, permit.workerGeneration);
@@ -22051,6 +22053,7 @@ async function driveNextXpiSharedCwdTurn(
       },
       boundary: centralTurnWorkerBoundary,
       permitStore: centralTurnPermitStore,
+      retireUnproven: current => retireWorkerForReplacement(current),
       resource: {
         acquire: async permit => {
           admission = claimExactXpiSharedCwdAdmission({
@@ -22131,6 +22134,7 @@ async function dispatchReservedInitialSession(
     },
     boundary: centralTurnWorkerBoundary,
     permitStore: centralTurnPermitStore,
+    retireUnproven: current => retireWorkerForReplacement(current),
   });
   if (!accepted) return false;
   rememberLastCliInput(ds, userPrompt, input);
@@ -26084,10 +26088,12 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
     // (5th arg) is the reply anchor so provenance holds on session-group births.
     await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    const primaryAdmission = durablePrimaryWorkerAdmission(ctx, ds, replyAnchorId);
-    forkReservedInitialSession(ds, availableBots, trustedCaller, primaryAdmission?.options);
-    primaryAdmission?.markForkReturned();
-    await primaryAdmission?.waitIfMarginal();
+    if (!await dispatchReservedInitialSession(ds, availableBots, trustedCaller, {
+      resume: false,
+      ...(ctx.durablePrimaryDispatch
+        ? { dispatchAttempt: ctx.durablePrimaryDispatch.attempt, durablePrimaryInbox: true as const }
+        : {}),
+    })) return;
     logger.info(`Session ${session.sessionId} ready (no projects to select), total active: ${getActiveCount()}`);
   }
 }

@@ -267,6 +267,11 @@ function seedThreadSession(anchor: string, title: string): DaemonSession {
     lastMessageAt: Date.now(),
     hasHistory: false,
     ownerOpenId: OWNER,
+    workingDir: mocks.dataDir,
+    workerGeneration: 1,
+    workerReady: true,
+    cliReady: true,
+    lastWorkerReadyCwd: mocks.dataDir,
     session: {
       sessionId: 'sess-seeded-' + Math.random().toString(36).slice(2),
       chatId: CHAT,
@@ -275,6 +280,8 @@ function seedThreadSession(anchor: string, title: string): DaemonSession {
       status: 'active',
       createdAt: NOW,
       larkAppId: APP,
+      workingDir: mocks.dataDir,
+      workerGeneration: 1,
     },
   } as unknown as DaemonSession;
   activeSessions.set(sessionKey(anchor, APP), ds);
