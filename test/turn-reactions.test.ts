@@ -73,7 +73,7 @@ import { getBot, registerBot } from '../src/bot-registry.js';
 import {
   noteTurnReceived,
   handleOwnedTurnFeedbackTerminal,
-  withOwnedTurnFeedbackTerminal,
+  createTurnFeedbackWorkerCallbacks,
   __testOnly_applyLiveTurnFeedbackTerminal as applyLiveFeedbackTerminal,
   __testOnly_turnFeedbackReconciler as feedbackReconciler,
 } from '../src/daemon.js';
@@ -205,7 +205,7 @@ describe('two-phase turn reactions', () => {
       session: structuredClone(durableOwner.session),
     } as DaemonSession;
 
-    await withOwnedTurnFeedbackTerminal()(detached, {
+    await createTurnFeedbackWorkerCallbacks().onTurnTerminal!(detached, {
       turnId: 'om_detached_terminal', status: 'completed', completedAtMs: Date.now(),
     }, { workerGeneration: detached.workerGeneration ?? 1 });
     await new Promise(resolve => setTimeout(resolve, 0));
@@ -230,7 +230,7 @@ describe('two-phase turn reactions', () => {
     mocks.addReaction.mockClear();
     mocks.removeReaction.mockClear();
 
-    await withOwnedTurnFeedbackTerminal()(restored, {
+    await createTurnFeedbackWorkerCallbacks().onTurnTerminal!(restored, {
       turnId: 'om_restored_terminal', status: 'completed', completedAtMs: Date.now(),
     }, { workerGeneration: restored.workerGeneration ?? 1 });
     await feedbackReconciler.reconcile(restored, 'om_restored_terminal');
@@ -1233,7 +1233,7 @@ describe('turn reaction screen_update behavioral gate', () => {
       getSessionWorkingDir: () => '/repo',
       getActiveCount: () => 1,
       closeSession: vi.fn(),
-      onTurnTerminal: withOwnedTurnFeedbackTerminal(),
+      ...createTurnFeedbackWorkerCallbacks(),
     });
   });
 

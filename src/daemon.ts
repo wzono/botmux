@@ -4270,6 +4270,15 @@ export function withOwnedTurnFeedbackTerminal(
   };
 }
 
+/** Production assembly factory for the worker-pool feedback callback. Keep the
+ * wrapper selection here—not at individual tests/callers—so a daemon wiring
+ * regression is observable by driving the returned callback. */
+export function createTurnFeedbackWorkerCallbacks(
+  next?: NonNullable<WorkerPoolCallbacks['onTurnTerminal']>,
+): Pick<WorkerPoolCallbacks, 'onTurnTerminal'> {
+  return { onTurnTerminal: withOwnedTurnFeedbackTerminal(next) };
+}
+
 const capacitySidebandRuntime = createCapacitySidebandRuntime(binding => {
   const ds = findActiveBySessionId(binding.sessionId);
   const persisted = ds?.session.turnFeedback?.[binding.turnId]?.capacityBinding;
@@ -31529,7 +31538,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       })) throw new Error('capacity_sideband_binding_conflict');
       consumerCapacitySidebandRetry?.();
     },
-    onTurnTerminal: withOwnedTurnFeedbackTerminal(async (ds, terminal, context) => {
+    ...createTurnFeedbackWorkerCallbacks(async (ds, terminal, context) => {
       const originalFailedCaller = failedTurnCaller(ds, terminal.turnId);
       const originalFailedSilent = isSilentScheduledTurn(ds, terminal.turnId);
       // Queue ACKs do not prove consumption. Only a matching completed native
