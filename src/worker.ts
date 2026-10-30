@@ -4467,6 +4467,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
                 undefined,
                 undefined,
                 undefined,
+                undefined,
                 fence,
               );
               if (result === 'stale-before-write') {
@@ -13183,6 +13184,7 @@ async function writeAdoptMessage(
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin,
   trustedCaller?: TrustedCaller,
   trustedController?: TrustedCaller,
+  control?: { controlDispatchId?: string; controlReplyDigest?: string },
   fence?: AdoptWriteFence,
 ): Promise<AdoptWriteResult> {
   rememberTurnLinkRefMode(turnId, dispatchAttempt, linkRefMode);
@@ -13326,8 +13328,11 @@ async function writeAdoptMessage(
         persistCliSessionId(result.cliSessionId);
         codexBridgeNotifyCliSessionId(result.cliSessionId);
       }
-      if (result?.submitted === true && adoptStructuredBridgeTurnId) {
-        codexBridgeQueue.confirmPendingTurn(adoptStructuredBridgeTurnId, undefined, dispatchAttempt);
+      if (result?.submitted === true) {
+        if (adoptStructuredBridgeTurnId) {
+          codexBridgeQueue.confirmPendingTurn(adoptStructuredBridgeTurnId, undefined, dispatchAttempt);
+        }
+        acknowledgeTurnInputCommitted(turnId, dispatchAttempt, undefined, control);
       } else if (adoptStructuredBridgeTurnId && !(result?.submitted === false && result.recheck && !result.failureReason)) {
         codexBridgeQueue.finishSubmitVerification(adoptStructuredBridgeTurnId, undefined, dispatchAttempt);
       }
@@ -13473,6 +13478,7 @@ async function runAdoptMessageForCapturedGeneration(
       item.vcMeetingImTurnOrigin,
       item.trustedCaller,
       item.trustedController,
+      { controlDispatchId: item.controlDispatchId, controlReplyDigest: item.controlReplyDigest },
       fence,
     ),
   });
