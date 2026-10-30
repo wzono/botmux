@@ -5,13 +5,17 @@ import {
 } from 'node:child_process';
 import { statSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { basename, dirname, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveEntrySpawn } from './self-spawn.js';
 
 export interface PathIdentity {
   dev: string;
   ino: string;
+}
+
+export interface WorkspaceIdentity extends PathIdentity {
+  path: string;
 }
 
 export type PathUsabilityFailureReason =
@@ -124,6 +128,9 @@ export function probePathUsability(
   path: string,
   options: PathUsabilityProbeOptions = {},
 ): PathUsabilityResult {
+  if (!isAbsolute(path)) {
+    return { ok: false, normalizedPath: path, reason: 'io_error', code: 'EINVAL' };
+  }
   const normalizedPath = resolve(path);
   let before: ReturnType<typeof identityOf>;
   try {
