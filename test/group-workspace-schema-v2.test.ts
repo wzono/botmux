@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { GroupWorkspaceStore, canonicalTextSourceEventId } from '../src/services/group-workspace-store.js';
+import { GroupWorkspaceStore, canonicalGroupOperationPayloadDigest, canonicalTextSourceEventId } from '../src/services/group-workspace-store.js';
 import { GroupWorkspaceOperationStore } from '../src/services/group-workspace-operation-store.js';
 import { groupWorkspaceOperationKey } from '../src/services/group-workspace-store.js';
 import { WORKSPACE_SCHEMA_VERSION, workspaceIdentityEqual } from '../src/types.js';
@@ -14,6 +14,31 @@ const identity = { path: '/repo/x', dev: '9007199254740993', ino: '9007199254740
 const dir = () => mkdtempSync(join(tmpdir(), 'schema-v2-'));
 
 describe('workspace schema v2', () => {
+  it('durably upgrades a real v1 binding under the store lock before reads', async () => {
+    const dataDir = dir(); const path = join(dataDir, 'group-workspaces.json');
+    const legacySource = canonicalTextSourceEventId({ tenantKey: actor.tenantKey, chatId: 'chat', messageId: 'legacy' });
+    if (!legacySource.ok) throw new Error('source');
+    const operationKey = groupWorkspaceOperationKey(legacySource.sourceEventId, 'set');
+    writeFileSync(path, JSON.stringify({ schemaVersion: 1, records: { chat: {
+      chatId: 'chat', revision: 1, directory: { kind: 'bound', workingDir: '/repo' },
+      directoryIdentity: { dev: '7', ino: '9' }, updatedAt: 1, updatedBy: actor,
+    } }, receipts: { [operationKey]: {
+      operationKey, sourceEventId: legacySource.sourceEventId, kind: 'set',
+      payloadDigest: canonicalGroupOperationPayloadDigest({ kind: 'set', chatId: 'chat', sourceEventId: legacySource.sourceEventId,
+        requestedWorkingDir: '/repo', expectedRevision: 0, expectedSessionGeneration: 1, actor,
+        authorized: true, directoryValid: true, now: 1 }),
+      chatId: 'chat', outcome: 'committed', resultingRevision: 1,
+      resultingDirectory: { kind: 'bound', workingDir: '/repo' }, actor, completedAt: 1,
+      expectedRevision: 0, expectedSessionGeneration: 1, canonicalTargetWorkingDir: '/repo',
+    } } }));
+    const store = new GroupWorkspaceStore(dataDir, { pathProbe: () => ({
+      ok: true, normalizedPath: '/repo', identity: { dev: '7', ino: '9' },
+    }) });
+    await expect(store.read('chat')).resolves.toMatchObject({ status: 'available', record: {
+      workspaceIdentity: { path: '/repo', dev: '7', ino: '9' },
+    } });
+    expect(JSON.parse(readFileSync(path, 'utf8')).schemaVersion).toBe(2);
+  });
   it('writes bound record and committed receipt identities as strings', async () => {
     const dataDir = dir(); const store = new GroupWorkspaceStore(dataDir, { pathProbe: () => ({ ok: true, normalizedPath: identity.path, identity }) });
     await store.mutate({ kind: 'set', chatId: 'chat', sourceEventId: source.sourceEventId, requestedWorkingDir: identity.path,
@@ -43,7 +68,8 @@ describe('workspace schema v2', () => {
     expect((result as any).journal).toMatchObject({ target: { kind: 'absent' } });
     expect((result as any).journal).not.toHaveProperty('targetWorkingDir');
   });
-  it.each([1, 99])('loads schema %s only as unavailable migration input without rewriting', async schemaVersion => {
+  it('rejects a future schema without rewriting', async () => {
+    const schemaVersion = 99;
     const dataDir = dir(); const path = join(dataDir, 'group-workspaces.json');
     writeFileSync(path, JSON.stringify({ schemaVersion, records: {}, receipts: {} })); const before = readFileSync(path, 'utf8');
     expect((await new GroupWorkspaceStore(dataDir).read('chat')).status).toBe('store_unavailable'); expect(readFileSync(path, 'utf8')).toBe(before);

@@ -347,7 +347,7 @@ function validateReceipt(value: unknown, key: string): asserts value is GroupOpe
   }
 }
 
-function parseRegistry(path: string): GroupWorkspaceRegistry {
+function parseRegistry(path: string, migrateV1?: (legacy: Record<string, unknown>) => GroupWorkspaceRegistry): GroupWorkspaceRegistry {
   let raw: string;
   try {
     raw = readFileSync(path, 'utf8');
@@ -356,6 +356,7 @@ function parseRegistry(path: string): GroupWorkspaceRegistry {
     throw error;
   }
   const parsed: unknown = JSON.parse(raw);
+  if (isObject(parsed) && parsed.schemaVersion === 1 && migrateV1) return migrateV1(parsed);
   if (!isObject(parsed)
     || parsed.schemaVersion !== SCHEMA_VERSION
     || !isObject(parsed.records)
@@ -492,6 +493,36 @@ export class GroupWorkspaceStore {
     this.pathProbe = options.pathProbe ?? probePathUsability;
   }
 
+  private readRegistryWithMigration(): GroupWorkspaceRegistry {
+    const registry = parseRegistry(this.path, legacy => {
+      if (!isObject(legacy.records) || !isObject(legacy.receipts)) throw new Error('invalid legacy group workspace store schema');
+      const records = toNullMap(legacy.records as Record<string, GroupWorkspaceRecord>);
+      const receipts = toNullMap(legacy.receipts as Record<string, GroupOperationReceipt>);
+      for (const record of Object.values(records)) {
+        if (record.directory.kind !== 'bound') continue;
+        const proof = this.pathProbe(record.directory.workingDir, record.directoryIdentity
+          ? { expectedIdentity: record.directoryIdentity } : undefined);
+        if (!proof.ok || proof.normalizedPath !== record.directory.workingDir) throw new Error('legacy workspace identity unavailable');
+        record.workspaceIdentity = { path: record.directory.workingDir, ...proof.identity };
+      }
+      for (const receipt of Object.values(receipts)) {
+        if (receipt.kind === 'set' && receipt.outcome === 'committed') {
+          const identity = records[receipt.chatId]?.workspaceIdentity;
+          if (!identity) throw new Error('legacy receipt identity unavailable');
+          receipt.workspaceIdentity = structuredClone(identity);
+        }
+      }
+      const migrated = { schemaVersion: SCHEMA_VERSION, records, receipts } as GroupWorkspaceRegistry;
+      for (const [key, value] of Object.entries(records)) validateRecord(value, key);
+      for (const [key, value] of Object.entries(receipts)) validateReceipt(value, key);
+      validateRegistryHistory(migrated);
+      this.writer(this.path, `${JSON.stringify(migrated, null, 2)}\n`, { mode: 0o600, durable: true, followTargetSymlink: false });
+      return migrated;
+    });
+    validateRegistryHistory(registry);
+    return registry;
+  }
+
   async readReceipt(operationKey: string): Promise<
     | { status: 'found'; receipt: GroupOperationReceipt }
     | { status: 'missing' }
@@ -500,7 +531,7 @@ export class GroupWorkspaceStore {
     try {
       mkdirSync(resolve(this.path, '..'), { recursive: true });
       return await withFileLock(this.path, async () => {
-        const receipt = own(readRegistry(this.path).receipts, operationKey);
+        const receipt = own(this.readRegistryWithMigration().receipts, operationKey);
         return receipt
           ? { status: 'found' as const, receipt: structuredClone(receipt) }
           : { status: 'missing' as const };
@@ -514,7 +545,7 @@ export class GroupWorkspaceStore {
     try {
       mkdirSync(resolve(this.path, '..'), { recursive: true });
       return await withFileLock(this.path, async () => {
-        const registry = readRegistry(this.path);
+        const registry = this.readRegistryWithMigration();
         return { status: 'available' as const, record: cloneRecord(own(registry.records, chatId)) };
       }, { maxWaitMs: this.lockTimeoutMs });
     } catch {

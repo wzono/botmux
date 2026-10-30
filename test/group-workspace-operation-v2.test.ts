@@ -33,6 +33,26 @@ describe('same-source winner and executor lease', () => {
     });
   });
 
+  it.each(['prepared', 'session_committed', 'unknown', 'group_committed'] as const)(
+    'lists unbind %s journals for startup recovery without session semantics', async phase => {
+      const store = new GroupWorkspaceOperationStore(dir());
+      const unbind = { ...journal, operationKey: groupWorkspaceOperationKey(sourceEventId, 'unbind'), kind: 'unbind',
+        target: { kind: 'absent' }, targetWorkingDir: undefined, targetWorkspaceIdentity: undefined,
+        sessionId: 'group-workspace-unbind', expectedSessionGeneration: 0, phase: 'prepared' as const };
+      await store.prepare(unbind);
+      if (phase !== 'prepared') await store.transition(unbind.operationKey, 'session_committed', {
+        sessionGenerationAfter: 0, updatedAt: 2,
+      });
+      if (phase === 'unknown') await store.transition(unbind.operationKey, 'unknown', { updatedAt: 3 });
+      if (phase === 'group_committed') await store.transition(unbind.operationKey, 'group_committed', {
+        groupRevisionAfter: 2, updatedAt: 3,
+      });
+      await expect(store.listRecoverable()).resolves.toMatchObject({
+        status: 'available', journals: [{ kind: 'unbind', phase }],
+      });
+    },
+  );
+
   it('rejects changed semantic intent or frozen authority identity', async () => {
     const store = new GroupWorkspaceOperationStore(dir());
     await store.prepareOrAdopt({ ...journal, authorityFingerprint: 'fingerprint-a' });

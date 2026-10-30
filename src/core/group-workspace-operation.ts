@@ -101,6 +101,7 @@ export interface GroupWorkspaceOperationDependencies {
     expectedGeneration: number;
     source: 'explicit' | 'group';
     groupRevision?: number;
+    workspaceIdentity?: WorkspaceIdentity;
   }): Promise<void>;
   fencingToken?(): number | undefined;
   afterBoundary?(boundary:
@@ -443,7 +444,11 @@ export class GroupWorkspaceOperationCoordinator {
       if (readback.status === 'store_unavailable') return { status: 'store_unavailable', journal };
       return this.convergeReceipt(journal, readback.receipt);
     }
-    if (journal.phase === 'group_committed') return { status: 'unknown', journal };
+    if (journal.phase === 'group_committed') {
+      const readback = await this.dependencies.reconcileUnknownGroupReceipt(journal);
+      if (readback.status === 'found') return this.convergeReceipt(journal, readback.receipt);
+      return { status: readback.status === 'store_unavailable' ? 'store_unavailable' : 'unknown', journal };
+    }
     if (journal.phase === 'conflict') return { status: 'conflict', journal };
     if (journal.phase === 'store_unavailable') return { status: 'store_unavailable', journal };
 
@@ -523,6 +528,7 @@ export class GroupWorkspaceOperationCoordinator {
         expectedGeneration: completed.sessionGenerationAfter!,
         source: 'group',
         groupRevision: groupResult.resultingRevision,
+        workspaceIdentity: completed.targetWorkspaceIdentity,
       });
       await this.dependencies.afterBoundary?.('receipt_before_response');
       return { status: 'group_committed', journal: completed, groupRevision: groupResult.resultingRevision };
@@ -570,6 +576,7 @@ export class GroupWorkspaceOperationCoordinator {
         expectedGeneration: completed.sessionGenerationAfter ?? completed.expectedSessionGeneration + 1,
         source: 'group',
         groupRevision: receipt.resultingRevision,
+        workspaceIdentity: completed.targetWorkspaceIdentity,
       });
       return { status: 'group_committed', journal: completed, groupRevision: receipt.resultingRevision };
     }

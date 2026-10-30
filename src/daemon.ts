@@ -33152,7 +33152,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         }
         applySessionWorkingDir(current, input.source === 'group'
           ? { workingDir: getSessionWorkingDir(current), source: 'group', groupWorkspaceRevision: input.groupRevision!,
-              groupWorkspaceIdentity: frozen.targetWorkspaceIdentity! }
+              groupWorkspaceIdentity: input.workspaceIdentity! }
           : { workingDir: getSessionWorkingDir(current), source: 'explicit' });
       },
     });
@@ -33276,7 +33276,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                 }
                 applySessionWorkingDir(current, input.source === 'group'
                   ? { workingDir: getSessionWorkingDir(current), source: 'group', groupWorkspaceRevision: input.groupRevision!,
-                      groupWorkspaceIdentity: current.session.groupWorkspaceIdentity! }
+                      groupWorkspaceIdentity: input.workspaceIdentity! }
                   : { workingDir: getSessionWorkingDir(current), source: 'explicit' });
               },
             });
