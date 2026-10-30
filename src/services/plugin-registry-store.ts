@@ -65,7 +65,7 @@ function assertPublicPluginRegistry(registry: PluginRegistryFile): void {
   }
 }
 
-function writePluginRegistryUnlocked(registry: PluginRegistryFile): void {
+export function writePluginRegistryUnlocked(registry: PluginRegistryFile): void {
   assertPublicPluginRegistry(registry);
   mkdirSync(dirname(pluginRegistryPath()), { recursive: true });
   atomicWriteFileSync(pluginRegistryPath(), JSON.stringify(registry, null, 2) + '\n', { mode: 0o600 });
@@ -193,6 +193,10 @@ function isUnwritableMigrationError(error: unknown): boolean {
   return code === 'EBUSY' || code === 'EPERM' || code === 'EACCES' || code === 'EROFS';
 }
 
+export function readPluginRegistryWithoutMigration(): PluginRegistryFile {
+  return readPluginRegistryReadOnly();
+}
+
 export function readPluginRegistry(): PluginRegistryFile {
   try {
     return withFileLockSync(registryLockTarget(), () => readPluginRegistryUnlocked(), { maxWaitMs: 30_000 });
@@ -218,6 +222,37 @@ export function listInstalledPlugins(): InstalledPluginRecord[] {
 
 export function getInstalledPlugin(id: string): InstalledPluginRecord | undefined {
   return readPluginRegistry().plugins[assertValidPluginId(id)];
+}
+
+export function compareAndSwapInstalledPlugin(
+  id: string,
+  expected: InstalledPluginRecord,
+  next: InstalledPluginRecord,
+): PluginRegistryFile {
+  return withFileLockSync(registryLockTarget(), () => {
+    const registry = readPluginRegistryUnlocked();
+    if (JSON.stringify(registry.plugins[id]) !== JSON.stringify(expected)) {
+      throw new Error(`plugin_repair_registry_changed:${id}`);
+    }
+    registry.plugins[id] = next;
+    writePluginRegistryUnlocked(registry);
+    return registry;
+  }, { maxWaitMs: 30_000 });
+}
+
+export function restoreInstalledPluginAfterFailedRepair(
+  id: string,
+  written: InstalledPluginRecord,
+  previous: InstalledPluginRecord,
+): void {
+  withFileLockSync(registryLockTarget(), () => {
+    const registry = readPluginRegistryUnlocked();
+    if (JSON.stringify(registry.plugins[id]) !== JSON.stringify(written)) {
+      throw new Error(`plugin_repair_registry_changed:${id}`);
+    }
+    registry.plugins[id] = previous;
+    writePluginRegistryUnlocked(registry);
+  }, { maxWaitMs: 30_000 });
 }
 
 export function upsertInstalledPlugin(record: InstalledPluginRecord): InstalledPluginRecord {
