@@ -1274,19 +1274,16 @@ const pendingRemoteWorkerCloses = new Map<string, {
 
 export function setActiveSessionsRegistry(m: Map<string, DaemonSession> | undefined): void {
   activeSessionsRegistry = m;
-  if (!m) return;
-  void reconcileTurnPermitDispatches([...m.values()]).catch(err => logger.error(
-    `[turn-admission] startup dispatch reconciliation failed: ${err instanceof Error ? err.message : String(err)}`,
-  ));
 }
 
 export async function reconcileTurnPermitDispatches(
   sessions: Iterable<DaemonSession>,
-  store: Pick<TurnPermitStore, 'listDispatching' | 'reconcileBusinessDispatch'> = productionTurnPermitStore,
+  store: Pick<TurnPermitStore, 'listDispatching' | 'reconcileBusinessDispatch' | 'listDispatchingControls' | 'reconcileControlReplyDispatch'> = productionTurnPermitStore,
 ): Promise<void> {
+  const restored = [...sessions];
   await reconcilePersistedTurnPermitDispatches({
     pending: await store.listDispatching(),
-    sessions: [...sessions].map(ds => ({
+    sessions: restored.map(ds => ({
       sessionId: ds.session.sessionId,
       workerGeneration: ds.session.workerGeneration,
       workerAlive: !!ds.worker && !ds.worker.killed && ds.workerGeneration === ds.session.workerGeneration,
@@ -1294,6 +1291,21 @@ export async function reconcileTurnPermitDispatches(
     })),
     reconcile: (permit, evidence) => store.reconcileBusinessDispatch(permit, evidence),
   });
+  const sessionsById = new Map(restored.map(ds => [ds.session.sessionId, ds]));
+  for (const pending of await store.listDispatchingControls()) {
+    const ds = sessionsById.get(pending.permit.sessionId);
+    if (!ds) continue;
+    const receipt = ds.session.dispatchInputReceipts?.[pending.permit.originalTurnId];
+    const acknowledged = receipt?.workerGeneration === pending.permit.expectedGeneration;
+    const sameGenerationAlive = !!ds.worker && !ds.worker.killed
+      && ds.workerGeneration === pending.permit.expectedGeneration
+      && ds.session.workerGeneration === pending.permit.expectedGeneration;
+    if (sameGenerationAlive && !acknowledged) continue;
+    await store.reconcileControlReplyDispatch(pending.permit, pending.replyDigest, {
+      acknowledged,
+      safeToRetry: !pending.retryUsed && !sameGenerationAlive,
+    });
+  }
 }
 
 export function listActiveSessions(): DaemonSession[] {
