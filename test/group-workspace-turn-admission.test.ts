@@ -179,6 +179,21 @@ describe('durable turn permits', () => {
     });
     expect((await retry.store.beginBusinessDispatch(retry.permit, 'digest-retry-startup')).status).toBe('rejected');
   });
+  it('repairs a post-restart dispatch from a late exact ACK after live-generation reconcile', async () => {
+    const store = new TurnPermitStore(mkdtempSync(join(tmpdir(), 'turn-permit-')), { now: () => 100 });
+    const blank = await store.issueBlank({ ...base, turnId: 'late-ack', reservedGeneration: 4 });
+    await store.beginSpawn(blank);
+    const issued = await store.proveReady(blank, { actualGeneration: 4, cwd: identity, backend: identity });
+    if (issued.status !== 'issued') throw new Error('expected business permit');
+    await store.beginBusinessDispatch(issued.permit, 'digest-late-ack');
+    await reconcileTurnPermitDispatches({
+      pending: await store.listDispatching(),
+      sessions: [{ sessionId: 's1', workerGeneration: 4, workerAlive: true }],
+      reconcile: (permit, evidence) => store.reconcileBusinessDispatch(permit, evidence),
+    });
+    expect((await store.acknowledgeBusinessDelivery({ sessionId: 's1', turnId: 'late-ack', workerGeneration: 4 })).status).toBe('delivered');
+    expect((await store.acknowledgeBusinessDelivery({ sessionId: 's1', turnId: 'late-ack', workerGeneration: 5 })).status).toBe('rejected');
+  });
   it('binds one-shot control replies to the original wait and frozen workspace', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'turn-permit-'));
     const store = new TurnPermitStore(dataDir, { now: () => 100 });

@@ -69,6 +69,7 @@ export async function reconcileTurnPermitDispatches(input: {
       : undefined;
     const sameGenerationAlive = session?.workerAlive === true
       && session.workerGeneration === pending.permit.workerGeneration;
+    if (sameGenerationAlive && !ack) continue;
     await input.reconcile(pending.permit, {
       ...(ack ? { ack } : {}),
       safeToRetry: !pending.retryUsed && !sameGenerationAlive,

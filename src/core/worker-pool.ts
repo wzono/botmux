@@ -16240,18 +16240,16 @@ function setupWorkerHandlers(
         // receipt ACK was delayed or dropped on the reverse IPC channel.
         completeOrdinaryImDelivery(ds, msg.turnId, workerGeneration);
         const permitAckKey = businessPermitAckKey(ds.session.sessionId, msg.turnId, workerGeneration);
-        const permitStore = activeBusinessPermitStores.get(permitAckKey);
-        if (permitStore) {
-          void permitStore.acknowledgeBusinessDelivery({
-            sessionId: ds.session.sessionId,
-            turnId: msg.turnId,
-            workerGeneration,
-          }).then(result => {
-            if (result.status === 'delivered') activeBusinessPermitStores.delete(permitAckKey);
-          }).catch(err => logger.warn(
-            `[${t}] durable business ACK failed: ${err instanceof Error ? err.message : String(err)}`,
-          ));
-        }
+        const permitStore = activeBusinessPermitStores.get(permitAckKey) ?? productionTurnPermitStore;
+        void permitStore.acknowledgeBusinessDelivery({
+          sessionId: ds.session.sessionId,
+          turnId: msg.turnId,
+          workerGeneration,
+        }).then(result => {
+          if (result.status === 'delivered') activeBusinessPermitStores.delete(permitAckKey);
+        }).catch(err => logger.warn(
+          `[${t}] durable business ACK failed: ${err instanceof Error ? err.message : String(err)}`,
+        ));
         // An input ACK proves acceptance, not a new execution. Codex can emit
         // it after transcript failure while awaiting submit confirmation. Keep
         // that HTTP terminal and its failed UI closed to late/repeated ACKs.
