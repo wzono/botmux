@@ -53,6 +53,13 @@ export interface BotAdminIdentityConfig {
   resolvedAllowedUsers: readonly string[];
 }
 
+export interface VerifiedBotTenant {
+  appId: string;
+  tenantKey: string;
+  verifiedAt: number;
+  source: 'app_api' | 'signed_callback';
+}
+
 /**
  * Host-wide administrator snapshot usable by group-workspace authorization.
  * Snapshots expire after a short bounded interval even when configuration is unchanged.
