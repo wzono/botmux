@@ -17,10 +17,12 @@ export interface AskApiBody {
   chatId: string;
   larkAppId: string;
   rootMessageId: string | null;
+  /** Explicit `--into` target; daemon validates it against the authenticated chat. */
+  requestedRootMessageId?: string;
   /** v0.1.8：替换旧的 options/prompt，支持多问多选。 */
   questions: AskQuestion[];
   /** Already in milliseconds. CLI side converts from `--timeout` seconds. */
-  timeoutMs: number;
+  timeoutMs: number | null;
   /** Per-invocation identity (hook generates once, reuses across reconnect
    *  retries) so a re-POST after a daemon restart re-attaches to the same ask.
    *  Optional — legacy callers omit it and the broker synthesizes one. */
@@ -45,6 +47,7 @@ export type AskApiBodyError =
   | 'bad_chatId'
   | 'bad_larkAppId'
   | 'bad_rootMessageId'
+  | 'bad_requestedRootMessageId'
   | 'bad_prompt'
   | 'bad_timeoutMs'
   | 'bad_options'
@@ -83,10 +86,20 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
   if (r.rootMessageId !== null && typeof r.rootMessageId !== 'string') {
     return { error: 'bad_rootMessageId' };
   }
+  let requestedRootMessageId: string | undefined;
+  if (r.requestedRootMessageId !== undefined) {
+    if (typeof r.requestedRootMessageId !== 'string'
+      || !/^om_[A-Za-z0-9_-]{1,128}$/.test(r.requestedRootMessageId)) {
+      return { error: 'bad_requestedRootMessageId' };
+    }
+    requestedRootMessageId = r.requestedRootMessageId;
+  }
   if (
-    typeof r.timeoutMs !== 'number' ||
-    !Number.isFinite(r.timeoutMs) ||
-    r.timeoutMs < 1000
+    r.timeoutMs !== null && (
+      typeof r.timeoutMs !== 'number' ||
+      !Number.isFinite(r.timeoutMs) ||
+      r.timeoutMs < 1000
+    )
   ) {
     return { error: 'bad_timeoutMs' };
   }
@@ -174,6 +187,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     chatId: r.chatId,
     larkAppId: r.larkAppId,
     rootMessageId: r.rootMessageId as string | null,
+    ...(requestedRootMessageId !== undefined ? { requestedRootMessageId } : {}),
     questions,
     timeoutMs: r.timeoutMs,
     ...(requestId !== undefined ? { requestId } : {}),

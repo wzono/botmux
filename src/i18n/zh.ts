@@ -1963,6 +1963,7 @@ export const messages: Record<string, string> = {
 
   // Ask card
   'card.ask.field.deadline': '截止',
+  'card.ask.permanent': '等待你回答',
   'card.ask.field.answerable': '可答复',
   'card.ask.question_n': '问题 {n}',
   'card.ask.prompt_truncated': '（问题正文过长，卡片内已截断；完整内容见本话题中的附件文件）',

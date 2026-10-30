@@ -54,6 +54,24 @@ describe('parseAskBody — happy path', () => {
     expect(out.rootMessageId).toBe('om_root');
   });
 
+  it('accepts an explicit null timeout as no deadline', () => {
+    const out = parseAskBody(validBody({ timeoutMs: null }));
+    expect('error' in out).toBe(false);
+    if ('error' in out) return;
+    expect(out.timeoutMs).toBeNull();
+  });
+
+  it('keeps requestedRootMessageId separate from the ambient root claim', () => {
+    const out = parseAskBody(validBody({
+      rootMessageId: null,
+      requestedRootMessageId: 'om_requested_topic',
+    }));
+    expect('error' in out).toBe(false);
+    if ('error' in out) return;
+    expect(out.rootMessageId).toBeNull();
+    expect(out.requestedRootMessageId).toBe('om_requested_topic');
+  });
+
   it('accepts rootMessageId=null (chat-scope ask)', () => {
     const out = parseAskBody(validBody({ rootMessageId: null }));
     expect('error' in out).toBe(false);
@@ -79,6 +97,8 @@ describe('parseAskBody — validation', () => {
     ['bad_chatId', { chatId: '' }],
     ['bad_larkAppId', { larkAppId: '' }],
     ['bad_rootMessageId', { rootMessageId: 42 }],
+    ['bad_requestedRootMessageId', { requestedRootMessageId: 'oc_not_a_root' }],
+    ['bad_requestedRootMessageId', { requestedRootMessageId: 'om_' }],
     ['bad_prompt', { prompt: '' }],
     ['bad_prompt', { prompt: '   ' }],
     ['bad_timeoutMs', { timeoutMs: 500 }],          // below minimum (1s)
