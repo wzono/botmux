@@ -37,7 +37,7 @@ export type AdmittedBusinessTurnDependencies = {
   hasLiveWorker(): boolean;
   freezeWorkspace(): Promise<{ workspace: WorkspaceIdentity; groupRevision?: number }>;
   currentWorkerGeneration(): number | undefined;
-  proveExistingWorkerReady(generation: number): Promise<boolean>;
+  proveExistingWorkerReady(generation: number, workspace: WorkspaceIdentity): Promise<boolean>;
   issueExistingBusiness(input: {
     sessionId: string; turnId: string; workerGeneration: number;
     workspace: WorkspaceIdentity; groupRevision?: number;
@@ -70,7 +70,7 @@ export async function dispatchAdmittedBusinessTurn(input: {
   let permit: BusinessSubmitPermit | undefined;
   if (deps.hasLiveWorker()) {
     const generation = deps.currentWorkerGeneration();
-    if (!generation || !await deps.proveExistingWorkerReady(generation)) return false;
+    if (!generation || !await deps.proveExistingWorkerReady(generation, frozen.workspace)) return false;
     permit = await deps.issueExistingBusiness({
       sessionId: input.sessionId, turnId: input.turnId, workerGeneration: generation,
       workspace: frozen.workspace, ...(frozen.groupRevision === undefined ? {} : { groupRevision: frozen.groupRevision }),
@@ -119,15 +119,21 @@ export async function resumeOriginalTurnReply<T>(
 export async function resumeAdmittedControlReply<T>(input: {
   authorizeFresh(): Promise<boolean>;
   issuePermit(): Promise<ControlReplyPermit | undefined>;
-  consume(permit: ControlReplyPermit): Promise<'consumed' | 'duplicate' | 'rejected'>;
+  beginDispatch(permit: ControlReplyPermit): Promise<'acquired' | 'observing' | 'delivered' | 'rejected'>;
   resume(permit: ControlReplyPermit): Promise<T>;
+  acknowledge(permit: ControlReplyPermit): Promise<void>;
+  abort(permit: ControlReplyPermit): Promise<void>;
 }): Promise<T | undefined> {
   if (!await input.authorizeFresh()) return undefined;
   const permit = await input.issuePermit();
   if (!permit) return undefined;
-  const consumed = await input.consume(permit);
-  if (consumed !== 'consumed') return undefined;
-  return resumeOriginalTurnReply(permit, () => input.resume(permit));
+  const dispatch = await input.beginDispatch(permit);
+  if (dispatch === 'delivered') return undefined;
+  if (dispatch !== 'acquired') return undefined;
+  const result = await resumeOriginalTurnReply(permit, () => input.resume(permit));
+  if (result === false) await input.abort(permit);
+  else await input.acknowledge(permit);
+  return result;
 }
 
 export async function reconcileTurnPermitDispatches(input: {
@@ -146,7 +152,8 @@ export async function reconcileTurnPermitDispatches(input: {
   const sessions = new Map([...input.sessions].map(session => [session.sessionId, session]));
   for (const pending of input.pending) {
     const session = sessions.get(pending.permit.sessionId);
-    const receipt = session?.dispatchInputReceipts?.[pending.permit.turnId];
+    if (!session) continue;
+    const receipt = session.dispatchInputReceipts?.[pending.permit.turnId];
     const ack = receipt?.workerGeneration === pending.permit.workerGeneration
       ? { sessionId: pending.permit.sessionId, turnId: pending.permit.turnId, workerGeneration: receipt.workerGeneration }
       : undefined;

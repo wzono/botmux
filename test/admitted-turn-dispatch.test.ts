@@ -26,6 +26,24 @@ describe('central admitted turn dispatch', () => {
     expect(trace).toEqual(['freeze', 'ready', 'permit', 'lease', 'attempting', 'submit']);
   });
 
+  it('passes the frozen identity into existing-worker proof', async () => {
+    const prove = vi.fn(async () => true);
+    await dispatchAdmittedBusinessTurn({ sessionId: 's', turnId: 't', dependencies: {
+      hasLiveWorker: () => true,
+      freezeWorkspace: async () => ({ workspace, groupRevision: 3 }),
+      currentWorkerGeneration: () => 4,
+      proveExistingWorkerReady: prove,
+      issueExistingBusiness: async () => business,
+      reserveWorkerGeneration: () => 5,
+      issueBlank: async () => { throw new Error('cold only'); },
+      forkBlank: async () => false,
+      awaitBlankReady: async () => undefined,
+      proveBlankReady: async () => undefined,
+      submit: async () => true,
+    } });
+    expect(prove).toHaveBeenCalledWith(4, workspace);
+  });
+
   it('cold starts with an empty fork and waits for exact proof before business submission', async () => {
     const trace: string[] = [];
     const accepted = await dispatchAdmittedBusinessTurn({ sessionId: 's', turnId: 't', dependencies: {
@@ -70,26 +88,43 @@ describe('central admitted turn dispatch', () => {
     expect(abort).toHaveBeenCalledWith(expect.objectContaining({ permitId: 'blank' }), phase);
   });
 
-  it('authorizes control reply before consuming and resumes only the original turn', async () => {
+  it('authorizes control reply, durably dispatches, then ACKs only after worker acceptance', async () => {
     const trace: string[] = [];
     const result = await resumeAdmittedControlReply({
       authorizeFresh: async () => (trace.push('auth'), true),
       issuePermit: async () => (trace.push('permit'), ({ permitId: 'c', sessionId: 's', originalTurnId: 'original', wait: { kind: 'ask', askId: 'a' }, expectedGeneration: 4, workspace, expiresAt: Date.now() + 1000 } as never)),
-      consume: async () => (trace.push('consume'), 'consumed'),
+      beginDispatch: async () => (trace.push('dispatching'), 'acquired'),
       resume: async permit => (trace.push(`resume:${permit.originalTurnId}`), true),
+      acknowledge: async () => { trace.push('delivered'); },
+      abort: async () => { trace.push('abort'); },
     });
     expect(result).toBe(true);
-    expect(trace).toEqual(['auth', 'permit', 'consume', 'resume:original']);
+    expect(trace).toEqual(['auth', 'permit', 'dispatching', 'resume:original', 'delivered']);
   });
 
-  it('never consumes a control permit when fresh authorization fails', async () => {
-    const consume = vi.fn();
+  it('never dispatches a control permit when fresh authorization fails', async () => {
+    const beginDispatch = vi.fn();
     expect(await resumeAdmittedControlReply({
       authorizeFresh: async () => false,
       issuePermit: async () => undefined,
-      consume,
+      beginDispatch,
       resume: async () => true,
+      acknowledge: async () => {},
+      abort: async () => {},
     })).toBeUndefined();
-    expect(consume).not.toHaveBeenCalled();
+    expect(beginDispatch).not.toHaveBeenCalled();
+  });
+
+  it('aborts a synchronously refused control submission so one retry remains', async () => {
+    const trace: string[] = [];
+    expect(await resumeAdmittedControlReply({
+      authorizeFresh: async () => true,
+      issuePermit: async () => ({ permitId: 'c', sessionId: 's', originalTurnId: 'original', wait: { kind: 'ask', askId: 'a' }, expectedGeneration: 4, workspace, expiresAt: Date.now() + 1000 } as never),
+      beginDispatch: async () => 'acquired',
+      resume: async () => false,
+      acknowledge: async () => { trace.push('delivered'); },
+      abort: async () => { trace.push('abort'); },
+    })).toBe(false);
+    expect(trace).toEqual(['abort']);
   });
 });

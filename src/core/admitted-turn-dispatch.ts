@@ -39,9 +39,12 @@ const payloadDigest = (payload: string | CliTurnPayload) => createHash('sha256')
   .update(JSON.stringify(payload)).digest('hex');
 
 function exactIdentity(path: string): WorkspaceIdentity | undefined {
-  const proof = probePathUsability(path);
-  if (!proof.ok) return undefined;
-  return { path: proof.normalizedPath, ...proof.identity };
+  try {
+    const canonicalPath = realpathSync(path);
+    const proof = probePathUsability(canonicalPath);
+    if (!proof.ok) return undefined;
+    return { path: canonicalPath, ...proof.identity };
+  } catch { return undefined; }
 }
 
 export function frozenSessionWorkspace(ds: DaemonSession): { workspace: WorkspaceIdentity; groupRevision?: number } | undefined {
@@ -58,9 +61,16 @@ export function frozenSessionWorkspace(ds: DaemonSession): { workspace: Workspac
   return { workspace: actual, groupRevision: ds.session.groupWorkspaceRevision };
 }
 
-function workerBackendIdentity(ds: DaemonSession): WorkspaceIdentity | undefined {
+export function authoritativeWorkerWorkspaceIdentity(ds: DaemonSession): WorkspaceIdentity | undefined {
+  const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
   const remote = ds.lastWorkerReadyHostWorkingDirContract;
-  if (remote) return { path: remote.workingDir, ...remote.identity };
+  if (backendType === 'riff' || backendType === 'mojo') {
+    if (!remote) return undefined;
+    const actual = exactIdentity(remote.workingDir);
+    if (!actual || actual.dev !== remote.identity.dev || actual.ino !== remote.identity.ino) return undefined;
+    return actual;
+  }
+  if (remote) return undefined;
   const cwd = ds.lastWorkerReadyCwd;
   if (!cwd) return undefined;
   try {
@@ -68,6 +78,10 @@ function workerBackendIdentity(ds: DaemonSession): WorkspaceIdentity | undefined
     const stat = statSync(real, { bigint: true });
     return { path: real, dev: String(stat.dev), ino: String(stat.ino) };
   } catch { return undefined; }
+}
+
+function sameWorkspaceIdentity(a: WorkspaceIdentity, b: WorkspaceIdentity): boolean {
+  return a.path === b.path && a.dev === b.dev && a.ino === b.ino;
 }
 
 async function waitForExactReady(ds: DaemonSession, permit: BlankBootstrapPermit): Promise<{
@@ -79,7 +93,7 @@ async function waitForExactReady(ds: DaemonSession, permit: BlankBootstrapPermit
     if (generation && generation > permit.reservedGeneration) return undefined;
     if (generation === permit.reservedGeneration && ds.workerReady === true && ds.cliReady === true) {
       const frozen = frozenSessionWorkspace(ds);
-      const backend = workerBackendIdentity(ds);
+      const backend = authoritativeWorkerWorkspaceIdentity(ds);
       if (!frozen || !backend) return undefined;
       return { actualGeneration: generation, cwd: frozen.workspace, backend };
     }
@@ -109,10 +123,14 @@ export async function dispatchAdmittedBusinessTurn(input: {
       hasLiveWorker: () => !!input.ds.worker && !input.ds.worker.killed,
       freezeWorkspace: async () => frozen,
       currentWorkerGeneration: () => input.ds.workerGeneration ?? input.ds.session.workerGeneration,
-      proveExistingWorkerReady: async generation =>
-        generation === (input.ds.workerGeneration ?? input.ds.session.workerGeneration)
-        && input.ds.workerReady === true && input.ds.cliReady === true
-        && !!frozenSessionWorkspace(input.ds) && !!workerBackendIdentity(input.ds),
+      proveExistingWorkerReady: async (generation, workspace) => {
+        const current = frozenSessionWorkspace(input.ds);
+        const backend = authoritativeWorkerWorkspaceIdentity(input.ds);
+        return generation === (input.ds.workerGeneration ?? input.ds.session.workerGeneration)
+          && input.ds.workerReady === true && input.ds.cliReady === true
+          && !!current && sameWorkspaceIdentity(current.workspace, workspace)
+          && !!backend && sameWorkspaceIdentity(backend, workspace);
+      },
       issueExistingBusiness: async request => input.permitStore.issueBusiness({
         ...request, expiresAt: Date.now() + PERMIT_TTL_MS,
       }),
