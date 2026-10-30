@@ -162,7 +162,7 @@ describe('production group-workspace route dependency assembly', () => {
       reply: vi.fn(),
     });
     await expect(runtime.resolveAuthority({ chatId: CHAT, senderOpenId: 'ou_b', senderUnionId: ACTOR.unionId,
-      tenantKey: ACTOR.tenantKey, humanProvenance: true })).resolves.toBeUndefined();
+      tenantKey: ACTOR.tenantKey, humanProvenance: true })).resolves.toEqual({ status: 'recognized_denied', reason: 'identity_unavailable' });
     expect(dispatchRepo).not.toHaveBeenCalled();
   });
 

@@ -306,7 +306,7 @@ describe('group workspace production event route', () => {
     mockGetChatMode.mockResolvedValue('group');
     const handlers = makeHandlers();
     const resolveAuthority = vi.fn(async () => ({
-      actor: { tenantKey: 'tenant-1', unionId: 'on_admin' },
+      status: 'authorized' as const, actor: { tenantKey: 'tenant-1', unionId: 'on_admin' }, configFingerprint: 'f',
       freshSnapshot: { configFingerprint: 'f', admins: [{ tenantKey: 'tenant-1', unionId: 'on_admin' }], updatedAt: 1, expiresAt: 2 },
       canSwitchSession: true,
     }));

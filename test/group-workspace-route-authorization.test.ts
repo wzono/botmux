@@ -17,7 +17,8 @@ const SNAPSHOT: FreshBotAdminUnionSnapshot = {
 };
 
 function authority(canSwitchSession = true) {
-  return { actor: ACTOR, freshSnapshot: SNAPSHOT, canSwitchSession };
+  return { status: 'authorized' as const, actor: ACTOR, configFingerprint: SNAPSHOT.configFingerprint,
+    freshSnapshot: SNAPSHOT, canSwitchSession };
 }
 
 describe('group workspace text pre-gate route', () => {
@@ -83,23 +84,24 @@ describe('group workspace text pre-gate route', () => {
     ['missing union', undefined, ACTOR.tenantKey, SNAPSHOT],
     ['missing tenant', ACTOR.unionId, undefined, SNAPSHOT],
     ['fresh snapshot unavailable', ACTOR.unionId, ACTOR.tenantKey, undefined],
-  ])('fails closed when %s', async (_name, senderUnionId, tenantKey, freshSnapshot) => {
+  ])('consumes recognized denial when %s', async (_name, senderUnionId, tenantKey, freshSnapshot) => {
     const route = vi.fn();
     const genericGate = vi.fn(() => false);
     const result = await tryDispatchGroupWorkspaceTextRoute({
       text: '/repo unbind', chatId: CHAT, chatType: 'group', scope: 'chat', regularGroupTopLevel: true,
       senderOpenId: 'ou_b', senderUnionId, tenantKey,
     }, {
-      resolveAuthority: vi.fn(async () => freshSnapshot ? {
-        actor: { tenantKey: tenantKey!, unionId: senderUnionId! }, freshSnapshot, canSwitchSession: true,
-      } : undefined),
+      resolveAuthority: vi.fn(async () => freshSnapshot && senderUnionId && tenantKey ? {
+        status: 'authorized' as const, actor: { tenantKey, unionId: senderUnionId }, configFingerprint: freshSnapshot.configFingerprint,
+        freshSnapshot, canSwitchSession: true,
+      } : { status: 'recognized_denied' as const, reason: 'identity_unavailable' as const }),
       handleRoute: route,
       canRunGenericCommand: genericGate,
       replyDenied: vi.fn(),
     });
-    expect(result).toBe('not_authorized');
+    expect(result).toBe('recognized_denied');
     expect(route).not.toHaveBeenCalled();
-    expect(genericGate).toHaveBeenCalledOnce();
+    expect(genericGate).not.toHaveBeenCalled();
   });
 
   it('denies group manager without session-switch capability and never falls back', async () => {

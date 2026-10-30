@@ -119,7 +119,6 @@ import { LARK_CODE_APP_SCOPE_MISSING } from './lark-errors.js';
 import {
   authorizeGroupWorkspaceRoute,
   classifyGroupWorkspaceTextRoute,
-  type GroupWorkspaceRouteAuthority,
   type GroupWorkspaceRouteIntent,
 } from '../../core/group-workspace-policy.js';
 
@@ -2455,7 +2454,7 @@ export interface GroupWorkspaceTextRouteInput {
 }
 
 export interface GroupWorkspaceTextRouteDeps {
-  resolveAuthority: (input: GroupWorkspaceTextRouteInput) => Promise<GroupWorkspaceRouteAuthority | undefined>;
+  resolveAuthority: (input: GroupWorkspaceTextRouteInput) => Promise<import('../../core/group-workspace-policy.js').GroupWorkspaceRouteAuthorityResult | undefined>;
   handleRoute: (route: GroupWorkspaceRouteIntent & {
     source: 'text'; chatId: string; actor: import('../../services/bot-admin-unions-store.js').TenantHumanId;
     actorOpenId?: string; messageId?: string;
@@ -2471,7 +2470,7 @@ export interface GroupWorkspaceTextRouteDeps {
 export async function tryDispatchGroupWorkspaceTextRoute(
   input: GroupWorkspaceTextRouteInput,
   deps: GroupWorkspaceTextRouteDeps,
-): Promise<'dispatched' | 'switch_denied' | 'not_authorized' | 'not_applicable'> {
+): Promise<'dispatched' | 'switch_denied' | 'recognized_denied' | 'not_authorized' | 'not_applicable'> {
   const intent = classifyGroupWorkspaceTextRoute(input);
   if (!intent) {
     deps.canRunGenericCommand();
@@ -2479,6 +2478,10 @@ export async function tryDispatchGroupWorkspaceTextRoute(
   }
   const authority = await deps.resolveAuthority(input);
   if (!authorizeGroupWorkspaceRoute(authority)) {
+    if (authority?.status === 'recognized_denied') {
+      await deps.replyDenied('无法验证群目录操作权限；本次未切换会话，也未写入群目录。');
+      return 'recognized_denied';
+    }
     deps.canRunGenericCommand();
     return 'not_authorized';
   }
@@ -5890,7 +5893,7 @@ export function createLarkEventDispatcherRuntime(
           canRunGenericCommand: () => false,
           replyDenied: message => replyMessage(larkAppId, messageId, JSON.stringify({ text: message })).then(() => undefined),
         });
-        if (routeResult === 'dispatched' || routeResult === 'switch_denied') return;
+        if (routeResult === 'dispatched' || routeResult === 'switch_denied' || routeResult === 'recognized_denied') return;
       }
 
       const summaryCommandMatch = await resolveSummaryCommandMatch({

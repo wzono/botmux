@@ -331,7 +331,7 @@ describe('group workspace production card route', () => {
     const activeSessions = new Map([[sessionKey(CHAT_ID, APP_ID), ds]]);
     const handleRoute = vi.fn(async () => undefined);
     const resolveAuthority = vi.fn(async () => ({
-      actor: { tenantKey: 'tenant-1', unionId: 'on_admin' },
+      status: 'authorized' as const, actor: { tenantKey: 'tenant-1', unionId: 'on_admin' }, configFingerprint: 'f',
       freshSnapshot: { configFingerprint: 'f', admins: [{ tenantKey: 'tenant-1', unionId: 'on_admin' }], updatedAt: 1, expiresAt: 2 },
       canSwitchSession: true,
     }));
@@ -368,7 +368,7 @@ describe('group workspace production card route', () => {
       activeSessions: new Map([[sessionKey(CHAT_ID, APP_ID), ds]]),
       sessionReply: vi.fn(async () => 'om_reply'), lastRepoScan: new Map(),
       resolveGroupWorkspaceRouteAuthority: vi.fn(async () => ({
-        actor: { tenantKey: 'tenant-1', unionId: 'on_admin' },
+        status: 'authorized' as const, actor: { tenantKey: 'tenant-1', unionId: 'on_admin' }, configFingerprint: 'f',
         freshSnapshot: { configFingerprint: 'f', admins: [{ tenantKey: 'tenant-1', unionId: 'on_admin' }], updatedAt: 1, expiresAt: 2 },
         canSwitchSession: false,
       })),

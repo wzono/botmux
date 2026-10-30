@@ -138,7 +138,6 @@ import { isSharedAdoptSession } from '../../core/shared-adopt.js';
 import {
   authorizeGroupWorkspaceRoute,
   classifyGroupWorkspaceCardRoute,
-  type GroupWorkspaceRouteAuthority,
   type GroupWorkspaceRouteIntent,
 } from '../../core/group-workspace-policy.js';
 
@@ -319,7 +318,7 @@ export interface GroupWorkspaceCardRouteInput {
 }
 
 export interface GroupWorkspaceCardRouteDeps {
-  resolveAuthority: (input: GroupWorkspaceCardRouteInput) => Promise<GroupWorkspaceRouteAuthority | undefined>;
+  resolveAuthority: (input: GroupWorkspaceCardRouteInput) => Promise<import('../../core/group-workspace-policy.js').GroupWorkspaceRouteAuthorityResult | undefined>;
   handleRoute: (route: GroupWorkspaceRouteIntent & {
     source: 'card'; chatId: string; actor: import('../../services/bot-admin-unions-store.js').TenantHumanId;
     actorOpenId?: string; originMessageId: string; actionId: string;
@@ -331,7 +330,7 @@ export interface GroupWorkspaceCardRouteDeps {
 export async function tryDispatchGroupWorkspaceCardRoute(
   input: GroupWorkspaceCardRouteInput,
   deps: GroupWorkspaceCardRouteDeps,
-): Promise<{ status: 'dispatched' | 'switch_denied' | 'not_authorized' | 'not_applicable'; toast?: string }> {
+): Promise<{ status: 'dispatched' | 'switch_denied' | 'recognized_denied' | 'not_authorized' | 'not_applicable'; toast?: string }> {
   const intent = classifyGroupWorkspaceCardRoute(input);
   if (!intent) {
     deps.canRunGenericCardAction();
@@ -339,6 +338,9 @@ export async function tryDispatchGroupWorkspaceCardRoute(
   }
   const authority = await deps.resolveAuthority(input);
   if (!authorizeGroupWorkspaceRoute(authority)) {
+    if (authority?.status === 'recognized_denied') {
+      return { status: 'recognized_denied', toast: '无法验证群目录操作权限；本次未切换会话，也未写入群目录。' };
+    }
     deps.canRunGenericCardAction();
     return { status: 'not_authorized' };
   }
@@ -5451,7 +5453,9 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       currentRepoCardMessageId: targetDs.repoCardMessageId,
       operatorOpenId,
       operatorUnionId: data.operator?.union_id,
-      tenantKey: (data as CardActionData & { tenant_key?: string }).tenant_key,
+      // The receiving app is transport-authenticated; its runtime supplies the
+      // verified app→tenant mapping. Never read tenant identity from card data.
+      tenantKey: undefined,
       actionId: data.event_id ?? data.header?.event_id ?? data.event?.event_id,
       // Card callbacks expose an SDK-verified human operator envelope rather than sender_type.
       humanProvenance: !!operatorOpenId,
@@ -5461,7 +5465,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       canRunGenericCardAction: () => false,
     });
     if (groupRoute.status === 'dispatched') return;
-    if (groupRoute.status === 'switch_denied') {
+    if (groupRoute.status === 'switch_denied' || groupRoute.status === 'recognized_denied') {
       return { toast: { type: 'error', content: groupRoute.toast } };
     }
   }

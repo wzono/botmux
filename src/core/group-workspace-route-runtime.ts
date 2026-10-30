@@ -6,7 +6,7 @@ import type {
   TenantHumanId,
 } from '../services/bot-admin-unions-store.js';
 import { loadFreshBotAdminUnionSnapshot } from '../services/bot-admin-unions-store.js';
-import type { GroupWorkspaceRouteAuthority, GroupWorkspaceRouteIntent } from './group-workspace-policy.js';
+import type { GroupWorkspaceRouteAuthorityResult, GroupWorkspaceRouteIntent } from './group-workspace-policy.js';
 
 interface WorkspaceAclRead {
   status: 'available' | 'store_unavailable';
@@ -63,16 +63,16 @@ export function createGroupWorkspaceRouteRuntime(options: {
 
   const resolveAuthority = async (
     input: GroupWorkspaceAuthorityInput,
-  ): Promise<GroupWorkspaceRouteAuthority | undefined> => {
+  ): Promise<GroupWorkspaceRouteAuthorityResult> => {
     const envelopeUnionId = input.senderUnionId ?? input.operatorUnionId;
     const actorOpenId = input.senderOpenId ?? input.operatorOpenId;
     const tenantKey = input.tenantKey;
     if (input.humanProvenance !== true
       || !tenantKey?.trim()
       || !actorOpenId
-      || !envelopeUnionId?.startsWith('on_')) return undefined;
+      || !envelopeUnionId?.startsWith('on_')) return { status: 'recognized_denied', reason: 'identity_unavailable' };
     const verifiedUnionId = await options.resolveActorUnion(actorOpenId);
-    if (verifiedUnionId !== envelopeUnionId) return undefined;
+    if (verifiedUnionId !== envelopeUnionId) return { status: 'recognized_denied', reason: 'identity_unavailable' };
 
     snapshot = await loadFreshBotAdminUnionSnapshot({
       registeredBots: options.registeredBots(tenantKey),
@@ -80,10 +80,10 @@ export function createGroupWorkspaceRouteRuntime(options: {
       resolveAllowedUser: options.resolveAllowedUser,
       now: options.now,
     });
-    if (!snapshot) return undefined;
+    if (!snapshot) return { status: 'recognized_denied', reason: 'stale_config' };
 
     const workspace = await options.readWorkspace(input.chatId);
-    if (workspace.status !== 'available') return undefined;
+    if (workspace.status !== 'available') return { status: 'recognized_denied', reason: 'stale_config' };
     const session = options.activeSessions.get(options.sessionKey(input.chatId, options.larkAppId));
     const exactSession = session?.larkAppId === options.larkAppId
       && session.chatId === input.chatId
@@ -98,7 +98,9 @@ export function createGroupWorkspaceRouteRuntime(options: {
       humanProvenance: true,
     };
     return {
+      status: 'authorized',
       actor: { tenantKey, unionId: verifiedUnionId },
+      configFingerprint: snapshot.configFingerprint,
       freshSnapshot: snapshot,
       workspaceManagers: workspace.record?.workspaceManagers,
       canSwitchSession: !!exactSession && options.canSwitchSession(exactSession, sessionActor),
