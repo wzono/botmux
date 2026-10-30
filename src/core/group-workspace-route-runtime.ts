@@ -60,15 +60,18 @@ export function createGroupWorkspaceRouteRuntime(options: {
   now?: () => number;
 }) {
   let snapshot: FreshBotAdminUnionSnapshot | undefined;
+  let verifiedTenantKey: string | undefined;
 
   const resolveAuthority = async (
     input: GroupWorkspaceAuthorityInput,
   ): Promise<GroupWorkspaceRouteAuthorityResult> => {
     const envelopeUnionId = input.senderUnionId ?? input.operatorUnionId;
     const actorOpenId = input.senderOpenId ?? input.operatorOpenId;
-    const tenantKey = input.tenantKey;
+    const callbackTenantKey = input.tenantKey?.trim();
+    if (callbackTenantKey) verifiedTenantKey = callbackTenantKey;
+    const tenantKey = callbackTenantKey ?? verifiedTenantKey;
     if (input.humanProvenance !== true
-      || !tenantKey?.trim()
+      || !tenantKey
       || !actorOpenId
       || !envelopeUnionId?.startsWith('on_')) return { status: 'recognized_denied', reason: 'identity_unavailable' };
     const verifiedUnionId = await options.resolveActorUnion(actorOpenId);

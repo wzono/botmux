@@ -166,6 +166,21 @@ describe('production group-workspace route dependency assembly', () => {
     expect(dispatchRepo).not.toHaveBeenCalled();
   });
 
+  it('reuses a signed text tenant mapping for an authentic card callback without synthetic tenant data', async () => {
+    const ds = liveSession();
+    const runtime = createGroupWorkspaceRouteRuntime({
+      larkAppId: APP, activeSessions: new Map([[`${APP}:${CHAT}`, ds]]), sessionKey: (chatId, appId) => `${appId}:${chatId}`,
+      registeredBots: tenantKey => [{ larkAppId: APP, tenantKey, resolvedAllowedUsers: ['ou_owner'] }],
+      resolveAllowedUser: vi.fn(async () => ACTOR), resolveActorUnion: vi.fn(async () => ACTOR.unionId),
+      readWorkspace: vi.fn(async () => ({ status: 'available' as const })), canSwitchSession: () => true,
+      dispatchRepo: vi.fn(), reply: vi.fn(),
+    });
+    await expect(runtime.resolveAuthority({ chatId: CHAT, senderOpenId: 'ou_user', senderUnionId: ACTOR.unionId,
+      tenantKey: ACTOR.tenantKey, humanProvenance: true })).resolves.toMatchObject({ status: 'authorized' });
+    await expect(runtime.resolveAuthority({ chatId: CHAT, operatorOpenId: 'ou_user', operatorUnionId: ACTOR.unionId,
+      humanProvenance: true })).resolves.toMatchObject({ status: 'authorized', actor: ACTOR });
+  });
+
   it('keeps unbind on the authenticated no-write seam', async () => {
     const { runtime, dispatchRepo, reply } = setup();
     await runtime.handleRoute({ kind: 'unbind', source: 'card', chatId: CHAT, actor: ACTOR,
