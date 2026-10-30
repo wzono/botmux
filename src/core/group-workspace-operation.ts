@@ -5,6 +5,7 @@ import {
   groupWorkspaceReceiptMatchesMutation,
   type GroupOperationKind,
   type GroupWorkspaceMutationResult,
+  type GroupWorkspaceStore,
   type GroupWorkspaceUnbindMutation,
 } from '../services/group-workspace-store.js';
 import type {
@@ -89,6 +90,76 @@ export interface GroupWorkspaceOperationDependencies {
     | 'group_committed_before_convergence'
     | 'receipt_before_response'
   ): Promise<void>;
+}
+
+export function createGroupWorkspaceSetCoordinator(options: {
+  journalStore: GroupWorkspaceOperationStore;
+  groupStore: Pick<GroupWorkspaceStore, 'read' | 'readReceipt' | 'reconcileExactOperation' | 'mutate'>;
+  now(): number;
+  resolveCanonicalTarget: GroupWorkspaceOperationDependencies['resolveCanonicalTarget'];
+  readSession: GroupWorkspaceOperationDependencies['readSession'];
+  switchSession: GroupWorkspaceOperationDependencies['switchSession'];
+  convergeSession: GroupWorkspaceOperationDependencies['convergeSession'];
+  originMessageId?: string;
+  afterBoundary?: GroupWorkspaceOperationDependencies['afterBoundary'];
+}): GroupWorkspaceOperationCoordinator {
+  const receiptFor = (receipt: import('../services/group-workspace-store.js').GroupOperationReceipt): GroupCommitReceipt | undefined => {
+    if (receipt.kind !== 'set' || !receipt.canonicalTargetWorkingDir) return undefined;
+    const identity = {
+      operationKey: receipt.operationKey, payloadDigest: receipt.payloadDigest,
+      chatId: receipt.chatId, targetWorkingDir: receipt.canonicalTargetWorkingDir,
+    };
+    if (receipt.outcome === 'committed') return { ...identity, status: 'committed', resultingRevision: receipt.resultingRevision! };
+    if (receipt.outcome === 'conflict') return { ...identity, status: 'conflict', currentRevision: receipt.resultingRevision ?? receipt.expectedRevision };
+    return { ...identity, status: 'store_unavailable' };
+  };
+  const dependencies: GroupWorkspaceOperationDependencies = {
+    journalStore: options.journalStore,
+    now: options.now,
+    lookupGroupReceipt: async operationKey => {
+      const found = await options.groupStore.readReceipt(operationKey);
+      if (found.status !== 'found') return found;
+      const receipt = receiptFor(found.receipt);
+      return receipt ? { status: 'found', receipt } : { status: 'missing' };
+    },
+    reconcileUnknownGroupReceipt: async journal => {
+      const result = await options.groupStore.reconcileExactOperation({
+        kind: 'set', chatId: journal.chatId, sourceEventId: journal.sourceEventId,
+        requestedWorkingDir: journal.targetWorkingDir, expectedRevision: journal.expectedGroupRevision,
+        expectedSessionGeneration: journal.expectedSessionGeneration, actor: journal.actor,
+        authorized: true, directoryValid: true, now: journal.updatedAt,
+      });
+      if (!('receipt' in result)) return result.outcome === 'store_unavailable'
+        ? { status: 'store_unavailable' } : { status: 'missing' };
+      const receipt = receiptFor(result.receipt);
+      return receipt ? { status: 'found', receipt } : { status: 'missing' };
+    },
+    readCurrentGroupRevision: async chatId => {
+      const current = await options.groupStore.read(chatId);
+      return current.status === 'available'
+        ? { status: 'available', revision: current.record?.revision ?? 0 }
+        : current;
+    },
+    resolveCanonicalTarget: options.resolveCanonicalTarget,
+    readSession: options.readSession,
+    switchSession: options.switchSession,
+    commitGroup: async journal => {
+      const result = await options.groupStore.mutate({
+        kind: 'set', chatId: journal.chatId, sourceEventId: journal.sourceEventId,
+        ...(options.originMessageId ? { originMessageId: options.originMessageId } : {}),
+        requestedWorkingDir: journal.targetWorkingDir, expectedRevision: journal.expectedGroupRevision,
+        expectedSessionGeneration: journal.expectedSessionGeneration, actor: journal.actor,
+        authorized: true, directoryValid: true, now: options.now(),
+      });
+      if (result.outcome === 'committed') return { status: 'committed', resultingRevision: result.receipt.resultingRevision! };
+      if (result.outcome === 'conflict') return { status: 'conflict', currentRevision: result.receipt.expectedRevision };
+      if (result.outcome === 'unknown') return { status: 'unknown' };
+      return { status: 'store_unavailable' };
+    },
+    convergeSession: options.convergeSession,
+    ...(options.afterBoundary ? { afterBoundary: options.afterBoundary } : {}),
+  };
+  return new GroupWorkspaceOperationCoordinator(dependencies);
 }
 
 function sameIntent(journal: RepoGroupOperationJournal, request: GroupWorkspaceOperationRequest): boolean {

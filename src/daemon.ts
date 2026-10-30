@@ -11,9 +11,8 @@ import {
 import { GroupWorkspaceOperationStore } from './services/group-workspace-operation-store.js';
 import { probePathUsability, type PathIdentity } from './core/path-usability.js';
 import {
-  GroupWorkspaceOperationCoordinator,
+  createGroupWorkspaceSetCoordinator,
   executeGroupWorkspaceUnbind,
-  type GroupCommitReceipt,
 } from './core/group-workspace-operation.js';
 import { DecisionBoardService } from './core/decision-board/service.js';
 import { lookupChatAcrossBots } from './core/decision-board/chat-lookup.js';
@@ -33034,51 +33033,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             const requestIntentDigest = canonicalGroupWorkspaceRequestIntentDigest({
               kind: 'set', chatId: request.chatId, selection: request.selection,
             });
-            const coordinator = new GroupWorkspaceOperationCoordinator({
+            const coordinator = createGroupWorkspaceSetCoordinator({
               journalStore: groupWorkspaceOperationStore,
+              groupStore: groupWorkspaceStore,
               now: Date.now,
-              lookupGroupReceipt: async operationKey => {
-                const found = await groupWorkspaceStore.readReceipt(operationKey);
-                if (found.status !== 'found') return found;
-                const receipt: GroupCommitReceipt = {
-                  operationKey: found.receipt.operationKey,
-                  payloadDigest: found.receipt.payloadDigest,
-                  chatId: found.receipt.chatId,
-                  targetWorkingDir: found.receipt.canonicalTargetWorkingDir ?? request.selection!,
-                  ...(found.receipt.outcome === 'committed'
-                    ? { status: 'committed', resultingRevision: found.receipt.resultingRevision! }
-                    : found.receipt.outcome === 'conflict'
-                      ? { status: 'conflict', currentRevision: found.receipt.resultingRevision ?? found.receipt.expectedRevision }
-                      : { status: 'store_unavailable' }),
-                };
-                return { status: 'found', receipt };
-              },
-              reconcileUnknownGroupReceipt: async journal => {
-                const result = await groupWorkspaceStore.reconcileExactOperation({
-                  kind: 'set', chatId: journal.chatId, sourceEventId: journal.sourceEventId,
-                  requestedWorkingDir: journal.targetWorkingDir, expectedRevision: journal.expectedGroupRevision,
-                  expectedSessionGeneration: journal.expectedSessionGeneration, actor: journal.actor,
-                  authorized: true, directoryValid: true, now: journal.updatedAt,
-                });
-                if ('receipt' in result) {
-                  return { status: 'found', receipt: {
-                    operationKey: result.receipt.operationKey, payloadDigest: result.receipt.payloadDigest,
-                    chatId: result.receipt.chatId, targetWorkingDir: journal.targetWorkingDir,
-                    ...(result.receipt.outcome === 'committed'
-                      ? { status: 'committed', resultingRevision: result.receipt.resultingRevision! }
-                      : result.receipt.outcome === 'conflict'
-                        ? { status: 'conflict', currentRevision: result.receipt.expectedRevision }
-                        : { status: 'store_unavailable' }),
-                  } };
-                }
-                return result.outcome === 'store_unavailable' ? { status: 'store_unavailable' } : { status: 'missing' };
-              },
-              readCurrentGroupRevision: async chatId => {
-                const current = await groupWorkspaceStore.read(chatId);
-                return current.status === 'available'
-                  ? { status: 'available', revision: current.record?.revision ?? 0 }
-                  : current;
-              },
+              ...(route.originMessageId ? { originMessageId: route.originMessageId } : {}),
               resolveCanonicalTarget: async () => {
                 const resolved = resolveGroupWorkspaceRepoSelection(
                   request.selection!, getProjectScanDirs(ds), lastRepoScan.get(ds.chatId),
@@ -33115,19 +33074,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                 const generation = current.workerGeneration ?? before + 1;
                 current.workerGeneration = generation;
                 return { status: 'committed', generation };
-              },
-              commitGroup: async journal => {
-                const result = await groupWorkspaceStore.mutate({
-                  kind: 'set', chatId: journal.chatId, sourceEventId: journal.sourceEventId,
-                  ...(route.originMessageId ? { originMessageId: route.originMessageId } : {}),
-                  requestedWorkingDir: journal.targetWorkingDir, expectedRevision: journal.expectedGroupRevision,
-                  expectedSessionGeneration: journal.expectedSessionGeneration, actor: journal.actor,
-                  authorized: true, directoryValid: true, now: Date.now(),
-                });
-                if (result.outcome === 'committed') return { status: 'committed', resultingRevision: result.receipt.resultingRevision! };
-                if (result.outcome === 'conflict') return { status: 'conflict', currentRevision: result.receipt.expectedRevision };
-                if (result.outcome === 'unknown') return { status: 'unknown' };
-                return { status: 'store_unavailable' };
               },
               convergeSession: async input => {
                 const current = activeSessions.get(sessionKey(ds.chatId, cfg.larkAppId));
