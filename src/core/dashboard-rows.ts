@@ -11,7 +11,8 @@ import type { CodexAppDispatchLedgerEntry, ReplyTargetEntry, Session, StreamStat
 import type { CliId } from '../adapters/cli/types.js';
 import { basename } from 'node:path';
 import { getTerminalAdvertisedPort } from './terminal-url.js';
-import { getBotBrand } from '../bot-registry.js';
+import { getBot, getBotBrand } from '../bot-registry.js';
+import { sessionSandboxDrift, type SandboxMode } from '../adapters/cli/sandbox-mode.js';
 import { type Brand, chatAppLink, threadAppLink } from '../im/lark/lark-hosts.js';
 import { getSessionUsageWithContext, type SessionTokenUsage } from './cost-calculator.js';
 import { buildContextUsage } from './session-context-usage.js';
@@ -29,6 +30,9 @@ import { isSuspendableBackendType, resolvePersistentBackendTarget } from './pers
 import { isNativeTopicId } from './native-topic-id.js';
 
 export interface SessionRow extends SessionMessagePreview {
+  /** Present only when the session's frozen sandbox mode differs from what the
+   *  bot's CURRENT config would give a new session (dashboard badge). */
+  sandboxDrift?: { session: SandboxMode; current: SandboxMode };
   cliInstanceId?: string;
   cliInstanceSource?: string;
   creationSource?: string;
@@ -156,6 +160,34 @@ export interface SessionRow extends SessionMessagePreview {
   quoteTargetId?: string;
   quoteTargetSenderOpenId?: string;
   codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
+  capacityFeedback?: {
+    state: 'waiting' | 'stale' | 'unsupported';
+    position?: number;
+    observedAtMs?: number;
+    ageMs?: number;
+  };
+}
+
+export function projectCapacityFeedback(
+  session: Session,
+  turnId: string | undefined,
+  nowMs = Date.now(),
+): SessionRow['capacityFeedback'] {
+  if (!turnId) return undefined;
+  const record = session.turnFeedback?.[turnId];
+  if (!record || (record.phase !== 'capacity_waiting' && record.phase !== 'capacity_stale')) {
+    return undefined;
+  }
+  const capacity = record.capacity;
+  if (!capacity || (capacity.state !== 'waiting' && capacity.state !== 'stale')) return undefined;
+  return {
+    state: capacity.state,
+    ...(capacity.state === 'waiting' && capacity.position !== undefined
+      ? { position: capacity.position }
+      : {}),
+    observedAtMs: capacity.updatedAtMs,
+    ageMs: Math.max(0, nowMs - capacity.updatedAtMs),
+  };
 }
 
 function composeSendRoutingFields(
@@ -298,6 +330,14 @@ function sessionRuntimeFields(s: Session): Pick<SessionRow, 'runtimeId' | 'runti
   return {};
 }
 
+function sandboxDriftField(s: Session): Pick<SessionRow, 'sandboxDrift'> {
+  if (s.sandbox === undefined || !s.larkAppId) return {};
+  let botCfg: Parameters<typeof sessionSandboxDrift>[1];
+  try { botCfg = getBot(s.larkAppId).config; } catch { return {}; }
+  const drift = sessionSandboxDrift(s.sandbox, botCfg);
+  return drift ? { sandboxDrift: drift } : {};
+}
+
 export interface DashboardRowOptions {
   fresh?: boolean;
   /**
@@ -397,8 +437,12 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     openTodos: sessionOpenTodos(ds.session, ds.workingDir, opts?.fresh),
     ...(ds.worker?.pid !== undefined ? { workerPid: ds.worker.pid } : {}),
     ...(ds.adoptedFrom?.originalCliPid !== undefined ? { adoptCliPid: ds.adoptedFrom.originalCliPid } : {}),
+    ...sandboxDriftField(ds.session),
     ...buildSessionMessagePreview(ds.session),
     ...composeSendRoutingFields(ds.session, ds.currentReplyTarget),
+    ...(projectCapacityFeedback(ds.session, ds.currentTurnId)
+      ? { capacityFeedback: projectCapacityFeedback(ds.session, ds.currentTurnId) }
+      : {}),
   };
 }
 
@@ -511,6 +555,7 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     queued: !!s.queued,
     hasHistory: !!(s.cliId || s.lastCliInput || s.backendType || s.adoptedFrom),
     quarantined: !!s.restoreQuarantinedAt,
+    ...sandboxDriftField(s),
     ...maybeSessionRowUsage(s, undefined, opts),
     ...buildSessionMessagePreview(s),
     ...composeSendRoutingFields(s),

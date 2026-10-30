@@ -21,6 +21,8 @@ import type { TurnTerminalCarrierKind } from './core/types.js';
 import type { LinkRefTurnEnvelope } from './services/link-ref-types.js';
 import type { TurnSendKind } from './services/turn-send-ledger.js';
 import type { IdentityStorageModel } from './core/lark-tool-binding.js';
+import type { CapacityWaitPhase } from './services/capacity-wait-evidence.js';
+import type { TurnFeedbackPhase } from './services/turn-feedback-state.js';
 
 /** Managed meeting sinks supported by the first multi-consumer slice. */
 export type VcMeetingConsumerManagedSink = 'meeting_text' | 'meeting_voice';
@@ -489,8 +491,88 @@ export interface MessageProvenance {
   updatedAt: string;
 }
 
+/** Durable ownership and projection state for one exact admitted turn. */
+export interface PersistedTurnFeedback {
+  version: 1;
+  turnId: string;
+  /** Exact inbound trigger. It may be a Lark message, document comment, or another anchor. */
+  messageId?: string;
+  /** Admission-time requester snapshot retained after replyTargets pruning. */
+  requesterOpenId?: string;
+  requesterIsBot?: boolean;
+  phase: TurnFeedbackPhase;
+  updatedAt: string;
+  /** Per-turn receipt override, for example the substitute-mode Get reaction. */
+  receivedReactionEmoji?: string;
+  capacity?: CapacityWaitPhase;
+  capacityClearedAt?: string;
+  attention?: {
+    state: 'needs_user' | 'resumed';
+    promptNonce: string;
+    dispatchAttempt: number;
+    workerGeneration: number;
+    openedAtMs: number;
+  };
+  reaction?: { id: string; type: string };
+  reactionMessageGone?: true;
+  reactionIntent?: {
+    id: string;
+    messageId: string;
+    desiredType?: string;
+    createdAt: string;
+    stage: 'observe' | 'delete' | 'create' | 'cleanup' | 'blocked' | 'permanent';
+    adopted?: { id: string; type: string };
+    deleteIds: string[];
+    retryClass?: 'transient' | 'blocked';
+    diagnostic?:
+      | 'invalid_request'
+      | 'unsupported_message'
+      | 'invalid_response'
+      | 'permission_denied'
+      | 'chat_unavailable'
+      | 'operator_unavailable';
+    retryExhausted?: true;
+  };
+  reminder?: {
+    messageId?: string;
+    sentAt?: string;
+    uuid?: string;
+    episodeKey?: string;
+    status?: 'pending' | 'sent' | 'ambiguous';
+    attemptedAt?: string;
+    closeStatus?: 'pending' | 'ambiguous';
+    closeAttemptedAt?: string;
+    closeAttempts?: number;
+    closeNextAttemptAt?: string;
+    closeDiagnostic?: 'card_mismatch' | 'unavailable' | 'transport_error' | 'intent_commit_failed';
+    closed?: true;
+  };
+  /** Last daemon-committed signed v3 event for replay protection. */
+  capacitySidebandCursor?: {
+    adapter: 'codex' | 'claude-code';
+    signerKeyId: string;
+    signerEpoch: number;
+    requestId: string;
+    sequence: number;
+    observedAtMs: number;
+  };
+  /** Restart-recoverable native ownership for exact sideband attribution. */
+  capacityBinding?: {
+    adapter: 'codex' | 'claude-code';
+    nativeSessionId?: string;
+    nativeTurnId: string;
+    dispatchAttempt: number;
+    workerGeneration: number;
+  };
+  reactionSilent?: boolean;
+  reminderSilent?: boolean;
+  background?: boolean;
+}
+
 export interface Session {
   sessionId: string;
+  /** Whole-row optional v1 state; legacy rows require no SQL migration. */
+  turnFeedback?: Record<string, PersistedTurnFeedback>;
   /** Frozen opt-in at birth; ordinary sessions never inherit listener cleanup. */
   messageListenerAutoClose?: boolean;
   /** Internal target-side owner for an idempotent dispatch-launch session. */
@@ -1989,7 +2071,7 @@ type DaemonToWorkerBase =
    *  IPCs would race: process.on('message') handlers don't serialize, and the
    *  raw_input branch awaits 200ms between sendText and Enter, a window where
    *  a separate `message` IPC could write into the PTY first. */
-  | { type: 'raw_input'; content: string; turnId?: string; trustedController?: TrustedCaller; followUpContent?: string; followUpTurnId?: string; followUpCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; mojoLivePatch?: MojoLivePatch; turnCallerOpenId?: string }
+  | { type: 'raw_input'; content: string; turnId?: string; trustedController?: TrustedCaller; followUpContent?: string; followUpTurnId?: string; followUpCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; mojoLivePatch?: MojoLivePatch; turnCallerOpenId?: string; requireSafeComposer?: true }
   /** Rename the current CLI-native interactive session. The worker queues this
    *  administrative slash command until the TUI is idle and does not treat it
    *  as a model turn. Only adapters declaring buildSessionRenameCommand handle
@@ -2229,6 +2311,26 @@ export type WorkerToDaemon =
    * CLI input queue. The daemon persists a root-bound receipt only after this
    * acknowledgement; IPC arrival alone is not acceptance. */
   | { type: 'turn_input_committed'; turnId: string; dispatchAttempt?: number; durablePrimaryInbox?: true }
+  | {
+      type: 'capacity_sideband_binding';
+      adapter: 'codex' | 'claude-code';
+      sessionId: string;
+      turnId: string;
+      dispatchAttempt: number;
+      nativeTurnId: string;
+      nativeSessionId?: string;
+    }
+  | {
+      type: 'capacity_wait';
+      sessionId: string;
+      turnId: string;
+      dispatchAttempt?: number;
+      source: 'traex-viewport';
+      state: 'waiting' | 'clear';
+      position?: number;
+      observedAtMs: number;
+      revision: number;
+    }
   /** Native write observation for display timing; never an admission or completion receipt. */
   | { type: 'turn_execution_started'; turnId: string; dispatchAttempt?: number; startedAtMs: number }
   /** The native CLI accepted this exact dispatched input into its own
@@ -2316,6 +2418,8 @@ export type WorkerToDaemon =
     canParkDiagnostic?: boolean;
     /** A Codex App thread is still owned by another app-server writer. */
     codexAppActiveWriter?: boolean;
+    /** Linux bwrap sandbox could not create this namespace on this host. */
+    sandboxNamespace?: 'pid' | 'user';
     turnId?: string;
     dispatchAttempt?: number;
   }
@@ -2372,7 +2476,7 @@ export type WorkerToDaemon =
   /** Executor-observed Codex tier, bound to this worker + rollout generation.
    * `null` explicitly clears any previous generation's snapshot. */
   | { type: 'codex_service_tier'; snapshot: CodexServiceTierSnapshot | null }
-  | { type: 'error'; message: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'error'; message: string; turnId?: string; dispatchAttempt?: number; sandboxNamespace?: 'pid' | 'user' }
   | { type: 'bridge_source_session'; bridge: 'hermes'; sourceSessionId: string }
   /** Worker observed a successful explicit `botmux send` for this turn, so
    * the daemon should treat listener-preview runs as visibly replied even

@@ -442,6 +442,11 @@ botmux plugin service start my-plugin
 Botmux never stops a running Service implicitly during install, update, or
 uninstall.
 
+`botmux plugin repair [id|--all] [--dry-run]` is supported only on Linux hosts.
+It explicitly repairs legacy contribution materialization and Service identity
+state; other platforms fail closed and do not enable the Dashboard Service
+Bridge.
+
 Uninstall:
 
 ```bash

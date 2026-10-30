@@ -14,6 +14,7 @@ import {
 } from './adapters/cli/codex-app-turn.js';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
 import { CODEX_APP_ACTIVE_WRITER_EXIT_CODE } from './services/codex-app-runner-protocol.js';
+import { codexAppTurnFailureCode } from './services/codex-app-failure.js';
 import { captureCodexAppProcessIdentity, type CodexAppProcessIdentity } from './services/codex-app-process-attestation.js';
 import {
   CODEX_APP_CONTROL_BOOTSTRAP_ENV,
@@ -94,6 +95,7 @@ interface ActiveTurn {
   startedAtMs: number;
   lastActivityMarkerAtMs: number;
   finalText: string;
+  failureCode?: string;
   userInputFailure?: string;
   allAgentText: string;
   itemText: Map<string, string>;
@@ -919,6 +921,7 @@ function handleAsyncUserInput(item: JsonObject, nativeTurnId: string, turn: Acti
   const context = {
     sessionId: args.sessionId, larkAppId: process.env.BOTMUX_LARK_APP_ID ?? '',
     chatId: process.env.BOTMUX_CHAT_ID ?? '', rootMessageId: process.env.BOTMUX_ROOT_MESSAGE_ID, originTurnId,
+    originWorkerGeneration: Number(process.env.BOTMUX_WORKER_GENERATION) || undefined,
   };
   const reportFailure = (reason: 'limit' | 'invalid_questions', questions?: import('./core/ask-types.js').AskQuestion[]) => {
     void postCodexAsk(context, questions ?? [{ prompt: 'Async question could not be displayed', inputMode: 'text',
@@ -994,6 +997,7 @@ function handleNativeUserInput(msg: JsonObject): void {
     sessionId: args.sessionId, larkAppId: process.env.BOTMUX_LARK_APP_ID ?? '',
     chatId: process.env.BOTMUX_CHAT_ID ?? '', rootMessageId: process.env.BOTMUX_ROOT_MESSAGE_ID,
     originTurnId,
+    originWorkerGeneration: Number(process.env.BOTMUX_WORKER_GENERATION) || undefined,
   }, params, signal).then(
     result => {
       if (!signal.aborted && client === current && !generationFenced) current.respond(msg.id, result);
@@ -1104,6 +1108,7 @@ function rebuildReconciledFinal(turn: JsonObject, userItemIndex: number): string
 
 function completeActiveTurnFromNative(turn: ActiveTurn, nativeTurn: JsonObject, exactIndex?: number): void {
   if (activeTurn !== turn || turn.completed || !isTerminalNativeTurn(nativeTurn)) return;
+  turn.failureCode = codexAppTurnFailureCode(nativeTurn);
   if (exactIndex !== undefined) {
     turn.finalText = rebuildReconciledFinal(nativeTurn, exactIndex);
     turn.allAgentText = '';
@@ -1904,6 +1909,7 @@ function settleSteeredCompletion(turn: ActiveTurn, nativeTurn: JsonObject): void
     turn.knownAgentItemIds.clear();
   }
   turn.terminalCompletion = nativeTurn;
+  turn.failureCode = codexAppTurnFailureCode(nativeTurn);
   if (typeof nativeTurn?.id === 'string' && nativeActiveTurnId === nativeTurn.id) {
     nativeActiveTurnId = undefined;
   }
@@ -1967,6 +1973,7 @@ async function reconcileSteeredGroupFromHistory(
       turn.itemText.clear();
       turn.knownAgentItemIds.clear();
       turn.terminalCompletion = matched;
+      turn.failureCode = codexAppTurnFailureCode(matched);
       // R4-B3: the matched turn is now the authoritative native identity for this
       // group — the final marker, native id, and usage drain must all key off
       // matched.id, not the stale pre-history canonical. Compare-and-clear the OLD
@@ -2190,6 +2197,7 @@ function finalizeAcceptedGroup(turn: ActiveTurn): void {
       ...(replyTurnId ? { turnId: replyTurnId } : {}),
       ...(turn.nativeTurnId ? { nativeTurnId: turn.nativeTurnId } : {}),
       content: isReal ? finalText : '',
+      ...(isReal && turn.failureCode ? { errorCode: turn.failureCode } : {}),
       // The real answer's clock starts at the LAST accepted dispatch so a
       // botmux-send marker emitted before the follow-up landed cannot race
       // ahead and suppress it. A single-member group keeps the turn's own
@@ -2548,6 +2556,7 @@ async function drainQueue(): Promise<void> {
           ...(replyTurnId ? { turnId: replyTurnId } : {}),
           ...(nativeTurnId ? { nativeTurnId } : {}),
           content: message,
+          errorCode: codexAppTurnFailureCode({ status: 'failed', error: err }),
           startedAtMs: activeTurn?.startedAtMs ?? completedAtMs,
           completedAtMs,
         });

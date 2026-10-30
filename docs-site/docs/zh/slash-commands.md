@@ -85,7 +85,9 @@ botmux 日常运维
 - 头部的 `/repo wt` 不接受编号形式（编号只在选仓卡片上有意义）；会话内的 `/repo wt <编号|项目名> [分支]` 仍可用。
 - 会话中途单独发的 `/repo` 仍然吃整行，与头部里的单 token 规则不同。
 
-Codex 容量不足自动续跑**默认关闭**。管理员可用 `/botconfig set codexCapacityRecovery on` 开启，`/botconfig set codexCapacityRecovery off` 关闭。开启后，Botmux 管理的 Codex 飞书会话遇到明确的模型容量错误（`server_overloaded`）时，会在 15 秒、45 秒后各自动续跑一次。每次续跑会向原生会话追加一条恢复提示（每个任务最多两条），可能保留在模型上下文中，关闭开关不会删除已有历史。关闭时若存在待执行的恢复，会保存取消状态并只提示一次；重新开启或重启不会自动恢复这条旧任务。这不是只针对 modelhub 的识别，也不保证错误会在短时间内恢复。续跑沿用当前会话进度，不重发原始任务；新消息、`/stop` 或关闭会话会停止旧轮恢复。进程重启后，尚未执行的恢复与交接结果未知的恢复均停止并提示人工继续；已在执行的任务仍可正常交付成功结果，但晚到的容量失败不会再自动续跑，避免重放未能保存的取消操作。两次仍未恢复时显示失败卡，可稍后点击重试继续。普通 503、断流、鉴权和限额错误不进入这条恢复链，外部 adopt、HTTP 和会议接收会话也不受影响。
+Codex 容量不足自动续跑**默认关闭**。管理员可用 `/botconfig set codexCapacityRecovery on` 开启，`/botconfig set codexCapacityRecovery off` 关闭。开启后，Botmux 管理的 Codex / Codex App 飞书会话遇到明确的模型容量错误（`server_overloaded`）时，会在 15 秒、45 秒后各自动续跑一次。每次续跑会向原生会话追加一条恢复提示（每个任务最多两条），可能保留在模型上下文中，关闭开关不会删除已有历史。关闭时若存在待执行的恢复，会保存取消状态并只提示一次；重新开启或重启不会自动恢复这条旧任务。这不是只针对 modelhub 的识别，也不保证错误会在短时间内恢复。续跑沿用当前会话进度，不重发原始任务；新消息、`/stop` 或关闭会话会停止旧轮恢复。进程重启后，尚未执行的恢复与交接结果未知的恢复均停止并提示人工继续；已在执行的任务仍可正常交付成功结果，但晚到的容量失败不会再自动续跑，避免重放未能保存的取消操作。两次仍未恢复时显示失败卡，可稍后点击重试继续。普通 503、断流、鉴权和限额错误不进入这条恢复链，外部 adopt、HTTP 和会议接收会话也不受影响。
+
+容量反馈与上述“自动续跑”相互独立。TraeX 只依据当前 viewport 的原生排队 UI；Codex/Claude Proxy 只依据签名的 `capacity-wait.v3` sideband，不能从普通文本或静默猜测。反馈状态和表情意图成功写入 SessionStore 后可在 daemon 重启后继续收敛；provider 结果不确定时先 LIST 自身表情，再决定删除或创建。首次终态反馈提交失败只跳过反馈表情，不阻断或重放 Botmux 原有终态流程。全量发布使用同一版本并分阶段启用；无权威信号的 provider 显示 unsupported。
 
 ## 群负责人（Agent 工具）
 
@@ -359,3 +361,9 @@ Dashboard 的「Bot 默认设置 → 安全 → Slash 命令」还有一个可�
 ## ⏰ 定时 & ❓帮助
 
 `/schedule ...`（见 [定时任务](/schedule)）· `/help`（话题内显示完整清单）
+
+### 容量反馈
+
+- `/capacity status`：查看容量反馈分批阶段，以及已持久禁用的机器人 × adapter。
+- 宿主 CLI：`botmux capacity status --json`、`phase <shadow|traex|proxy|full|off>`、`disable <appId> <adapter> --reason <原因>`、`enable <appId> <adapter>`。
+- 等待只由 TraeX 当前视口或签名 `capacity-wait.v3` 触发；不从静默、普通文本或引用内容猜测。

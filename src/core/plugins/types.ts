@@ -59,6 +59,19 @@ export interface PluginServiceContribution extends PluginRuntimeEntrypoint {
   mode: PluginServiceMode;
 }
 
+export interface PluginServiceHttpRoute {
+  method: 'GET' | 'POST';
+  path: string;
+}
+
+/** Public allowlist for authenticated Dashboard requests forwarded to the
+ * plugin-owned loopback service. Hosts and credentials are never declared by
+ * plugins or copied into this contribution. */
+export interface PluginServiceHttpContribution {
+  schemaVersion: 1;
+  routes: PluginServiceHttpRoute[];
+}
+
 /** Public, install-time allowlist for card actions handled by a plugin service. */
 export interface PluginCardActionsContribution {
   schemaVersion: 1;
@@ -86,6 +99,7 @@ export interface PluginContributions {
   mcp?: PluginMcpContribution;
   cli?: PluginCliContribution;
   service?: PluginServiceContribution;
+  serviceHttp?: PluginServiceHttpContribution;
   cardActions?: PluginCardActionsContribution;
   commands?: PluginCommandsContribution;
 }
@@ -149,6 +163,8 @@ export interface PluginServiceState {
   updatedAt: string;
   status?: string;
   pid?: number;
+  processStart?: string;
+  host?: string;
   port?: number;
   openUrl?: string;
   healthUrl?: string;
@@ -164,6 +180,7 @@ export interface PluginMaterializedFile {
   cli?: Array<{ name: string }>;
   dashboard?: Array<{ id: string; entry: string }>;
   service?: Array<{ name: string }>;
+  serviceHttp?: PluginServiceHttpContribution;
   cardActions?: PluginCardActionsContribution;
   commands?: PluginCommandsContribution;
 }

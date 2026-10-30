@@ -466,13 +466,6 @@ export interface DaemonSession {
   turnReceivedAtMs?: Map<string, number>;
   /** Native write observations, scoped to the worker generation and exact attempt. */
   replyExecutionStarts?: Map<string, { startedAtMs: number; workerGeneration: number }>;
-  /** Two-phase turn reactions (auto-on for card-off sessions, i.e. streaming
-   *  card disabled). The bot reacts 冲! on each user message the moment it's accepted for the session
-   *  (bound to the message, NOT a worker status edge — so type-ahead / busy-
-   *  batched messages each get their own reaction). Every pending ✋ here is
-   *  flipped to ✅ when the turn returns to idle. In-memory only (a daemon
-   *  restart mid-turn just leaves a stale ✋ — purely cosmetic). */
-  pendingAckReactions?: Array<{ messageId: string; reactionId?: string }>;
   /** Card body display mode. Default 'hidden'. When user clicks 显示输出, defaults to 'screenshot'. */
   displayMode?: DisplayMode;
   /** Latest uploaded screenshot image_key for the streaming card. */
@@ -718,6 +711,8 @@ export interface DaemonSession {
     taskId?: string | null;
   };
   usageLimit?: CliUsageLimitState;
+  /** A failed persistence must be retried even if the next frame is identical. */
+  usageLimitPersistPending?: boolean;
   usageLimitRetryTimer?: NodeJS.Timeout;
   /** Latch for the proactive rate/usage-limit owner notification: the
    *  usageLimitStateKey of the limit episode we already posted about. Exactly

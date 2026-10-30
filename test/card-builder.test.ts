@@ -347,6 +347,15 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     expect(md).not.toContain('![x](');
   });
 
+  it('offers a clear-search button on no match that re-fires adopt_search', () => {
+    const resumable = [{ cliSessionId: 'aaa', cwd: '/home/proj', title: 'unrelated', lastActivityAt: 1 }];
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'en', resumable, { searchQuery: 'ja' }));
+    const buttons = (card.body.elements ?? []).filter((e: any) => e.tag === 'button');
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0].behaviors[0].value.action).toBe('adopt_search');
+    expect(buttons[0].behaviors[0].value.selected).toBe('');
+  });
+
   const herdrLive = (extra: Partial<AdoptableSession> = {}): AdoptableSession => ({
     source: 'herdr',
     herdrSessionName: 'collie',
@@ -1333,6 +1342,24 @@ describe('buildStreamingCard', () => {
   // ── Header / status / template color ───────────────────────────────────
 
   describe('header status and color', () => {
+    it('renders one stable capacity wait status element without replacing the process header', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'working', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, {
+          capacityWait: { state: 'waiting', position: 3, ageMs: 125_000 },
+        } as any,
+      ));
+      const status = card.elements.filter(
+        (element: any) => element.element_id === 'capacity_wait_status',
+      );
+      expect(status).toHaveLength(1);
+      expect(status[0].content).toContain('等待模型容量');
+      expect(status[0].content).toContain('3');
+      expect(status[0].content).toContain('2 分钟');
+      expect(card.header.title.content).toContain('工作中');
+    });
+
     it('should show yellow template and "启动中..." for starting status', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'starting'));
       expect(card.header.template).toBe('yellow');
@@ -2690,6 +2717,32 @@ describe('buildRelayPickerCard', () => {
     expect(containers(card)).toHaveLength(0);
     const allMd = card.body.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
     expect(allMd).toMatch(/没有匹配|No sessions match/);
+  });
+
+  // Regression: the no-match card used to dead-end — the only way back was to
+  // clear the input and submit '', which Lark doesn't fire. A clear-search
+  // button re-fires relay_search without input_value, so the handler resolves
+  // the query to '' and re-renders the full list.
+  it('offers a clear-search button on no match that re-fires relay_search', () => {
+    const card = parse(buildRelayPickerCard(fixtureEntries(3), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: 'ja' }));
+    const buttons = card.body.elements.filter((e: any) => e.tag === 'button');
+    expect(buttons).toHaveLength(1);
+    const v = buttons[0].behaviors[0].value;
+    expect(v.action).toBe('relay_search');
+    expect(v.target_chat_id).toBe('oc_t');
+    expect(v.root_id).toBe('om_r');
+    expect(v.invoker_open_id).toBe('ou_invoker_test');
+    expect(v.selected).toBe('');
+    // Not shown when the search has hits.
+    const hit = parse(buildRelayPickerCard(fixtureEntries(3), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: 'session 1' }));
+    expect(hit.body.elements.filter((e: any) => e.tag === 'button')).toHaveLength(0);
+  });
+
+  it('escapes the echoed search query in the no-match message', () => {
+    const card = parse(buildRelayPickerCard(fixtureEntries(1), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: '![x](http://evil/b)' }));
+    const allMd = card.body.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
+    expect(allMd).toContain('\\[x\\]');
+    expect(allMd).not.toContain('![x](');
   });
 
   // Regression (申晗现场): a p2p entry's chatLabel is the raw DM chatId while

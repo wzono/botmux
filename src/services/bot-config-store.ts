@@ -148,6 +148,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'pinStreamingCard', configKey: 'pinStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '置顶当前公开实时卡片 on|off（失败不影响会话）' },
   { key: 'cotEnabled', configKey: 'cotEnabled', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '思考过程消息 on|off（默认 on）：turn 进行中把模型思考过程以飞书原生 CoT 消息（message_cot）流式展示（客户端需 PC ≥7.70 / 移动端 ≥7.74；支持 claude-code / codex / traex / pi 等适配器）。这是 bot 级总开关，单个群可用 /cot off 关闭' },
   { key: 'thinkingCardToolResult', configKey: 'thinkingCardToolResult', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '思考气泡是否贴工具输出 on|off（默认 on）：off 时气泡只保留思考段落与工具节点标题（工具名 · 命令/路径），不再附带命令输出/文件内容代码块，与 Claude Code 自身界面一致' },
+  { key: 'replyCardShowTools', configKey: 'replyCardShowTools', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '动态单卡是否显示工具调用 on|off（默认 on）：仅 replyCardMode=unified 时生效，legacy 模式无效（切换模式保留该值）；off 时卡片隐藏工具节点、命令、结果与工具次数，思考摘要和公开进度仍显示；不影响原生思考气泡，/cot show 也不会显示被隐藏的工具' },
   { key: 'silentTurnReactions', configKey: 'silentTurnReactions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭无卡片模式下的 GoGoGo/DONE reaction 和 Codex App 追加指令确认回执 on|off' },
   { key: 'writableTerminalLinkInCard', configKey: 'writableTerminalLinkInCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '卡片内嵌可写终端链接 on|off' },
   { key: 'privateCard', configKey: 'privateCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/card 发 owner-only 私有快照 on|off' },
@@ -181,6 +182,8 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'cardActionAckTimeoutMs', configKey: 'cardActionAckTimeoutMs', kind: 'number', effect: 'immediate', clearable: true, min: MIN_CARD_ACTION_ACK_TIMEOUT_MS, max: MAX_CARD_ACTION_ACK_TIMEOUT_MS, hint: '本 bot 所有卡片动作的同步 ACK 等待时长（500–2500ms，默认 2500ms）；超时先提示后台处理，插件可继续执行；unset 回默认' },
   { key: 'maxLiveWorkers', configKey: 'maxLiveWorkers', kind: 'number', effect: 'immediate', clearable: true, hint: '最大常驻会话数；超过后最久未用的会话自动休眠（退出后台进程和 CLI、回收内存，下条消息冷恢复）；unset=默认 30' },
   { key: 'idleSuspendMinutes', configKey: 'idleSuspendMinutes', kind: 'number', effect: 'immediate', clearable: true, hint: '空闲会话自动休眠超时（分钟，正整数）；会话持续空闲超过该时长即自动休眠回收内存，与最大常驻会话数互不影响；unset=关闭（默认，空闲不超时，仅受数量上限约束）' },
+  { key: 'capacityInteractiveReminderMinutes', configKey: 'capacityInteractiveReminderMinutes', kind: 'number', effect: 'immediate', clearable: true, min: 1, max: 60, hint: '交互任务连续等待模型容量多久后原地更新工作卡（分钟，默认 2；1–60；unset 恢复默认）' },
+  { key: 'capacityBackgroundReminderMinutes', configKey: 'capacityBackgroundReminderMinutes', kind: 'number', effect: 'immediate', clearable: true, min: 1, max: 240, hint: '定时/后台任务连续等待模型容量多久后原地更新工作卡（分钟，默认 10；1–240；unset 恢复默认）' },
   { key: 'customPassthroughCommands', configKey: 'customPassthroughCommands', kind: 'stringList', effect: 'immediate', clearable: true, hint: '额外放行透传给 CLI 的 slash 命令（逗号/换行分隔，或“空格+/”分隔，如 /goal /export；名字内空格归一为连字符，/Ultra Goal → /ultra-goal）；unset 回仅内置白名单' },
   { key: 'canTalkDaemonCommands', configKey: 'canTalkDaemonCommands', kind: 'stringList', effect: 'immediate', clearable: true, parseList: parseCanTalkDaemonCommandsInput, hint: '把列出的 daemon 命令权限从 canOperate（仅管理员）降到 canTalk（对话放行即可用），如 /status /help；仅认 daemon 命令，透传命令无效；unset 回全部仅管理员' },
   { key: 'startupCommands', configKey: 'startupCommands', kind: 'stringList', effect: 'next-session', clearable: true, parseList: parseStartupCommandsInput, hint: '开会话后、首条消息前自动发给 CLI 的命令（逗号/换行分隔，可带参数，如 /effort ultracode）；unset 回不发' },
@@ -443,7 +446,10 @@ async function applyConfigFieldInternal(
   if (spec.configKey === 'sandboxNetworkPolicy' && value !== null) {
     try {
       value = parseSandboxNetworkPolicy(value);
-      const reason = networkPolicySupportError({ platform: process.platform, backendType: bot.config.backendType ?? 'pty', sandbox: bot.config.sandbox, policy: value });
+      // Judge the backend new sessions launch on: the override, else the
+      // daemon default (tmux unless BACKEND_TYPE says otherwise), CLI-paired.
+      const backendType = resolvePairedBackendId(bot.config.cliId, bot.config.backendType, config.daemon.backendType) ?? 'pty';
+      const reason = networkPolicySupportError({ platform: process.platform, backendType, sandbox: bot.config.sandbox, policy: value });
       if (reason) return { ok: false, reason };
     } catch (error) { return { ok: false, reason: (error as Error).message }; }
   }

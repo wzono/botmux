@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import {
   MockLlmServer,
   extractMarker,
@@ -234,6 +234,113 @@ describe('MockLlmServer', () => {
       const bodyText = await res.text();
       expect(bodyText).toContain('"finish_reason":"stop"');
       expect(bodyText).toContain('data: [DONE]');
+    });
+  });
+
+  describe('shell tool of each CLI', () => {
+    const post = (path: string, body: unknown) =>
+      fetch(`${baseUrl}${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then((r) => r.text());
+    const prompt = '请立刻调用 botmux send 在本话题里回复一行内容："ACK-e2e-cli-1793300000000"';
+
+    it('calls Grok\'s run_terminal_command with its required description', async () => {
+      const text = await post('/v1/messages', {
+        model: 'mock-model',
+        stream: true,
+        tools: [
+          { name: 'session_title', input_schema: { type: 'object', properties: { title: { type: 'string' } } } },
+          {
+            name: 'run_terminal_command',
+            input_schema: { type: 'object', required: ['command', 'description'], properties: { command: { type: 'string' }, description: { type: 'string' } } },
+          },
+        ],
+        messages: [{ role: 'user', content: prompt }],
+      });
+      const input = JSON.parse(JSON.parse(text.match(/"partial_json":("(?:[^"\\]|\\.)*")/)![1]));
+      expect(text).toContain('"name":"run_terminal_command"');
+      expect(input.command).toContain('ACK-e2e-cli-1793300000000');
+      expect(typeof input.description).toBe('string');
+    });
+
+    it('answers a call whose tools hold no shell with text, not an unknown tool', async () => {
+      const text = await post('/v1/messages', {
+        model: 'mock-model',
+        tools: [{ name: 'session_title', input_schema: { type: 'object' } }],
+        messages: [{ role: 'user', content: prompt }],
+      });
+      expect(text).not.toContain('tool_use');
+    });
+
+    it('prefers Claude\'s exact Bash over BashOutput and KillShell', async () => {
+      const text = await post('/v1/messages', {
+        model: 'mock-model',
+        tools: ['BashOutput', 'KillShell', 'Bash'].map((name) => ({ name, input_schema: { type: 'object' } })),
+        messages: [{ role: 'user', content: prompt }],
+      });
+      expect(text).toContain('"name":"Bash"');
+    });
+
+    it('calls the OpenAI-chat tool by the name the CLI offers (Kimi: Bash)', async () => {
+      const text = await post('/v1/chat/completions', {
+        model: 'mock-model',
+        tools: [{ type: 'function', function: { name: 'Bash', parameters: { type: 'object', required: ['command'], properties: { command: { type: 'string' } } } } }],
+        messages: [{ role: 'user', content: prompt }],
+      });
+      expect(text).toContain('"name":"Bash"');
+      expect(text).toContain('ACK-e2e-cli-1793300000000');
+    });
+
+    it('speaks Gemini: a run_shell_command call, then text after the functionResponse', async () => {
+      const tools = [{ functionDeclarations: [{ name: 'run_shell_command', parametersJsonSchema: { type: 'object', required: ['command'], properties: { command: { type: 'string' } } } }] }];
+      const first = await post('/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse', {
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        tools,
+      });
+      const call = JSON.parse(first.replace(/^data: /, '').trim()).candidates[0].content.parts[0].functionCall;
+      expect(call.name).toBe('run_shell_command');
+      // The reply command carries an env-snapshot fragment (live diagnostic)
+      // followed by the real `botmux send`.
+      expect(call.args.command).toMatch(/^printf '%s %s %s\\n' "\$\(date \+%s\)" "[\s\S]*" >> \.e2e-gemini-shell-env\.log; /);
+      expect(call.args.command).toContain("GITHUB_SHA={${GITHUB_SHA+x}:${GITHUB_SHA-}}");
+      expect(call.args.command).toContain("botmux send --mention-back 'ACK-e2e-cli-1793300000000'");
+
+      const second = await post('/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse', {
+        contents: [
+          { role: 'user', parts: [{ text: prompt }] },
+          { role: 'model', parts: [{ functionCall: call }] },
+          { role: 'user', parts: [{ functionResponse: { name: 'run_shell_command', response: { output: 'sent' } } }] },
+        ],
+        tools,
+      });
+      expect(JSON.parse(second.replace(/^data: /, '').trim()).candidates[0].content.parts[0].text).toBeTypeOf('string');
+
+      const routed = await fetch(`${baseUrl}/v1beta/models/flash:generateContent`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'route' }] }], generationConfig: { responseJsonSchema: {} } }),
+      }).then((r) => r.json() as Promise<any>);
+      expect(JSON.parse(routed.candidates[0].content.parts[0].text)).toHaveProperty('complexity_score');
+    });
+
+    it('warns only after a marker asks the router >2 times without a main-model call', async () => {
+      const warnings: string[] = [];
+      const spy = vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+        warnings.push(args.join(' '));
+      });
+      const postRouter = () =>
+        post('/v1beta/models/flash:generateContent', {
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig: { responseJsonSchema: {} },
+        });
+      try {
+        await postRouter();
+        await postRouter();
+        expect(warnings.filter((w) => w.includes('gemini router'))).toHaveLength(0);
+        await postRouter();
+        const hits = warnings.filter((w) => w.includes('gemini router') && w.includes('hit 3 times'));
+        expect(hits).toHaveLength(1);
+      } finally {
+        spy.mockRestore();
+      }
     });
   });
 
