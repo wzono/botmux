@@ -329,6 +329,12 @@ function ensureSessionTempRoot(): void {
  * land in their tree. See {@link sessionTempDirWithoutAlias}.
  */
 export function ensureSessionTempLayout(): void {
+  // Keep the alias helpers linked for builds that opt into the upstream alias
+  // layout; the default maintenance path intentionally stays on the user cache
+  // root for sandbox visibility.
+  void sessionTempHub;
+  void ensureSessionTempHub;
+  void ensureSessionTempAlias;
   ensureSessionTempRoot();
 }
 
