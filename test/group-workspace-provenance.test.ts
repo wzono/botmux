@@ -18,7 +18,7 @@ function daemonSession(): DaemonSession {
 
 describe('session cwd provenance', () => {
   it.each<SessionWorkingDirMutation>([
-    { workingDir: '/group', source: 'group', groupWorkspaceRevision: 7 },
+    { workingDir: '/group', source: 'group', groupWorkspaceRevision: 7, groupWorkspaceIdentity: { path: '/group', dev: '1', ino: '2' } },
     { workingDir: '/repo', source: 'explicit' },
     { workingDir: '/cd', source: 'explicit' },
     { workingDir: '/worktree', source: 'worktree' },

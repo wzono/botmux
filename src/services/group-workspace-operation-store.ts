@@ -4,9 +4,10 @@ import type { TenantHumanId } from './bot-admin-unions-store.js';
 import { groupWorkspaceOperationKey, type GroupOperationKind } from './group-workspace-store.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLock } from '../utils/file-lock.js';
+import { WORKSPACE_SCHEMA_VERSION, type WorkspaceIdentity } from '../types.js';
 
 export const GROUP_WORKSPACE_OPERATION_STORE_FILE = 'group-workspace-operations.json';
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = WORKSPACE_SCHEMA_VERSION;
 
 export type RepoGroupOperationPhase =
   | 'prepared'
@@ -29,6 +30,7 @@ export interface RepoGroupOperationJournal {
   expectedSessionGeneration: number;
   expectedGroupRevision: number;
   targetWorkingDir: string;
+  targetWorkspaceIdentity?: WorkspaceIdentity;
   actor: TenantHumanId;
   phase: RepoGroupOperationPhase;
   sessionGenerationAfter?: number;
@@ -37,7 +39,7 @@ export interface RepoGroupOperationJournal {
 }
 
 interface OperationRegistry {
-  schemaVersion: 1;
+  schemaVersion: 2;
   operations: Record<string, RepoGroupOperationJournal>;
   sourceIndex: Record<string, string>;
 }
@@ -86,6 +88,12 @@ function isActor(value: unknown): value is TenantHumanId {
     && typeof value.unionId === 'string' && /^on_\S+$/.test(value.unionId);
 }
 
+function isWorkspaceIdentity(value: unknown): value is WorkspaceIdentity {
+  return isObject(value) && typeof value.path === 'string' && isAbsolute(value.path)
+    && typeof value.dev === 'string' && /^\d+$/.test(value.dev)
+    && typeof value.ino === 'string' && /^\d+$/.test(value.ino);
+}
+
 const PHASES = new Set<RepoGroupOperationPhase>([
   'prepared', 'session_committed', 'group_committed', 'conflict', 'invalid_dir', 'unauthorized', 'store_unavailable', 'unknown',
 ]);
@@ -107,6 +115,9 @@ function validateJournal(value: unknown, key: string): asserts value is RepoGrou
     || !validNonnegativeInteger(value.expectedSessionGeneration)
     || !validNonnegativeInteger(value.expectedGroupRevision)
     || typeof value.targetWorkingDir !== 'string' || !isAbsolute(value.targetWorkingDir)
+    || (value.kind === 'set' && (!isWorkspaceIdentity(value.targetWorkspaceIdentity)
+      || value.targetWorkspaceIdentity.path !== value.targetWorkingDir))
+    || (value.kind === 'unbind' && value.targetWorkspaceIdentity !== undefined)
     || !isActor(value.actor)
     || !PHASES.has(value.phase as RepoGroupOperationPhase)
     || !Number.isFinite(value.updatedAt)

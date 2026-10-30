@@ -19,7 +19,8 @@ export function inheritSessionLaunchConfiguration(
   Object.assign(target, structuredClone(Object.fromEntries(fields.map(key => [key, source[key]]))));
   if (effectiveWorkingDir) {
     setSessionWorkingDirMetadata(target, source.workingDirSource === 'group'
-      ? { workingDir: effectiveWorkingDir, source: 'group', groupWorkspaceRevision: source.groupWorkspaceRevision! }
+      ? { workingDir: effectiveWorkingDir, source: 'group', groupWorkspaceRevision: source.groupWorkspaceRevision!,
+          groupWorkspaceIdentity: source.groupWorkspaceIdentity! }
       : { workingDir: effectiveWorkingDir, source: source.workingDirSource ?? 'legacy-unknown' });
   }
 }

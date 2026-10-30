@@ -3,13 +3,13 @@
  * Extracted from the `/cd` command handler so the upcoming dashboard IPC
  * `cd` route (Task 9) can reuse the exact same daemon-record write path.
  */
-import type { Session, SessionWorkingDirSource } from '../types.js';
+import { WORKSPACE_SCHEMA_VERSION, type Session, type SessionWorkingDirSource, type WorkspaceIdentity } from '../types.js';
 import type { DaemonSession } from './types.js';
 import * as sessionStore from '../services/session-store.js';
 import { dashboardEventBus } from './dashboard-events.js';
 
 export type SessionWorkingDirMutation =
-  | { workingDir: string; source: 'group'; groupWorkspaceRevision: number; groupWorkspaceDirectoryIdentity?: { dev: string; ino: string } }
+  | { workingDir: string; source: 'group'; groupWorkspaceRevision: number; groupWorkspaceIdentity: WorkspaceIdentity }
   | { workingDir: string; source: Exclude<SessionWorkingDirSource, 'group'>; groupWorkspaceRevision?: never; groupWorkspaceDirectoryIdentity?: never };
 
 export type GroupWorkspaceFollowJournal = NonNullable<Session['groupWorkspaceFollow']>;
@@ -45,7 +45,7 @@ type GroupWorkspaceReadForFollow =
 export type GroupWorkspaceFollowTargetResolution =
   | { kind: 'continue' }
   | { kind: 'store_unavailable' }
-  | { kind: 'follow'; target: { workingDir: string; revision: number } };
+  | { kind: 'follow'; target: { workingDir: string; revision: number; workspaceIdentity?: WorkspaceIdentity } };
 
 /**
  * Once a follow journal exists, its target is frozen durable intent. A later
@@ -61,6 +61,7 @@ export function resolveGroupWorkspaceFollowTarget(input: {
     return { kind: 'follow', target: {
       workingDir: input.journal.targetWorkingDir,
       revision: input.journal.targetRevision,
+      workspaceIdentity: input.journal.targetWorkspaceIdentity!,
     } };
   }
   if (input.group.status === 'store_unavailable') return { kind: 'store_unavailable' };
@@ -76,7 +77,7 @@ export function resolveGroupWorkspaceFollowTarget(input: {
 /** Crash-resumable replacement at an admitted business-turn boundary. */
 export async function runGroupWorkspaceSessionFollow(
   ds: DaemonSession,
-  target: { workingDir: string; revision: number; directoryIdentity?: { dev: string; ino: string } },
+  target: { workingDir: string; revision: number; workspaceIdentity: WorkspaceIdentity },
   deps: GroupWorkspaceFollowDeps,
 ): Promise<GroupWorkspaceFollowResult> {
   const session = ds.session as FollowSession;
@@ -93,11 +94,13 @@ export async function runGroupWorkspaceSessionFollow(
   if (ds.adoptedFrom || !deps.supportsReplacement(ds)) return fail('worker replacement unsupported');
 
   const previousGeneration = session.workerGeneration ?? 0;
-  const journal: GroupWorkspaceFollowJournal = session.groupWorkspaceFollow?.targetWorkingDir === target.workingDir
+  let journal: GroupWorkspaceFollowJournal = session.groupWorkspaceFollow?.targetWorkingDir === target.workingDir
     && session.groupWorkspaceFollow.targetRevision === target.revision
     ? session.groupWorkspaceFollow
-    : { targetWorkingDir: target.workingDir, targetRevision: target.revision,
-        targetDirectoryIdentity: target.directoryIdentity,
+    : { schemaVersion: WORKSPACE_SCHEMA_VERSION, journalRevision: 0,
+        targetWorkingDir: target.workingDir, targetRevision: target.revision,
+        targetWorkspaceIdentity: target.workspaceIdentity,
+        targetDirectoryIdentity: { dev: target.workspaceIdentity.dev, ino: target.workspaceIdentity.ino },
         previousRevision: session.groupWorkspaceRevision ?? -1,
         previousGeneration, nextGeneration: previousGeneration + 1, phase: 'prepared' };
   try {
@@ -109,19 +112,19 @@ export async function runGroupWorkspaceSessionFollow(
           || (session.workerGeneration ?? 0) !== journal.previousGeneration) {
         return fail('session changed during worker replacement');
       }
-      journal.phase = 'old_exited';
-      deps.persist({ journal, phase: journal.phase });
+      const next = { ...journal, journalRevision: journal.journalRevision! + 1, phase: 'old_exited' as const };
+      deps.persist({ journal: next, phase: next.phase }); journal = next;
     }
     if (journal.phase === 'old_exited') {
       deps.persist({ workingDir: target.workingDir, source: 'group',
         groupWorkspaceRevision: target.revision,
-        groupWorkspaceDirectoryIdentity: journal.targetDirectoryIdentity,
-        journal: { ...journal, phase: 'persisted' } });
+        groupWorkspaceIdentity: journal.targetWorkspaceIdentity!,
+        journal: { ...journal, journalRevision: journal.journalRevision! + 1, phase: 'persisted' } });
       setSessionWorkingDirMetadata(session, { workingDir: target.workingDir, source: 'group',
         groupWorkspaceRevision: target.revision,
-        groupWorkspaceDirectoryIdentity: journal.targetDirectoryIdentity });
+        groupWorkspaceIdentity: journal.targetWorkspaceIdentity! });
       ds.workingDir = target.workingDir;
-      journal.phase = 'persisted';
+      journal = { ...journal, journalRevision: journal.journalRevision! + 1, phase: 'persisted' };
     }
     // A crash may happen after forkWorker durably reserves the generation but
     // before this journal reaches `spawned`. Reconcile that exact reservation
@@ -129,25 +132,25 @@ export async function runGroupWorkspaceSessionFollow(
     // before the mismatch became visible.
     if (journal.phase === 'persisted'
         && (session.workerGeneration ?? 0) === journal.nextGeneration) {
-      journal.phase = 'spawned';
-      deps.persist({ journal, phase: journal.phase });
+      const next = { ...journal, journalRevision: journal.journalRevision! + 1, phase: 'spawned' as const };
+      deps.persist({ journal: next, phase: next.phase }); journal = next;
     }
     if (journal.phase === 'spawned' && !deps.isWorkerLive(ds)) {
       // The replacement was durably spawned by the prior daemon, but no process
       // survived this boot. Rebase the reservation onto one fresh generation;
       // persisting `persisted` first makes a second crash repeat this exact step,
       // never overlap the vanished generation.
-      journal.previousGeneration = Math.max(session.workerGeneration ?? 0, journal.nextGeneration);
-      journal.nextGeneration = journal.previousGeneration + 1;
-      journal.phase = 'persisted';
-      deps.persist({ journal, phase: journal.phase });
+      const previousGeneration = Math.max(session.workerGeneration ?? 0, journal.nextGeneration);
+      const next = { ...journal, journalRevision: journal.journalRevision! + 1,
+        previousGeneration, nextGeneration: previousGeneration + 1, phase: 'persisted' as const };
+      deps.persist({ journal: next, phase: next.phase }); journal = next;
     }
     if (journal.phase === 'persisted') {
       let reservedGeneration: number | undefined;
       if (!deps.spawn(ds, generation => { reservedGeneration = generation; })) return fail('replacement worker spawn refused');
       if (reservedGeneration !== journal.nextGeneration) return fail('replacement worker generation mismatch');
-      journal.phase = 'spawned';
-      deps.persist({ journal, phase: journal.phase });
+      const next = { ...journal, journalRevision: journal.journalRevision! + 1, phase: 'spawned' as const };
+      deps.persist({ journal: next, phase: next.phase }); journal = next;
     }
     const ready = await deps.awaitReady(ds);
     if (!ready.ready) return fail('replacement worker not ready');
@@ -195,8 +198,10 @@ export function setSessionWorkingDirMetadata(session: Session, mutation: Session
   session.workingDir = mutation.workingDir;
   session.workingDirSource = mutation.source;
   session.groupWorkspaceRevision = mutation.source === 'group' ? mutation.groupWorkspaceRevision : undefined;
+  session.workspaceSchemaVersion = mutation.source === 'group' ? WORKSPACE_SCHEMA_VERSION : undefined;
+  session.groupWorkspaceIdentity = mutation.source === 'group' ? mutation.groupWorkspaceIdentity : undefined;
   session.groupWorkspaceDirectoryIdentity = mutation.source === 'group'
-    ? mutation.groupWorkspaceDirectoryIdentity
+    ? { dev: mutation.groupWorkspaceIdentity.dev, ino: mutation.groupWorkspaceIdentity.ino }
     : undefined;
   session.riffRepoDirs = undefined;
 }

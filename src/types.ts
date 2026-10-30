@@ -498,6 +498,12 @@ export type SessionWorkingDirSource =
   | 'worktree'
   | 'legacy-unknown';
 
+export const WORKSPACE_SCHEMA_VERSION = 2 as const;
+export interface WorkspaceIdentity { path: string; dev: string; ino: string }
+export function workspaceIdentityEqual(left: WorkspaceIdentity, right: WorkspaceIdentity): boolean {
+  return left.path === right.path && left.dev === right.dev && left.ino === right.ino;
+}
+
 export interface Session {
   sessionId: string;
   /** Frozen opt-in at birth; ordinary sessions never inherit listener cleanup. */
@@ -792,17 +798,22 @@ export interface Session {
    *  `pid`; a row without it is never signalled through `pid`. */
   pidProcStart?: string;
   workingDir?: string;
+  workspaceSchemaVersion?: typeof WORKSPACE_SCHEMA_VERSION;
   /** Durable origin of workingDir. Missing legacy values normalize to legacy-unknown. */
   workingDirSource?: SessionWorkingDirSource;
   /** Present exactly when workingDirSource is group. */
   groupWorkspaceRevision?: number;
   /** Directory identity captured from the authoritative group binding. */
   groupWorkspaceDirectoryIdentity?: { dev: string; ino: string };
+  groupWorkspaceIdentity?: WorkspaceIdentity;
   /** Durable replacement journal for a group-following local worker. */
   groupWorkspaceFollow?: {
+    schemaVersion?: typeof WORKSPACE_SCHEMA_VERSION;
+    journalRevision?: number;
     targetWorkingDir: string;
     targetRevision: number;
     targetDirectoryIdentity?: { dev: string; ino: string };
+    targetWorkspaceIdentity?: WorkspaceIdentity;
     previousRevision: number;
     previousGeneration: number;
     nextGeneration: number;

@@ -11,9 +11,10 @@ import {
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { fsyncFilesAndDirectorySync } from '../utils/fs-durability.js';
 import { withFileLock } from '../utils/file-lock.js';
+import { WORKSPACE_SCHEMA_VERSION, type WorkspaceIdentity } from '../types.js';
 
 export const GROUP_WORKSPACE_STORE_FILE = 'group-workspaces.json';
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = WORKSPACE_SCHEMA_VERSION;
 const SOURCE_VERSION = 1;
 const PAYLOAD_VERSION = 1;
 const OPERATION_KEY_VERSION = 1;
@@ -27,6 +28,7 @@ export interface GroupWorkspaceRecord {
   revision: number;
   directory: GroupDirectoryState;
   directoryIdentity?: PathIdentity;
+  workspaceIdentity?: WorkspaceIdentity;
   workspaceManagers?: TenantHumanId[];
   updatedAt: number;
   updatedBy: TenantHumanId;
@@ -56,10 +58,11 @@ export interface GroupOperationReceipt {
   expectedRevision: number;
   expectedSessionGeneration?: number;
   canonicalTargetWorkingDir?: string;
+  workspaceIdentity?: WorkspaceIdentity;
 }
 
 interface GroupWorkspaceRegistry {
-  schemaVersion: 1;
+  schemaVersion: 2;
   records: Record<string, GroupWorkspaceRecord>;
   receipts: Record<string, GroupOperationReceipt>;
 }
@@ -262,14 +265,21 @@ function isPathIdentity(value: unknown): value is PathIdentity {
     && typeof value.ino === 'string' && /^\d+$/.test(value.ino);
 }
 
+function isWorkspaceIdentity(value: unknown): value is WorkspaceIdentity {
+  return isPathIdentity(value) && isObject(value)
+    && typeof value.path === 'string' && isAbsolute(value.path);
+}
+
 function validateRecord(value: unknown, key: string): asserts value is GroupWorkspaceRecord {
   if (!isObject(value)
     || value.chatId !== key
     || !Number.isSafeInteger(value.revision) || (value.revision as number) < 1
     || !isDirectoryState(value.directory)
     || (value.directory.kind === 'bound'
-      && value.directoryIdentity !== undefined && !isPathIdentity(value.directoryIdentity))
-    || (value.directory.kind === 'unbound' && value.directoryIdentity !== undefined)
+      && (!isWorkspaceIdentity(value.workspaceIdentity)
+        || value.workspaceIdentity.path !== value.directory.workingDir
+        || (value.directoryIdentity !== undefined && !isPathIdentity(value.directoryIdentity))))
+    || (value.directory.kind === 'unbound' && (value.directoryIdentity !== undefined || value.workspaceIdentity !== undefined))
     || !validManagers(value.workspaceManagers)
     || !Number.isFinite(value.updatedAt)
     || !isTenantHumanId(value.updatedBy)) {
@@ -311,7 +321,9 @@ function validateReceipt(value: unknown, key: string): asserts value is GroupOpe
     throw new Error(`invalid group workspace committed revision: ${key}`);
   }
   if (value.kind === 'set') {
-    if (typeof value.canonicalTargetWorkingDir !== 'string') {
+    if (typeof value.canonicalTargetWorkingDir !== 'string'
+      || (committed && (!isWorkspaceIdentity(value.workspaceIdentity)
+        || value.workspaceIdentity.path !== value.canonicalTargetWorkingDir))) {
       throw new Error(`invalid group workspace set receipt target: ${key}`);
     }
     const expectedDigest = digest('group-workspace-payload-v1', [
@@ -327,7 +339,7 @@ function validateReceipt(value: unknown, key: string): asserts value is GroupOpe
       PAYLOAD_VERSION, value.chatId, value.kind, 'tombstone',
     ]);
     if (value.payloadDigest !== expectedDigest
-      || value.canonicalTargetWorkingDir !== undefined
+      || value.canonicalTargetWorkingDir !== undefined || value.workspaceIdentity !== undefined
       || value.expectedSessionGeneration !== undefined
       || (committed && value.resultingDirectory?.kind !== 'unbound')) {
       throw new Error(`invalid group workspace unbind receipt payload: ${key}`);
@@ -573,6 +585,9 @@ export class GroupWorkspaceStore {
             ? { expectedSessionGeneration: input.expectedSessionGeneration }
             : {}),
           ...(input.kind === 'set' ? { canonicalTargetWorkingDir: target.workingDir } : {}),
+          ...(input.kind === 'set' && current.workspaceIdentity
+            ? { workspaceIdentity: structuredClone(current.workspaceIdentity) }
+            : {}),
         };
         registry.receipts[operationKey] = receipt;
         validateRegistryHistory(registry);
@@ -672,6 +687,9 @@ export class GroupWorkspaceStore {
             revision: resultingRevision,
             directory: resultingDirectory,
             ...(validatedIdentity ? { directoryIdentity: validatedIdentity } : {}),
+            ...(validatedIdentity && resultingDirectory.kind === 'bound'
+              ? { workspaceIdentity: { path: resultingDirectory.workingDir, ...validatedIdentity } }
+              : {}),
             ...(current?.workspaceManagers?.length
               ? { workspaceManagers: current.workspaceManagers.map(manager => ({ ...manager })) }
               : {}),
@@ -698,6 +716,9 @@ export class GroupWorkspaceStore {
             : {}),
           ...(input.kind === 'set'
             ? { canonicalTargetWorkingDir: canonicalWorkingDir(input.requestedWorkingDir) }
+            : {}),
+          ...(input.kind === 'set' && validatedIdentity
+            ? { workspaceIdentity: { path: canonicalWorkingDir(input.requestedWorkingDir), ...validatedIdentity } }
             : {}),
         };
         registry.receipts[operationKey] = receipt;

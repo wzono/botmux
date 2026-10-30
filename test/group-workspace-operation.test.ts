@@ -31,7 +31,7 @@ const BASE = {
     expectedRevision: 2, actor: ACTOR, authorized: true, directoryValid: true, now: 0,
   }), chatId: 'chat-1', sessionId: 'session-1',
   expectedSessionGeneration: 4, expectedGroupRevision: 2,
-  targetWorkingDir: '/repo/X', actor: ACTOR,
+  targetWorkingDir: '/repo/X', targetWorkspaceIdentity: { path: '/repo/X', dev: '1', ino: '2' }, actor: ACTOR,
 };
 
 function dir(): string { return mkdtempSync(join(tmpdir(), 'botmux-operation-')); }
@@ -88,7 +88,7 @@ describe('GroupWorkspaceOperationStore', () => {
     const path = join(dataDir, 'group-workspace-operations.json');
     const legacy = journal() as Partial<RepoGroupOperationJournal>;
     delete legacy.requestIntentDigest;
-    writeFileSync(path, JSON.stringify({ schemaVersion: 1, operations: { [BASE.operationKey]: legacy } }));
+    writeFileSync(path, JSON.stringify({ schemaVersion: 2, operations: { [BASE.operationKey]: legacy } }));
     await expect(new GroupWorkspaceOperationStore(dataDir).getByIntent(BASE.sourceEventId, BASE.kind))
       .resolves.toEqual({ status: 'store_unavailable' });
   });
@@ -160,7 +160,7 @@ function harness(options: {
         : { status: 'missing' };
     },
     readCurrentGroupRevision: async () => { calls.push('revision'); return { status: 'available', revision }; },
-    resolveCanonicalTarget: async () => { calls.push('target'); return { status: 'resolved', workingDir: options.target ?? '/repo/X' }; },
+    resolveCanonicalTarget: async () => { calls.push('target'); const path = options.target ?? '/repo/X'; return { status: 'resolved', workingDir: path, workspaceIdentity: { path, dev: '1', ino: '2' } }; },
     readSession: async () => { calls.push('session-read'); return { status: 'available', ...session }; },
     switchSession: async input => {
       calls.push('switch'); switches += 1; workers += 1;

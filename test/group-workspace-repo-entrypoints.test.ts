@@ -62,7 +62,7 @@ describe('group workspace /repo entrypoints', () => {
           resolveCanonicalTarget: async () => {
             resolutions += 1;
             const resolved = resolveGroupWorkspaceRepoSelection(request.selection!, [scanRoot], mapping);
-            return resolved ? { status: 'resolved' as const, workingDir: resolved.path } : { status: 'store_unavailable' as const };
+            return resolved ? { status: 'resolved' as const, workingDir: resolved.path, workspaceIdentity: { path: resolved.path, dev: '1', ino: '2' } } : { status: 'store_unavailable' as const };
           },
           readSession: async () => ({ status: 'available' as const, generation: 0, workingDir: '/old' }),
           switchSession: async () => { switches += 1; return { status: 'committed' as const, generation: 1 }; },

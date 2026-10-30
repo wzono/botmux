@@ -17,7 +17,7 @@ function harness(opts: HarnessOptions = {}) {
     sessionId: 's1', workingDir: '/x1', workingDirSource: opts.source ?? 'group',
     groupWorkspaceRevision: opts.revision ?? 1, workerGeneration: 4,
     ...(opts.journalPhase ? { groupWorkspaceFollow: {
-      targetWorkingDir: '/x2', targetRevision: 2, previousRevision: 1, previousGeneration: 4,
+      schemaVersion: 2, journalRevision: 0, targetWorkingDir: '/x2', targetRevision: 2, targetWorkspaceIdentity: { path: '/x2', dev: '1', ino: '2' }, previousRevision: 1, previousGeneration: 4,
       nextGeneration: 5, phase: opts.journalPhase,
     } } : {}),
   };
@@ -51,20 +51,20 @@ describe('group workspace pre-turn worker follow', () => {
     'keeps the durable %s target authoritative after the group is unbound',
     phase => {
       const journal = {
-        targetWorkingDir: '/x2', targetRevision: 2, previousRevision: 1,
+        schemaVersion: 2, journalRevision: 0, targetWorkingDir: '/x2', targetRevision: 2, targetWorkspaceIdentity: { path: '/x2', dev: '1', ino: '2' }, previousRevision: 1,
         previousGeneration: 4, nextGeneration: 5, phase,
       };
       expect(resolveGroupWorkspaceFollowTarget({
         journal,
         group: { status: 'available', record: { revision: 3, directory: { kind: 'unbound' } } },
-      })).toEqual({ kind: 'follow', target: { workingDir: '/x2', revision: 2 } });
+      })).toEqual({ kind: 'follow', target: { workingDir: '/x2', revision: 2, workspaceIdentity: { path: '/x2', dev: '1', ino: '2' } } });
     },
   );
 
   it('does not admit an unbound group session while its follow journal is unresolved', () => {
     expect(resolveGroupWorkspaceFollowTarget({
       journal: {
-        targetWorkingDir: '/x2', targetRevision: 2, previousRevision: 1,
+        schemaVersion: 2, journalRevision: 0, targetWorkingDir: '/x2', targetRevision: 2, targetWorkspaceIdentity: { path: '/x2', dev: '1', ino: '2' }, previousRevision: 1,
         previousGeneration: 4, nextGeneration: 5, phase: 'persisted',
       },
       group: { status: 'available', record: { revision: 3, directory: { kind: 'unbound' } } },
@@ -76,17 +76,17 @@ describe('group workspace pre-turn worker follow', () => {
     phase => {
       expect(resolveGroupWorkspaceFollowTarget({
         journal: {
-          targetWorkingDir: '/x2', targetRevision: 2, previousRevision: 1,
+          schemaVersion: 2, journalRevision: 0, targetWorkingDir: '/x2', targetRevision: 2, targetWorkspaceIdentity: { path: '/x2', dev: '1', ino: '2' }, previousRevision: 1,
           previousGeneration: 4, nextGeneration: 5, phase,
         },
         group: { status: 'store_unavailable' },
-      })).toEqual({ kind: 'follow', target: { workingDir: '/x2', revision: 2 } });
+      })).toEqual({ kind: 'follow', target: { workingDir: '/x2', revision: 2, workspaceIdentity: { path: '/x2', dev: '1', ino: '2' } } });
     },
   );
 
   it.each(['claude', 'codex'])('replaces an idle local PTY generation before delivering on %s', async () => {
     const h = harness();
-    const result = await runGroupWorkspaceSessionFollow(h.ds, { workingDir: '/x2', revision: 2 }, h.deps);
+    const result = await runGroupWorkspaceSessionFollow(h.ds, { workingDir: '/x2', revision: 2, workspaceIdentity: { path: '/x2', dev: '1', ino: '2' } }, h.deps);
     h.order.push('deliver');
     expect(result).toEqual({ kind: 'migrated' });
     expect(h.order).toEqual(['persist:prepared', 'retire',
@@ -103,7 +103,7 @@ describe('group workspace pre-turn worker follow', () => {
     ['bot default', { source: 'bot-default' }], ['legacy', { source: 'legacy-unknown' }],
   ])('defers or skips %s without lifecycle mutation', async (_name, options) => {
     const h = harness(options as HarnessOptions);
-    const result = await runGroupWorkspaceSessionFollow(h.ds, { workingDir: '/x2', revision: 2 }, h.deps);
+    const result = await runGroupWorkspaceSessionFollow(h.ds, { workingDir: '/x2', revision: 2, workspaceIdentity: { path: '/x2', dev: '1', ino: '2' } }, h.deps);
     expect(result.kind).toMatch(/deferred|unchanged/);
     expect(h.order).toEqual([]);
   });
@@ -111,7 +111,7 @@ describe('group workspace pre-turn worker follow', () => {
   it.each(['retire', 'persist', 'spawn', 'ready', 'cwd'] as const)(
     'fails closed once when %s fails', async fail => {
       const h = harness({ fail });
-      const result = await runGroupWorkspaceSessionFollow(h.ds, { workingDir: '/x2', revision: 2 }, h.deps);
+      const result = await runGroupWorkspaceSessionFollow(h.ds, { workingDir: '/x2', revision: 2, workspaceIdentity: { path: '/x2', dev: '1', ino: '2' } }, h.deps);
       expect(result.kind).toBe('failed');
       expect(h.order.filter(x => x === 'notice:failed')).toHaveLength(1);
       if (fail === 'retire') expect(h.order).not.toContain('spawn');
@@ -120,7 +120,7 @@ describe('group workspace pre-turn worker follow', () => {
   it.each([['remote', { local: false }], ['adopt', { adopted: true }]])(
     'fails closed and retains the old cwd for %s sessions', async (_name, options) => {
       const h = harness(options as HarnessOptions);
-      const result = await runGroupWorkspaceSessionFollow(h.ds, { workingDir: '/x2', revision: 2 }, h.deps);
+      const result = await runGroupWorkspaceSessionFollow(h.ds, { workingDir: '/x2', revision: 2, workspaceIdentity: { path: '/x2', dev: '1', ino: '2' } }, h.deps);
       expect(result.kind).toBe('failed');
       expect(h.ds.session.workingDir).toBe('/x1');
       expect(h.order).toEqual(['notice:failed']);
@@ -134,7 +134,7 @@ describe('group workspace pre-turn worker follow', () => {
       h.ds.session.workingDirSource = 'explicit';
       return true;
     };
-    const result = await runGroupWorkspaceSessionFollow(h.ds, { workingDir: '/x2', revision: 2 }, h.deps);
+    const result = await runGroupWorkspaceSessionFollow(h.ds, { workingDir: '/x2', revision: 2, workspaceIdentity: { path: '/x2', dev: '1', ino: '2' } }, h.deps);
     expect(result.kind).toBe('failed');
     expect(h.ds.session.workingDir).toBe('/manual');
     expect(h.order).not.toContain('spawn');
@@ -142,7 +142,7 @@ describe('group workspace pre-turn worker follow', () => {
 
   it.each(['prepared', 'old_exited', 'persisted', 'spawned'] as const)('recovers %s journal without overlapping workers', async phase => {
     const h = harness({ journalPhase: phase });
-    const result = await runGroupWorkspaceSessionFollow(h.ds, { workingDir: '/x2', revision: 2 }, h.deps);
+    const result = await runGroupWorkspaceSessionFollow(h.ds, { workingDir: '/x2', revision: 2, workspaceIdentity: { path: '/x2', dev: '1', ino: '2' } }, h.deps);
     expect(result.kind).toBe('migrated');
     expect(h.order.filter(x => x === 'spawn')).toHaveLength(phase === 'spawned' ? 0 : 1);
   });
@@ -151,7 +151,7 @@ describe('group workspace pre-turn worker follow', () => {
     const h = harness({ journalPhase: 'persisted' });
     h.ds.session.workerGeneration = 5;
     h.deps.isWorkerLive = () => true;
-    const result = await runGroupWorkspaceSessionFollow(h.ds, { workingDir: '/x2', revision: 2 }, h.deps);
+    const result = await runGroupWorkspaceSessionFollow(h.ds, { workingDir: '/x2', revision: 2, workspaceIdentity: { path: '/x2', dev: '1', ino: '2' } }, h.deps);
     expect(result.kind).toBe('migrated');
     expect(h.order).not.toContain('spawn');
   });
@@ -164,7 +164,7 @@ describe('group workspace pre-turn worker follow', () => {
       reserved(6);
       return true;
     };
-    const result = await runGroupWorkspaceSessionFollow(h.ds, { workingDir: '/x2', revision: 2 }, h.deps);
+    const result = await runGroupWorkspaceSessionFollow(h.ds, { workingDir: '/x2', revision: 2, workspaceIdentity: { path: '/x2', dev: '1', ino: '2' } }, h.deps);
     expect(result.kind).toBe('migrated');
     expect(h.order.filter(x => x === 'spawn')).toHaveLength(1);
   });

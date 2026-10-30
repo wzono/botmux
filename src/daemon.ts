@@ -6414,7 +6414,7 @@ async function followGroupWorkspaceBeforeBusinessTurn(
   const outcome = await runGroupWorkspaceSessionFollow(ds, {
     workingDir: target.workingDir,
     revision: targetRevision,
-    directoryIdentity: health.usability.identity,
+    workspaceIdentity: { path: health.usability.normalizedPath, ...health.usability.identity },
   }, {
     isIdle: current => !!current.worker && !current.worker.killed
       && current.cliReady === true && current.lastScreenStatus === 'idle'
@@ -20431,7 +20431,7 @@ async function resolvePinnedWorkingDir(ctx: {
           workingDir: workspaceCwd.workingDir,
           source: 'group',
           groupWorkspaceRevision: workspaceCwd.groupWorkspaceRevision!,
-          groupWorkspaceDirectoryIdentity: workspaceCwd.groupWorkspaceDirectoryIdentity,
+          groupWorkspaceIdentity: { path: workspaceCwd.workingDir, ...workspaceCwd.groupWorkspaceDirectoryIdentity! },
         }
       : { workingDir: workspaceCwd.workingDir, source: workspaceCwd.source }
     : inheritedFrom
@@ -23319,7 +23319,8 @@ async function prepareIndependentCrossPrincipalSession(
       setSessionWorkingDirMetadata(child, isolatedWorktree
         ? { workingDir, source: 'worktree' }
         : sourceDs.session.workingDirSource === 'group'
-          ? { workingDir, source: 'group', groupWorkspaceRevision: sourceDs.session.groupWorkspaceRevision! }
+          ? { workingDir, source: 'group', groupWorkspaceRevision: sourceDs.session.groupWorkspaceRevision!,
+              groupWorkspaceIdentity: sourceDs.session.groupWorkspaceIdentity! }
           : { workingDir, source: sourceDs.session.workingDirSource ?? 'legacy-unknown' });
       child.nativeSessionTitle = title;
       child.nativeSessionTitleUserDefined = false;
@@ -33042,7 +33043,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                 const resolved = resolveGroupWorkspaceRepoSelection(
                   request.selection!, getProjectScanDirs(ds), lastRepoScan.get(ds.chatId),
                 );
-                return resolved ? { status: 'resolved', workingDir: resolved.path } : { status: 'store_unavailable' };
+                if (!resolved) return { status: 'store_unavailable' };
+                const proof = probePathUsability(resolved.path);
+                return proof.ok
+                  ? { status: 'resolved', workingDir: proof.normalizedPath,
+                      workspaceIdentity: { path: proof.normalizedPath, ...proof.identity } }
+                  : { status: 'store_unavailable' };
               },
               readSession: async sessionId => {
                 const current = activeSessions.get(sessionId);
@@ -33081,7 +33087,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                   throw new Error('session provenance convergence lost generation ownership');
                 }
                 applySessionWorkingDir(current, input.source === 'group'
-                  ? { workingDir: getSessionWorkingDir(current), source: 'group', groupWorkspaceRevision: input.groupRevision! }
+                  ? { workingDir: getSessionWorkingDir(current), source: 'group', groupWorkspaceRevision: input.groupRevision!,
+                      groupWorkspaceIdentity: current.session.groupWorkspaceIdentity! }
                   : { workingDir: getSessionWorkingDir(current), source: 'explicit' });
               },
             });

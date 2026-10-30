@@ -117,7 +117,7 @@ describe('GroupWorkspaceStore', () => {
     const dir = dataDir();
     const sourceEventId = textSource('om_bad_key');
     writeFileSync(join(dir, 'group-workspaces.json'), JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: 2,
       records: {},
       receipts: {
         wrong: {
@@ -130,7 +130,7 @@ describe('GroupWorkspaceStore', () => {
           actor: U,
           completedAt: 100,
           expectedRevision: 1,
-          canonicalTargetWorkingDir: '/tmp/X',
+          canonicalTargetWorkingDir: '/tmp/X', workspaceIdentity: { path: '/tmp/X', dev: '1', ino: '2' },
         },
       },
     }));
@@ -160,7 +160,7 @@ describe('GroupWorkspaceStore', () => {
     const sourceEventId = textSource('om_fabricated');
     const operationKey = groupWorkspaceOperationKey(sourceEventId, 'set');
     writeFileSync(join(dir, 'group-workspaces.json'), JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: 2,
       records: {},
       receipts: {
         [operationKey]: {
@@ -284,7 +284,7 @@ describe('GroupWorkspaceStore', () => {
   ])('rejects malformed mutation input before lookup or write: %s', async (_name, patch) => {
     const dir = dataDir();
     const path = join(dir, 'group-workspaces.json');
-    writeFileSync(path, JSON.stringify({ schemaVersion: 1, records: {}, receipts: {} }));
+    writeFileSync(path, JSON.stringify({ schemaVersion: 2, records: {}, receipts: {} }));
     let writes = 0;
     const store = createStore(dir, {
       writer: (...args) => {
@@ -298,7 +298,7 @@ describe('GroupWorkspaceStore', () => {
     } as any);
     expect(result).toEqual({ outcome: 'store_unavailable' });
     expect(writes).toBe(0);
-    expect(readFileSync(path, 'utf8')).toBe(JSON.stringify({ schemaVersion: 1, records: {}, receipts: {} }));
+    expect(readFileSync(path, 'utf8')).toBe(JSON.stringify({ schemaVersion: 2, records: {}, receipts: {} }));
   });
 
   it('leaves a readable store byte-for-byte unchanged for malformed mutation input', async () => {
@@ -411,10 +411,10 @@ describe('GroupWorkspaceStore', () => {
     const sourceEventId = textSource('om_exact_proof');
     const input = setInput({ sourceEventId, workingDir: '/tmp/exact', expectedRevision: 0, now: 100 });
     writeFileSync(path, JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: 2,
       records: {
         [CHAT]: {
-          chatId: CHAT, revision: 1, directory: { kind: 'bound', workingDir: '/tmp/exact' },
+          chatId: CHAT, revision: 1, directory: { kind: 'bound', workingDir: '/tmp/exact' }, workspaceIdentity: { path: '/tmp/exact', dev: '1', ino: '2' },
           updatedAt: 100, updatedBy: U,
         },
       },
@@ -433,8 +433,8 @@ describe('GroupWorkspaceStore', () => {
     const sourceEventId = textSource('om_exact_ambiguous');
     const input = setInput({ sourceEventId, workingDir: '/tmp/exact', expectedRevision: 0, now: 100 });
     writeFileSync(path, JSON.stringify({
-      schemaVersion: 1,
-      records: { [CHAT]: { chatId: CHAT, revision: 1, directory: { kind: 'bound', workingDir: '/tmp/exact' }, updatedAt: 100, updatedBy: U } },
+      schemaVersion: 2,
+      records: { [CHAT]: { chatId: CHAT, revision: 1, directory: { kind: 'bound', workingDir: '/tmp/exact' }, workspaceIdentity: { path: '/tmp/exact', dev: '1', ino: '2' }, updatedAt: 100, updatedBy: U } },
       receipts: {},
     }));
     let writes = 0;
@@ -456,10 +456,10 @@ describe('GroupWorkspaceStore', () => {
     const path = join(dir, 'group-workspaces.json');
     const sourceEventId = textSource('om_inexact_proof');
     writeFileSync(path, JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: 2,
       records: {
         [CHAT]: {
-          chatId: CHAT, revision: 1, directory: { kind: 'bound', workingDir: '/tmp/other' },
+          chatId: CHAT, revision: 1, directory: { kind: 'bound', workingDir: '/tmp/other' }, workspaceIdentity: { path: '/tmp/other', dev: '1', ino: '2' },
           updatedAt: 100, updatedBy: U,
         },
       },
@@ -559,7 +559,7 @@ describe('GroupWorkspaceStore', () => {
       receipt: {
         expectedRevision: 0,
         expectedSessionGeneration: 7,
-        canonicalTargetWorkingDir: '/tmp/X',
+        canonicalTargetWorkingDir: '/tmp/X', workspaceIdentity: { path: '/tmp/X', dev: '1', ino: '2' },
       },
     });
     expect(await createStore(dir).read(CHAT)).toMatchObject({
@@ -620,12 +620,12 @@ describe('GroupWorkspaceStore', () => {
     }));
     const operationKey = groupWorkspaceOperationKey(sourceEventId, 'set');
     writeFileSync(join(dir, 'group-workspaces.json'), JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: 2,
       records: {
         [CHAT]: {
           chatId: CHAT,
           revision: 1,
-          directory: { kind: 'bound', workingDir: '/tmp/X' },
+          directory: { kind: 'bound', workingDir: '/tmp/X' }, workspaceIdentity: { path: '/tmp/X', dev: '1', ino: '2' },
           workspaceManagers: [U],
           updatedAt: 100,
           updatedBy: U,
@@ -645,7 +645,7 @@ describe('GroupWorkspaceStore', () => {
           completedAt: 100,
           expectedRevision: 0,
           expectedSessionGeneration: 1,
-          canonicalTargetWorkingDir: '/tmp/X',
+          canonicalTargetWorkingDir: '/tmp/X', workspaceIdentity: { path: '/tmp/X', dev: '1', ino: '2' },
         },
       },
     }));
@@ -673,7 +673,7 @@ describe('GroupWorkspaceStore', () => {
   it('fails closed instead of overflowing the revision counter', async () => {
     const dir = dataDir();
     writeFileSync(join(dir, 'group-workspaces.json'), JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: 2,
       records: {
         [CHAT]: {
           chatId: CHAT,

@@ -155,7 +155,7 @@ function durableHarness(input: {
     resolveCanonicalTarget: async request => {
       calls.push('target');
       const target = input.targetBySelection.get(request.requestIntentDigest);
-      return target ? { status: 'resolved', workingDir: target } : { status: 'store_unavailable' };
+      return target ? { status: 'resolved', workingDir: target, workspaceIdentity: { path: target, dev: '1', ino: '2' } } : { status: 'store_unavailable' };
     },
     readSession: async () => {
       calls.push('session');
@@ -400,7 +400,7 @@ describe('precedence, explicit provenance, and safe local follow', () => {
       group: { status: 'available', record: { revision: 2, directory: { kind: 'bound', workingDir: '/group-r2' } } },
     })).toEqual({ kind: 'follow', target: { workingDir: '/group-r2', revision: 2 } });
     // The follow coordinator itself is the final policy gate for explicit sessions.
-    return expect(runGroupWorkspaceSessionFollow(ds, { workingDir: '/group-r2', revision: 2 }, {
+    return expect(runGroupWorkspaceSessionFollow(ds, { workingDir: '/group-r2', revision: 2, workspaceIdentity: { path: '/group-r2', dev: '1', ino: '2' } }, {
       isIdle: () => true, supportsReplacement: () => true, isWorkerLive: () => true,
       persist: () => { throw new Error('must not persist'); }, retire: async () => { throw new Error('must not retire'); },
       spawn: () => { throw new Error('must not spawn'); }, awaitReady: async () => ({ ready: true }), notice: () => undefined,
@@ -419,7 +419,7 @@ describe('precedence, explicit provenance, and safe local follow', () => {
       workerGeneration: 1,
     } as any;
     const ds = { session, workingDir: oldDir, scope: 'chat', workerGeneration: 1 } as DaemonSession;
-    const result = await runGroupWorkspaceSessionFollow(ds, { workingDir: newDir, revision: 2 }, {
+    const result = await runGroupWorkspaceSessionFollow(ds, { workingDir: newDir, revision: 2, workspaceIdentity: { path: newDir, dev: '1', ino: '2' } }, {
       isIdle: () => true,
       supportsReplacement: () => true,
       isWorkerLive: () => liveWorkers === 1,

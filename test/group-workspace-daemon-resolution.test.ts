@@ -143,6 +143,7 @@ describe('group workspace resolution', () => {
     const ds = {
       session: { sessionId: `sid-${backendType}`, chatId: CHAT, rootMessageId: CHAT, status: 'active', createdAt: new Date(0).toISOString(),
         larkAppId: `bot-${backendType}`, chatType: 'group', scope: 'chat', workingDir: requested, workingDirSource: 'group',
+        workspaceSchemaVersion: 2, groupWorkspaceIdentity: { path: requested, ...identity },
         groupWorkspaceRevision: 1, workerGeneration: 0, backendType },
       worker, workerPort: null, workerToken: null, larkAppId: `bot-${backendType}`, chatId: CHAT, chatType: 'group', scope: 'chat',
       spawnedAt: 0, lastMessageAt: 0, hasHistory: false, workerGeneration: 0,
@@ -177,7 +178,9 @@ describe('group workspace resolution', () => {
     worker.stderr = new EventEmitter();
     const ds = {
       session: { sessionId: 'sid', chatId: CHAT, rootMessageId: CHAT, status: 'active', createdAt: new Date(0).toISOString(),
-        larkAppId: 'bot-b', chatType: 'group', scope: 'chat', workingDir: requested, workingDirSource: 'group', groupWorkspaceRevision: 1, workerGeneration: 0 },
+        larkAppId: 'bot-b', chatType: 'group', scope: 'chat', workingDir: requested, workingDirSource: 'group',
+        workspaceSchemaVersion: 2, groupWorkspaceIdentity: { path: requested, dev: '1', ino: '2' },
+        groupWorkspaceRevision: 1, workerGeneration: 0 },
       worker, workerPort: null, workerToken: null, larkAppId: 'bot-b', chatId: CHAT, chatType: 'group', scope: 'chat',
       spawnedAt: 0, lastMessageAt: 0, hasHistory: false, workerGeneration: 0,
       groupWorkspaceLaunchGuard: { workingDir: requested },

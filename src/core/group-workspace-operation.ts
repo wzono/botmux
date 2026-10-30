@@ -12,6 +12,7 @@ import type {
   GroupWorkspaceOperationStore,
   RepoGroupOperationJournal,
 } from '../services/group-workspace-operation-store.js';
+import type { WorkspaceIdentity } from '../types.js';
 
 export type GroupCommitResult =
   | { status: 'committed'; resultingRevision: number }
@@ -24,6 +25,7 @@ export type GroupCommitReceipt = Exclude<GroupCommitResult, { status: 'unknown' 
   payloadDigest: string;
   chatId: string;
   targetWorkingDir: string;
+  workspaceIdentity: WorkspaceIdentity;
 };
 
 export type GroupReceiptLookupResult =
@@ -61,7 +63,7 @@ export interface GroupWorkspaceOperationDependencies {
     | { status: 'store_unavailable' }
   >;
   resolveCanonicalTarget(request: GroupWorkspaceOperationRequest): Promise<
-    | { status: 'resolved'; workingDir: string }
+    | { status: 'resolved'; workingDir: string; workspaceIdentity: WorkspaceIdentity }
     | { status: 'store_unavailable' }
   >;
   readSession(sessionId: string): Promise<
@@ -108,6 +110,7 @@ export function createGroupWorkspaceSetCoordinator(options: {
     const identity = {
       operationKey: receipt.operationKey, payloadDigest: receipt.payloadDigest,
       chatId: receipt.chatId, targetWorkingDir: receipt.canonicalTargetWorkingDir,
+      workspaceIdentity: receipt.workspaceIdentity!,
     };
     if (receipt.outcome === 'committed') return { ...identity, status: 'committed', resultingRevision: receipt.resultingRevision! };
     if (receipt.outcome === 'conflict') return { ...identity, status: 'conflict', currentRevision: receipt.resultingRevision ?? receipt.expectedRevision };
@@ -331,7 +334,7 @@ export class GroupWorkspaceOperationCoordinator {
         ...canonicalRequest, payloadDigest,
         expectedSessionGeneration: session.generation,
         expectedGroupRevision: revision.revision,
-        targetWorkingDir: target.workingDir,
+        targetWorkingDir: target.workingDir, targetWorkspaceIdentity: target.workspaceIdentity,
         phase: 'prepared',
         updatedAt: this.dependencies.now(),
       };

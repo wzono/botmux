@@ -254,8 +254,13 @@ async function resolveWorkingDir(larkAppId: string, chatId: string): Promise<
   const candidate = workspace?.workingDir || botDefault || bot.config.workingDir || '~';
   const v = validateWorkingDir(candidate, localeForBot(larkAppId));
   if (!v.ok) return { ok: false, error: v.error };
+  const groupIdentity = group.status === 'available' ? group.record?.workspaceIdentity : undefined;
+  if (workspace?.source === 'group' && !groupIdentity) {
+    return { ok: false, error: 'group workspace identity unavailable' };
+  }
   const mutation: SessionWorkingDirMutation = workspace?.source === 'group'
-    ? { workingDir: v.resolvedPath, source: 'group', groupWorkspaceRevision: workspace.groupWorkspaceRevision! }
+    ? { workingDir: v.resolvedPath, source: 'group', groupWorkspaceRevision: workspace.groupWorkspaceRevision!,
+        groupWorkspaceIdentity: groupIdentity! }
     : { workingDir: v.resolvedPath, source: workspace?.source ?? (botDefault ? 'bot-default' : 'legacy-unknown') };
   return { ok: true, mutation, fromBotDefault: !workspace && !!botDefault };
 }

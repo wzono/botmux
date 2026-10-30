@@ -27,7 +27,7 @@ import {
   type DatabaseSyncLike,
   type StatementLike,
 } from './sqlite-compat.js';
-import type {
+import { WORKSPACE_SCHEMA_VERSION, type
   HumanLaneIdentityEvidence,
   HumanLanePrincipal,
   InboundPrincipal,
@@ -2089,11 +2089,22 @@ export function normalizeSessionWorkingDirProvenance<T extends Session>(session:
     if (!Number.isSafeInteger(session.groupWorkspaceRevision) || session.groupWorkspaceRevision! < 0) {
       throw new Error('group cwd provenance requires a safe non-negative revision');
     }
+    if (session.workspaceSchemaVersion !== WORKSPACE_SCHEMA_VERSION
+      || !session.groupWorkspaceIdentity
+      || session.groupWorkspaceIdentity.path !== session.workingDir) {
+      throw new Error('group cwd provenance requires workspace identity v2');
+    }
   } else if (session.groupWorkspaceRevision !== undefined) {
     throw new Error('non-group cwd provenance must not carry a group revision');
   }
   const follow = session.groupWorkspaceFollow;
   if (follow !== undefined) {
+    if (follow.schemaVersion !== WORKSPACE_SCHEMA_VERSION
+      || !Number.isSafeInteger(follow.journalRevision) || follow.journalRevision! < 0
+      || !follow.targetWorkspaceIdentity
+      || follow.targetWorkspaceIdentity.path !== follow.targetWorkingDir) {
+      throw new Error('invalid groupWorkspaceFollow v2 journal');
+    }
     const validIdentity = follow.targetDirectoryIdentity === undefined
       || (typeof follow.targetDirectoryIdentity.dev === 'string'
         && !!follow.targetDirectoryIdentity.dev

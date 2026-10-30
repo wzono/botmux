@@ -200,7 +200,7 @@ async function productionComposition(input: {
         const requestIntentDigest = canonicalGroupWorkspaceRequestIntentDigest({ kind: 'set', chatId: route.chatId, selection: route.selection });
         const coordinator = createGroupWorkspaceSetCoordinator({
           journalStore: operationStore, groupStore, now: Date.now,
-          resolveCanonicalTarget: async () => ({ status: 'resolved', workingDir: input.targetDir }),
+          resolveCanonicalTarget: async () => ({ status: 'resolved', workingDir: input.targetDir, workspaceIdentity: { path: input.targetDir, dev: '1', ino: '2' } }),
           readSession: async sessionId => {
             const current = sessions.get(sessionId);
             return current ? { status: 'available', generation: current.workerGeneration ?? 0, workingDir: current.workingDir }
@@ -444,8 +444,10 @@ describe('group workspace follow with real PTY workers', () => {
       await waitUntil(() => old.messages.some(message => message.type === 'prompt_ready'), () => old.logs.join(''));
 
       const journal = {
-        targetWorkingDir: frozenDir, targetRevision: 2, previousRevision: 1,
-        previousGeneration: 4, nextGeneration: 5, phase,
+        schemaVersion: 2, journalRevision: 0,
+        targetWorkingDir: frozenDir, targetRevision: 2,
+        targetWorkspaceIdentity: { path: frozenDir, dev: '1', ino: '2' },
+        previousRevision: 1, previousGeneration: 4, nextGeneration: 5, phase,
       } as const;
       const session: any = {
         sessionId, chatId: 'oc_follow', rootMessageId: 'oc_follow', status: 'active',
@@ -486,7 +488,8 @@ describe('group workspace follow with real PTY workers', () => {
         journal: session.groupWorkspaceFollow,
         group: { status: 'available', record: { revision: 3, directory: { kind: 'unbound' } } },
       });
-      expect(resolution).toEqual({ kind: 'follow', target: { workingDir: frozenDir, revision: 2 } });
+      expect(resolution).toEqual({ kind: 'follow', target: { workingDir: frozenDir, revision: 2,
+        workspaceIdentity: { path: frozenDir, dev: '1', ino: '2' } } });
       if (resolution.kind !== 'follow') throw new Error('journal target was not recovered');
       const result = await runGroupWorkspaceSessionFollow(ds, resolution.target, {
         isIdle: () => true,
@@ -585,7 +588,7 @@ describe('group workspace follow with real PTY workers', () => {
     } as unknown as DaemonSession;
     let current = old;
     const order: string[] = [];
-    const result = await runGroupWorkspaceSessionFollow(ds, { workingDir: newDir, revision: 2 }, {
+    const result = await runGroupWorkspaceSessionFollow(ds, { workingDir: newDir, revision: 2, workspaceIdentity: { path: newDir, dev: '1', ino: '2' } }, {
       isIdle: () => true,
       supportsReplacement: () => true,
       isWorkerLive: candidate => !!candidate.worker && !candidate.worker.killed,
