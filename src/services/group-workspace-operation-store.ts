@@ -279,8 +279,7 @@ export class GroupWorkspaceOperationStore {
     const prior = await this.getByIntent(journal.sourceEventId, journal.kind);
     if (prior.status === 'store_unavailable') return prior;
     if (prior.status === 'found') {
-      return prior.journal.requestIntentDigest === journal.requestIntentDigest
-        && prior.journal.kind === journal.kind
+      return sameFrozenIntent(prior.journal, journal)
         ? { status: 'adopted', journal: prior.journal }
         : { status: 'protocol_conflict', journal: prior.journal };
     }

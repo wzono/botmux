@@ -65,6 +65,10 @@ export interface GroupWorkspaceOperationDependencies {
   >;
   renewExecutor?(operationKey: string, lease: OperationExecutorLease): Promise<OperationExecutorLease | undefined>;
   assertFence?(operationKey: string, lease: OperationExecutorLease): Promise<boolean>;
+  runFencedEffect?<T>(operationKey: string, lease: OperationExecutorLease, effect: () => Promise<T>): Promise<
+    | { status: 'applied'; value: T }
+    | { status: 'stale_fence' }
+  >;
   lookupGroupReceipt(operationKey: string): Promise<GroupReceiptLookupResult>;
   /** Under the group-store lock, establish-or-read and return the authoritative exact-operation receipt. */
   reconcileUnknownGroupReceipt(journal: RepoGroupOperationJournal): Promise<GroupReceiptLookupResult>;
@@ -157,6 +161,8 @@ export function createGroupWorkspaceSetCoordinator(options: {
       },
       assertFence: async (operationKey: string, lease: OperationExecutorLease) =>
         (await options.executorLeaseStore!.assertCurrent(operationKey, lease)).status === 'current',
+      runFencedEffect: <T>(operationKey: string, lease: OperationExecutorLease, effect: () => Promise<T>) =>
+        options.executorLeaseStore!.runFencedEffect(operationKey, lease, effect),
       fencingToken: () => currentLease?.fencingToken,
     } : {}),
     lookupGroupReceipt: async operationKey => {
@@ -437,13 +443,18 @@ export class GroupWorkspaceOperationCoordinator {
       const expectedAfter = journal.expectedSessionGeneration + 1;
       if (session.generation === journal.expectedSessionGeneration) {
         if (session.workingDir === journal.targetWorkingDir) return this.markUnknown(journal);
-        const switched = await this.dependencies.switchSession({
+        const switchInput = {
           sessionId: journal.sessionId,
           expectedGeneration: journal.expectedSessionGeneration,
           targetWorkingDir: journal.targetWorkingDir!,
           workspaceIdentity: journal.targetWorkspaceIdentity!,
           ...(lease ? { fencingToken: lease.fencingToken } : {}),
-        });
+        };
+        const fencedSwitch = lease && this.dependencies.runFencedEffect
+          ? await this.dependencies.runFencedEffect(journal.operationKey, lease, () => this.dependencies.switchSession(switchInput))
+          : { status: 'applied' as const, value: await this.dependencies.switchSession(switchInput) };
+        if (fencedSwitch.status === 'stale_fence') return { status: 'unknown', journal };
+        const switched = fencedSwitch.value;
         if (switched.status === 'unknown') return this.markUnknown(journal);
         if (switched.status === 'store_unavailable') return { status: 'store_unavailable', journal };
         journal = { ...journal, sessionGenerationAfter: switched.generation };
@@ -467,7 +478,13 @@ export class GroupWorkspaceOperationCoordinator {
       if (!lease) return { status: 'unknown', journal };
     }
     if (!(await this.hasFence(journal.operationKey, lease))) return { status: 'unknown', journal };
-    const groupResult = await this.dependencies.commitGroup(journal, lease?.fencingToken);
+    const fencedCommit = lease && this.dependencies.runFencedEffect
+      ? await this.dependencies.runFencedEffect(
+        journal.operationKey, lease, () => this.dependencies.commitGroup(journal, lease?.fencingToken),
+      )
+      : { status: 'applied' as const, value: await this.dependencies.commitGroup(journal, lease?.fencingToken) };
+    if (fencedCommit.status === 'stale_fence') return { status: 'unknown', journal };
+    const groupResult = fencedCommit.value;
     if (groupResult.status === 'unknown') return this.markUnknown(journal);
     await this.dependencies.afterBoundary?.('group_committed_before_convergence');
     if (groupResult.status === 'committed') {

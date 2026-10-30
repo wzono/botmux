@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -22,9 +22,15 @@ describe('same-source winner and executor lease', () => {
     const adopted = await store.prepareOrAdopt({ ...journal, expectedSessionGeneration: 99, targetWorkingDir: '/other', targetWorkspaceIdentity: { ...identity, path: '/other' } });
     expect(adopted).toMatchObject({ status: 'adopted', journal: { targetWorkingDir: '/repo/x', expectedSessionGeneration: 1 } });
   });
-  it('rejects changed semantic intent', async () => {
-    const store = new GroupWorkspaceOperationStore(dir()); await store.prepareOrAdopt(journal);
-    expect((await store.prepareOrAdopt({ ...journal, requestIntentDigest: 'other' })).status).toBe('protocol_conflict');
+  it('rejects changed semantic intent or frozen authority identity', async () => {
+    const store = new GroupWorkspaceOperationStore(dir());
+    await store.prepareOrAdopt({ ...journal, authorityFingerprint: 'fingerprint-a' });
+    expect((await store.prepareOrAdopt({ ...journal, authorityFingerprint: 'fingerprint-a', requestIntentDigest: 'other' })).status)
+      .toBe('protocol_conflict');
+    expect((await store.prepareOrAdopt({ ...journal, authorityFingerprint: 'fingerprint-b' })).status)
+      .toBe('protocol_conflict');
+    expect((await store.prepareOrAdopt({ ...journal, authorityFingerprint: 'fingerprint-a', actor: { ...journal.actor, unionId: 'on_other' } })).status)
+      .toBe('protocol_conflict');
   });
   it('fences live owner, expiry steal, and late old owner effects', async () => {
     let now = 10; const leases = new OperationExecutorLeaseStore(dir(), { now: () => now });
@@ -39,6 +45,7 @@ describe('same-source winner and executor lease', () => {
   it('uses a real shared store across two OS processes and rejects the slow old owner late effect', async () => {
     const dataDir = dir();
     const moduleUrl = new URL('../src/services/operation-executor-lease-store.js', import.meta.url).href;
+    const effectFile = join(dataDir, 'effects.log');
     const childSource = `
       import { OperationExecutorLeaseStore } from ${JSON.stringify(moduleUrl)};
       const dataDir = process.env.TEST_DATA_DIR; const owner = process.env.TEST_OWNER; const delay = process.env.TEST_DELAY;
@@ -46,14 +53,20 @@ describe('same-source winner and executor lease', () => {
       const acquired = await store.acquire('shared-op', owner, 80);
       process.stdout.write(JSON.stringify(acquired) + '\\n');
       await new Promise(resolve => setTimeout(resolve, Number(delay)));
-      process.stdout.write(JSON.stringify(await store.assertCurrent('shared-op', acquired.lease)) + '\\n');
+      const effect = await store.runFencedEffect('shared-op', acquired.lease, async () => {
+        const { appendFileSync } = await import('node:fs');
+        appendFileSync(process.env.TEST_EFFECT_FILE, owner + '\\n');
+        return owner;
+      });
+      process.stdout.write(JSON.stringify(effect) + '\\n');
     `;
     const run = (owner: string, delay: number) => {
       let firstResolve!: () => void;
       const first = new Promise<void>(resolve => { firstResolve = resolve; });
       const done = new Promise<string[]>((resolve, reject) => {
         const child = spawnTsEvalWithRepoImports(childSource, {
-          cwd: process.cwd(), env: { ...process.env, TEST_DATA_DIR: dataDir, TEST_OWNER: owner, TEST_DELAY: String(delay) },
+          cwd: process.cwd(), env: { ...process.env, TEST_DATA_DIR: dataDir, TEST_OWNER: owner,
+            TEST_DELAY: String(delay), TEST_EFFECT_FILE: effectFile },
           stdio: ['ignore', 'pipe', 'pipe'],
         });
         const lines: string[] = []; let stderr = '';
@@ -75,7 +88,8 @@ describe('same-source winner and executor lease', () => {
     expect(JSON.parse(oldLines[0]!)).toMatchObject({ status: 'acquired', lease: { fencingToken: 1 } });
     expect(JSON.parse(newLines[0]!)).toMatchObject({ status: 'acquired', lease: { fencingToken: 2 } });
     expect(JSON.parse(oldLines[1]!)).toEqual({ status: 'stale_fence' });
-    expect(JSON.parse(newLines[1]!)).toEqual({ status: 'current' });
+    expect(JSON.parse(newLines[1]!)).toEqual({ status: 'applied', value: 'new-owner' });
+    expect(readFileSync(effectFile, 'utf8')).toBe('new-owner\n');
   });
 
   it('renew increments epoch and restart identity has no implicit authority', async () => {

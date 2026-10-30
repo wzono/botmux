@@ -33072,12 +33072,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               },
               switchSession: async input => {
                 const before = ds.workerGeneration ?? 0;
-                const lease = await groupWorkspaceExecutorLeaseStore.assertCurrent(
-                  groupWorkspaceOperationKey(request.sourceEventId, 'set'),
-                  { owner: groupWorkspaceExecutorOwner, leaseEpoch: 0,
-                    fencingToken: input.fencingToken ?? -1, leaseExpiresAt: Number.MAX_SAFE_INTEGER },
-                );
-                if (lease.status !== 'current' || before !== input.expectedGeneration
+                if (before !== input.expectedGeneration
                   || activeSessions.get(sessionKey(ds.chatId, cfg.larkAppId)) !== ds) {
                   return { status: 'unknown' };
                 }
