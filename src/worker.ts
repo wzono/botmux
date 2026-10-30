@@ -25587,7 +25587,10 @@ async function spawnCli(
     });
   }
 
-  if (!cfg.expectedWorkingDirIdentity) {
+  // Output ownership is independent from workspace proof. Local backends with
+  // no submit-time validator installed the guarded listener above; every other
+  // backend (including Riff/Mojo) must always remain observable.
+  if (!cfg.expectedWorkingDirIdentity || observedBackend.validateWorkingDirBeforeBusinessInput) {
     observedBackend.onData((data) => {
       if (backend !== observedBackend) return;
       onPtyData(data);
