@@ -430,6 +430,26 @@ describe('dashboard IPC server', () => {
     expect(mutations).toBe(1);
   });
 
+  it('lets ask registration return retryable startup status without opening other IPC routes', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    let releaseReady!: () => void;
+    const ready = new Promise<void>(resolve => { releaseReady = resolve; });
+    let asks = 0;
+    ipcRoute('POST', '/api/asks', (_req, res) => {
+      asks += 1;
+      res.writeHead(503, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'startup_not_ready' }));
+    });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, ready });
+    const response = await fetch(`http://127.0.0.1:${handle.port}/api/asks`, {
+      method: 'POST',
+      headers: trustedHostHeaders('POST', '/api/asks', handle.port),
+    });
+    expect(response.status).toBe(503);
+    expect(asks).toBe(1);
+    releaseReady();
+  });
+
   it('denies sandbox-like loopback reads and mutations but accepts route-bound trusted-host calls', async () => {
     setIpcAuthSecret(TEST_IPC_SECRET);
     let mutations = 0;

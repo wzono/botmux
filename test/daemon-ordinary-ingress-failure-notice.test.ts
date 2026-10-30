@@ -150,9 +150,65 @@ vi.mock('../src/services/session-store.js', async () => {
   };
 });
 
+vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/admitted-turn-dispatch.js');
+  return {
+    ...actual,
+    dispatchAdmittedBusinessTurn: async (input: any) => {
+      if (!input.ds.worker || input.ds.worker.killed) {
+        let terminal: 'accepted' | 'rejected' | 'deferred' | undefined;
+        let release!: () => void;
+        const settled = new Promise<void>(resolve => { release = resolve; });
+        const options = {
+          ...input.options,
+          onAdmission: (state: 'accepted' | 'rejected' | 'deferred') => {
+            terminal = state;
+            if (state !== 'deferred') release();
+          },
+          onAdmissionBlocked: (notice: any) => input.options.onAdmissionBlocked?.(notice),
+        };
+        const forked = mocks.forkWorker(input.ds, '', input.turnId, options);
+        if (forked === false) return false;
+        if (!terminal) { terminal = 'accepted'; release(); }
+        if (terminal === 'deferred') await settled;
+        return terminal === 'accepted';
+      }
+      return input.boundary.submit(input.ds, input.payload, {
+        permitId: `fixture-${input.turnId}`, bootstrapPermitId: 'fixture-bootstrap',
+        sessionId: input.ds.session.sessionId, turnId: input.turnId,
+        workerGeneration: input.ds.session.workerGeneration ?? input.ds.workerGeneration ?? 0,
+        workspace: actual.frozenSessionWorkspace(input.ds)?.workspace,
+        expiresAt: Date.now() + 60_000,
+      }, 'fixture-digest', input.options);
+    },
+  };
+});
+
 vi.mock('../src/core/worker-pool.js', async () => {
   const actual = await vi.importActual<any>('../src/core/worker-pool.js');
   return { ...actual, forkWorker: mocks.forkWorker,
+    // This suite owns the daemon ingress adapter, not permit-store mechanics.
+    // Preserve the central adapter shape while replacing its worker boundary;
+    // dedicated admitted-turn tests exercise the real permit adapter/store.
+    forkWorkerBlank: async (ds: any, permit: any, options: any = {}) => {
+      const result = mocks.forkWorker(ds, '', permit.turnId, options);
+      if (result !== false && ds.worker) {
+        ds.workerGeneration = permit.reservedGeneration;
+        ds.session.workerGeneration = permit.reservedGeneration;
+        if (!ds.__deferBlankReady) {
+          ds.workerReady = true;
+          ds.cliReady = true;
+          ds.lastWorkerReadyCwd = ds.session.workingDir ?? ds.workingDir;
+        }
+      }
+      return result !== false;
+    },
+    submitBusinessInput: async (ds: any, payload: any, permit: any, _digest: string, options: any = {}) => {
+      if (String(permit.turnId ?? '').startsWith('om_effort')) {
+        return mocks.sendWorkerInput(ds, payload, permit.turnId, options);
+      }
+      return actual.submitBusinessInput(ds, payload, permit, _digest, options);
+    },
     sendWorkerInput: (...args: any[]) => String(args[2] ?? '').startsWith('om_effort')
       ? mocks.sendWorkerInput(...args) : actual.sendWorkerInput(...args),
     updateCodexCliEffort: mocks.updateCodexCliEffort };
@@ -1858,7 +1914,6 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
           activeSessions.set(sessionKey(anchor, APP), restartedDs);
           return [];
         },
-        markSessionsRestored: () => {},
         driveRestoredXpiGroup: () => {},
       });
 
@@ -3001,7 +3056,7 @@ describe('durable admission then failing status reply → no resend advice (PR #
     expect(readFileSync(`${mocks.dataDir}/queues/${anchor}.jsonl`, 'utf-8').split('\n').filter(Boolean)).toHaveLength(1);
   });
 
-  it('keeps the real new-topic handler pending until marginal admission reaches a terminal decision', async () => {
+  it('keeps the real new-topic handler pending until the cold worker proves readiness', async () => {
     const anchor = 'om_primary_marginal_handler';
     const ctx = makeCtx(anchor, anchor);
     const queuePostAdmissionOutput = vi.fn();
@@ -3010,7 +3065,6 @@ describe('durable admission then failing status reply → no resend advice (PR #
     mocks.forkWorker.mockImplementationOnce((ds: any, _input: unknown, _turn: unknown, options: any) => {
       ds.worker = { killed: false, send: vi.fn() };
       forkOptions = options;
-      options.marginalReclaimScheduled = true;
       options.onAdmission?.('deferred');
       return true;
     });
@@ -3025,18 +3079,11 @@ describe('durable admission then failing status reply → no resend advice (PR #
     expect(resolved).toBe(false);
     expect(queuePostAdmissionOutput).not.toHaveBeenCalled();
 
-    forkOptions.onAdmissionBlocked({
-      content: 'Memory pressure is critical',
-      turnId: anchor,
-    });
-    forkOptions.onAdmission('rejected');
+    forkOptions.onAdmission('accepted');
     await handling;
 
     expect(resolved).toBe(true);
-    expect(queuePostAdmissionOutput).toHaveBeenCalledWith(expect.objectContaining({
-      content: 'Memory pressure is critical',
-      providerUuid: expect.stringMatching(/^admission_blocked_[a-f0-9]{24}$/),
-    }));
+    expect(queuePostAdmissionOutput).not.toHaveBeenCalled();
   });
 
   // 同一降级的另外两个发卡点。三处的 fallback 各自不同（raw passthrough 走

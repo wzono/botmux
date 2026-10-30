@@ -975,6 +975,7 @@ import { resolveDocumentAskDelivery } from './core/doc-comment-ask.js';
 import { isHumanOpenId } from './im/lark/client.js';
 import { submitDocumentAskReply } from './core/ask-broker.js';
 import { shouldReturnAskStartupNotReady } from './core/ask-types.js';
+import { StartupAdmissionBarrier } from './core/startup-admission.js';
 import { computeCocoPickerKeys } from './core/coco-picker-keys.js';
 import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
 import { replyCardAskTarget } from './core/turn-reply-ask.js';
@@ -1196,13 +1197,19 @@ function mirrorDurableSessionShadow(session: Session): void {
 // Observation is independent of routing: registering this never starts a CLI.
 setGroupContextSettingsResolver(getGroupContextSettings);
 const preparedGroupContextRequests = new WeakSet<object>();
-/** False until restoreActiveSessions() finishes. During the startup window the
- *  IPC server is already listening but activeSessions is empty, so a reconnecting
- *  ask hook would fail session lookup and get a 403 origin_unproven — which the
- *  CLI would treat as permanent and passthrough into a stuck native picker
- *  (codex P1-2). While false, /api/asks returns a retryable 503 for unknown
- *  sessions instead, so the reconnecting hook keeps waiting through the restore. */
-let sessionsRestored = false;
+/** Set by startDaemon from the exact daemon-local bot set. A bot is published
+ * ready only after Session restore and permit/control reconciliation both
+ * succeed. IPC may already be listening, but every ask for that bot remains
+ * retryably fail-closed until then — even when its Session row is visible. */
+let startupAdmission = new StartupAdmissionBarrier([]);
+
+export function __testOnly_setStartupAdmission(
+  expectedBotIds: Iterable<string>,
+  readyBotIds: Iterable<string> = [],
+): void {
+  startupAdmission = new StartupAdmissionBarrier(expectedBotIds);
+  for (const botId of readyBotIds) startupAdmission.markReady(botId);
+}
 
 function scheduleRestoredStreamingCardPinRecovery(larkAppId: string): void {
   queueMicrotask(() => {
@@ -1244,7 +1251,6 @@ function scheduleRestoredStreamingCardStatusAlignment(larkAppId: string, restore
 async function restoreSessionsAndScheduleStartupRecovery(opts: {
   larkAppId: string;
   restoreSessions: () => Promise<Array<XpiSharedCwdStartupNotice | PrincipalLaneStartupNotice> | undefined>;
-  markSessionsRestored: () => void;
   driveRestoredXpiGroup: (groupId: string) => void;
   driveRestoredPrincipalLane: (ds: DaemonSession) => void;
 }): Promise<Array<XpiSharedCwdStartupNotice | PrincipalLaneStartupNotice>> {
@@ -1261,7 +1267,6 @@ async function restoreSessionsAndScheduleStartupRecovery(opts: {
   const quarantineNotices = restoredQuarantineNotices ?? [];
   scheduleRestoredStreamingCardPinRecovery(opts.larkAppId);
   scheduleRestoredStreamingCardStatusAlignment(opts.larkAppId, restoredAt);
-  opts.markSessionsRestored();
   queueMicrotask(() => {
     const groups = new Set<string>();
     for (const ds of activeSessions.values()) {
@@ -9369,7 +9374,7 @@ const explicitAskContinuation = createExplicitAskContinuation({
   hasHandoff: hasExplicitAskHandoff,
   canResume: receipt => {
     const ds = findActiveBySessionId(receipt.input.sessionId);
-    return sessionsRestored && !!ds && canResumeExplicitAskInSession(receipt, {
+    return startupAdmission.isReady(receipt.input.larkAppId) && !!ds && canResumeExplicitAskInSession(receipt, {
       larkAppId: ds.larkAppId,
       chatId: ds.chatId,
       sessionId: ds.session.sessionId,
@@ -9448,7 +9453,7 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
   // non-resumable ask during the restore window.
   if (shouldReturnAskStartupNotReady({
     hasSession: !!askSession,
-    sessionsRestored,
+    targetReady: startupAdmission.isReady(askSession?.larkAppId ?? parsed.larkAppId),
   })) {
     return jsonRes(res, 503, { ok: false, error: 'startup_not_ready' });
   }
@@ -31536,6 +31541,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     cfg = reloadExactDaemonBotConfig(idx, selectedAppId, loadBotConfigAtIndex);
   }
   registerBot(cfg);
+  // This process owns exactly the assigned bot. Deriving readiness from that
+  // active daemon set avoids waiting forever on configured-but-disabled bots.
+  startupAdmission = new StartupAdmissionBarrier([cfg.larkAppId]);
   selfDaemonLarkAppId = cfg.larkAppId;
   // per-user talk 授权（chatGrants / globalGrants / 额度 / 有效期）住在 <dataDir>/grants.sqlite：
   // 把本 bot 在 bots.json 上残留的授权字段并入并删除，再灌入内存缓存。必须先于任何事件处理；
@@ -33631,14 +33639,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     restoreSessions: () => restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds, {
       prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
     }),
-    // Restore complete → /api/asks may now safely 403 unknown sessions again; a
-    // reconnecting ask hook that raced the restore got retryable 503s until here.
-    markSessionsRestored: () => {
-      sessionsRestored = true;
-      const askRecoveryTimer = setInterval(() => { void explicitAskContinuation.sweep(); }, 5000);
-      askRecoveryTimer.unref();
-      void explicitAskContinuation.sweep();
-    },
     driveRestoredXpiGroup: groupId => { void driveNextXpiSharedCwdTurn(groupId); },
     driveRestoredPrincipalLane: ds => { driveNextPrincipalLaneTurn(ds); },
   });
@@ -33683,8 +33683,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   migrateMojoSessionIdentities(activeSessions);
 
   // Reconcile only after every persisted session and restored worker generation
-  // is visible, and before any IPC/Lark ingress can accept a new turn.
-  await reconcileTurnPermitDispatches(activeSessions.values());
+  // is visible. Readiness is published only after BOTH business and control
+  // permits reconcile; any failure leaves this exact bot fail-closed and aborts
+  // startup with the original error surfaced to the supervisor/log.
+  try {
+    await reconcileTurnPermitDispatches(activeSessions.values());
+    startupAdmission.markReady(cfg.larkAppId);
+  } catch (error) {
+    startupAdmission.markFailed(cfg.larkAppId, error);
+    logger.error(
+      `[startup-admission:${cfg.larkAppId}] permit reconciliation failed; ingress remains closed: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+    throw error;
+  }
+  const askRecoveryTimer = setInterval(() => { void explicitAskContinuation.sweep(); }, 5000);
+  askRecoveryTimer.unref();
+  void explicitAskContinuation.sweep();
 
   // Now that activeSessions is populated, release the forward-followup flush
   // barrier. Persisted seeds were loaded into the buffer at dispatcher startup

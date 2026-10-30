@@ -329,26 +329,19 @@ export function isRetryableAskHttpStatus(status: number): boolean {
 
 /**
  * Whether the daemon's `/api/asks` handler must answer a RETRYABLE 503
- * `startup_not_ready` instead of proceeding (codex P1-2/P1-4, executable
- * decision seam). PURE + exported so daemon.ts and its unit test share the SAME
- * predicate rather than asserting against source regex.
+ * `startup_not_ready` instead of proceeding (executable decision seam). PURE +
+ * exported so daemon.ts and its unit test share the SAME predicate rather than
+ * asserting against source regex.
  *
- * True iff an unknown session hits the route while restore is still in flight —
- * regardless of how the caller authenticated. The earlier `trustedHost` escape
- * was WRONG (codex P1-2): a normal unsandbox hook IS the trusted-host path
- * (`postAsk` loads the host secret and calls the HMAC `fetchDaemonIpc` when
- * there's no relay), so exempting trusted callers let exactly the reconnecting
- * hook we must protect slip through during the descriptor-published-but-sessions-
- * not-yet-restored window — it would then register a NEW ask computed as
- * `backendSurvivesRestart:false` (session unknown) and be lost on the next
- * restart. Every `POST /api/asks` caller is a session-scoped ask registration
- * (the desktop/dashboard ANSWER path is a different route), so gating all
- * unknown sessions here is safe: once `sessionsRestored` flips true the gate
- * lifts and unknown sessions fall through to normal authorization.
+ * True until the exact target bot has completed restore and permit/control
+ * reconciliation, regardless of whether its Session row is already visible or
+ * how the caller authenticated. A visible row is not readiness: accepting its
+ * ask before reconciliation recreates the startup split-brain this gate exists
+ * to prevent. Once ready, unknown sessions fall through to normal authorization.
  */
 export function shouldReturnAskStartupNotReady(args: {
   hasSession: boolean;
-  sessionsRestored: boolean;
+  targetReady: boolean;
 }): boolean {
-  return !args.hasSession && !args.sessionsRestored;
+  return !args.targetReady;
 }

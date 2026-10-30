@@ -233,6 +233,7 @@ import {
   __testOnly_releaseQueuedActivationReservation as releaseQueuedActivationReservation,
   __testOnly_resetDocCommentClaims as resetDocCommentClaims,
   __testOnly_retryPendingDocCommentDeliveries as retryPendingDocCommentDeliveries,
+  __testOnly_setStartupAdmission as setStartupAdmission,
 } from '../src/daemon.js';
 import {
   admitQueuedActivationTail,
@@ -271,12 +272,38 @@ describe('document Ask production routing', () => {
     resetRouteTestState();
     resetAsks();
     setActiveSessionsRegistry(activeSessions);
+    setStartupAdmission([APP], [APP]);
     mocks.isHumanOpenId.mockResolvedValue(true);
     setCanTalkChecker((_app, _chat, by) => by === OWNER);
   });
   afterEach(() => { resetAsks(); activeSessions.clear(); setActiveSessionsRegistry(undefined); });
 
   const questions = [{ prompt: 'Rebuild?', multiSelect: false, options: [{ key: 'yes', label: 'Yes' }, { key: 'no', label: 'No' }] }];
+
+  it('keeps the real ask HTTP handler closed for a restored target until permit reconciliation publishes readiness', async () => {
+    const ds = seedDocument();
+    setStartupAdmission([APP]);
+    let card: PendingAsk | undefined;
+    setCardDispatcher({ async send(ask) { card = ask; return { messageId: 'om_startup_card' }; } });
+    const secret = 'startup-ask-test-secret';
+    setIpcAuthSecret(secret);
+    const server = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    try {
+      const post = () => fetchDaemonIpc(server.port, '/api/asks', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: ds.session.sessionId, larkAppId: APP, chatId: ds.chatId,
+          rootMessageId: null, questions, timeoutMs: 1000, originTurnId: 'turn-A',
+          originKind: 'native-user-input' }),
+      }, secret);
+      expect((await post()).status).toBe(503);
+      setStartupAdmission([APP], [APP]);
+      const admitted = post();
+      await vi.waitFor(() => expect(card).toBeDefined());
+      expect(submitAsk({ askId: card!.askId, nonce: card!.nonce, by: OWNER, selections: [['yes']] })).toBe('accepted');
+      expect((await admitted).status).toBe(200);
+    } finally { await server.close(); setIpcAuthSecret(null); }
+  });
+
   function seedDocument() {
     const anchor = 'doc:fixture:comment';
     const ds = seedThreadSession(anchor, 'document task');

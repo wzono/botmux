@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { DaemonSession } from '../src/core/types.js';
 import { reconcileTurnPermitDispatches } from '../src/core/worker-pool.js';
+import { StartupAdmissionBarrier } from '../src/core/startup-admission.js';
 
 function restoredSession(): DaemonSession {
   return {
@@ -15,6 +16,25 @@ function restoredSession(): DaemonSession {
 }
 
 describe('startup turn permit reconciliation harness', () => {
+  it('tracks readiness per exact bot and keeps reconciliation failures closed', () => {
+    const barrier = new StartupAdmissionBarrier(['bot-A', 'bot-B']);
+    expect(barrier.isReady('bot-A')).toBe(false);
+    expect(barrier.isReady('bot-B')).toBe(false);
+    barrier.markReady('bot-A');
+    expect(barrier.isReady('bot-A')).toBe(true);
+    expect(barrier.isReady('bot-B')).toBe(false);
+    barrier.markFailed('bot-B', new Error('permit store unavailable'));
+    expect(barrier.isReady('bot-B')).toBe(false);
+    expect(barrier.failure('bot-B')?.message).toBe('permit store unavailable');
+  });
+
+  it('does not wait for bots that are not in the active daemon set', () => {
+    const barrier = new StartupAdmissionBarrier(['bot-A']);
+    barrier.markReady('bot-A');
+    expect(barrier.allReady()).toBe(true);
+    expect(barrier.isReady('disabled-bot')).toBe(false);
+  });
+
   it('observes restored session generation and ACK before ingress opens', async () => {
     const trace: string[] = [];
     const session = restoredSession();

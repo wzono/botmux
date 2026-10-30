@@ -10928,7 +10928,14 @@ export function startIpcServer(opts: {
           return jsonRes(res, 401, { ok: false, error: 'unauthorized', reason: auth.reason });
         }
       }
-      if (!publicRoute && opts.ready) await opts.ready;
+      // Ask hooks need a retryable response while startup reconciliation is in
+      // flight; holding the HTTP connection here hides the daemon's exact-target
+      // readiness guard and can strand native pickers behind a long restore.
+      // Let only ask registration reach its handler early. Every other
+      // state-bearing IPC route remains behind the process readiness barrier.
+      const startupAwareAskRoute = method === 'POST'
+        && (url.pathname === '/api/asks' || url.pathname === '/api/asks/form-v1');
+      if (!publicRoute && opts.ready && !startupAwareAskRoute) await opts.ready;
       for (const r of routes) {
         if (r.method !== req.method) continue;
         const m = r.pattern.exec(url.pathname);
