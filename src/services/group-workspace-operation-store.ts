@@ -55,6 +55,9 @@ export type OperationPrepareResult =
   | { status: 'protocol_conflict'; journal: RepoGroupOperationJournal }
   | { status: 'store_unavailable' };
 
+export type OperationPrepareOrAdoptResult = OperationPrepareResult
+  | { status: 'adopted'; journal: RepoGroupOperationJournal };
+
 export type OperationTransitionResult =
   | { status: 'updated'; journal: RepoGroupOperationJournal }
   | { status: 'invalid_transition'; journal: RepoGroupOperationJournal }
@@ -256,6 +259,18 @@ export class GroupWorkspaceOperationStore {
     } catch {
       return { status: 'store_unavailable' };
     }
+  }
+
+  async prepareOrAdopt(journal: RepoGroupOperationJournal): Promise<OperationPrepareOrAdoptResult> {
+    const prior = await this.getByIntent(journal.sourceEventId, journal.kind);
+    if (prior.status === 'store_unavailable') return prior;
+    if (prior.status === 'found') {
+      return prior.journal.requestIntentDigest === journal.requestIntentDigest
+        && prior.journal.kind === journal.kind
+        ? { status: 'adopted', journal: prior.journal }
+        : { status: 'protocol_conflict', journal: prior.journal };
+    }
+    return this.prepare(journal);
   }
 
   async transition(
