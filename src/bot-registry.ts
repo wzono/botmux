@@ -1783,7 +1783,8 @@ export interface BotConfig {
    *     docs/design/2026-09-21-sandbox-scratch-mode.md.
    *   false/"off"/missing — no local file isolation.
    * Env BOTMUX_SANDBOX=1 forces oncall, BOTMUX_SANDBOX=scratch forces scratch
-   * (testing/global).
+   * (testing/global); unset/0/false means no force and never turns this off
+   * (see resolveSandboxMode).
    */
   sandbox?: boolean | 'oncall' | 'scratch' | 'off';
   /**
@@ -2243,6 +2244,8 @@ export interface BotConfig {
   cotEnabled?: boolean;
   /** Legacy tool-output preference; false still suppresses result bodies. */
   thinkingCardToolResult?: boolean;
+  /** Show tool-call nodes in unified reply cards. Default on; false keeps thinking text. */
+  replyCardShowTools?: boolean;
   /** chat_id list: chats where the CoT (thinking process) message is suppressed
    *  even when {@link cotEnabled} is on. Written by `/cot off|on`. */
   noCotChats?: string[];
@@ -4384,6 +4387,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       disableStreamingCard: entry.disableStreamingCard === true || entry.replyCardMode === 'final-only' || undefined,
       replyCardMode: entry.replyCardMode === 'unified' || entry.replyCardMode === 'final-only' ? 'unified' : undefined,
       thinkingCardToolResult: entry.thinkingCardToolResult === false ? false : undefined,
+      replyCardShowTools: entry.replyCardShowTools === false ? false : undefined,
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons),
       pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).

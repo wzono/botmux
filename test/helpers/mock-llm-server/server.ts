@@ -18,7 +18,9 @@ import {
   streamOpenAiEvents,
 } from './openai-sse.js';
 import { pickShellTool } from './shell-tool.js';
+import { sandboxProbeCommand } from './sandbox-probe.js';
 import { buildGeminiResponse, geminiMessages, isGeminiToolResult, streamGeminiEvents } from './gemini-sse.js';
+import { buildGeminiShellEnvSnapshotFragment } from './gemini-shell-env.js';
 import {
   buildOpenAiResponsesTextEvents,
   streamResponsesEvents,
@@ -29,6 +31,9 @@ export class MockLlmServer {
   private config: Required<MockServerConfig>;
   private recorder: TapeRecorder;
   private recordedMarkers: Set<string> = new Set();
+  // marker -> router-verdict request count, to surface a Gemini CLI stuck
+  // re-asking the model router without ever calling the main model.
+  private geminiRouterHits = new Map<string, number>();
 
   constructor(config?: MockServerConfig) {
     const validModes = ['synthetic', 'record', 'replay'];
@@ -250,7 +255,7 @@ export class MockLlmServer {
     // Phase 1: Call the shell tool to send botmux reply. A request whose
     // tools hold no shell (a title call) gets plain text.
     const tool = pickShellTool(body?.tools, 'Bash');
-    const cmd = buildBotmuxSendCommand(buildMockReplyLine(messages, marker), true);
+    const cmd = sandboxProbeCommand(messages) ?? buildBotmuxSendCommand(buildMockReplyLine(messages, marker), true);
     const events = tool
       ? buildAnthropicToolUseEvents({ model, toolName: tool.name, command: cmd, input: tool.args(cmd) })
       : buildAnthropicTextEvents({ model, text: marker });
@@ -274,7 +279,7 @@ export class MockLlmServer {
     }
 
     const tool = pickShellTool(body?.tools, 'bash');
-    const cmd = buildBotmuxSendCommand(buildMockReplyLine(messages, marker), true);
+    const cmd = sandboxProbeCommand(messages) ?? buildBotmuxSendCommand(buildMockReplyLine(messages, marker), true);
     const events = tool
       ? buildOpenAiToolCallEvents({ model: body?.model, command: cmd, functionName: tool.name, args: tool.args(cmd) })
       : buildOpenAiTextEvents({ model: body?.model, text: marker });
@@ -286,15 +291,37 @@ export class MockLlmServer {
     const marker = extractMarkerFromMessages(messages) ?? 'ACK-test-message-received';
     this.recordedMarkers.add(marker);
     const tool = pickShellTool(body?.tools, 'run_shell_command');
+    const toolResult = isGeminiToolResult(body?.contents);
+    const toolNames = Array.isArray(body?.tools)
+      ? body.tools.flatMap((group: any) => group?.functionDeclarations?.map((f: any) => f?.name) ?? [])
+      : [];
+    const wantsJsonVerdict = Boolean(body?.generationConfig?.responseJsonSchema || body?.generationConfig?.responseSchema);
+
+    let branch: 'router' | 'text' | 'functionCall';
     let response;
-    if (body?.generationConfig?.responseJsonSchema || body?.generationConfig?.responseSchema) {
-      // Gemini CLI's model router asks for a JSON verdict; any valid one will do.
+    if (wantsJsonVerdict) {
+      branch = 'router';
+      const hits = (this.geminiRouterHits.get(marker) ?? 0) + 1;
+      this.geminiRouterHits.set(marker, hits);
+      if (hits > 2) {
+        console.warn(`[mock-llm-server] gemini router for ${marker} hit ${hits} times without a main-model call — likely a rejected JSON verdict (check responseJsonSchema shape)`);
+      }
       response = buildGeminiResponse({ text: JSON.stringify({ complexity_reasoning: 'mock', complexity_score: 1 }) });
-    } else if (isGeminiToolResult(body?.contents) || !tool) {
+    } else if (toolResult || !tool) {
+      branch = 'text';
       response = buildGeminiResponse({ text: '已成功调用 botmux send 回复消息，本轮自动化测试结束。' });
     } else {
-      const cmd = buildBotmuxSendCommand(buildMockReplyLine(messages, marker), true);
+      branch = 'functionCall';
+      // Prepend an env snapshot (only for a real reply, never the sandbox
+      // probe) so the live artifact shows exactly what the shell tool's
+      // sanitization left: GITHUB_SHA set-empty vs unset vs leaked value.
+      const probeCmd = sandboxProbeCommand(messages);
+      const sendCmd = probeCmd ?? buildBotmuxSendCommand(buildMockReplyLine(messages, marker), true);
+      const cmd = probeCmd ? sendCmd : `${buildGeminiShellEnvSnapshotFragment(marker)}; ${sendCmd}`;
       response = buildGeminiResponse({ functionCall: { name: tool.name, args: tool.args(cmd) } });
+    }
+    if (this.config.verbose) {
+      console.log(`[mock-llm-server] gemini branch=${branch} stream=${stream} toolResult=${toolResult} tools=[${toolNames.join(',')}] marker=${marker}`);
     }
     if (stream) {
       await streamGeminiEvents(res, [response], this.config.chunkDelayMs);
