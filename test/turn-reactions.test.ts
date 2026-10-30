@@ -298,7 +298,7 @@ describe('two-phase turn reactions', () => {
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_restored_terminal', 'DONE');
   });
 
-  it.each([false, true])('production terminal decorator forwards the exact tuple once (owned=%s)', async owned => {
+  it.each([false, true])('production terminal factory forwards the exact tuple once (owned=%s)', async owned => {
     const durableOwner = makeDs();
     const ds = owned ? durableOwner : {
       ...durableOwner,
@@ -310,7 +310,7 @@ describe('two-phase turn reactions', () => {
     const context = { workerGeneration: 7 };
     const next = vi.fn(async () => undefined);
 
-    await createTurnFeedbackWorkerCallbacks(next).onTurnTerminal!(ds, terminal, context);
+    await createProductionTurnFeedbackWorkerCallbacks(next).onTurnTerminal!(ds, terminal, context);
 
     expect(next).toHaveBeenCalledTimes(1);
     expect(next).toHaveBeenCalledWith(ds, terminal, context);
