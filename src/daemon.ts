@@ -246,6 +246,8 @@ import {
   validateCodexAppManagedSendOrigin,
 } from './utils/codex-app-dispatch-ledger.js';
 import { hasProtectedSessionMutationOwnership } from './core/session-mutation-guard.js';
+import { dispatchAdmittedBusinessTurn } from './core/admitted-turn-dispatch.js';
+import { TurnPermitStore } from './services/turn-permit-store.js';
 import { delay } from './utils/timing.js';
 import { BoundedMap } from './utils/bounded-map.js';
 import { checkAllowedChatGroupsConfig } from './services/allowed-chat-groups.js';
@@ -422,6 +424,8 @@ import {
   setActiveSessionsRegistry,
   forkWorker,
   forkAdoptWorker,
+  forkWorkerBlank,
+  submitBusinessInput,
   sendWorkerInput,
   promoteQueuedActivationTail,
   admitQueuedActivationTail,
@@ -6346,9 +6350,10 @@ async function submitQueuedMessage(
   if (!isCurrent()) { rollbackReplyContext(); return false; }
   // Intentionally omit codexAppSteerable. The omission is frozen in the ledger
   // and carried across runner recovery; user-written text cannot enable it.
-  if (!sendWorkerInput(ds, input, message.messageId, {
-    notifyRejection: false,
-    trustedCaller,
+  if (!await dispatchAdmittedBusinessTurn({
+    ds, turnId: message.messageId, payload: input,
+    options: { resume: ds.hasHistory, notifyRejection: false, trustedCaller },
+    boundary: centralTurnWorkerBoundary, permitStore: centralTurnPermitStore,
   })) { rollbackReplyContext(); return false; }
   ds.session.lastCallerOpenId = message.senderId;
   beginNewTurn(ds, text, message.messageId);
@@ -6359,6 +6364,27 @@ async function submitQueuedMessage(
 }
 
 const GROUP_WORKSPACE_FOLLOW_READY_TIMEOUT_MS = 30_000;
+const centralTurnPermitStore = new TurnPermitStore(config.session.dataDir);
+const centralTurnWorkerBoundary = {
+  reserveGeneration: (ds: DaemonSession) => (ds.session.workerGeneration ?? ds.workerGeneration ?? 0) + 1,
+  forkBlank: (ds: DaemonSession, permit: import('./core/turn-admission.js').BlankBootstrapPermit,
+    options: import('./core/admitted-turn-dispatch.js').BusinessTurnSubmitOptions) =>
+    forkWorkerBlank(ds, permit, { resume: options.resume,
+      ...(options.dispatchAttempt === undefined ? {} : { dispatchAttempt: options.dispatchAttempt }),
+      ...(options.trustedCaller ? { trustedCaller: options.trustedCaller } : {}),
+      ...(options.atMostOnce ? { atMostOnce: true as const } : {}) }),
+  submit: (ds: DaemonSession, payload: string | CliTurnPayload,
+    permit: import('./core/turn-admission.js').BusinessSubmitPermit, digest: string,
+    options: import('./core/admitted-turn-dispatch.js').BusinessTurnSubmitOptions) =>
+    submitBusinessInput(ds, payload, permit, digest, {
+      ...(options.dispatchAttempt === undefined ? {} : { dispatchAttempt: options.dispatchAttempt }),
+      ...(options.durablePrimaryInbox ? { durablePrimaryInbox: true as const } : {}),
+      ...(options.notifyRejection === false ? { notifyRejection: false as const } : {}),
+      ...(options.codexAppSteerable ? { codexAppSteerable: true as const } : {}),
+      ...(options.atMostOnce ? { atMostOnce: true as const } : {}),
+      ...(options.trustedCaller ? { trustedCaller: options.trustedCaller } : {}),
+    }),
+};
 
 type FollowPersistedSession = Session;
 
@@ -21173,7 +21199,7 @@ function schedulePrincipalLaneDispatchRetry(ds: DaemonSession, turnId: string): 
 /** Dispatch only the durable FIFO head.  The `attempting` write happens before
  * worker IPC, so a commit-unknown/restart can never replay a turn that may have
  * reached the CLI.  The head remains present until its exact terminal edge. */
-function driveNextPrincipalLaneTurn(ds: DaemonSession): boolean {
+async function driveNextPrincipalLaneTurn(ds: DaemonSession): Promise<boolean> {
   if (!ds.session.principalLane
       || ds.principalLaneRunningTurn
       || ds.activeInteractiveTurn) return false;
@@ -21186,36 +21212,29 @@ function driveNextPrincipalLaneTurn(ds: DaemonSession): boolean {
     clearPrincipalLaneDispatchRetry(ds);
   }
 
-  head.dispatchState = 'attempting';
-  sessionStore.updateSession(ds.session);
   let accepted = false;
   let ipcDispatchAttempted = false;
   try {
-    if (ds.worker && !ds.worker.killed) {
-      accepted = sendWorkerInput(ds, head.cliInput, head.turnId, {
-        ...(head.codexAppSteerable ? { codexAppSteerable: true } : {}),
-        trustedCaller: head.caller,
-      });
-    } else if (ds.adoptedFrom) {
-      accepted = forkAdoptWorker(ds, {
-        payload: head.cliInput,
-        turnId: head.turnId,
-        atMostOnce: true,
-        trustedCaller: head.caller,
-        onWorkerGenerationReserved: workerGeneration => {
-          ensurePrincipalLaneInboundTurnBinding(ds, head.turnId, workerGeneration);
+    accepted = await dispatchAdmittedBusinessTurn({
+      ds, turnId: head.turnId, payload: head.cliInput,
+      options: {
+        resume: head.resume, atMostOnce: true, trustedCaller: head.caller,
+        ...(head.codexAppSteerable ? { codexAppSteerable: true as const } : {}),
+      },
+      boundary: centralTurnWorkerBoundary,
+      permitStore: centralTurnPermitStore,
+      resource: {
+        markAttempting: async permit => {
+          ensurePrincipalLaneInboundTurnBinding(ds, head.turnId, permit.workerGeneration);
+          const durableHead = ds.session.principalLaneQueuedTurns?.[0];
+          if (!durableHead || durableHead.turnId !== head.turnId || durableHead.dispatchState !== 'queued') return false;
+          durableHead.dispatchState = 'attempting';
+          sessionStore.updateSession(ds.session);
+          return true;
         },
-        onIpcDispatchAttempted: () => { ipcDispatchAttempted = true; },
-      }) === 'accepted';
-    } else {
-      accepted = forkWorker(ds, head.cliInput, {
-        resume: head.resume,
-        turnId: head.turnId,
-        atMostOnce: true,
-        trustedCaller: head.caller,
-        onIpcDispatchAttempted: () => { ipcDispatchAttempted = true; },
-      });
-    }
+      },
+    });
+    ipcDispatchAttempted = accepted;
   } catch (error) {
     if (!ipcDispatchAttempted) {
       // Preflight, sandbox, binding, adapter and spawn-preparation failures are
@@ -21270,11 +21289,11 @@ export const __testOnly_driveNextPrincipalLaneTurn = driveNextPrincipalLaneTurn;
 
 /** Settle only the exact durable head, then synchronously hand the worker the
  * next lane-local turn before another inbound event can observe an idle gap. */
-function onPrincipalLaneTurnTerminal(
+async function onPrincipalLaneTurnTerminal(
   ds: DaemonSession,
   turnId: string,
   workerGeneration: number,
-): boolean {
+): Promise<boolean> {
   if (!ds.session.principalLane) return false;
   const running = ds.principalLaneRunningTurn;
   if (!running
@@ -21987,48 +22006,30 @@ async function driveNextXpiSharedCwdTurn(
   let admission: XpiSharedCwdTurnAdmission = { kind: 'unmanaged' };
   let accepted = false;
   try {
-    if (ds.worker && !ds.worker.killed) {
-      const workerGeneration = ds.workerGeneration ?? ds.session.workerGeneration;
-      if (!workerGeneration || workerGeneration <= 0) return false;
-      admission = claimExactXpiSharedCwdAdmission({
-        ds,
-        turnId: next.record.turnId,
-        workerGeneration,
-        caller: next.record.caller,
-        userPrompt: next.record.userPrompt,
-        cliInput: next.record.cliInput,
-        resume: next.record.resume,
-      });
-      if (admission.kind !== 'acquired') return false;
-      accepted = sendWorkerInput(ds, next.record.cliInput, next.record.turnId, {
+    accepted = await dispatchAdmittedBusinessTurn({
+      ds, turnId: next.record.turnId, payload: next.record.cliInput,
+      options: {
+        resume: next.record.resume, atMostOnce: true, trustedCaller: next.record.caller,
         ...(next.record.cliInput.codexAppSteerable ? { codexAppSteerable: true as const } : {}),
-        atMostOnce: true,
-        trustedCaller: next.record.caller,
-      });
-    } else {
-      const forkOutcome = forkXpiSharedCwdTurn(ds, {
-        cliInput: next.record.cliInput,
-        resume: next.record.resume,
-        turnId: next.record.turnId,
-        caller: next.record.caller,
-        onWorkerGenerationReserved(workerGeneration) {
+      },
+      boundary: centralTurnWorkerBoundary,
+      permitStore: centralTurnPermitStore,
+      resource: {
+        acquire: async permit => {
           admission = claimExactXpiSharedCwdAdmission({
             ds,
             turnId: next.record.turnId,
-            workerGeneration,
+            workerGeneration: permit.workerGeneration,
             caller: next.record.caller,
             userPrompt: next.record.userPrompt,
             cliInput: next.record.cliInput,
             resume: next.record.resume,
           });
-          if (admission.kind !== 'acquired') {
-            throw new Error('XPI shared-cwd admission changed at the worker reservation boundary');
-          }
+          return admission.kind === 'acquired';
         },
-      }, dependencies.forkAdoptWorker);
-      accepted = forkOutcome.accepted;
-    }
-    if (!accepted || admission.kind !== 'acquired') {
+      },
+    });
+    if (!accepted) {
       rollbackXpiSharedCwdAdmission(ds, admission, next.record.turnId);
       return false;
     }
@@ -29127,18 +29128,20 @@ async function handleThreadReplyAdmitted(
           throw new Error('grouped XPI input could not acquire shared-cwd admission');
         }
       }
-      accepted = sendWorkerInput(ds, cliInput, parsed.messageId,
-        {
+      accepted = await dispatchAdmittedBusinessTurn({
+        ds, turnId: parsed.messageId, payload: cliInput,
+        options: {
+          resume: ds.hasHistory,
           ...(ctx.durablePrimaryDispatch
-            ? {
-                dispatchAttempt: ctx.durablePrimaryDispatch.attempt,
-                durablePrimaryInbox: true as const,
-              }
+            ? { dispatchAttempt: ctx.durablePrimaryDispatch.attempt, durablePrimaryInbox: true as const }
             : {}),
-          ...(codexAppSteerable ? { codexAppSteerable: true } : {}),
+          ...(codexAppSteerable ? { codexAppSteerable: true as const } : {}),
           ...(ds.session.xpiSharedCwdAdmissionGroupId ? { atMostOnce: true as const } : {}),
           ...(threadTrustedCaller ? { trustedCaller: threadTrustedCaller } : {}),
-        });
+        },
+        boundary: centralTurnWorkerBoundary,
+        permitStore: centralTurnPermitStore,
+      });
       // Record the input as the session's last real CLI turn ONLY after the
       // worker accepted it. Recording before delivery (the old order) persisted
       // lastCliInput / lastUserPrompt / Codex-App sidecar for a turn that never
