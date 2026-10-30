@@ -74,7 +74,7 @@ import {
 } from './initial-native-rename.js';
 import { effectiveReplyDelivery } from './reply-delivery.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
-import { updateMessage, deleteMessage, listChatMessages, listThreadMessages, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
+import { updateMessage, deleteMessage, listChatMessages, listThreadMessages, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildTurnTerminalFooterPatch, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type StreamCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
 import { cardMessageTitle, staleWorkingCardIds, streamingCardTitleClaimsWork } from './restored-card-status.js';
@@ -781,7 +781,6 @@ import { isSessionGroup, touchSessionGroup } from '../services/session-groups-st
 import { freezePrincipalLaneTurnBinding, readPrincipalLaneTurnBinding } from './principal-lane-turn.js';
 import { settlePrincipalLaneOutboundProvenance } from './principal-lane-outbound-provenance.js';
 import { hasPendingSessionTurns } from './session-turn-queue.js';
-import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { buildTerminalUrl, getTerminalProxyPort } from './terminal-url.js';
 import { prependBotmuxBin, resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 import { snapshotProcessIdentities } from './current-actor-attestation.js';
@@ -1114,6 +1113,26 @@ export interface WorkerPoolCallbacks {
     ds: DaemonSession,
     receipt: Extract<WorkerToDaemon, { type: 'native_input_consumed' }>,
     context: { workerGeneration: number },
+  ) => void;
+  /** Authoritative capacity evidence from the exact live TraeX viewport. */
+  onCapacityWait?: (
+    ds: DaemonSession,
+    observation: Extract<WorkerToDaemon, { type: 'capacity_wait' }>,
+    context: { workerGeneration: number },
+  ) => void;
+  onCapacitySidebandBinding?: (
+    ds: DaemonSession,
+    binding: Extract<WorkerToDaemon, { type: 'capacity_sideband_binding' }> & { workerGeneration: number },
+  ) => void;
+  /** Authoritative exact-turn model/tool progress clears stale capacity wait. */
+  onTurnProgress?: (
+    ds: DaemonSession,
+    progress: Extract<WorkerToDaemon, { type: 'turn_progress' }>,
+    context: { workerGeneration: number },
+  ) => void;
+  onTurnAttention?: (
+    ds: DaemonSession,
+    attention: { turnId: string; dispatchAttempt?: number; workerGeneration: number; state: 'needs_user' | 'resumed' },
   ) => void;
   /** Provider submission proof for one durable-primary Lark Inbox turn. */
   onTurnInputCommitted?: (
@@ -1553,12 +1572,6 @@ function silentTurnReactions(ds: DaemonSession): boolean {
   } catch { return false; }
 }
 
-function doneReactionEmojiFor(ds: DaemonSession): string {
-  try {
-    return getBot(ds.larkAppId).config.doneReactionEmoji || DONE_REACTION_EMOJI_TYPE;
-  } catch { return DONE_REACTION_EMOJI_TYPE; }
-}
-
 /** Worker lifecycle readiness is independent from Web Terminal availability.
  * Legacy/test sessions predate workerReady, so retain the old port inference
  * only while the explicit flag is absent. A session restored after a daemon
@@ -1753,6 +1766,23 @@ export function idleCardLabel(ds: DaemonSession): IdleCardLabel | undefined {
  *  但仍有后台子任务在跑时为「后台子任务运行中（N）」，盖过 idle 标签；否则同
  *  {@link idleCardLabel}。冻结卡不用它——后台计数只描述当下。 */
 export function streamCardLabel(ds: DaemonSession): StreamCardLabel | undefined {
+  const feedback = ds.currentTurnId
+    ? ds.session.turnFeedback?.[ds.currentTurnId]
+    : undefined;
+  const capacity = feedback?.phase === 'capacity_waiting' || feedback?.phase === 'capacity_stale'
+    ? feedback.capacity
+    : undefined;
+  if (capacity?.state === 'waiting' || capacity?.state === 'stale') {
+    return {
+      capacityWait: {
+        state: capacity.state,
+        ...(capacity.state === 'waiting' && capacity.position !== undefined
+          ? { position: capacity.position }
+          : {}),
+        ageMs: Math.max(0, Date.now() - capacity.updatedAtMs),
+      },
+    };
+  }
   if (ds.backgroundTaskCount && (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'idle')) {
     return { backgroundTasks: ds.backgroundTaskCount };
   }
@@ -3583,7 +3613,9 @@ export function cachedStreamingCardStatus(ds: DaemonSession): StreamStatus {
  *  subtasks ran under the worker too, so a stale count is dropped with it;
  *  the turn's own outcome labels still apply. */
 export function cachedStreamCardLabel(ds: DaemonSession): StreamCardLabel | undefined {
-  return hasNoCliUnderDaemon(ds) ? idleCardLabel(ds) : streamCardLabel(ds);
+  const live = streamCardLabel(ds);
+  if (live && typeof live === 'object' && 'capacityWait' in live) return live;
+  return hasNoCliUnderDaemon(ds) ? idleCardLabel(ds) : live;
 }
 
 function hasNoCliUnderDaemon(ds: DaemonSession): boolean {
@@ -14869,6 +14901,7 @@ export function forkWorker(
       BOTMUX: '1',  // Marker so user scripts/skills can detect a botmux-spawned CLI
       SESSION_DATA_DIR: config.session.dataDir,
       BOTMUX_SESSION_ID: ds.session.sessionId,
+      BOTMUX_WORKER_GENERATION: String(workerGeneration),
       LARK_APP_ID: botCfg.larkAppId,
       // Withhold the real secret from the worker's own CLI env for a no-transport
       // session (apiOnly bot or HTTP virtual chat). SEPARATE leak from the
@@ -16135,9 +16168,52 @@ function setupWorkerHandlers(
         }
         break;
       }
+      case 'capacity_wait': {
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+          || msg.sessionId !== ds.session.sessionId
+          || !ownsLifecycleMutation()
+          || ds.currentTurnId !== msg.turnId
+          || (ds.turnDispatchAttemptHighWater?.turnId === msg.turnId
+            && ds.turnDispatchAttemptHighWater.dispatchAttempt !== msg.dispatchAttempt)
+        ) {
+          logger.warn(`[${t}] Ignored capacity_wait from stale or mismatched turn identity`);
+          break;
+        }
+        try {
+          cb.onCapacityWait?.(ds, msg, { workerGeneration });
+        } catch (err) {
+          logger.warn(`[${t}] capacity wait handler failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        break;
+      }
+      case 'capacity_sideband_binding': {
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+          || msg.sessionId !== ds.session.sessionId
+          || !ownsLifecycleMutation()
+          || ds.currentTurnId !== msg.turnId
+          || ds.turnDispatchAttemptHighWater?.turnId !== msg.turnId
+          || ds.turnDispatchAttemptHighWater.dispatchAttempt !== msg.dispatchAttempt
+        ) {
+          logger.warn(`[${t}] Ignored capacity_sideband_binding from stale or mismatched turn identity`);
+          break;
+        }
+        try {
+          cb.onCapacitySidebandBinding?.(ds, { ...msg, workerGeneration });
+        } catch (err) {
+          logger.warn(`[${t}] capacity sideband binding failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        break;
+      }
       case 'turn_progress': {
         if (!ownsLifecycleMutation() || !['model_output', 'tool_started', 'tool_returned'].includes(msg.stage)) break;
         cliNotices.progress(msg.turnId, msg.dispatchAttempt, workerGeneration, msg.stage);
+        cb.onTurnProgress?.(ds, msg, { workerGeneration });
         break;
       }
       case 'turn_execution_started': {
@@ -17204,21 +17280,12 @@ function setupWorkerHandlers(
             content: msg.content,
           });
           // Usage ledger: any settle-to-idle/limited edge records the delta.
-          // Turn reactions are stricter — only flip ✋→✅ after a real busy
-          // period (working/analyzing) that settles to IDLE. A limited settle
-          // is a blocked turn, not completion: DONE-ing ✋ on working→limited
-          // made users think the task finished while the CLI was stuck (the
-          // rate-limit notification below owns that attention instead).
-          // Cold-start starting→idle (or the first prompt-ready before the turn
-          // has gone working) must NOT DONE a message that is still about to be
-          // / just being processed. Grok card-off sessions hit this when the
-          // ready-gate settle fired idle ~seconds after GoGoGo while the CLI
-          // was still running the prompt.
+          // A screen idle only means the terminal looks ready for input. It is
+          // not evidence that any exact user turn completed, especially during
+          // `/th` cold start before UserPromptSubmit. Turn reactions therefore
+          // settle exclusively from the validated turn_terminal path below.
           if (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited') {
             recordUsageForDaemonSession(ds);
-            if (ds.lastScreenStatus === 'idle' && (prevStatus === 'working' || prevStatus === 'analyzing')) {
-              void finishTurnReactions(ds);
-            }
           }
           if (
             ds.lastScreenStatus === 'idle'
@@ -17714,6 +17781,9 @@ function setupWorkerHandlers(
         }
         clearTuiPromptAuthority(ds);
         if (hadAuthority) publishAttentionPatch(ds);
+        if (msg.turnId) cb.onTurnAttention?.(ds, {
+          turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt, workerGeneration, state: 'resumed',
+        });
         break;
       }
 
@@ -17858,6 +17928,9 @@ function setupWorkerHandlers(
           }
           ds.stuckWarningCardId = cardMsgId;
           publishAttentionPatch(ds);
+          if (msg.turnId) cb.onTurnAttention?.(ds, {
+            turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt, workerGeneration, state: 'needs_user',
+          });
         } catch (err: any) {
           logger.warn(`[${t}] Failed to post stuck warning card: ${err}`);
           // Card send failed — clear markers ONLY if this nonce is still
@@ -17885,6 +17958,9 @@ function setupWorkerHandlers(
             logger.debug(`[${t}] Failed to update stuck-warning card on expired: ${err}`),
           );
           clearStuckWarningAuthority(ds);
+          if (msg.turnId) cb.onTurnAttention?.(ds, {
+            turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt, workerGeneration, state: 'resumed',
+          });
         }
         break;
       }
@@ -17903,6 +17979,9 @@ function setupWorkerHandlers(
             logger.debug(`[${t}] Failed to resolve stuck-warning card on delivered: ${err}`),
           );
           clearStuckWarningAuthority(ds);
+          if (msg.turnId) cb.onTurnAttention?.(ds, {
+            turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt, workerGeneration, state: 'resumed',
+          });
         }
         break;
       }
@@ -20730,49 +20809,6 @@ function shouldDropMismatchedHermesFinalOutput(
   return true;
 }
 
-/**
- * Turn-end half of the two-phase turn reactions (auto-on for card-off sessions,
- * i.e. streaming card disabled). The 冲! "received" reactions are added per-message at the daemon
- * acceptance point (`noteTurnReceived`); the screen_update handler calls this
- * only on working|analyzing → idle|limited (not cold-start starting→idle), to
- * flip every pending ✋ on this session to ✅ DONE and clear the list. When
- * silentTurnReactions is enabled after a ✋ has already landed, we only remove
- * that received reaction and do not add DONE. Binding the start to the message
- * (not a status edge) means type-ahead / busy-batched messages each get their
- * own reaction and all settle together here.
- *
- * Every Feishu call is best-effort — a failure only means a missing emoji, so it
- * must never throw into the status pipeline (callers invoke as `void`).
- */
-async function finishTurnReactions(ds: DaemonSession): Promise<void> {
-  const list = ds.pendingAckReactions;
-  if (!list || list.length === 0) return;
-  // Detach the batch first so a second idle edge can't double-flip it.
-  ds.pendingAckReactions = [];
-  // Plan B: a meeting agent is an ordinary chat-scope session. Pending ack
-  // reactions only ever exist for a real inbound user message (the ✋ is placed
-  // when that message arrives — transcript deliveries have no inbound message to
-  // react to), so a non-empty list here always belongs to a plain user turn and
-  // must settle to ✅ like any session. No VC special-case.
-  const silent = silentTurnReactions(ds);
-  const doneEmoji = doneReactionEmojiFor(ds);
-  for (const ack of list) {
-    if (ack.reactionId) {
-      try {
-        await removeReaction(ds.larkAppId, ack.messageId, ack.reactionId);
-      } catch (err: any) {
-        logger.debug(`[reaction] failed to remove received reaction ${ack.reactionId}: ${err?.message ?? err}`);
-      }
-    }
-    if (silent) continue;
-    try {
-      await addReaction(ds.larkAppId, ack.messageId, doneEmoji);
-    } catch (err: any) {
-      logger.debug(`[reaction] failed to add done reaction to ${ack.messageId}: ${err?.message ?? err}`);
-    }
-  }
-}
-
 /** Deliver a bridge `final_output` to Lark. The current worker generation pops
  *  the turn at emit time, while replacement recovery may replay it with the
  *  same provider key; the daemon owns bounded transient retries. After 3 attempts we log
@@ -21884,7 +21920,6 @@ export const __testOnly_deliverFinalOutput = deliverFinalOutput;
 export const __testOnly_setupWorkerHandlers = setupWorkerHandlers;
 export const __testOnly_reserveWorkerGeneration = reserveWorkerGeneration;
 export const __testOnly_bindPreparedGroupContextWorker = bindPreparedGroupContextWorker;
-export const __testOnly_finishTurnReactions = finishTurnReactions;
 export const __testOnly_retireTerminalizedCodexAppLedgerEntriesForRecovery = retireTerminalizedCodexAppLedgerEntriesForRecovery;
 
 // ─── Fork adopt worker ──────────────────────────────────────────────────────

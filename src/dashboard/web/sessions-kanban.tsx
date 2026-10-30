@@ -120,6 +120,13 @@ function repoBasename(workingDir: unknown): string {
 }
 
 function boardSignalLabel(s: any): string {
+  if (s.capacityFeedback?.state === 'waiting') {
+    return s.capacityFeedback.position === undefined
+      ? t('sessions.board.signalCapacity')
+      : t('sessions.board.signalCapacityPosition', { position: s.capacityFeedback.position });
+  }
+  if (s.capacityFeedback?.state === 'stale') return t('sessions.board.signalCapacityStale');
+  if (s.capacityFeedback?.state === 'unsupported') return t('sessions.board.signalCapacityUnsupported');
   if (s.agentAttention?.reason) return s.agentAttention.reason;
   if (s.agentAttention) return t('sessions.board.signalAgent');
   if (s.pendingRepo) return t('sessions.board.signalRepo');

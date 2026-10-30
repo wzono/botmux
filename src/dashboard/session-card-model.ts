@@ -31,6 +31,7 @@ export interface SessionRowDto {
   lastMessageAt: number;
   webPort: number | null;
   scope?: 'thread' | 'chat';
+  capacityFeedback?: SessionRow['capacityFeedback'];
   /**
    * Raw row preserved for downstream card-builder use.
    */
@@ -60,6 +61,7 @@ export interface SessionDetailDto {
   workingDir?: string;
   webPort: number | null;
   scope?: 'thread' | 'chat';
+  capacityFeedback?: SessionRow['capacityFeedback'];
   actions: SessionActionMatrix;
   raw: SessionRow;
 }
@@ -110,6 +112,15 @@ function formatRelative(fromMs: number, nowMs: number): string {
 
 function buildSecondary(row: SessionRow, nowMs?: number): string {
   const parts: string[] = [];
+  if (row.capacityFeedback?.state === 'waiting') {
+    parts.push(row.capacityFeedback.position === undefined
+      ? 'capacity waiting'
+      : `capacity waiting #${row.capacityFeedback.position}`);
+  } else if (row.capacityFeedback?.state === 'stale') {
+    parts.push('capacity waiting (stale)');
+  } else if (row.capacityFeedback?.state === 'unsupported') {
+    parts.push('capacity signal unsupported');
+  }
   if (row.cliId) parts.push(String(row.cliId));
   if (row.cliInstanceSource) parts.push(`instance:${row.cliInstanceId ?? 'legacy'} (${row.cliInstanceSource})`);
   if (row.workingDir) parts.push(row.workingDir);
@@ -138,6 +149,7 @@ export function composeEntries(rows: ReadonlyArray<SessionRow>, nowMs?: number):
       lastMessageAt: row.lastMessageAt,
       webPort: row.webPort,
       scope: row.scope,
+      capacityFeedback: row.capacityFeedback,
       raw: row,
     });
   }
@@ -239,6 +251,7 @@ export function composeDetail(row: SessionRow, _nowMs?: number): SessionDetailDt
     workingDir: row.workingDir,
     webPort: row.webPort,
     scope: row.scope,
+    capacityFeedback: row.capacityFeedback,
     actions,
     raw: row,
   };

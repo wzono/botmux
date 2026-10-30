@@ -137,6 +137,18 @@ import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
+import { createTurnFeedbackReconciler } from './services/turn-feedback-reconciler.js';
+import { createCapacitySidebandDirectoryConsumer, type CapacitySidebandKey } from './services/capacity-sideband-consumer.js';
+import { createCapacitySidebandRuntime } from './services/capacity-sideband-runtime.js';
+import { createCapacityRolloutStore, type CapacityRolloutAdapter } from './services/capacity-rollout-store.js';
+import { createCapacityRolloutWatcher } from './services/capacity-rollout-watcher.js';
+import { appendCapacityAuditRecord, capacityEpisodeId } from './services/capacity-wait-audit.js';
+import { createCapacityWaitReminder } from './services/capacity-wait-reminder.js';
+import {
+  createCapacityAskFeedbackLifecycle,
+  ownsCapacityAskFeedback,
+} from './services/capacity-ask-feedback.js';
+import { createCapacityFeedbackProjection } from './services/capacity-feedback-projection.js';
 import { coordinationModeIsPrimary, initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
 import { effortTaskFingerprint } from './services/codex-effort-task-state.js';
 import { closeLinkRefRuntime, initializeLinkRefRuntime } from './services/link-ref-runtime.js';
@@ -406,7 +418,7 @@ import { buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCl
 import { codexServiceTierBadge } from './services/codex-service-tier.js';
 import { sessionConfiguredRuntimeDisplayName } from './core/cli-runtime-display.js';
 import { isLocalCliOpenReady } from './services/local-cli-opener.js';
-import { RECEIVED_REACTION_EMOJI_TYPE, SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE } from './core/pending-response.js';
+import { DONE_REACTION_EMOJI_TYPE, RECEIVED_REACTION_EMOJI_TYPE, SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE } from './core/pending-response.js';
 import { t as tr, localeForBot } from './i18n/index.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import {
@@ -420,6 +432,7 @@ import {
   reserveQueuedActivationTailAdmission,
   type QueuedActivationTailReservation,
   type WorkerForkAdmission,
+  type WorkerPoolCallbacks,
   codexAppCleanInputAcceptedForSession,
   hasQueuedActivationAdmissionGate,
   sendPromptCacheKeepalive,
@@ -4126,10 +4139,405 @@ function silentTurnReactionsFor(ds: DaemonSession): boolean {
   } catch { return false; }
 }
 
-function receivedReactionEmojiFor(ds: DaemonSession): string {
+const turnFeedbackReconciler = createTurnFeedbackReconciler({
+  now: () => Date.now(),
+  read(target) {
+    return sessionStore.getSessionFresh(target.session.sessionId) ?? target.session;
+  },
+  policy(target) {
+    const cfg = getBot(target.larkAppId).config;
+    return {
+      silent: cfg.silentTurnReactions === true,
+      processing: cfg.receivedReactionEmoji || RECEIVED_REACTION_EMOJI_TYPE,
+      completed: cfg.doneReactionEmoji || DONE_REACTION_EMOJI_TYPE,
+      failed: 'ERROR',
+    };
+  },
+  commit(target, mutate) {
+    const { rows } = sessionStore.mutateOwnedSessionsAtomically(
+      [target.session.sessionId],
+      fresh => mutate(fresh.get(target.session.sessionId)!),
+    );
+    const committed = rows.get(target.session.sessionId)!;
+    if (committed !== target.session) {
+      for (const key of Object.keys(target.session)) {
+        delete (target.session as unknown as Record<string, unknown>)[key];
+      }
+      Object.assign(target.session, structuredClone(committed));
+      return target.session;
+    }
+    return committed;
+  },
+});
+export const __testOnly_turnFeedbackReconciler = turnFeedbackReconciler;
+
+const capacityWaitReminder = createCapacityWaitReminder({
+  read: target => sessionStore.getSessionFresh(target.session.sessionId) ?? target.session,
+  commit(target, mutate) {
+    const sessionId = target.session.sessionId;
+    sessionStore.mutateOwnedSessionsAtomically([sessionId], fresh => mutate(fresh.get(sessionId)!));
+  },
+  async send(target, row, uuid) {
+    const ds = findActiveBySessionId(target.session.sessionId);
+    if (!ds) throw new Error('capacity reminder session is not active');
+    void uuid;
+    if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL) {
+      throw new Error('capacity reminder has no patchable work card');
+    }
+    const messageId = ds.streamCardId;
+    await updateMessage(target.larkAppId, messageId, buildStreamingCardJson(ds), {
+      beforeWrite: () => {
+        const current = findActiveBySessionId(target.session.sessionId);
+        if (current !== ds || current.streamCardId !== messageId
+          || current.currentTurnId !== row.turnId) {
+          throw new Error('capacity reminder no longer owns the work card');
+        }
+      },
+    });
+    return messageId;
+  },
+  patch: async (target, _row, messageId) => {
+    const ds = findActiveBySessionId(target.session.sessionId);
+    if (!ds) return { kind: 'unavailable' as const };
+    if (ds.streamCardId !== messageId) return { kind: 'card_mismatch' as const };
+    try {
+      await updateMessage(target.larkAppId, messageId, buildStreamingCardJson(ds), {
+        beforeWrite: () => {
+          const current = findActiveBySessionId(target.session.sessionId);
+          if (current !== ds || current.streamCardId !== messageId
+            || current.currentTurnId !== _row.turnId) {
+            throw new Error('capacity reminder close no longer owns the work card');
+          }
+        },
+      });
+      return { kind: 'patched' as const };
+    } catch (error) {
+      const detail = String(error);
+      if (/message.*(?:withdrawn|deleted|not found)|230002/i.test(detail)) {
+        return { kind: 'already_gone' as const };
+      }
+      throw error;
+    }
+  },
+  now: () => Date.now(),
+  thresholds(target) {
+    const cfg = getBot(target.larkAppId).config;
+    return {
+      interactiveMs: (cfg.capacityInteractiveReminderMinutes ?? 2) * 60_000,
+      backgroundMs: (cfg.capacityBackgroundReminderMinutes ?? 10) * 60_000,
+    };
+  },
+});
+
+const capacityFeedbackProjection = createCapacityFeedbackProjection({
+  read: (target, turnId) => {
+    const row = (sessionStore.getSessionFresh(target.session.sessionId) ?? target.session)
+      .turnFeedback?.[turnId];
+    return row?.phase === 'capacity_waiting' || row?.phase === 'capacity_stale'
+      ? row.capacity
+      : undefined;
+  },
+  markStale: (target, turnId, observedAtMs, nowMs) =>
+    turnFeedbackReconciler.markCapacityStale(target, turnId, observedAtMs, nowMs),
+  patch(ds, turnId) {
+    scheduleCardPatch(ds, buildStreamingCardJson(ds), turnId);
+  },
+  reminderSync: (target, turnId) => capacityWaitReminder.sync(target, turnId),
+  now: () => Date.now(),
+  trailingMs: 15_000,
+  staleMs: 60_000,
+});
+
+function applyLiveTurnFeedbackTerminal(
+  ds: DaemonSession,
+  terminal: Pick<Extract<WorkerToDaemon, { type: 'turn_terminal' }>,
+    'turnId' | 'status' | 'completedAtMs'>,
+): void {
   try {
-    return getBot(ds.larkAppId).config.receivedReactionEmoji || RECEIVED_REACTION_EMOJI_TYPE;
-  } catch { return RECEIVED_REACTION_EMOJI_TYPE; }
+    const changed = turnFeedbackReconciler.terminal(
+      { session: ds.session, larkAppId: ds.larkAppId },
+      terminal.turnId,
+      terminal.status === 'completed' ? 'completed' : 'failed',
+      terminal.completedAtMs,
+    );
+    if (changed) {
+      capacityFeedbackProjection.sync(ds, terminal.turnId);
+      void turnFeedbackReconciler.reconcile(
+        { session: ds.session, larkAppId: ds.larkAppId },
+        terminal.turnId,
+      ).catch(error => logger.warn(
+        `[reaction] terminal reconcile failed turn=${terminal.turnId.slice(0, 12)}: ${String(error)}`,
+      ));
+    }
+  } catch (error) {
+    logger.error(
+      `[reaction] feedback_terminal_commit_failed turn=${terminal.turnId.slice(0, 12)}: ${String(error)}`,
+    );
+  }
+}
+
+export const __testOnly_applyLiveTurnFeedbackTerminal = applyLiveTurnFeedbackTerminal;
+
+/** Production worker-terminal feedback seam. A matching session id is not
+ * ownership: adopt/restore compatibility paths and detached snapshots can
+ * carry the same id as the daemon-owned row. Only the exact Session object
+ * attached to this process's writable store may project terminal feedback. */
+export function handleOwnedTurnFeedbackTerminal(
+  ds: DaemonSession,
+  terminal: Pick<Extract<WorkerToDaemon, { type: 'turn_terminal' }>,
+    'turnId' | 'status' | 'completedAtMs'>,
+): void {
+  if (!sessionStore.ownsSessionForMutation(ds.session)) return;
+  applyLiveTurnFeedbackTerminal(ds, terminal);
+}
+
+/** Decorate the daemon's real worker terminal callback with the feedback
+ * ownership gate. Production assembly and behavior tests use this same seam,
+ * so removing the daemon wiring also removes terminal feedback in the tests. */
+export function withOwnedTurnFeedbackTerminal(
+  next?: NonNullable<WorkerPoolCallbacks['onTurnTerminal']>,
+): NonNullable<WorkerPoolCallbacks['onTurnTerminal']> {
+  return async (ds, terminal, context) => {
+    handleOwnedTurnFeedbackTerminal(ds, terminal);
+    await next?.(ds, terminal, context);
+  };
+}
+
+/** Production assembly factory for the worker-pool feedback callback. Keep the
+ * wrapper selection here—not at individual tests/callers—so a daemon wiring
+ * regression is observable by driving the returned callback. */
+export function createTurnFeedbackWorkerCallbacks(
+  next?: NonNullable<WorkerPoolCallbacks['onTurnTerminal']>,
+): Pick<WorkerPoolCallbacks, 'onTurnTerminal'> {
+  return { onTurnTerminal: withOwnedTurnFeedbackTerminal(next) };
+}
+
+/** First production terminal lifecycle step after feedback projection. Keeping
+ * this in an executable seam lets the daemon assembly and behavior tests share
+ * the exact deployment-continuation retirement logic. */
+export function handleProductionTurnTerminalLifecycle(
+  ds: DaemonSession,
+  terminal: Pick<Extract<WorkerToDaemon, { type: 'turn_terminal' }>, 'turnId'>,
+  context: { workerGeneration: number },
+): void {
+  if (ds.session.deploymentContinuation?.state === 'cancelled'
+    || ds.session.deploymentContinuation?.workerGeneration !== context.workerGeneration) return;
+  try {
+    cancelDeploymentContinuation(
+      ds.session,
+      previous => sessionStore.updateDeploymentContinuation(ds.session, previous),
+      terminal.turnId,
+    );
+  } catch (error) {
+    logger.error(
+      `[restart] Could not retire task checkpoint: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+/** Exact production callback factory used by startDaemon and behavior tests. */
+export function createProductionTurnFeedbackWorkerCallbacks(
+  next?: NonNullable<WorkerPoolCallbacks['onTurnTerminal']>,
+): Pick<WorkerPoolCallbacks, 'onTurnTerminal'> {
+  return createTurnFeedbackWorkerCallbacks(async (ds, terminal, context) => {
+    handleProductionTurnTerminalLifecycle(ds, terminal, context);
+    await next?.(ds, terminal, context);
+  });
+}
+
+const capacitySidebandRuntime = createCapacitySidebandRuntime(binding => {
+  const ds = findActiveBySessionId(binding.sessionId);
+  const persisted = ds?.session.turnFeedback?.[binding.turnId]?.capacityBinding;
+  const liveAttempt = ds?.turnDispatchAttemptHighWater?.turnId === binding.turnId
+    ? ds.turnDispatchAttemptHighWater.dispatchAttempt
+    : ds?.managedTurnOrigin?.turnId === binding.turnId
+      ? ds.managedTurnOrigin.dispatchAttempt
+      : undefined;
+  return !!ds && (liveAttempt === undefined || liveAttempt === binding.dispatchAttempt)
+    && persisted?.adapter === binding.adapter
+    && persisted.nativeTurnId === binding.nativeTurnId
+    && persisted.nativeSessionId === binding.nativeSessionId
+    && persisted.dispatchAttempt === binding.dispatchAttempt
+    && persisted.workerGeneration === binding.workerGeneration;
+});
+let stopCapacitySidebandConsumer: (() => void) | undefined;
+let consumerCapacitySidebandRetry: (() => void) | undefined;
+let stopCapacityRolloutPolicyWatcher: (() => void) | undefined;
+
+function capacityProjectionEnabled(
+  appId: string,
+  adapter: CapacityRolloutAdapter,
+): boolean {
+  try {
+    return createCapacityRolloutStore(config.session.dataDir)
+      .evaluate(appId, adapter, true) === 'enabled';
+  } catch (error) {
+    logger.warn(`[capacity] rollout policy unavailable; projection disabled: ${String(error)}`);
+    return false;
+  }
+}
+
+async function reconcileCapacityRolloutPolicy(ownerAppId: string): Promise<void> {
+  const rollout = createCapacityRolloutStore(config.session.dataDir);
+  for (const ds of activeSessions.values()) {
+    if (ds.larkAppId !== ownerAppId || !sessionStore.ownsSessionForMutation(ds.session)) continue;
+    for (const adapter of ['traex', 'codex', 'claude-code'] as const) {
+      if (rollout.evaluate(ownerAppId, adapter, true) === 'enabled') continue;
+      const changed = turnFeedbackReconciler.disableCapacity(
+        { session: ds.session, larkAppId: ds.larkAppId }, adapter,
+      );
+      for (const turnId of changed) {
+        capacityFeedbackProjection.sync(ds, turnId);
+        await turnFeedbackReconciler.reconcile(ds, turnId);
+      }
+    }
+  }
+}
+
+function startCapacityRolloutPolicyWatcher(ownerAppId: string): void {
+  stopCapacityRolloutPolicyWatcher?.();
+  const watcher = createCapacityRolloutWatcher({
+    snapshot: () => JSON.stringify(createCapacityRolloutStore(config.session.dataDir).snapshot()),
+    reconcile: () => reconcileCapacityRolloutPolicy(ownerAppId),
+    warn: error => logger.warn(`[capacity] rollout policy reconcile failed: ${String(error)}`),
+  });
+  stopCapacityRolloutPolicyWatcher = watcher.start(250);
+}
+
+function recordCapacityAudit(
+  ds: DaemonSession,
+  turnId: string,
+  adapter: CapacityRolloutAdapter,
+  schemaVersion: 'traex-viewport.v1' | 'capacity-wait.v3',
+  event: 'waiting' | 'position' | 'clear' | 'terminal' | 'stale',
+  observedAtMs: number,
+  positionKnown: boolean,
+  verdict: 'accepted' | 'rejected' | 'unsupported' | 'disabled',
+  signer?: { keyId: string; epoch: number },
+): void {
+  try {
+    const row = ds.session.turnFeedback?.[turnId];
+    const episodeStart = row?.capacity && row.capacity.state !== 'cleared'
+      ? row.capacity.startedAtMs
+      : observedAtMs;
+    appendCapacityAuditRecord(config.session.dataDir, {
+      episodeId: capacityEpisodeId([ds.larkAppId, ds.session.sessionId, turnId, String(episodeStart)]),
+      adapter, schemaVersion, event, observedAt: new Date(observedAtMs).toISOString(),
+      positionKnown, visibility: verdict === 'accepted' ? 'work-card' : 'none',
+      latencyMs: Math.max(0, Date.now() - observedAtMs), verdict,
+      ...(signer ? { signerKeyId: signer.keyId, signerEpoch: signer.epoch } : {}),
+    });
+  } catch (error) {
+    logger.warn(`[capacity] audit append failed: ${String(error)}`);
+  }
+}
+
+function decodeCapacitySidebandKeyring(raw: string | undefined): CapacitySidebandKey[] {
+  if (!raw) return [];
+  const parsed = JSON.parse(raw) as Array<{
+    keyId: string; publicKeyDer: string; minEpoch: number; maxEpoch: number;
+  }>;
+  return parsed.map(entry => ({
+    keyId: entry.keyId, publicKeyDer: Buffer.from(entry.publicKeyDer, 'base64url'),
+    minEpoch: entry.minEpoch, maxEpoch: entry.maxEpoch,
+  }));
+}
+
+function startCapacitySidebandConsumer(ownerAppId: string): void {
+  stopCapacitySidebandConsumer?.();
+  stopCapacitySidebandConsumer = undefined;
+  consumerCapacitySidebandRetry = undefined;
+  capacitySidebandRuntime.clear();
+  for (const session of sessionStore.listSessions()) {
+    if (session.larkAppId !== ownerAppId) continue;
+    for (const row of Object.values(session.turnFeedback ?? {})) {
+      const binding = row.capacityBinding;
+      if (binding) capacitySidebandRuntime.restore({
+        ...binding, sessionId: session.sessionId, turnId: row.turnId,
+      });
+    }
+  }
+  const root = process.env.BOTMUX_CAPACITY_SIDEBAND_ROOT;
+  let keyring: CapacitySidebandKey[] = [];
+  try { keyring = decodeCapacitySidebandKeyring(process.env.BOTMUX_CAPACITY_SIDEBAND_KEYRING); }
+  catch (error) { logger.error(`[capacity] invalid sideband keyring: ${String(error)}`); return; }
+  if (!root || keyring.length === 0) return;
+  const consumer = createCapacitySidebandDirectoryConsumer({
+    root, ownerAppId, keyring,
+    quarantine({ reason }) {
+      const rollout = createCapacityRolloutStore(config.session.dataDir);
+      for (const adapter of ['codex', 'claude-code'] as const) {
+        rollout.disable(ownerAppId, adapter, `sideband_${reason}`);
+      }
+      for (const ds of activeSessions.values()) {
+        if (ds.larkAppId !== ownerAppId) continue;
+        const changed = turnFeedbackReconciler.disableCapacity(
+          { session: ds.session, larkAppId: ds.larkAppId },
+        );
+        for (const turnId of changed) {
+          capacityFeedbackProjection.sync(ds, turnId);
+          void turnFeedbackReconciler.reconcile(ds, turnId);
+        }
+      }
+    },
+    resolve(event) {
+      return capacitySidebandRuntime.resolve({
+        adapter: event.adapter, nativeTurnId: event.native_turn_id,
+        ...(event.native_session_id ? { nativeSessionId: event.native_session_id } : {}),
+      });
+    },
+    async observe(binding, observation, event) {
+      const ds = findActiveBySessionId(binding.sessionId);
+      const persisted = ds?.session.turnFeedback?.[binding.turnId]?.capacityBinding;
+      const liveAttempt = ds?.turnDispatchAttemptHighWater?.turnId === binding.turnId
+        ? ds.turnDispatchAttemptHighWater.dispatchAttempt
+        : ds?.managedTurnOrigin?.turnId === binding.turnId
+          ? ds.managedTurnOrigin.dispatchAttempt
+          : undefined;
+      if (!ds || ds.currentTurnId !== binding.turnId
+        || ds.workerGeneration !== binding.workerGeneration
+        || ds.session.workerGeneration !== binding.workerGeneration
+        || liveAttempt !== undefined && liveAttempt !== binding.dispatchAttempt
+        || persisted?.dispatchAttempt !== binding.dispatchAttempt
+        || persisted.workerGeneration !== binding.workerGeneration) return false;
+      const enabled = capacityProjectionEnabled(ds.larkAppId, event.adapter);
+      if (enabled) {
+        const changed = turnFeedbackReconciler.observeCapacity(
+          { session: ds.session, larkAppId: ds.larkAppId }, binding.turnId, observation,
+        );
+        if (changed) {
+          await turnFeedbackReconciler.reconcile(ds, binding.turnId);
+          capacityFeedbackProjection.sync(ds, binding.turnId);
+        }
+      } else {
+        const changed = turnFeedbackReconciler.disableCapacity(
+          { session: ds.session, larkAppId: ds.larkAppId }, event.adapter,
+        );
+        for (const turnId of changed) {
+          capacityFeedbackProjection.sync(ds, turnId);
+          await turnFeedbackReconciler.reconcile(ds, turnId);
+        }
+      }
+      recordCapacityAudit(
+        ds, binding.turnId, event.adapter, 'capacity-wait.v3',
+        event.state === 'waiting' ? 'waiting' : event.state, Date.parse(event.observed_at),
+        event.position !== undefined, enabled ? 'accepted' : 'disabled',
+        { keyId: event.signer_key_id, epoch: event.signer_epoch },
+      );
+      sessionStore.mutateOwnedSessionsAtomically([ds.session.sessionId], fresh => {
+        const row = fresh.get(ds.session.sessionId)?.turnFeedback?.[binding.turnId];
+        if (row) row.capacitySidebandCursor = {
+          adapter: event.adapter, signerKeyId: event.signer_key_id,
+          signerEpoch: event.signer_epoch, requestId: event.request_id,
+          sequence: event.sequence, observedAtMs: Date.parse(event.observed_at),
+        };
+      });
+      return true;
+    },
+  });
+  consumer.retryPending();
+  consumerCapacitySidebandRetry = () => consumer.retryPending();
+  stopCapacitySidebandConsumer = consumer.start();
 }
 
 export async function noteTurnReceived(
@@ -4139,13 +4547,85 @@ export async function noteTurnReceived(
   _sender?: { name?: string },
   _turnId?: string,
   receivedReactionEmoji?: string,
+  ownedReplyAliasRoots?: readonly string[],
 ): Promise<void> {
+  const turnId = _turnId ?? triggerMessageId;
+  const reactionSilent = !streamingCardDisabledFor(ds, turnId)
+    || silentTurnReactionsFor(ds)
+    || (ds.session.vcMeetingReceiver
+      && resolveVcMeetingImTurnOrigin(ds.session, triggerMessageId) !== undefined);
+  const background = turnId.startsWith('schedule:') || ds.chatId.startsWith('http_async_')
+    || ds.chatId.startsWith('http_wait_') || ds.chatId.startsWith('headless_');
+  const reminderSilent = isSilentScheduledTurn(ds, turnId)
+    || ds.session.vcMeetingReceiver !== undefined;
+  // Durable admission is the synchronous linearization point. It must complete
+  // before identity publication or any other await lets a second live-only turn
+  // stage routing beside this one.
+  // Feedback admission is durable state owned by this daemon's SessionStore.
+  // Some compatibility/test ingress paths intentionally use synthetic sessions
+  // that are not attached to the owned store; keep those historical paths
+  // working without inventing recoverability for a row we do not own. Once an
+  // owned row exists, admission remains fail-closed so routing and feedback
+  // cannot diverge after a real persistence failure.
+  const ownsFeedbackSession = sessionStore.ownsSessionForMutation(ds.session);
+  if (ownsFeedbackSession) {
+    const committed = turnFeedbackReconciler.admit(
+      { session: ds.session, larkAppId: ds.larkAppId },
+      {
+        turnId, messageId: triggerMessageId, receivedReactionEmoji,
+        ...(reactionSilent ? { reactionSilent: true } : {}),
+        ...(reminderSilent ? { reminderSilent: true } : {}),
+        ...(background ? { background: true } : {}),
+        ownedReplyAliasRoots,
+      },
+    );
+    syncReplyTargetState(ds, committed);
+    try {
+      await turnFeedbackReconciler.reconcile(
+        { session: ds.session, larkAppId: ds.larkAppId },
+        turnId,
+      );
+    } catch (error) {
+      logger.debug(
+        `[reaction] received reconcile failed for ${triggerMessageId}: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  } else if (!reactionSilent && triggerMessageId.startsWith('om_')) {
+    // Compatibility-only synthetic sessions have no durable owner row. Keep
+    // their historical best-effort receipt without pretending it has trusted
+    // terminal ownership. It deliberately remains GoGoGo: no durable row means
+    // no safe turn/attempt/generation tuple from which to infer DONE or ERROR.
+    try {
+      await addReaction(
+        ds.larkAppId, triggerMessageId,
+        receivedReactionEmoji ?? getBot(ds.larkAppId).config.receivedReactionEmoji
+          ?? RECEIVED_REACTION_EMOJI_TYPE,
+      );
+    } catch (error) {
+      logger.debug(`[reaction] legacy receipt failed for ${triggerMessageId}: ${String(error)}`);
+    }
+  }
   if (getBot(ds.larkAppId).config.showReplyTiming === true) {
-    const turnId = _turnId ?? triggerMessageId;
     const received = ds.turnReceivedAtMs ??= new Map();
     if (!received.has(turnId)) received.set(turnId, Date.now());
     // Keep recent timestamps for delivery retries; unknown/evicted turns omit waiting time.
     if (received.size > 512) received.delete(received.keys().next().value!);
+  }
+  // Trigger-user CLI auth: publish (or withhold) the acting identity for THIS
+  // turn. This is the per-message acceptance point — every inbound turn passes
+  // through here before reaching the worker — so it is the one place that can
+  // guarantee no turn runs with the previous sender's credentials still on disk.
+  // It precedes the reaction bookkeeping and its early returns: a card-on session
+  // returns below, but its turns need the identity refreshed just the same.
+  //
+  // The enablement check is SYNCHRONOUS on purpose. An unconditional `await`
+  // here would yield a microtask before the bookkeeping below on every turn of
+  // every bot, reordering concurrent turns that the single-flight paths depend
+  // on. A feature that is off must not perturb timing at all, so the await only
+  // happens once a bot has actually opted in.
+  if (triggerUserAuthEnabledFor(ds)) {
+    await refreshTurnCliIdentity(ds, turnId);
   }
   // Replaces the old 「处理中」 placeholder card. That card existed only to be
   // PATCHed with the final answer, and `im.v1.message.patch` is silent (no Feishu
@@ -4160,45 +4640,14 @@ export async function noteTurnReceived(
   // out via silentTurnReactions for low-noise observer scenarios.
   // React 冲! on the triggering message the instant it's accepted. Binding to the
   // message — not a worker status edge — means type-ahead / busy-batched messages
-  // each get their own ✋. `finishTurnReactions` flips every pending ✋ to ✅ when
-  // the worker next goes idle.
+  // each get their own ✋. Owned receipts settle only from the exact worker
+  // turn_terminal; unowned compatibility receipts fail closed at GoGoGo.
   // Plan B: a meeting agent is an ordinary chat-scope session that hosts plain
   // user turns. A plain user message should get the ✋→✅ progress reaction like
   // any card-off session. Only a stamped meeting @mention follow-up stays
   // reaction-free (it is meeting-driven and routes through the audited listener
   // action, not the ordinary progress-reaction channel). Transcript deliveries
   // never reach this inbound-message acceptance point at all.
-  let reactionId: string;
-  try {
-    if (ds.session.vcMeetingReceiver
-      && resolveVcMeetingImTurnOrigin(ds.session, triggerMessageId) !== undefined) return;
-    // Turn-exact card-off check: the reaction ack belongs to THIS message's turn,
-    // not to whichever turn most recently overwrote currentReplyTarget.
-    if (!streamingCardDisabledFor(ds, triggerMessageId)) return;
-    if (silentTurnReactionsFor(ds)) return;
-    // Only Lark messages carry reactions — doc-comment ids / chat anchors can't.
-    if (!triggerMessageId.startsWith('om_')) return;
-    if ((ds.pendingAckReactions ??= []).some(a => a.messageId === triggerMessageId)) return;
-    // Add the ✋ FIRST, register the entry only after it lands. If we pushed the
-    // entry before awaiting addReaction, a previous turn's idle edge
-    // (finishTurnReactions) could detach this half-formed entry mid-flight —
-    // DONE-ing a message that hasn't even reached the worker yet and orphaning its
-    // reactionId. Callers await this before dispatching the message to the worker,
-    // so a registered entry is always in place before its own turn can go idle.
-    try {
-      reactionId = await addReaction(ds.larkAppId, triggerMessageId, receivedReactionEmoji ?? receivedReactionEmojiFor(ds));
-    } catch (err) {
-      logger.debug(`[reaction] received add failed for ${triggerMessageId}: ${err instanceof Error ? err.message : String(err)}`);
-      return;
-    }
-  } finally {
-    // 每个入口都先完成本轮身份准备，再把消息交给 worker。
-    // 表情先展示；登记待完成表情时身份已就绪，完成状态与本轮执行保持一致。
-    if (triggerUserAuthEnabledFor(ds)) {
-      await refreshTurnCliIdentity(ds, _turnId ?? triggerMessageId);
-    }
-  }
-  (ds.pendingAckReactions ??= []).push({ messageId: triggerMessageId, reactionId });
 }
 
 /**
@@ -9546,6 +9995,7 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
     // Invocation identity (from the hook; enables cross-restart re-attach).
     requestId: boundAsk.requestId,
     originKind: boundAsk.originKind,
+    originWorkerGeneration: boundAsk.originWorkerGeneration,
     ...((documentDelivery?.openId ?? asyncCaller ?? boundAsk.answererOpenId)
       ? { answererOpenId: documentDelivery?.openId ?? asyncCaller ?? boundAsk.answererOpenId } : {}),
     // Authoritative persistence gate (codex P1-4): derive resumability from the
@@ -9557,9 +10007,50 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
   };
   const managedExplicit = askInput.originKind === 'explicit' && !!askInput.requestId && !!askSession;
   const explicitInput = { ...askInput, originKind: 'host_explicit', requestId: askInput.requestId! };
+  const askTurnId = typeof body.originTurnId === 'string'
+    ? body.originTurnId
+    : askSession?.currentTurnId;
+  const claimedAttempt = typeof body.originDispatchAttempt === 'number'
+    && Number.isSafeInteger(body.originDispatchAttempt)
+    ? body.originDispatchAttempt
+    : undefined;
+  const claimedWorkerGeneration = askInput.originWorkerGeneration;
+  const ownsAskFeedback = () => {
+    if (!askSession || !askTurnId) return false;
+    let ownsSession = false;
+    try { ownsSession = sessionStore.ownsSessionForMutation(askSession.session); }
+    catch (error) { logger.warn(`[capacity] ask ownership check failed: ${String(error)}`); }
+    return findActiveBySessionId(askSession.session.sessionId) === askSession
+      && ownsCapacityAskFeedback({
+        ownsSession,
+        currentTurnId: askSession.currentTurnId,
+        claimedTurnId: askTurnId,
+        claimedDispatchAttempt: claimedAttempt,
+        currentWorkerGeneration: claimedWorkerGeneration,
+        liveWorkerGeneration: askSession.workerGeneration ?? askSession.session.workerGeneration,
+        dispatchHighWater: askSession.turnDispatchAttemptHighWater,
+        managedTurnOrigin: askSession.managedTurnOrigin,
+      });
+  };
+  const transitionAskFeedback = (transition: 'observeAttention' | 'resumeAttention') => {
+    if (!ownsAskFeedback()) return;
+    const changed = turnFeedbackReconciler[transition](
+      { session: askSession!.session, larkAppId: askSession!.larkAppId }, askTurnId!, Date.now(),
+    );
+    if (changed) {
+      capacityFeedbackProjection.sync(askSession!, askTurnId!);
+      void turnFeedbackReconciler.reconcile(askSession!, askTurnId!);
+    }
+  };
+  const askFeedback = createCapacityAskFeedbackLifecycle({
+    owns: ownsAskFeedback,
+    observe: () => transitionAskFeedback('observeAttention'),
+    resume: () => transitionAskFeedback('resumeAttention'),
+    onTransitionError: error => logger.warn(`[capacity] ask feedback projection failed: ${String(error)}`),
+  });
   if (body.acknowledge === true) {
     if (!managedExplicit) return jsonRes(res, 400, { error: 'invalid_acknowledgement' });
-    const result = explicitAskContinuation.acknowledge(explicitInput);
+    const result = askFeedback.acknowledge(() => explicitAskContinuation.acknowledge(explicitInput));
     return result ? jsonRes(res, 200, result) : jsonRes(res, 409, { error: 'ask_result_not_ready' });
   }
   if (managedExplicit && explicitInput.timeoutMs === null) {
@@ -9567,18 +10058,19 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
       logger.warn(`[ask-continuation] ${error instanceof Error ? error.message : String(error)}`);
     });
     try {
-      const delivery = await waitForAskDelivery(explicitInput);
+      const delivery = await askFeedback.pending(() => waitForAskDelivery(explicitInput));
       return jsonRes(res, 200, {
         kind: 'pending', requestId: explicitInput.requestId,
         askId: delivery.askId, messageId: delivery.messageId, pending: true,
+        originWorkerGeneration: explicitInput.originWorkerGeneration,
       });
     } catch (error) {
       return jsonRes(res, 500, { error: error instanceof Error ? error.message : String(error) });
     }
   }
-  const result = managedExplicit
-    ? await explicitAskContinuation.wait(explicitInput)
-    : await registerAskForResponse(askInput, res);
+  const result = await askFeedback.settled(() => managedExplicit
+    ? explicitAskContinuation.wait(explicitInput)
+    : registerAskForResponse(askInput, res));
   if (res.destroyed) return;
 
   if (asyncInput && askSession && result.kind === 'answered') {
@@ -9782,6 +10274,19 @@ ipcRoute('POST', '/api/attention', async (req, res) => {
   const kind = ['authz', 'decision', 'blocked', 'help'].includes(rawKind) ? rawKind : 'blocked';
 
   ds.agentAttention = { kind, reason, at: Date.now() };
+  if (ds.currentTurnId && sessionStore.ownsSessionForMutation(ds.session)) {
+    try {
+      const changed = turnFeedbackReconciler.observeAttention(
+        { session: ds.session, larkAppId: ds.larkAppId }, ds.currentTurnId, Date.now(),
+      );
+      if (changed) {
+        capacityFeedbackProjection.sync(ds, ds.currentTurnId);
+        void turnFeedbackReconciler.reconcile(ds, ds.currentTurnId);
+      }
+    } catch (error) {
+      logger.warn(`[capacity] attention projection failed: ${String(error)}`);
+    }
+  }
   publishAttentionPatch(ds);
   emitSessionLifecycleHook(ds, 'session.requires_attention', { reason: 'agent_request', kind, message: reason });
   return jsonRes(res, 200, { ok: true });
@@ -25729,7 +26234,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     const availableBots = await getAvailableBots(larkAppId, chatId);
     // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
     // (5th arg) is the reply anchor so provenance holds on session-group births.
-    await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+    await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined, ctx.foldedRootId ? [ctx.foldedRootId] : undefined);
     const primaryAdmission = durablePrimaryWorkerAdmission(ctx, ds, replyAnchorId);
     forkReservedInitialSession(ds, availableBots, trustedCaller, primaryAdmission?.options);
     primaryAdmission?.markForkReturned();
@@ -25813,7 +26318,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     const availableBots = await getAvailableBots(larkAppId, chatId);
     // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
     // (5th arg) is the reply anchor so provenance holds on session-group births.
-    await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+    await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined, ctx.foldedRootId ? [ctx.foldedRootId] : undefined);
     const primaryAdmission = durablePrimaryWorkerAdmission(ctx, ds, replyAnchorId);
     forkReservedInitialSession(ds, availableBots, trustedCaller, primaryAdmission?.options);
     primaryAdmission?.markForkReturned();
@@ -27538,7 +28043,22 @@ async function handleThreadReplyAdmitted(
   const clearAgentAttentionForHumanInbound = (): void => {
     if (isForeignBot || isBotSenderType) return;
     const ds = activeSessions.get(runtimeSessionKey);
-    if (ds) clearAgentAttention(ds);
+    if (ds) {
+      clearAgentAttention(ds);
+      if (ds.currentTurnId && sessionStore.ownsSessionForMutation(ds.session)) {
+        try {
+          const changed = turnFeedbackReconciler.resumeAttention(
+            { session: ds.session, larkAppId: ds.larkAppId }, ds.currentTurnId, Date.now(),
+          );
+          if (changed) {
+            capacityFeedbackProjection.sync(ds, ds.currentTurnId);
+            void turnFeedbackReconciler.reconcile(ds, ds.currentTurnId);
+          }
+        } catch (error) {
+          logger.warn(`[capacity] attention resume failed: ${String(error)}`);
+        }
+      }
+    }
   };
   // Any human-authored reply means the user has seen/touched the raised-hand
   // blocker. Do this before command, callback, workflow, and ask-custom early
@@ -28515,7 +29035,7 @@ async function handleThreadReplyAdmitted(
       if (await replyInvalidWorkingDirs(anchor, larkAppId, newDs)) return;
       ensureSessionWhiteboard(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
-      await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+      await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined, ctx.foldedRootId ? [ctx.foldedRootId] : undefined);
       const primaryAdmission = durablePrimaryWorkerAdmission(ctx, newDs, parsed.messageId);
       forkReservedInitialSession(newDs, availableBots, threadTrustedCaller, primaryAdmission?.options);
       primaryAdmission?.markForkReturned();
@@ -28581,7 +29101,7 @@ async function handleThreadReplyAdmitted(
       newDs.pendingRepo = false;
       ensureSessionWhiteboard(newDs);
       const availableBots = await getAvailableBots(larkAppId, autoCreateChatId);
-      await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+      await noteTurnReceived(newDs, parsed.messageId, parsed.content, autoCreateSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined, ctx.foldedRootId ? [ctx.foldedRootId] : undefined);
       const primaryAdmission = durablePrimaryWorkerAdmission(ctx, newDs, parsed.messageId);
       forkReservedInitialSession(newDs, availableBots, threadTrustedCaller, primaryAdmission?.options);
       primaryAdmission?.markForkReturned();
@@ -28619,7 +29139,7 @@ async function handleThreadReplyAdmitted(
     messageQueue.appendMessage(anchor, parsed);
     publishSessionMessagePreviewPatch(ds);
     if (!ctx.effortTaskReentry) markIngressAdmitted(ctx);
-    await noteTurnReceived(ds, parsed.messageId, parsed.content, sender, parsed.messageId);
+    await noteTurnReceived(ds, parsed.messageId, parsed.content, sender, parsed.messageId, undefined, ctx.foldedRootId ? [ctx.foldedRootId] : undefined);
     if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
     await stageCrossPrincipalInterruption({
       ds,
@@ -28763,7 +29283,7 @@ async function handleThreadReplyAdmitted(
         linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
         });
     if (!ctx.completionProposalContinuation) {
-      await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+      await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined, ctx.foldedRootId ? [ctx.foldedRootId] : undefined);
     }
     if (threadTrustedCaller) {
       cliInput.rerouteEnvelope = {
@@ -29003,6 +29523,7 @@ async function handleThreadReplyAdmitted(
         await getThreadSender(),
         parsed.messageId,
         substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined,
+        ctx.foldedRootId ? [ctx.foldedRootId] : undefined,
       );
     };
     // Codex App may retain an ACK journal/FIFO head after its worker dies. A
@@ -29190,7 +29711,7 @@ async function handleThreadReplyAdmitted(
       }
     }
     if (!queuedHasDurableTail && !ctx.completionProposalContinuation) {
-      await noteTurnReceived(ds, parsed.messageId, parsed.content, reforkSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+      await noteTurnReceived(ds, parsed.messageId, parsed.content, reforkSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined, ctx.foldedRootId ? [ctx.foldedRootId] : undefined);
     }
     // A dead worker must not let a newly-arrived turn jump ahead of a durable
     // principal-lane follower. Append this exact rebuilt input and wake the
@@ -30415,7 +30936,18 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
       ensureCurrentRoutingGeneration(generation, 'comment:refork-note');
       sub = currentDocSubscriptionForDelivery(larkAppId, sub);
       if (ds.worker && !ds.worker.killed) {
-        throw new Error('worker became active during comment:refork-note');
+        // A sibling reply in the same newly-created comment thread may finish
+        // the one canonical fork while this turn was awaiting admission-side
+        // feedback/identity work. That worker is the expected successor, not a
+        // foreign generation: deliver this exact frozen input to it instead of
+        // attempting a second fork or rejecting the provider event.
+        if (!sendWorkerInput(ds, wrappedInput, turnId,
+          wrappedInput.trustedCaller ? { trustedCaller: wrappedInput.trustedCaller } : {})) {
+          throw new Error('worker became unavailable during comment:refork-handoff');
+        }
+        acceptDocCommentSession(ds);
+        markDocCommentActivityAfterAdmission(ds, turnId);
+        return;
       }
       sessionStore.updateSession(ds.session);
       if (ds.adoptedFrom) {
@@ -31247,6 +31779,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     groupDefaultModels: chatId => getBot(cfg.larkAppId).config.groupDefaultModels?.[chatId],
     occupancy: { bootId: getDaemonBootId(), pid: process.pid },
   });
+  try {
+    const feedbackTargets = sessionStore.listSessions()
+      .filter(session => session.turnFeedback !== undefined)
+      .map(session => ({ session, larkAppId: cfg.larkAppId }));
+    await turnFeedbackReconciler.restore(feedbackTargets);
+  } catch (error) {
+    logger.warn(`[reaction] startup feedback restore failed: ${String(error)}`);
+  }
   chatFirstSeenStore.init(cfg.larkAppId);
   initSessionGroups(cfg.larkAppId);
   const ambiguousOnBoot = reconcileVcMeetingDeliveriesOnBoot(
@@ -31730,12 +32270,110 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         { kind: receipt.proofKind, ...(receipt.nativeTurnId ? { nativeTurnId: receipt.nativeTurnId } : {}) });
       } catch { logger.warn('[group-context] native input receipt unavailable; background may repeat'); }
     },
-    async onTurnTerminal(ds, terminal, context) {
-      if (ds.session.deploymentContinuation?.state !== 'cancelled'
-        && ds.session.deploymentContinuation?.workerGeneration === context.workerGeneration) {
-        try { cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous), terminal.turnId); }
-        catch (error) { logger.error(`[restart] Could not retire task checkpoint: ${error instanceof Error ? error.message : String(error)}`); }
+    onCapacityWait(ds, observation) {
+      try {
+        const enabled = capacityProjectionEnabled(ds.larkAppId, 'traex');
+        if (!enabled) {
+          const changed = turnFeedbackReconciler.disableCapacity(
+            { session: ds.session, larkAppId: ds.larkAppId }, 'traex',
+          );
+          for (const turnId of changed) {
+            capacityFeedbackProjection.sync(ds, turnId);
+            void turnFeedbackReconciler.reconcile(ds, turnId);
+          }
+          recordCapacityAudit(
+            ds, observation.turnId, 'traex', 'traex-viewport.v1', observation.state,
+            observation.observedAtMs, observation.position !== undefined, 'disabled',
+          );
+          return;
+        }
+        const changed = turnFeedbackReconciler.observeCapacity(
+          { session: ds.session, larkAppId: ds.larkAppId },
+          observation.turnId,
+          {
+            state: observation.state, observedAtMs: observation.observedAtMs,
+            ...(observation.position !== undefined ? { position: observation.position } : {}),
+          },
+        );
+        if (changed) {
+          capacityFeedbackProjection.sync(ds, observation.turnId);
+          void turnFeedbackReconciler.reconcile(
+            { session: ds.session, larkAppId: ds.larkAppId },
+            observation.turnId,
+          ).catch(error => logger.warn(
+            `[reaction] capacity reconcile failed turn=${observation.turnId.slice(0, 12)}: ${String(error)}`,
+          ));
+        }
+        recordCapacityAudit(
+          ds, observation.turnId, 'traex', 'traex-viewport.v1', observation.state,
+          observation.observedAtMs, observation.position !== undefined, 'accepted',
+        );
+      } catch (error) {
+        logger.warn(`[capacity] feedback observation commit failed: ${String(error)}`);
       }
+    },
+    onTurnProgress(ds, progress, context) {
+      if (ds.workerGeneration !== context.workerGeneration
+        || ds.currentTurnId !== progress.turnId
+        || progress.dispatchAttempt !== undefined
+          && ds.turnDispatchAttemptHighWater?.turnId === progress.turnId
+          && ds.turnDispatchAttemptHighWater.dispatchAttempt !== progress.dispatchAttempt) return;
+      try {
+        const changed = turnFeedbackReconciler.observeProgress(
+          { session: ds.session, larkAppId: ds.larkAppId },
+          progress.turnId,
+          Date.now(),
+        );
+        if (changed) {
+          capacityFeedbackProjection.sync(ds, progress.turnId);
+          void turnFeedbackReconciler.reconcile(ds, progress.turnId);
+        }
+      } catch (error) {
+        logger.warn(`[capacity] progress clear failed: ${String(error)}`);
+      }
+    },
+    onTurnAttention(ds, attention) {
+      if (ds.workerGeneration !== attention.workerGeneration
+        || ds.currentTurnId !== attention.turnId
+        || attention.dispatchAttempt !== undefined
+          && ds.turnDispatchAttemptHighWater?.turnId === attention.turnId
+          && ds.turnDispatchAttemptHighWater.dispatchAttempt !== attention.dispatchAttempt) return;
+      try {
+        const changed = attention.state === 'needs_user'
+          ? turnFeedbackReconciler.observeAttention(
+              { session: ds.session, larkAppId: ds.larkAppId }, attention.turnId, Date.now(),
+            )
+          : turnFeedbackReconciler.resumeAttention(
+              { session: ds.session, larkAppId: ds.larkAppId }, attention.turnId, Date.now(),
+            );
+        if (changed) {
+          capacityFeedbackProjection.sync(ds, attention.turnId);
+          void turnFeedbackReconciler.reconcile(ds, attention.turnId);
+        }
+      } catch (error) {
+        logger.warn(`[capacity] TUI attention projection failed: ${String(error)}`);
+      }
+    },
+    onCapacitySidebandBinding(ds, binding) {
+      sessionStore.mutateOwnedSessionsAtomically([ds.session.sessionId], fresh => {
+        const session = fresh.get(ds.session.sessionId)!;
+        const record = session.turnFeedback?.[binding.turnId];
+        if (!record) return;
+        record.capacityBinding = {
+          adapter: binding.adapter, nativeTurnId: binding.nativeTurnId,
+          ...(binding.nativeSessionId ? { nativeSessionId: binding.nativeSessionId } : {}),
+          dispatchAttempt: binding.dispatchAttempt, workerGeneration: binding.workerGeneration,
+        };
+      });
+      if (!capacitySidebandRuntime.bind({
+        adapter: binding.adapter, sessionId: ds.session.sessionId, turnId: binding.turnId,
+        dispatchAttempt: binding.dispatchAttempt, workerGeneration: binding.workerGeneration,
+        nativeTurnId: binding.nativeTurnId,
+        ...(binding.nativeSessionId ? { nativeSessionId: binding.nativeSessionId } : {}),
+      })) throw new Error('capacity_sideband_binding_conflict');
+      consumerCapacitySidebandRetry?.();
+    },
+    ...createProductionTurnFeedbackWorkerCallbacks(async (ds, terminal, context) => {
       const originalFailedCaller = failedTurnCaller(ds, terminal.turnId);
       const originalFailedSilent = isSilentScheduledTurn(ds, terminal.turnId);
       // Queue ACKs do not prove consumption. Only a matching completed native
@@ -31821,7 +32459,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         ds.messageListenerCompletedTurnId = terminal.status === 'completed' ? terminal.turnId : undefined;
         scheduleMessageListenerAutoClose(ds);
       }
-    },
+    }),
     onDeferredScheduleTurnSettled(ds, context) {
       scheduleDeferredScheduleSettlement(ds, context);
     },
@@ -33063,6 +33701,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     driveRestoredXpiGroup: groupId => { void driveNextXpiSharedCwdTurn(groupId); },
     driveRestoredPrincipalLane: ds => { driveNextPrincipalLaneTurn(ds); },
   });
+  startCapacitySidebandConsumer(cfg.larkAppId);
+  startCapacityRolloutPolicyWatcher(cfg.larkAppId);
+  capacityFeedbackProjection.restore(activeSessions.values());
+  capacityWaitReminder.restore([...activeSessions.values()].map(ds => ({
+    session: ds.session, larkAppId: ds.larkAppId,
+  })));
   // Completion Proposal may resume an accepted pending decision immediately.
   // Schedule it only after restore populated activeSessions; doing this before
   // the awaited startup I/O deterministically marks every pending record failed.
@@ -34033,6 +34677,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     await (await import('./services/constrained-invocation/daemon.js')).closeConstrainedInvocations();
     await waitAllWithin([stopInputCaptureRuntimes()], shutdownDeadlineMs);
     stopMaintenance();
+    stopCapacitySidebandConsumer?.();
+    stopCapacitySidebandConsumer = undefined;
+    consumerCapacitySidebandRetry = undefined;
+    stopCapacityRolloutPolicyWatcher?.();
+    stopCapacityRolloutPolicyWatcher = undefined;
+    capacityFeedbackProjection.dispose();
+    capacityWaitReminder.dispose();
+    turnFeedbackReconciler.dispose();
     vcMeetingTerminalReconciler?.stop();
     clearInterval(vcMeetingDeliveryLeaseTimer);
     for (const timer of vcMeetingReceiverRecoveryTimers.values()) clearTimeout(timer);

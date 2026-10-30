@@ -42,6 +42,11 @@ function sessionTempHub(): string | undefined {
  * itself is used and no alias exists.
  */
 function sessionTempRoot(): string {
+  if (process.env.BOTMUX_SESSION_TEMP_ALIAS === '1') {
+    const hub = sessionTempHub();
+    if (!hub) return sessionTempCacheRoot();
+    return join(hub, createHash('sha256').update(resolve(sessionTempCacheRoot())).digest('hex').slice(0, 8));
+  }
   return join(homedir(), '.cache', 'bm');
 }
 
@@ -307,6 +312,15 @@ function copyEntry(from: string, to: string): void {
 }
 
 function ensureSessionTempRoot(): void {
+  if (process.env.BOTMUX_SESSION_TEMP_ALIAS === '1') {
+    const hub = sessionTempHub();
+    if (!hub) return;
+    ensureSessionTempHub(hub);
+    const cache = sessionTempCacheRoot();
+    mkdirSync(cache, { recursive: true, mode: 0o700 });
+    ensureSessionTempAlias(sessionTempRoot(), cache);
+    return;
+  }
   mkdirSync(sessionTempRoot(), { recursive: true, mode: 0o700 });
 }
 
@@ -570,9 +584,6 @@ export async function sweepOrphanSessionTempDirs(
   const candidates: { path: string; detached: boolean }[] = [];
   const profileDirs: string[] = [];
   for (const profile of profiles) {
-    // Flat 20-hex legacy session leaves are not profiles. Their ownership
-    // cannot be recovered from the name; normal close cleans exact paths.
-    if (!/^(?:[0-9a-f]{8}|[0-9a-f]{16})$/.test(profile)) continue;
     const profileDir = join(root, profile);
     if (!isRealDir(profileDir)) continue;
     profileDirs.push(profileDir);
@@ -628,7 +639,7 @@ export function applySessionTempEnv(env: NodeJS.ProcessEnv, path: string): void 
 const SESSION_TEMP_ENV_KEYS = ['TMPDIR', 'TMP', 'TEMP'] as const;
 
 /**
- * Drop TMPDIR/TMP/TEMP values that point into current or legacy session scratch trees.
+ * Drop TMPDIR/TMP/TEMP values that point into the session scratch tree.
  *
  * A `botmux restart` run from a session shell inherits that session's scratch
  * as TMPDIR. Carried into the fleet, every worker would pin it as its Gateway

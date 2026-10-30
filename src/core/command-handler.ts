@@ -8,6 +8,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
+import { createCapacityRolloutStore } from '../services/capacity-rollout-store.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, loadBotConfigs, type BotConfig } from '../bot-registry.js';
 import { triggerUserAuthApplies, credentialSourceOf } from '../services/trigger-user-auth.js';
@@ -3784,6 +3785,25 @@ export async function handleCommand(
         break;
       }
 
+      case '/capacity': {
+        const arg = message.content.replace(/^\/capacity\s*/i, '').trim().toLowerCase();
+        if (arg && arg !== 'status') {
+          await sessionReply(rootId, '用法：/capacity status');
+          break;
+        }
+        const snapshot = createCapacityRolloutStore(config.session.dataDir).snapshot();
+        const disabled = Object.entries(snapshot.disabled).map(([key, value]) => {
+          const [appId, adapter] = JSON.parse(key) as [string, string];
+          return `- ${appId} × ${adapter}: ${value.reason}`;
+        });
+        await sessionReply(rootId, [
+          `Capacity phase: ${snapshot.phase}`,
+          `Disabled cells: ${disabled.length}`,
+          ...disabled,
+        ].join('\n'));
+        break;
+      }
+
       case '/schedule': {
         const scheduleArgs = message.content.replace(/^\/schedule\s*/, '');
         const chatId = ds?.chatId!;
@@ -6397,6 +6417,7 @@ export async function handleCommand(
           t('help.repo_wt', undefined, loc),
           t('help.rename', undefined, loc),
           t('help.status', undefined, loc),
+          t('help.capacity', undefined, loc),
           t('help.retry', undefined, loc),
           t('help.queue', undefined, loc),
           t('help.card', undefined, loc),

@@ -921,6 +921,7 @@ function handleAsyncUserInput(item: JsonObject, nativeTurnId: string, turn: Acti
   const context = {
     sessionId: args.sessionId, larkAppId: process.env.BOTMUX_LARK_APP_ID ?? '',
     chatId: process.env.BOTMUX_CHAT_ID ?? '', rootMessageId: process.env.BOTMUX_ROOT_MESSAGE_ID, originTurnId,
+    originWorkerGeneration: Number(process.env.BOTMUX_WORKER_GENERATION) || undefined,
   };
   const reportFailure = (reason: 'limit' | 'invalid_questions', questions?: import('./core/ask-types.js').AskQuestion[]) => {
     void postCodexAsk(context, questions ?? [{ prompt: 'Async question could not be displayed', inputMode: 'text',
@@ -996,6 +997,7 @@ function handleNativeUserInput(msg: JsonObject): void {
     sessionId: args.sessionId, larkAppId: process.env.BOTMUX_LARK_APP_ID ?? '',
     chatId: process.env.BOTMUX_CHAT_ID ?? '', rootMessageId: process.env.BOTMUX_ROOT_MESSAGE_ID,
     originTurnId,
+    originWorkerGeneration: Number(process.env.BOTMUX_WORKER_GENERATION) || undefined,
   }, params, signal).then(
     result => {
       if (!signal.aborted && client === current && !generationFenced) current.respond(msg.id, result);

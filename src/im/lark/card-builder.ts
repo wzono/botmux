@@ -887,8 +887,16 @@ export interface BackgroundWaitCardLabel {
   backgroundTasks: number;
 }
 
+export interface CapacityWaitCardLabel {
+  capacityWait: {
+    state: 'waiting' | 'stale';
+    position?: number;
+    ageMs?: number;
+  };
+}
+
 /** 卡头的替代标签：idle 专用的 {@link IdleCardLabel}，或 {@link BackgroundWaitCardLabel}。 */
-export type StreamCardLabel = IdleCardLabel | BackgroundWaitCardLabel;
+export type StreamCardLabel = IdleCardLabel | BackgroundWaitCardLabel | CapacityWaitCardLabel;
 
 /** 兼容旧调用：布尔 `true` 等价于 'silent'。 */
 function normalizeIdleLabel(v: boolean | StreamCardLabel | undefined): IdleCardLabel | undefined {
@@ -900,8 +908,14 @@ function normalizeIdleLabel(v: boolean | StreamCardLabel | undefined): IdleCardL
 /** 后台子任务数；仅当标签是 {@link BackgroundWaitCardLabel} 且状态为 working/idle 时有值。 */
 function backgroundWaitCount(status: StreamStatus, label: boolean | StreamCardLabel | undefined): number | undefined {
   if (status !== 'working' && status !== 'idle') return undefined;
-  if (!label || typeof label !== 'object' || !(label.backgroundTasks > 0)) return undefined;
+  if (!label || typeof label !== 'object' || !('backgroundTasks' in label)
+    || !(label.backgroundTasks > 0)) return undefined;
   return label.backgroundTasks;
+}
+
+function capacityWaitLabel(label: boolean | StreamCardLabel | undefined): CapacityWaitCardLabel['capacityWait'] | undefined {
+  if (!label || typeof label !== 'object' || !('capacityWait' in label)) return undefined;
+  return label.capacityWait;
 }
 
 /** 冻结卡（FrozenCard）回读 idle 标签：新字段 `idleLabel` 优先；旧盘只有
@@ -1075,6 +1089,25 @@ export function buildStreamingCard(
 
   // ── Output body (shared with the private snapshot card) ──────────────────
   pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale, usage, screenshotUnavailable });
+  const capacityWait = capacityWaitLabel(silentIdle);
+  if (capacityWait) {
+    const waitedMinutes = capacityWait.ageMs !== undefined && capacityWait.ageMs >= 60_000
+      ? Math.max(1, Math.floor(capacityWait.ageMs / 60_000))
+      : undefined;
+    const key = capacityWait.state === 'stale'
+      ? waitedMinutes === undefined ? 'card.capacity_wait.stale' : 'card.capacity_wait.stale_minutes'
+      : capacityWait.position === undefined
+        ? waitedMinutes === undefined ? 'card.capacity_wait.waiting' : 'card.capacity_wait.waiting_minutes'
+        : waitedMinutes === undefined ? 'card.capacity_wait.position' : 'card.capacity_wait.position_minutes';
+    elements.unshift({
+      tag: 'markdown',
+      element_id: 'capacity_wait_status',
+      content: t(key, {
+        position: capacityWait.position ?? '',
+        minutes: waitedMinutes ?? '',
+      }, locale),
+    });
+  }
 
   // ── 上下文余量：**不再单独渲染一行** ────────────────────────────────────
   // 曾经这里 push 过一行 `📊 上下文 N%`，但卡片下方本来就有 usage footer

@@ -657,6 +657,10 @@ import {
   type TraexAutoModelAction,
 } from './services/traex-auto-model.js';
 import { readTraexModelLoads } from './services/traex-model-load.js';
+import {
+  createCapacityWaitTracker,
+  type CapacityCaptureIdentity,
+} from './services/worker-capacity-wait.js';
 import { parseDaemonIpcPort } from './utils/daemon-discovery.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
 import { resolveCodexAppFinalTurnIdentity } from './adapters/cli/codex-app-turn.js';
@@ -1582,6 +1586,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         sessionId: cfg.sessionId, larkAppId: cfg.larkAppId, chatId: cfg.chatId,
         rootMessageId: cfg.rootMessageId, originTurnId: identity?.turnId,
         originDispatchAttempt: identity?.dispatchAttempt,
+        originWorkerGeneration: Number(process.env.BOTMUX_WORKER_GENERATION) || undefined,
       }, params, signal),
       onTurnTerminal: (terminal) => {
         if (!engine) return;
@@ -3011,7 +3016,7 @@ function zeroPromptTerminalSync(): boolean {
  *  do not prove envelope consumption, so they stay on the terminal fallback. */
 function notifyNativeTranscriptConsumedLarkTurn(
   turn: { turnId: string; isLocal?: boolean; isScheduled?: boolean },
-  evidence: { fullContentMatch: boolean; sourceJsonlPath?: string },
+  evidence: { fullContentMatch: boolean; sourceJsonlPath?: string; nativeTurnId?: string },
 ): void {
   if (!evidence.fullContentMatch || turn.isLocal || turn.isScheduled) return;
   if (!cliAdapter?.claudeDataDir || lastInitConfig?.adoptMode) return;
@@ -3019,7 +3024,14 @@ function notifyNativeTranscriptConsumedLarkTurn(
   const nativeSessionId = base.endsWith('.jsonl') && /^[A-Za-z0-9-]{8,128}\.jsonl$/.test(base)
     ? base.slice(0, -'.jsonl'.length)
     : undefined;
-  acknowledgeNativeInputConsumed(turn.turnId, 'claude_transcript_user_record', nativeSessionId ?? lastInitConfig?.cliSessionId);
+  const session = nativeSessionId ?? lastInitConfig?.cliSessionId;
+  if (evidence.nativeTurnId) {
+    acknowledgeNativeInputConsumed(
+      turn.turnId, 'claude_transcript_user_record', session, evidence.nativeTurnId,
+    );
+  } else {
+    acknowledgeNativeInputConsumed(turn.turnId, 'claude_transcript_user_record', session);
+  }
 }
 
 function notifyTerminalTurnStarted(turn: { turnId: string; markTimeMs?: number; replyContextTurnId?: string }): void {
@@ -5220,6 +5232,8 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
             ...(capability.dispatchAttempt !== undefined
               ? { dispatchAttempt: capability.dispatchAttempt }
               : {}),
+            ...(Number(process.env.BOTMUX_WORKER_GENERATION) > 0
+              ? { workerGeneration: Number(process.env.BOTMUX_WORKER_GENERATION) } : {}),
             ...(authorityLinkRefMode ? { linkRefMode: authorityLinkRefMode } : {}),
             ...(daemonIpcPort !== undefined ? { ipcPort: daemonIpcPort } : {}),
           }),
@@ -5243,6 +5257,8 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
             ...(capability.dispatchAttempt !== undefined
               ? { dispatchAttempt: capability.dispatchAttempt }
               : {}),
+            ...(Number(process.env.BOTMUX_WORKER_GENERATION) > 0
+              ? { workerGeneration: Number(process.env.BOTMUX_WORKER_GENERATION) } : {}),
             ...(authorityLinkRefMode ? { linkRefMode: authorityLinkRefMode } : {}),
             ...(daemonIpcPort !== undefined ? { ipcPort: daemonIpcPort } : {}),
           }),
@@ -5658,6 +5674,8 @@ function writeCliPidMarker(): void {
         const effectiveController = authority?.controller;
         atomicWriteFileSync(markerPath, JSON.stringify({
           sessionId,
+          ...(Number(process.env.BOTMUX_WORKER_GENERATION) > 0
+            ? { workerGeneration: Number(process.env.BOTMUX_WORKER_GENERATION) } : {}),
           turnId: currentBotmuxTurnId ?? null,
           dispatchAttempt: currentBotmuxDispatchAttempt ?? null,
           ...(currentBotmuxLinkRefMode ? { linkRefMode: currentBotmuxLinkRefMode } : {}),
@@ -7569,7 +7587,15 @@ codexBridgeQueue.setCotObserver((entries, turn) => {
 // Same evidence for the structured bridges (Pi, TraeX, Grok, …): the turn's
 // own user record is in the CLI's transcript.
 codexBridgeQueue.setTurnStartObserver((turn) => {
-  if (!turn.isLocal) inflightInputs.onTurnStarted(turn.turnId);
+  if (turn.isLocal) return;
+  inflightInputs.onTurnStarted(turn.turnId);
+  if (turn.sourceTurnId && turn.dispatchAttempt !== undefined) {
+    send({
+      type: 'capacity_sideband_binding', adapter: 'codex', sessionId, turnId: turn.turnId,
+      dispatchAttempt: turn.dispatchAttempt, nativeTurnId: turn.sourceTurnId,
+      ...(turn.sourceSessionId ? { nativeSessionId: turn.sourceSessionId } : {}),
+    });
+  }
 });
 codexBridgeQueue.setCotSupersededObserver((turn) => {
   if (!sessionId || turn.isLocal) return;
@@ -12732,6 +12758,44 @@ let renderer: TerminalRenderer | null = null;
  *  have a fresh snapshot to read without needing their own tmux capture-pane
  *  call. (Historically also fed the AI ScreenAnalyzer, now removed.) */
 let lastAnalyzerSnapshot = '';
+const capacityWaitTracker = createCapacityWaitTracker();
+
+function currentCapacityCaptureIdentity(): CapacityCaptureIdentity | undefined {
+  if (lastInitConfig?.cliId !== 'traex' || !currentBotmuxTurnId) return undefined;
+  return {
+    sessionId,
+    turnId: currentBotmuxTurnId,
+    ...(currentBotmuxDispatchAttempt !== undefined
+      ? { dispatchAttempt: currentBotmuxDispatchAttempt }
+      : {}),
+    revision: captureRevision,
+  };
+}
+
+function publishTraexCapacityObservation(
+  captured: CapacityCaptureIdentity | undefined,
+  screen: string,
+  observedAtMs: number,
+): void {
+  if (!captured) return;
+  const current = currentCapacityCaptureIdentity();
+  if (!current) return;
+  const observation = capacityWaitTracker.observe(captured, current, screen, observedAtMs);
+  if (!observation) return;
+  send({
+    type: 'capacity_wait',
+    sessionId,
+    turnId: observation.identity.turnId,
+    ...(observation.identity.dispatchAttempt !== undefined
+      ? { dispatchAttempt: observation.identity.dispatchAttempt }
+      : {}),
+    source: 'traex-viewport',
+    state: observation.type,
+    ...(observation.position !== undefined ? { position: observation.position } : {}),
+    observedAtMs: observation.observedAtMs,
+    revision: observation.identity.revision,
+  });
+}
 let screenUpdateTimer: ReturnType<typeof setInterval> | null = null;
 const SCREEN_UPDATE_INTERVAL_MS = 2_000;
 
@@ -17626,9 +17690,9 @@ function markPromptReady(): void {
   // <task-notification>. isPromptReady was just set true above, so this generic
   // snapshot would project 'idle' and reach the daemon BEFORE the busy arm below
   // re-publishes 'working'. Combined with the first-turn working already sent by
-  // startScreenUpdates, the daemon would then see working→idle and fire
-  // finishTurnReactions() — a premature ✅ DONE mid-turn (and a
-  // 「工作中→等待输入→工作中」 flicker on the open card). The busy arm below owns the
+  // startScreenUpdates, the daemon would then see a false working→idle mid-turn
+  // and show a 「工作中→等待输入→工作中」 flicker on the open card. Reaction
+  // settlement is terminal-driven; the busy arm below owns the
   // correct 'working' publish for these paths, so this idle must not escape first.
   refreshBackgroundWait();
   if (renderer && !spawnArgvInitialPromptBusy && backgroundTaskTracker.pendingTurnAgents() === 0 && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
@@ -17650,7 +17714,7 @@ function markPromptReady(): void {
   //  - Grok-class argv-baked prompt + reliable turn terminal: first ready is
   //    pre-execution, so park as working until assistant_final/fireIdle;
   //  - quiescence argv CLIs (Pi/Gemini/MTR/OpenCode): first ready IS turn end
-  //    — seed working then idle so card-off gets working→idle (review P2).
+  //    — seed working then idle for runtime-status compatibility.
   const hasPendingWork =
     pendingMessages.length > 0
     || pendingRawInputs.length > 0
@@ -17668,9 +17732,8 @@ function markPromptReady(): void {
       log('Spawn argv initial prompt still in flight — reporting working (not idle) so turn reactions can settle later');
     } else if (spawnArgvNeedsWorkingSeed) {
       // First ready = true completion for quiescence argv adapters. Seed a
-      // working edge before idle/limited so daemon finishTurnReactions (gated
-      // on working→idle|limited) still flips card-off GoGoGo on cold-start
-      // one-shots — including when the terminal already shows a rate-limit
+      // working edge before idle/limited for the runtime status stream —
+      // including when the terminal already shows a rate-limit
       // banner (classify would otherwise collapse both seeds to limited).
       spawnArgvNeedsWorkingSeed = false;
       publishScreenStatus('working', { force: true });
@@ -19816,6 +19879,7 @@ function startScreenUpdates(): void {
   screenUpdateTimer = setInterval(() => {
     const capacityBackend = backend;
     const capacityGeneration = cliSpawnGeneration;
+    const capacityIdentity = currentCapacityCaptureIdentity();
     if (awaitingFirstPrompt) {
       inspectAidenCodexUpdateDialogOnScreen();
       if (renderer) observeTraexAutoModelCapacity(renderer.rawSnapshot());
@@ -19914,7 +19978,9 @@ function startScreenUpdates(): void {
       if (!snapshot) return;
 
       if (backend === capacityBackend && cliSpawnGeneration === capacityGeneration) {
-        observeTraexAutoModelCapacity(lastAnalyzerSnapshot || renderer?.rawSnapshot() || snapshot.content);
+        const evidenceScreen = lastAnalyzerSnapshot || renderer?.rawSnapshot() || snapshot.content;
+        observeTraexAutoModelCapacity(evidenceScreen);
+        publishTraexCapacityObservation(capacityIdentity, evidenceScreen, Date.now());
       }
       const usageAware = classifyUsageLimitWithNativeEvidence(snapshot.content, status);
       // Claude Code's permission dialogs — including one raised by a
@@ -22948,6 +23014,9 @@ async function spawnCli(
   // Shim paths and the identity-file locator must reach the tool shell together.
   // Use cfg.sessionId, not the native CLI resume id: the daemon publishes the
   // identity under the Botmux session id. No credential is passed here.
+  if (cfg.cliId === 'traex' && !cfg.adoptMode && effectiveResume && effectiveCliSessionId) {
+    noteTraexResumeTargetLeftInDefaultHome(effectiveCliSessionId);
+  }
   const identityShellEnv: Record<string, string> = {
     BOTMUX_SESSION_ID: cfg.sessionId,
     BOTMUX_CHAT_ID: cfg.chatId,
@@ -22986,9 +23055,6 @@ async function spawnCli(
       const dir = identityShellEnv.BOTMUX_IDENTITY_BIN;
       identityShellEnv.PATH = [dir, ...effectivePath.split(':').filter(path => path !== dir)].join(':');
     }
-  }
-  if (cfg.cliId === 'traex' && !cfg.adoptMode && effectiveResume && effectiveCliSessionId) {
-    noteTraexResumeTargetLeftInDefaultHome(effectiveCliSessionId);
   }
   const args = cliAdapter.buildArgs({
     sessionId: effectiveAdapterSessionId,
@@ -29484,6 +29550,18 @@ function acknowledgeNativeInputConsumed(
     ...(nativeSessionId ? { nativeSessionId } : {}),
     ...(nativeTurnId ? { nativeTurnId } : {}),
   });
+  const dispatchAttempt = currentBotmuxTurnId === turnId
+    ? currentBotmuxDispatchAttempt
+    : undefined;
+  const adapter = lastInitConfig?.cliId === 'codex'
+    ? 'codex'
+    : lastInitConfig?.cliId === 'claude-code' ? 'claude-code' : undefined;
+  if (adapter && nativeTurnId && dispatchAttempt !== undefined) {
+    send({
+      type: 'capacity_sideband_binding', adapter, sessionId, turnId, dispatchAttempt,
+      nativeTurnId, ...(nativeSessionId ? { nativeSessionId } : {}),
+    });
+  }
 }
 
 /** Codex tmux/paste mode proves acceptance by matching the exact submitted
