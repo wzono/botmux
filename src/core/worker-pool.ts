@@ -199,6 +199,8 @@ import { beginFinalOutputDelivery, waitForTurnFinalOutputDeliveryDrain } from '.
 import { createTurnResultRuntime, setTurnResultRuntime } from './turn-result-runtime.js';
 import { TurnResultStore } from '../services/turn-result-store.js';
 import type { TurnResult, TurnDeliveryReceipt } from '../services/turn-result.js';
+import type { BlankBootstrapPermit, BusinessSubmitPermit } from './turn-admission.js';
+import type { TurnPermitStore } from '../services/turn-permit-store.js';
 import { turnResultEnabled, turnResultBinding, turnResultSessionEligible, observeTurnResultTerminal, observeTurnResultDelivery } from './turn-result-session.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
@@ -15445,6 +15447,34 @@ export function forkWorker(
  * already resolved the card to its final state — we only need to drop the
  * nonce/cardId/turnId so a late duplicate click cannot re-inject keys.
  */
+/** Foundational AR-01 boundary. Production ingress adapters adopt this in later tasks. */
+export async function forkWorkerBlank(
+  ds: DaemonSession,
+  permit: BlankBootstrapPermit,
+  permitStore: Pick<TurnPermitStore, 'beginSpawn'>,
+): Promise<boolean> {
+  if (permit.sessionId !== ds.session.sessionId) return false;
+  const transition = await permitStore.beginSpawn(permit);
+  if (transition.status !== 'spawning') return false;
+  return forkWorker(ds, '', permit.turnId);
+}
+
+/** One-shot business boundary paired with forkWorkerBlank. */
+export async function submitBusinessInput(
+  ds: DaemonSession,
+  payload: string | CliTurnPayload,
+  permit: BusinessSubmitPermit,
+  payloadDigest: string,
+  permitStore: Pick<TurnPermitStore, 'consumeBusiness'>,
+): Promise<boolean> {
+  if (permit.sessionId !== ds.session.sessionId
+    || permit.workerGeneration !== (ds.session.workerGeneration ?? 0)) return false;
+  const consumed = await permitStore.consumeBusiness(permit, payloadDigest);
+  if (consumed.status === 'duplicate') return true;
+  if (consumed.status !== 'consumed') return false;
+  return sendWorkerInput(ds, payload, permit.turnId);
+}
+
 export function clearStuckWarningAuthority(ds: DaemonSession): void {
   ds.stuckWarningCardId = undefined;
   ds.stuckWarningTurnId = undefined;
