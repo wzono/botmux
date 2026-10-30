@@ -53,8 +53,11 @@ export function frozenSessionWorkspace(ds: DaemonSession): { workspace: Workspac
   const actual = exactIdentity(path);
   if (!actual) return undefined;
   if (ds.session.workingDirSource !== 'group') return { workspace: actual };
+  // Reuse the canonical path from the single identity probe. A second realpath
+  // can observe a symlink swap between probes and must never authorize the new
+  // target with the old persisted inode tuple.
   const persisted = ds.session.groupWorkspaceIdentity ?? (ds.session.groupWorkspaceDirectoryIdentity
-    ? { path: realpathSync(path), ...ds.session.groupWorkspaceDirectoryIdentity }
+    ? { path: actual.path, ...ds.session.groupWorkspaceDirectoryIdentity }
     : undefined);
   if (!persisted || persisted.path !== actual.path || persisted.dev !== actual.dev || persisted.ino !== actual.ino
     || ds.session.groupWorkspaceRevision === undefined) return undefined;
