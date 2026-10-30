@@ -33,6 +33,65 @@ export async function admitTurn(input: {
   return input.runUnderAdmission(() => admitTurnUnderMutation(input));
 }
 
+export type AdmittedBusinessTurnDependencies = {
+  hasLiveWorker(): boolean;
+  freezeWorkspace(): Promise<{ workspace: WorkspaceIdentity; groupRevision?: number }>;
+  currentWorkerGeneration(): number | undefined;
+  proveExistingWorkerReady(generation: number): Promise<boolean>;
+  issueExistingBusiness(input: {
+    sessionId: string; turnId: string; workerGeneration: number;
+    workspace: WorkspaceIdentity; groupRevision?: number;
+  }): Promise<BusinessSubmitPermit | undefined>;
+  reserveWorkerGeneration(): number;
+  issueBlank(input: BlankBootstrapPermitInput): Promise<BlankBootstrapPermit>;
+  forkBlank(permit: BlankBootstrapPermit): Promise<boolean>;
+  awaitBlankReady(permit: BlankBootstrapPermit): Promise<{
+    actualGeneration: number; cwd: WorkspaceIdentity; backend: WorkspaceIdentity;
+  } | undefined>;
+  proveBlankReady(permit: BlankBootstrapPermit, proof: {
+    actualGeneration: number; cwd: WorkspaceIdentity; backend: WorkspaceIdentity;
+  }): Promise<BusinessSubmitPermit | undefined>;
+  acquireResource?(permit: BusinessSubmitPermit): Promise<boolean>;
+  markAttempting?(permit: BusinessSubmitPermit): Promise<boolean>;
+  submit(permit: BusinessSubmitPermit): Promise<boolean>;
+};
+
+/** The only business-turn ordering primitive: workspace/readiness proof and a
+ * durable typed permit always precede narrower leases, attempting, and IPC. */
+export async function dispatchAdmittedBusinessTurn(input: {
+  sessionId: string;
+  turnId: string;
+  permitTtlMs?: number;
+  dependencies: AdmittedBusinessTurnDependencies;
+}): Promise<boolean> {
+  const deps = input.dependencies;
+  const frozen = await deps.freezeWorkspace();
+  let permit: BusinessSubmitPermit | undefined;
+  if (deps.hasLiveWorker()) {
+    const generation = deps.currentWorkerGeneration();
+    if (!generation || !await deps.proveExistingWorkerReady(generation)) return false;
+    permit = await deps.issueExistingBusiness({
+      sessionId: input.sessionId, turnId: input.turnId, workerGeneration: generation,
+      workspace: frozen.workspace, ...(frozen.groupRevision === undefined ? {} : { groupRevision: frozen.groupRevision }),
+    });
+  } else {
+    const blank = await deps.issueBlank({
+      sessionId: input.sessionId, turnId: input.turnId,
+      reservedGeneration: deps.reserveWorkerGeneration(), target: frozen.workspace,
+      ...(frozen.groupRevision === undefined ? {} : { groupRevision: frozen.groupRevision }),
+      expiresAt: Date.now() + (input.permitTtlMs ?? 60_000),
+    });
+    if (!await deps.forkBlank(blank)) return false;
+    const proof = await deps.awaitBlankReady(blank);
+    if (!proof) return false;
+    permit = await deps.proveBlankReady(blank, proof);
+  }
+  if (!permit) return false;
+  if (deps.acquireResource && !await deps.acquireResource(permit)) return false;
+  if (deps.markAttempting && !await markBusinessAttempting(permit, () => deps.markAttempting!(permit!))) return false;
+  return deps.submit(permit);
+}
+
 export async function markBusinessAttempting<T>(
   _permit: BusinessSubmitPermit,
   mark: () => Promise<T>,
@@ -45,6 +104,22 @@ export async function resumeOriginalTurnReply<T>(
   resume: () => Promise<T>,
 ): Promise<T> {
   return resume();
+}
+
+/** Exact-turn control replies authorize first, validate and consume their
+ * original needs_user wait second, and may only resume that turn. */
+export async function resumeAdmittedControlReply<T>(input: {
+  authorizeFresh(): Promise<boolean>;
+  issuePermit(): Promise<ControlReplyPermit | undefined>;
+  consume(permit: ControlReplyPermit): Promise<'consumed' | 'duplicate' | 'rejected'>;
+  resume(permit: ControlReplyPermit): Promise<T>;
+}): Promise<T | undefined> {
+  if (!await input.authorizeFresh()) return undefined;
+  const permit = await input.issuePermit();
+  if (!permit) return undefined;
+  const consumed = await input.consume(permit);
+  if (consumed !== 'consumed') return undefined;
+  return resumeOriginalTurnReply(permit, () => input.resume(permit));
 }
 
 export async function reconcileTurnPermitDispatches(input: {

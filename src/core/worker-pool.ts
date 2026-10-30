@@ -6498,6 +6498,8 @@ export function killWorker(
   restartCoordinator.cancelSession(ds.session.sessionId);
   clearUsageLimitState(ds);
   ds.workerReady = false;
+  ds.lastWorkerReadyCwd = undefined;
+  ds.lastWorkerReadyHostWorkingDirContract = undefined;
   // The CLI process dies with this worker — no prompt is ready any more.
   ds.cliReady = false;
   clearUsageRefreshTimer(ds);
@@ -6582,6 +6584,8 @@ export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void
   restartCoordinator.cancelSession(ds.session.sessionId);
   clearUsageLimitState(ds);
   ds.workerReady = false;
+  ds.lastWorkerReadyCwd = undefined;
+  ds.lastWorkerReadyHostWorkingDirContract = undefined;
   // SIGTERM below makes the worker killCli() — the CLI prompt is gone.
   ds.cliReady = false;
   clearUsageRefreshTimer(ds);
@@ -6610,6 +6614,8 @@ function clearTransferWorkerState(
   restartCoordinator.cancelSession(ds.session.sessionId);
   clearUsageLimitState(ds);
   ds.workerReady = false;
+  ds.lastWorkerReadyCwd = undefined;
+  ds.lastWorkerReadyHostWorkingDirContract = undefined;
   // The transfer detaches this worker/CLI pair; the replacement must re-prove
   // readiness with its own prompt_ready.
   ds.cliReady = false;
@@ -7163,6 +7169,8 @@ export function requestSessionRestart(
     try {
       if (ds.worker && !ds.worker.killed) {
         ds.workerReady = false;
+  ds.lastWorkerReadyCwd = undefined;
+  ds.lastWorkerReadyHostWorkingDirContract = undefined;
         // In-worker respawn: the next prompt belongs to a NEW CLI generation.
         ds.cliReady = false;
         ds.worker.send({ type: 'restart', attemptId, ...restartIpcReason(observer.source), ...cwdMove,
@@ -9195,6 +9203,8 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   }
   if (!ds.worker || ds.worker.killed) {
     ds.workerReady = false;
+  ds.lastWorkerReadyCwd = undefined;
+  ds.lastWorkerReadyHostWorkingDirContract = undefined;
     // No live worker ⟹ no live CLI prompt; converge the flag with reality.
     ds.cliReady = false;
     // There is no live generation that can still own this capability.
@@ -9219,6 +9229,8 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
 
   ds.worker = null;
   ds.workerReady = false;
+  ds.lastWorkerReadyCwd = undefined;
+  ds.lastWorkerReadyHostWorkingDirContract = undefined;
   // The CLI is destroyed by the suspend; the cold resume brings a new one.
   ds.cliReady = false;
   ds.localProcessAttestation = undefined;
@@ -14635,6 +14647,8 @@ export function forkWorker(
     try { replacedWorker.kill(); } catch { /* ignore */ }
     ds.worker = null;
     ds.workerReady = false;
+  ds.lastWorkerReadyCwd = undefined;
+  ds.lastWorkerReadyHostWorkingDirContract = undefined;
     ds.workerPort = null;
     ds.workerToken = null;
     ds.workerViewToken = null;
@@ -15475,13 +15489,24 @@ export function forkWorker(
 export async function forkWorkerBlank(
   ds: DaemonSession,
   permit: BlankBootstrapPermit,
+  options: Exclude<ForkResumeOrTurnId, boolean | string> = {},
   permitStore: Pick<TurnPermitStore, 'beginSpawn'> = productionTurnPermitStore,
 ): Promise<boolean> {
   if (permit.sessionId !== ds.session.sessionId) return false;
   const transition = await permitStore.beginSpawn(permit);
   if (transition.status !== 'acquired') return false;
-  return forkWorker(ds, '', permit.turnId);
+  if (ds.adoptedFrom) {
+    return forkAdoptWorker(ds, {
+      prompt: '', turnId: permit.turnId, atMostOnce: options.atMostOnce,
+      trustedCaller: options.trustedCaller,
+      onWorkerGenerationReserved: options.onWorkerGenerationReserved,
+      onIpcDispatchAttempted: options.onIpcDispatchAttempted,
+    }) === 'accepted';
+  }
+  return forkWorker(ds, '', { ...options, turnId: permit.turnId });
 }
+
+export type PermitAwareSubmitOptions = Parameters<typeof sendWorkerInput>[3];
 
 /** One-shot business boundary paired with forkWorkerBlank. */
 export async function submitBusinessInput(
@@ -15489,6 +15514,7 @@ export async function submitBusinessInput(
   payload: string | CliTurnPayload,
   permit: BusinessSubmitPermit,
   payloadDigest: string,
+  options: PermitAwareSubmitOptions = {},
   permitStore: Pick<TurnPermitStore, 'consumeBusiness' | 'acknowledgeBusinessDelivery'> = productionTurnPermitStore,
 ): Promise<boolean> {
   if (permit.sessionId !== ds.session.sessionId
@@ -15498,7 +15524,7 @@ export async function submitBusinessInput(
   if (dispatch.status !== 'acquired') return false;
   const key = businessPermitAckKey(permit.sessionId, permit.turnId, permit.workerGeneration);
   activeBusinessPermitStores.set(key, permitStore);
-  const accepted = sendWorkerInput(ds, payload, permit.turnId);
+  const accepted = sendWorkerInput(ds, payload, permit.turnId, options);
   if (!accepted) activeBusinessPermitStores.delete(key);
   return accepted;
 }
@@ -16411,6 +16437,8 @@ function setupWorkerHandlers(
         startupState.ready = true;
         startupState.onPreReadyExit = undefined;
         ds.workerReady = true;
+        ds.lastWorkerReadyCwd = msg.cwd;
+        ds.lastWorkerReadyHostWorkingDirContract = msg.hostWorkingDirContract;
         // A generation reached ready: the transient-startup failing streak is
         // over. Clear the budget and any still-pending retry timer (an inbound
         // message may have revived the session while a retry slept).
@@ -18279,6 +18307,8 @@ function setupWorkerHandlers(
             // terminal URL can show the startup failure; the next user message
             // tells that same worker to destroy the diagnostic shell and retry.
             ds.workerReady = false;
+  ds.lastWorkerReadyCwd = undefined;
+  ds.lastWorkerReadyHostWorkingDirContract = undefined;
             // The worker now holds a parked diagnostic shell and will respawn the
             // CLI itself on the next message (no restart IPC in that path), so the
             // next message must carry the current launch model. Cleared once a
@@ -20295,6 +20325,8 @@ function setupWorkerHandlers(
       }
       ds.worker = null;
       ds.workerReady = false;
+  ds.lastWorkerReadyCwd = undefined;
+  ds.lastWorkerReadyHostWorkingDirContract = undefined;
       // The worker process died; its CLI died with it.
       ds.cliReady = false;
       ds.workerPort = null;
@@ -22041,6 +22073,8 @@ export function forkAdoptWorker(
   }
   if (!canForkRegisteredSession(ds)) return 'rejected';
   ds.workerReady = false;
+  ds.lastWorkerReadyCwd = undefined;
+  ds.lastWorkerReadyHostWorkingDirContract = undefined;
   ds.taskContinuationRpcProof = undefined;
   // Same spawn rule as forkWorker: the adopt bridge is a new CLI generation.
   ds.cliReady = false;
@@ -22092,6 +22126,8 @@ export function forkAdoptWorker(
     try { replacedWorker.kill(); } catch {}
     ds.worker = null;
     ds.workerReady = false;
+  ds.lastWorkerReadyCwd = undefined;
+  ds.lastWorkerReadyHostWorkingDirContract = undefined;
     ds.workerPort = null;
     ds.workerToken = null;
     ds.workerViewToken = null;

@@ -100,6 +100,12 @@ export interface DaemonSession {
    * separate from workerPort because backends without a Web Terminal still
    * emit screen/idle/screenshot updates and support native local attach. */
   workerReady?: boolean;
+  /** Exact cwd/backend proof reported by the current worker generation's ready IPC. */
+  lastWorkerReadyCwd?: string;
+  lastWorkerReadyHostWorkingDirContract?: {
+    workingDir: string;
+    identity: { dev: string; ino: string };
+  };
   /** Task9 launch-only fence; set by the daemon's immediate pre-spawn group probe
    * and consumed by the matching worker-ready cwd confirmation. */
   groupWorkspaceLaunchGuard?: {
