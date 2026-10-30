@@ -21,7 +21,7 @@ export interface GroupWorkspaceFollowDeps {
   supportsReplacement(ds: DaemonSession): boolean;
   isWorkerLive(ds: DaemonSession): boolean;
   persist(input: ({ journal?: GroupWorkspaceFollowJournal; phase?: 'complete' | GroupWorkspaceFollowJournal['phase'] }
-    & Partial<SessionWorkingDirMutation> & { workerGeneration?: number })): void;
+    & Partial<SessionWorkingDirMutation> & { workerGeneration?: number; expectedJournalRevision: number | null })): boolean;
   /** Retire the exact old local worker and its PTY/persistent backing, then prove exit. */
   retire(ds: DaemonSession): Promise<boolean>;
   spawn(ds: DaemonSession, onGenerationReserved: (generation: number) => void): boolean;
@@ -34,6 +34,8 @@ export type GroupWorkspaceFollowResult =
   | { kind: 'deferred' }
   | { kind: 'migrated' }
   | { kind: 'failed'; error: string };
+
+const runningGroupWorkspaceFollows = new WeakSet<object>();
 
 type GroupWorkspaceReadForFollow =
   | { status: 'store_unavailable' }
@@ -92,6 +94,8 @@ export async function runGroupWorkspaceSessionFollow(
     return { kind: 'failed', error: error instanceof Error ? error.message : String(error) };
   };
   if (ds.adoptedFrom || !deps.supportsReplacement(ds)) return fail('worker replacement unsupported');
+  if (runningGroupWorkspaceFollows.has(session)) return { kind: 'deferred' };
+  runningGroupWorkspaceFollows.add(session);
 
   const previousGeneration = session.workerGeneration ?? 0;
   let journal: GroupWorkspaceFollowJournal = session.groupWorkspaceFollow?.targetWorkingDir === target.workingDir
@@ -104,7 +108,8 @@ export async function runGroupWorkspaceSessionFollow(
         previousRevision: session.groupWorkspaceRevision ?? -1,
         previousGeneration, nextGeneration: previousGeneration + 1, phase: 'prepared' };
   try {
-    if (!session.groupWorkspaceFollow) deps.persist({ journal, phase: journal.phase });
+    if (!session.groupWorkspaceFollow
+        && !deps.persist({ journal, phase: journal.phase, expectedJournalRevision: null })) return { kind: 'deferred' };
     if (journal.phase === 'prepared') {
       if (!await deps.retire(ds)) return fail('old worker retirement unverified');
       if (session.workingDirSource !== 'group'
@@ -113,18 +118,21 @@ export async function runGroupWorkspaceSessionFollow(
         return fail('session changed during worker replacement');
       }
       const next = { ...journal, journalRevision: journal.journalRevision! + 1, phase: 'old_exited' as const };
-      deps.persist({ journal: next, phase: next.phase }); journal = next;
+      if (!deps.persist({ journal: next, phase: next.phase,
+        expectedJournalRevision: journal.journalRevision! })) return { kind: 'deferred' };
+      journal = next;
     }
     if (journal.phase === 'old_exited') {
-      deps.persist({ workingDir: target.workingDir, source: 'group',
+      const next = { ...journal, journalRevision: journal.journalRevision! + 1, phase: 'persisted' as const };
+      if (!deps.persist({ workingDir: target.workingDir, source: 'group',
         groupWorkspaceRevision: target.revision,
         groupWorkspaceIdentity: journal.targetWorkspaceIdentity!,
-        journal: { ...journal, journalRevision: journal.journalRevision! + 1, phase: 'persisted' } });
+        journal: next, expectedJournalRevision: journal.journalRevision! })) return { kind: 'deferred' };
       setSessionWorkingDirMetadata(session, { workingDir: target.workingDir, source: 'group',
         groupWorkspaceRevision: target.revision,
         groupWorkspaceIdentity: journal.targetWorkspaceIdentity! });
       ds.workingDir = target.workingDir;
-      journal = { ...journal, journalRevision: journal.journalRevision! + 1, phase: 'persisted' };
+      journal = next;
     }
     // A crash may happen after forkWorker durably reserves the generation but
     // before this journal reaches `spawned`. Reconcile that exact reservation
@@ -133,7 +141,9 @@ export async function runGroupWorkspaceSessionFollow(
     if (journal.phase === 'persisted'
         && (session.workerGeneration ?? 0) === journal.nextGeneration) {
       const next = { ...journal, journalRevision: journal.journalRevision! + 1, phase: 'spawned' as const };
-      deps.persist({ journal: next, phase: next.phase }); journal = next;
+      if (!deps.persist({ journal: next, phase: next.phase,
+        expectedJournalRevision: journal.journalRevision! })) return { kind: 'deferred' };
+      journal = next;
     }
     if (journal.phase === 'spawned' && !deps.isWorkerLive(ds)) {
       // The replacement was durably spawned by the prior daemon, but no process
@@ -143,26 +153,34 @@ export async function runGroupWorkspaceSessionFollow(
       const previousGeneration = Math.max(session.workerGeneration ?? 0, journal.nextGeneration);
       const next = { ...journal, journalRevision: journal.journalRevision! + 1,
         previousGeneration, nextGeneration: previousGeneration + 1, phase: 'persisted' as const };
-      deps.persist({ journal: next, phase: next.phase }); journal = next;
+      if (!deps.persist({ journal: next, phase: next.phase,
+        expectedJournalRevision: journal.journalRevision! })) return { kind: 'deferred' };
+      journal = next;
     }
     if (journal.phase === 'persisted') {
       let reservedGeneration: number | undefined;
       if (!deps.spawn(ds, generation => { reservedGeneration = generation; })) return fail('replacement worker spawn refused');
       if (reservedGeneration !== journal.nextGeneration) return fail('replacement worker generation mismatch');
       const next = { ...journal, journalRevision: journal.journalRevision! + 1, phase: 'spawned' as const };
-      deps.persist({ journal: next, phase: next.phase }); journal = next;
+      if (!deps.persist({ journal: next, phase: next.phase,
+        expectedJournalRevision: journal.journalRevision! })) return { kind: 'deferred' };
+      journal = next;
     }
     const ready = await deps.awaitReady(ds);
     if (!ready.ready) return fail('replacement worker not ready');
     if (ready.workingDir !== target.workingDir) return fail('replacement worker cwd mismatch');
-    deps.persist({ journal: undefined, phase: 'complete' });
+    if (!deps.persist({ journal: undefined, phase: 'complete',
+      expectedJournalRevision: journal.journalRevision! })) return { kind: 'deferred' };
     session.groupWorkspaceFollow = undefined;
     deps.notice('migrated');
     return { kind: 'migrated' };
   } catch (error) {
     return fail(error);
+  } finally {
+    runningGroupWorkspaceFollows.delete(session);
   }
 }
+
 
 const SESSION_WORKING_DIR_SOURCES = new Set<SessionWorkingDirSource>([
   'explicit', 'oncall-explicit', 'oncall-default-auto', 'group',

@@ -31,10 +31,13 @@ function harness(opts: HarnessOptions = {}) {
     persist: (mutation: any) => {
       order.push(`persist:${mutation.phase ?? mutation.source}`);
       if (opts.fail === 'persist' && mutation.source === 'group') throw new Error('disk');
+      const currentRevision = session.groupWorkspaceFollow?.journalRevision ?? null;
+      if (currentRevision !== mutation.expectedJournalRevision) return false;
       if (mutation.source) Object.assign(session, { workingDir: mutation.workingDir,
         workingDirSource: mutation.source, groupWorkspaceRevision: mutation.groupWorkspaceRevision,
         workerGeneration: mutation.workerGeneration });
       session.groupWorkspaceFollow = mutation.journal;
+      return true;
     },
     retire: async () => { order.push('retire'); if (opts.fail === 'retire') return false; liveWorkers = 0; return true; },
     spawn: (_ds: unknown, reserved: (generation: number) => void) => { order.push('spawn'); if (liveWorkers) throw new Error('double worker');
@@ -138,6 +141,56 @@ describe('group workspace pre-turn worker follow', () => {
     expect(result.kind).toBe('failed');
     expect(h.ds.session.workingDir).toBe('/manual');
     expect(h.order).not.toContain('spawn');
+  });
+
+  it('publishes neither replacement metadata nor effects when persistence fails', async () => {
+    const h = harness({ fail: 'persist' });
+    const result = await runGroupWorkspaceSessionFollow(h.ds, { workingDir: '/x2', revision: 2,
+      workspaceIdentity: { path: '/x2', dev: '1', ino: '2' } }, h.deps);
+    expect(result.kind).toBe('failed');
+    expect(h.ds.workingDir).toBe('/x1');
+    expect(h.ds.session.workingDir).toBe('/x1');
+    expect(h.order).not.toContain('spawn');
+  });
+
+  it('defers an overlapping runner while the winner awaits worker retirement', async () => {
+    const h = harness();
+    let releaseRetire!: (retired: boolean) => void;
+    h.deps.retire = vi.fn(async () => new Promise<boolean>(resolve => { releaseRetire = retired => {
+      if (retired) {
+        h.deps.isWorkerLive = () => false;
+        h.deps.spawn = (_ds: unknown, reserved: (generation: number) => void) => {
+          h.order.push('spawn'); reserved(5); return true;
+        };
+      }
+      resolve(retired);
+    }; }));
+    const first = runGroupWorkspaceSessionFollow(h.ds, { workingDir: '/x2', revision: 2,
+      workspaceIdentity: { path: '/x2', dev: '1', ino: '2' } }, h.deps);
+    await vi.waitFor(() => expect(h.deps.retire).toHaveBeenCalledTimes(1));
+    const loser = await runGroupWorkspaceSessionFollow(h.ds, { workingDir: '/x2', revision: 2,
+      workspaceIdentity: { path: '/x2', dev: '1', ino: '2' } }, h.deps);
+    expect(loser).toEqual({ kind: 'deferred' });
+    expect(h.deps.retire).toHaveBeenCalledTimes(1);
+    releaseRetire(true);
+    expect(await first).toEqual({ kind: 'migrated' });
+  });
+
+  it('defers when a newer journal revision wins during a worker await', async () => {
+    const h = harness();
+    h.deps.retire = async () => {
+      h.order.push('retire');
+      h.ds.session.groupWorkspaceFollow = {
+        ...h.ds.session.groupWorkspaceFollow,
+        journalRevision: 1,
+      };
+      return true;
+    };
+    const result = await runGroupWorkspaceSessionFollow(h.ds, { workingDir: '/x2', revision: 2,
+      workspaceIdentity: { path: '/x2', dev: '1', ino: '2' } }, h.deps);
+    expect(result).toEqual({ kind: 'deferred' });
+    expect(h.order).not.toContain('spawn');
+    expect(h.order).not.toContain('notice:failed');
   });
 
   it.each(['prepared', 'old_exited', 'persisted', 'spawned'] as const)('recovers %s journal without overlapping workers', async phase => {

@@ -424,6 +424,7 @@ describe('precedence, explicit provenance, and safe local follow', () => {
       supportsReplacement: () => true,
       isWorkerLive: () => liveWorkers === 1,
       persist: mutation => {
+        if ((session.groupWorkspaceFollow?.journalRevision ?? null) !== mutation.expectedJournalRevision) return false;
         if (mutation.workingDir && mutation.source) {
           session.workingDir = mutation.workingDir;
           session.workingDirSource = mutation.source;
@@ -432,6 +433,7 @@ describe('precedence, explicit provenance, and safe local follow', () => {
         }
         if (mutation.workerGeneration !== undefined) session.workerGeneration = mutation.workerGeneration;
         session.groupWorkspaceFollow = mutation.journal;
+        return true;
       },
       retire: async () => { order.push('retire'); liveWorkers = 0; return true; },
       spawn: (_candidate, reserve) => {

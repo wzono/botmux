@@ -6433,9 +6433,10 @@ async function followGroupWorkspaceBeforeBusinessTurn(
         setSessionWorkingDirMetadata(next, input as SessionWorkingDirMutation);
       }
       next.groupWorkspaceFollow = input.journal;
-      sessionStore.updateSession(next);
+      if (!sessionStore.updateGroupWorkspaceFollowSession(next, input.expectedJournalRevision)) return false;
       Object.assign(ds.session, next);
       if (input.workingDir) ds.workingDir = input.workingDir;
+      return true;
     },
     retire: current => retireWorkerForReplacement(current),
     spawn: (current, onGenerationReserved) => forkWorker(current, '', {

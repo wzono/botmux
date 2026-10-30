@@ -2935,6 +2935,34 @@ export function updateSession(session: Session): void {
   sessions.set(session.sessionId, session);
 }
 
+/** Persist one immutable group-follow transition iff the durable journal still
+ * has the revision observed by its runner. */
+export function updateGroupWorkspaceFollowSession(
+  next: Session,
+  expectedJournalRevision: number | null,
+): boolean {
+  loadForWrite();
+  const db = ownStore;
+  if (!db) throw new SessionStoreUnavailableError(new Error('owned session store is not attached'));
+  const hit = db.selectRow.get(next.sessionId) as { row: string } | undefined;
+  if (!hit) throw new Error('group workspace follow session is missing');
+  const durable = parseSessionRow(hit.row);
+  const currentRevision = durable.groupWorkspaceFollow?.journalRevision ?? null;
+  if (currentRevision !== expectedJournalRevision) return false;
+  durable.workingDir = next.workingDir;
+  durable.workingDirSource = next.workingDirSource;
+  durable.groupWorkspaceRevision = next.groupWorkspaceRevision;
+  durable.workspaceSchemaVersion = next.workspaceSchemaVersion;
+  durable.groupWorkspaceIdentity = structuredClone(next.groupWorkspaceIdentity);
+  durable.groupWorkspaceDirectoryIdentity = structuredClone(next.groupWorkspaceDirectoryIdentity);
+  durable.riffRepoDirs = next.riffRepoDirs;
+  durable.groupWorkspaceFollow = structuredClone(next.groupWorkspaceFollow);
+  const result = db.updateExact.run(sessionStatusText(durable), JSON.stringify(durable), next.sessionId, hit.row);
+  if (Number(result.changes) !== 1) return false;
+  sessions.set(next.sessionId, durable);
+  return true;
+}
+
 /** Exact task authority mutation; ordinary metadata updates cannot write it. */
 export function updateDeploymentContinuation(
   session: Session,

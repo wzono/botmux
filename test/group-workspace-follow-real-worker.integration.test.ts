@@ -496,6 +496,7 @@ describe('group workspace follow with real PTY workers', () => {
         supportsReplacement: () => true,
         isWorkerLive: candidate => !!candidate.worker && !candidate.worker.killed,
         persist: mutation => {
+          if ((session.groupWorkspaceFollow?.journalRevision ?? null) !== mutation.expectedJournalRevision) return false;
           if (mutation.source && mutation.workingDir) {
             session.workingDir = mutation.workingDir;
             session.workingDirSource = mutation.source;
@@ -504,6 +505,7 @@ describe('group workspace follow with real PTY workers', () => {
           }
           if (mutation.workerGeneration !== undefined) session.workerGeneration = mutation.workerGeneration;
           session.groupWorkspaceFollow = mutation.journal;
+          return true;
         },
         retire: async candidate => {
           const retired = await retireWorkerForReplacement(candidate, { timeoutMs: 5_000 });
@@ -593,6 +595,7 @@ describe('group workspace follow with real PTY workers', () => {
       supportsReplacement: () => true,
       isWorkerLive: candidate => !!candidate.worker && !candidate.worker.killed,
       persist: mutation => {
+        if ((ds.session.groupWorkspaceFollow?.journalRevision ?? null) !== mutation.expectedJournalRevision) return false;
         if (mutation.source && mutation.workingDir) {
           ds.session.workingDir = mutation.workingDir;
           ds.session.workingDirSource = mutation.source;
@@ -600,6 +603,7 @@ describe('group workspace follow with real PTY workers', () => {
           ds.workingDir = mutation.workingDir;
         }
         ds.session.groupWorkspaceFollow = mutation.journal;
+        return true;
       },
       retire: async candidate => {
         order.push('retire');
