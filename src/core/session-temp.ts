@@ -42,6 +42,11 @@ function sessionTempHub(): string | undefined {
  * itself is used and no alias exists.
  */
 function sessionTempRoot(): string {
+  if (process.env.BOTMUX_SESSION_TEMP_ALIAS === '1') {
+    const hub = sessionTempHub();
+    if (!hub) return sessionTempCacheRoot();
+    return join(hub, createHash('sha256').update(resolve(sessionTempCacheRoot())).digest('hex').slice(0, 8));
+  }
   return join(homedir(), '.cache', 'bm');
 }
 
@@ -307,6 +312,15 @@ function copyEntry(from: string, to: string): void {
 }
 
 function ensureSessionTempRoot(): void {
+  if (process.env.BOTMUX_SESSION_TEMP_ALIAS === '1') {
+    const hub = sessionTempHub();
+    if (!hub) return;
+    ensureSessionTempHub(hub);
+    const cache = sessionTempCacheRoot();
+    mkdirSync(cache, { recursive: true, mode: 0o700 });
+    ensureSessionTempAlias(sessionTempRoot(), cache);
+    return;
+  }
   mkdirSync(sessionTempRoot(), { recursive: true, mode: 0o700 });
 }
 
