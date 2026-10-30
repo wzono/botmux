@@ -1253,6 +1253,9 @@ async function restoreSessionsAndScheduleStartupRecovery(opts: {
   restoreSessions: () => Promise<Array<XpiSharedCwdStartupNotice | PrincipalLaneStartupNotice> | undefined>;
   driveRestoredXpiGroup: (groupId: string) => void;
   driveRestoredPrincipalLane: (ds: DaemonSession) => void;
+  /** Runs after durable sessions/schema migration exist, but before any restored
+   * queue is scheduled. Throwing keeps ingress fenced and aborts startup. */
+  recoverGroupWorkspaceOperations?: () => Promise<void>;
 }): Promise<Array<XpiSharedCwdStartupNotice | PrincipalLaneStartupNotice>> {
   const restoredQuarantineNotices = await opts.restoreSessions();
   // Reconcile every persisted follow journal while ingress is still fenced. This
@@ -1263,6 +1266,7 @@ async function restoreSessionsAndScheduleStartupRecovery(opts: {
       throw new Error(`workspace follow startup reconciliation failed for ${ds.session.sessionId}`);
     }
   }
+  await opts.recoverGroupWorkspaceOperations?.();
   const restoredAt = Date.now();
   const quarantineNotices = restoredQuarantineNotices ?? [];
   scheduleRestoredStreamingCardPinRecovery(opts.larkAppId);
@@ -7365,6 +7369,9 @@ const groupWorkspaceOperationStore = new GroupWorkspaceOperationStore(config.ses
 const groupWorkspaceExecutorLeaseStore = new OperationExecutorLeaseStore(config.session.dataDir);
 const groupWorkspaceExecutorOwner = `${process.pid}:${randomUUID()}`;
 const groupWorkspaceRouteRuntimes = new Map<string, ReturnType<typeof createGroupWorkspaceRouteRuntime>>();
+const groupWorkspaceRecoveryCoordinators = new Map<string, (
+  journal: import('./services/group-workspace-operation-store.js').RepoGroupOperationJournal,
+) => ReturnType<typeof createGroupWorkspaceSetCoordinator>>();
 
 const cardDeps: CardHandlerDeps = {
   activeSessions,
@@ -33087,7 +33094,69 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     });
     setInputCaptureRuntime(cfg.larkAppId, inputCapture);
     inputCapture.start();
-    const groupWorkspaceRouteRuntime = createGroupWorkspaceRouteRuntime({
+    let groupWorkspaceRouteRuntime: ReturnType<typeof createGroupWorkspaceRouteRuntime>;
+    const findGroupOperationSession = (durableId: string, chatId: string): DaemonSession | undefined =>
+      findActiveBySessionId(durableId)
+      ?? activeSessions.get(durableId)
+      ?? activeSessions.get(sessionKey(chatId, cfg.larkAppId));
+    const groupWorkspaceCoordinatorForJournal = (
+      frozen: import('./services/group-workspace-operation-store.js').RepoGroupOperationJournal,
+    ) => createGroupWorkspaceSetCoordinator({
+      journalStore: groupWorkspaceOperationStore,
+      groupStore: groupWorkspaceStore,
+      now: Date.now,
+      authorityFingerprint: frozen.authorityFingerprint,
+      revalidateAuthority: async journal => ({
+        status: await groupWorkspaceRouteRuntime.revalidateAuthority({
+          chatId: journal.chatId,
+          actor: journal.actor,
+          authorityFingerprint: journal.authorityFingerprint ?? '',
+        }) ? 'authorized' : 'unauthorized',
+      }),
+      executorLeaseStore: groupWorkspaceExecutorLeaseStore,
+      executorOwner: groupWorkspaceExecutorOwner,
+      resolveCanonicalTarget: async () => ({
+        status: 'resolved', workingDir: frozen.targetWorkingDir!,
+        workspaceIdentity: frozen.targetWorkspaceIdentity!,
+      }),
+      readSession: async durableId => {
+        const current = findGroupOperationSession(durableId, frozen.chatId);
+        return current
+          ? { status: 'available', generation: current.workerGeneration ?? current.session.workerGeneration ?? 0,
+              workingDir: getSessionWorkingDir(current) }
+          : { status: 'store_unavailable' };
+      },
+      switchSession: async input => {
+        const current = findGroupOperationSession(input.sessionId, frozen.chatId);
+        if (!current || current.larkAppId !== cfg.larkAppId
+          || (current.workerGeneration ?? current.session.workerGeneration ?? 0) !== input.expectedGeneration) {
+          return { status: 'unknown' };
+        }
+        const proof = probePathUsability(input.targetWorkingDir);
+        if (!proof.ok || proof.normalizedPath !== input.targetWorkingDir
+          || proof.identity.dev !== input.workspaceIdentity.dev
+          || proof.identity.ino !== input.workspaceIdentity.ino) return { status: 'unknown' };
+        if (!await retireWorkerForReplacement(current)) return { status: 'unknown' };
+        applySessionWorkingDir(current, { workingDir: input.targetWorkingDir, source: 'explicit' });
+        const accepted = forkWorker(current, '', false);
+        if (accepted === false) return { status: 'unknown' };
+        const generation = current.workerGeneration ?? current.session.workerGeneration ?? input.expectedGeneration + 1;
+        return generation === input.expectedGeneration + 1
+          ? { status: 'committed', generation }
+          : { status: 'unknown' };
+      },
+      convergeSession: async input => {
+        const current = findGroupOperationSession(input.sessionId, frozen.chatId);
+        if (!current || (current.workerGeneration ?? current.session.workerGeneration ?? 0) !== input.expectedGeneration) {
+          throw new Error('session provenance convergence lost generation ownership');
+        }
+        applySessionWorkingDir(current, input.source === 'group'
+          ? { workingDir: getSessionWorkingDir(current), source: 'group', groupWorkspaceRevision: input.groupRevision!,
+              groupWorkspaceIdentity: frozen.targetWorkspaceIdentity! }
+          : { workingDir: getSessionWorkingDir(current), source: 'explicit' });
+      },
+    });
+    groupWorkspaceRouteRuntime = createGroupWorkspaceRouteRuntime({
       larkAppId: cfg.larkAppId,
       activeSessions,
       sessionKey,
@@ -33270,6 +33339,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       },
     });
     groupWorkspaceRouteRuntimes.set(cfg.larkAppId, groupWorkspaceRouteRuntime);
+    groupWorkspaceRecoveryCoordinators.set(cfg.larkAppId, groupWorkspaceCoordinatorForJournal);
 
     const botEventHandlers: EventHandlers = {
       resolveGroupWorkspaceRouteAuthority: groupWorkspaceRouteRuntime.resolveAuthority,
@@ -33644,6 +33714,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }),
     driveRestoredXpiGroup: groupId => { void driveNextXpiSharedCwdTurn(groupId); },
     driveRestoredPrincipalLane: ds => { driveNextPrincipalLaneTurn(ds); },
+    recoverGroupWorkspaceOperations: async () => {
+      const recoverable = await groupWorkspaceOperationStore.listRecoverable();
+      if (recoverable.status !== 'available') throw new Error('group workspace operation store unavailable');
+      for (const journal of recoverable.journals) {
+        const session = findActiveBySessionId(journal.sessionId)
+          ?? activeSessions.get(journal.sessionId)
+          ?? activeSessions.get(sessionKey(journal.chatId, cfg.larkAppId));
+        if (!session || session.larkAppId !== cfg.larkAppId) continue;
+        const coordinator = groupWorkspaceRecoveryCoordinators.get(cfg.larkAppId);
+        if (!coordinator) throw new Error(`group workspace recovery coordinator unavailable: ${cfg.larkAppId}`);
+        const result = await coordinator(journal).recover(journal);
+        if (result.status !== 'group_committed' && result.status !== 'conflict'
+          && result.status !== 'unauthorized') {
+          throw new Error(`group workspace operation recovery unresolved: ${journal.operationKey}:${result.status}`);
+        }
+      }
+    },
   });
   // Completion Proposal may resume an accepted pending decision immediately.
   // Schedule it only after restore populated activeSessions; doing this before

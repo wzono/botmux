@@ -22,6 +22,17 @@ describe('same-source winner and executor lease', () => {
     const adopted = await store.prepareOrAdopt({ ...journal, expectedSessionGeneration: 99, targetWorkingDir: '/other', targetWorkspaceIdentity: { ...identity, path: '/other' } });
     expect(adopted).toMatchObject({ status: 'adopted', journal: { targetWorkingDir: '/repo/x', expectedSessionGeneration: 1 } });
   });
+  it('lists terminal group commits that still require session convergence at startup', async () => {
+    const store = new GroupWorkspaceOperationStore(dir());
+    await store.prepare(journal);
+    await store.transition(journal.operationKey, 'session_committed', { sessionGenerationAfter: 2, updatedAt: 2 });
+    await store.transition(journal.operationKey, 'group_committed', { groupRevisionAfter: 3, updatedAt: 3 });
+    await expect(store.listUnresolved()).resolves.toEqual({ status: 'available', journals: [] });
+    await expect(store.listRecoverable()).resolves.toMatchObject({
+      status: 'available', journals: [{ operationKey: journal.operationKey, phase: 'group_committed' }],
+    });
+  });
+
   it('rejects changed semantic intent or frozen authority identity', async () => {
     const store = new GroupWorkspaceOperationStore(dir());
     await store.prepareOrAdopt({ ...journal, authorityFingerprint: 'fingerprint-a' });

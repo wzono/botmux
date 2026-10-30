@@ -340,6 +340,21 @@ export class GroupWorkspaceOperationStore {
     }
   }
 
+  async listRecoverable(): Promise<{ status: 'available'; journals: RepoGroupOperationJournal[] } | { status: 'store_unavailable' }> {
+    try {
+      mkdirSync(dirname(this.path), { recursive: true });
+      return await withFileLock(this.path, async () => ({
+        status: 'available' as const,
+        journals: Object.values(readRegistry(this.path).operations)
+          .filter(item => item.kind === 'set' && (item.phase === 'prepared' || item.phase === 'session_committed'
+            || item.phase === 'unknown' || item.phase === 'group_committed'))
+          .map(item => structuredClone(item)),
+      }), { maxWaitMs: this.lockTimeoutMs });
+    } catch {
+      return { status: 'store_unavailable' };
+    }
+  }
+
   async listUnresolved(): Promise<{ status: 'available'; journals: RepoGroupOperationJournal[] } | { status: 'store_unavailable' }> {
     try {
       mkdirSync(dirname(this.path), { recursive: true });

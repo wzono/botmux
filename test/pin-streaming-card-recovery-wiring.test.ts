@@ -112,6 +112,28 @@ describe('startup restore phase wiring for restored streaming-card Pin recovery'
     expect(events).toEqual(['restore:start', 'restore:done', 'pin:app-pin', 'pin:done:app-pin']);
   });
 
+  it('completes group-operation recovery before restored queues are scheduled', async () => {
+    const activeSessions = daemon.__testOnly_activeSessions;
+    activeSessions.clear();
+    const events: string[] = [];
+    await daemon.__testOnly_restoreSessionsAndScheduleStartupRecovery({
+      larkAppId: 'app-group-recovery',
+      restoreSessions: async () => {
+        events.push('restore');
+        activeSessions.set('app-group-recovery:session', {
+          larkAppId: 'app-group-recovery',
+          session: { sessionId: 'session', status: 'active', xpiSharedCwdAdmissionGroupId: 'restored-group' },
+        } as any);
+      },
+      recoverGroupWorkspaceOperations: async () => { events.push('group-recovery'); },
+      driveRestoredXpiGroup: () => { events.push('queue'); },
+      driveRestoredPrincipalLane: () => {},
+    });
+    await Promise.resolve();
+    expect(events).toEqual(['restore', 'group-recovery', 'queue']);
+    activeSessions.clear();
+  });
+
   it('re-drives each restored durable XPI group once after runtime sessions are published', async () => {
     const activeSessions = daemon.__testOnly_activeSessions;
     activeSessions.clear();
