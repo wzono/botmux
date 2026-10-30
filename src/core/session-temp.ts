@@ -42,9 +42,7 @@ function sessionTempHub(): string | undefined {
  * itself is used and no alias exists.
  */
 function sessionTempRoot(): string {
-  const hub = sessionTempHub();
-  if (!hub) return sessionTempCacheRoot();
-  return join(hub, createHash('sha256').update(resolve(sessionTempCacheRoot())).digest('hex').slice(0, 8));
+  return join(homedir(), '.cache', 'bm');
 }
 
 /**
@@ -309,15 +307,7 @@ function copyEntry(from: string, to: string): void {
 }
 
 function ensureSessionTempRoot(): void {
-  // Keep large scratch trees on the cache filesystem, but expose a bounded
-  // lexical path to tools. Chrome appends ~40 bytes for its SingletonSocket;
-  // shortening only the session/profile segments cannot bound a long HOME.
-  const hub = sessionTempHub();
-  if (!hub) return;
-  ensureSessionTempHub(hub);
-  const cache = sessionTempCacheRoot();
-  mkdirSync(cache, { recursive: true, mode: 0o700 });
-  ensureSessionTempAlias(sessionTempRoot(), cache);
+  mkdirSync(sessionTempRoot(), { recursive: true, mode: 0o700 });
 }
 
 /**
