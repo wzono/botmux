@@ -2,6 +2,7 @@ import type {
   FreshBotAdminUnionSnapshot,
   TenantHumanId,
 } from '../services/bot-admin-unions-store.js';
+import { resolveWorkspace, type WorkspaceResolveInput, type WorkspaceResolution } from './workspace-resolver.js';
 
 export interface BotWorkspaceActor {
   kind: 'bot';
@@ -33,6 +34,13 @@ export type GroupWorkspaceCwdResolution =
   | { status: 'invalid' | 'inaccessible'; workingDir: string; groupWorkspaceRevision: number }
   | { status: 'store-unavailable' }
   | { status: 'picker' };
+
+/** Async compatibility boundary for existing group-session resolvers. It keeps
+ * every discriminated resolver failure intact; callers opt in without an
+ * ingress-wide migration. */
+export function resolveGroupWorkspaceCwdAsync(input: WorkspaceResolveInput): Promise<WorkspaceResolution> {
+  return resolveWorkspace(input);
+}
 
 type OncallWorkspace = { workingDir: string; provenance?: 'oncall-explicit' | 'oncall-default-auto' };
 
@@ -85,12 +93,18 @@ export function resolveGroupWorkspaceCwd(input: {
 }
 
 export interface GroupWorkspaceRouteAuthority {
+  status: 'authorized';
   actor: TenantHumanId;
+  configFingerprint: string;
   freshSnapshot: FreshBotAdminUnionSnapshot;
   workspaceManagers?: readonly TenantHumanId[];
   /** A set operation also replaces the receiving Bot's current session. */
   canSwitchSession: boolean;
 }
+
+export type GroupWorkspaceRouteAuthorityResult =
+  | { status: 'recognized_denied'; reason: 'identity_unavailable' | 'stale_config' | 'unauthorized' | 'tenant_mismatch' }
+  | GroupWorkspaceRouteAuthority;
 
 export function classifyGroupWorkspaceTextRoute(input: {
   text: string;
@@ -139,9 +153,9 @@ export function classifyGroupWorkspaceCardRoute(input: {
 }
 
 export function authorizeGroupWorkspaceRoute(
-  authority: GroupWorkspaceRouteAuthority | undefined,
+  authority: GroupWorkspaceRouteAuthorityResult | undefined,
 ): authority is GroupWorkspaceRouteAuthority {
-  return !!authority && canManageGroupWorkspace({
+  return authority?.status === 'authorized' && canManageGroupWorkspace({
     actor: authority.actor,
     freshSnapshot: authority.freshSnapshot,
     workspaceManagers: authority.workspaceManagers,

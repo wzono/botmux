@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { resolveWorkspace } from '../src/core/workspace-resolver.js';
 import { consumeWorkspace } from '../src/core/workspace-consumption.js';
+import { resolveGroupWorkspaceCwdAsync } from '../src/core/group-workspace-policy.js';
 
 const identity = (path: string, ino = '2') => ({ path, dev: '1', ino });
 const resolved = (path: string, source: any, extra = {}) => ({ status: 'resolved' as const, source, identity: identity(path), ...extra });
@@ -40,6 +41,23 @@ describe('async workspace resolver', () => {
       group: async () => ({ status: 'unbound' }), defaults: async () => ({ status: 'unbound' }),
       picker: async () => ({ status: 'needs_picker', candidates: [{ path: '/x', label: 'x' }] }) });
     expect(result).toMatchObject({ status: 'needs_picker' });
+  });
+
+  it.each(['store_unavailable', 'invalid_dir', 'inaccessible', 'identity_changed'] as const)
+  ('preserves %s through the existing group policy compatibility boundary', async status => {
+    const failure: any = status === 'identity_changed'
+      ? { status, expected: identity('/group'), actual: identity('/group', '9') }
+      : { status, detail: status };
+    let defaultsCalled = false;
+    const result = await resolveGroupWorkspaceCwdAsync({
+      explicit: async () => ({ status: 'unbound' }),
+      oncallExplicit: async () => ({ status: 'unbound' }),
+      group: async () => failure,
+      defaults: async () => { defaultsCalled = true; return resolved('/fallback', 'bot-default'); },
+      picker: async () => ({ status: 'needs_picker', candidates: [] }),
+    });
+    expect(result.status).toBe(status);
+    expect(defaultsCalled).toBe(false);
   });
 });
 
