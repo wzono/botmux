@@ -72,6 +72,8 @@ vi.mock('../src/core/turn-cli-identity.js', async () => {
 import { getBot, registerBot } from '../src/bot-registry.js';
 import {
   noteTurnReceived,
+  handleOwnedTurnFeedbackTerminal,
+  withOwnedTurnFeedbackTerminal,
   __testOnly_applyLiveTurnFeedbackTerminal as applyLiveFeedbackTerminal,
   __testOnly_turnFeedbackReconciler as feedbackReconciler,
 } from '../src/daemon.js';
@@ -190,6 +192,53 @@ describe('two-phase turn reactions', () => {
     await noteTurnReceived(detached, 'om_existing');
 
     expect(sessionStore.getSessionFresh(durableOwner.session.sessionId)).toEqual(before);
+  });
+
+  it('does not settle a durable owner row from a detached same-id terminal seam', async () => {
+    registerWith(true);
+    const durableOwner = makeDs();
+    await noteTurnReceived(durableOwner, 'om_detached_terminal');
+    mocks.addReaction.mockClear();
+    mocks.removeReaction.mockClear();
+    const detached = {
+      ...durableOwner,
+      session: structuredClone(durableOwner.session),
+    } as DaemonSession;
+
+    await withOwnedTurnFeedbackTerminal()(detached, {
+      turnId: 'om_detached_terminal', status: 'completed', completedAtMs: Date.now(),
+    }, { workerGeneration: detached.workerGeneration ?? 1 });
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(sessionStore.getSessionFresh(durableOwner.session.sessionId)?.turnFeedback
+      ?.om_detached_terminal?.phase).toBe('processing');
+    expect(mocks.removeReaction).not.toHaveBeenCalled();
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+  });
+
+  it('settles an exact terminal through the production seam after store restore', async () => {
+    registerWith(true);
+    const original = makeDs();
+    await noteTurnReceived(original, 'om_restored_terminal');
+    const sessionId = original.session.sessionId;
+    sessionStore.init(APP);
+    const restoredSession = sessionStore.getSession(sessionId)!;
+    const restored = {
+      ...original,
+      session: restoredSession,
+    } as DaemonSession;
+    mocks.addReaction.mockClear();
+    mocks.removeReaction.mockClear();
+
+    await withOwnedTurnFeedbackTerminal()(restored, {
+      turnId: 'om_restored_terminal', status: 'completed', completedAtMs: Date.now(),
+    }, { workerGeneration: restored.workerGeneration ?? 1 });
+    await feedbackReconciler.reconcile(restored, 'om_restored_terminal');
+
+    expect(sessionStore.getSessionFresh(sessionId)?.turnFeedback?.om_restored_terminal?.phase)
+      .toBe('completed');
+    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_restored_terminal', 'rid_om_restored_terminal');
+    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_restored_terminal', 'DONE');
   });
 
   it.each([true, false])('unified replies retain the independent status-card reaction gate (off=%s)', async statusOff => {
@@ -1184,7 +1233,7 @@ describe('turn reaction screen_update behavioral gate', () => {
       getSessionWorkingDir: () => '/repo',
       getActiveCount: () => 1,
       closeSession: vi.fn(),
-      onTurnTerminal: async (ds, terminal) => { applyLiveFeedbackTerminal(ds, terminal); },
+      onTurnTerminal: withOwnedTurnFeedbackTerminal(),
     });
   });
 

@@ -410,6 +410,7 @@ import {
   reserveQueuedActivationTailAdmission,
   type QueuedActivationTailReservation,
   type WorkerForkAdmission,
+  type WorkerPoolCallbacks,
   codexAppCleanInputAcceptedForSession,
   hasQueuedActivationAdmissionGate,
   sendPromptCacheKeepalive,
@@ -4243,6 +4244,31 @@ function applyLiveTurnFeedbackTerminal(
 }
 
 export const __testOnly_applyLiveTurnFeedbackTerminal = applyLiveTurnFeedbackTerminal;
+
+/** Production worker-terminal feedback seam. A matching session id is not
+ * ownership: adopt/restore compatibility paths and detached snapshots can
+ * carry the same id as the daemon-owned row. Only the exact Session object
+ * attached to this process's writable store may project terminal feedback. */
+export function handleOwnedTurnFeedbackTerminal(
+  ds: DaemonSession,
+  terminal: Pick<Extract<WorkerToDaemon, { type: 'turn_terminal' }>,
+    'turnId' | 'status' | 'completedAtMs'>,
+): void {
+  if (!sessionStore.ownsSessionForMutation(ds.session)) return;
+  applyLiveTurnFeedbackTerminal(ds, terminal);
+}
+
+/** Decorate the daemon's real worker terminal callback with the feedback
+ * ownership gate. Production assembly and behavior tests use this same seam,
+ * so removing the daemon wiring also removes terminal feedback in the tests. */
+export function withOwnedTurnFeedbackTerminal(
+  next?: NonNullable<WorkerPoolCallbacks['onTurnTerminal']>,
+): NonNullable<WorkerPoolCallbacks['onTurnTerminal']> {
+  return async (ds, terminal, context) => {
+    handleOwnedTurnFeedbackTerminal(ds, terminal);
+    await next?.(ds, terminal, context);
+  };
+}
 
 const capacitySidebandRuntime = createCapacitySidebandRuntime(binding => {
   const ds = findActiveBySessionId(binding.sessionId);
@@ -31503,10 +31529,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       })) throw new Error('capacity_sideband_binding_conflict');
       consumerCapacitySidebandRetry?.();
     },
-    async onTurnTerminal(ds, terminal, context) {
+    onTurnTerminal: withOwnedTurnFeedbackTerminal(async (ds, terminal, context) => {
       const originalFailedCaller = failedTurnCaller(ds, terminal.turnId);
       const originalFailedSilent = isSilentScheduledTurn(ds, terminal.turnId);
-      applyLiveTurnFeedbackTerminal(ds, terminal);
       // Queue ACKs do not prove consumption. Only a matching completed native
       // turn confirms that this exact frozen input reached this conversation.
       if (terminal.status === 'completed' && ds.session.workerGeneration === context.workerGeneration) {
@@ -31590,7 +31615,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         ds.messageListenerCompletedTurnId = terminal.status === 'completed' ? terminal.turnId : undefined;
         scheduleMessageListenerAutoClose(ds);
       }
-    },
+    }),
     onDeferredScheduleTurnSettled(ds, context) {
       scheduleDeferredScheduleSettlement(ds, context);
     },
