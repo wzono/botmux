@@ -1,4 +1,5 @@
 import { armTriggerStreamingCard } from './trigger-streaming-card.js';
+import { rememberTriggerTurn } from './turn-origin.js';
 import { zeroPromptInjectionForBot, sessionPromptInjection } from './prompt-injection.js';
 import { withLarkTurnIdempotency } from './lark-turn-idempotency.js';
 import * as sessionStore from '../services/session-store.js';
@@ -779,6 +780,7 @@ async function triggerSessionTurnAdmitted(
 ): Promise<TriggerResponse> {
   const stableTurnId = internal?.stableTurnId?.trim();
   const triggerId = stableTurnId || `trg_${randomUUID()}`;
+  rememberTriggerTurn(triggerId, req.source.type);
   // HTTP opt-in for codex-app native in-flight steer (turn/steer). The flag is
   // pure AUTHORIZATION forwarded to the worker — the live runner decides whether
   // it can actually merge into an active turn (canSteer); when it cannot, the
@@ -806,8 +808,10 @@ async function triggerSessionTurnAdmitted(
         ? { content, codexAppSteerable: true }
         : { ...content, codexAppSteerable: true };
   const prepareStableDispatch = (target: DaemonSession, willFork: boolean): number | undefined => {
-    prepareTriggerPresentation(target, willFork || !!(stableTurnId || loudTurnId
-      || req.options?.waitForFinalOutput || req.options?.asyncReturnSessionId));
+    // Every accepted external input owns its generated turn, including quiet
+    // report follow-ups on an already-running worker. Keep its reply anchor
+    // independent of presentation and final-output suppression options.
+    prepareTriggerPresentation(target, true);
     if (!stableTurnId || !internal?.beforeDispatch) return undefined;
     const currentWorkerGeneration = Math.max(
       target.workerGeneration ?? 0,
@@ -1574,7 +1578,7 @@ async function triggerSessionTurnAdmitted(
       const dispatchAttempt = prepareStableDispatch(target, false);
       armFinalOutputSuppression(target, dispatchAttempt);
       armLoudFinalSuppression(target);
-      const accepted = sendWorkerInput(target, content, stableTurnId ? triggerId : loudTurnId, {
+      const accepted = sendWorkerInput(target, content, triggerId, {
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
         ...(internal?.atMostOnce ? { atMostOnce: true } : {}),
         ...(steerRequested ? { codexAppSteerable: true as const } : {}),

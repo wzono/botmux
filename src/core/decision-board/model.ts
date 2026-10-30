@@ -48,8 +48,18 @@ export interface BoardOption {
 export interface BoardLink {
   kind: BoardLinkKind;
   ref: string;
+  /** 管家给的标签。展示优先用它，其次（chat）查到的群名。 */
   label?: string;
+  /**
+   * 仅 chat：写入时有没有用本机 bot 查到这个群。verified = 查到了；unverified = 查不到、管家显式
+   * 允许先写上。缺省 = 这条核实功能上线前写的旧关联，不打标。
+   */
+  chatCheck?: BoardChatCheck;
+  /** 仅 chat：最近一次核实时查到的群名。和管家的标签分开存，重新核实只刷新它、不碰标签。 */
+  chatName?: string;
 }
+
+export type BoardChatCheck = 'verified' | 'unverified';
 
 export type BoardActor = 'steward' | 'owner' | 'system';
 export type BoardEventKind = 'create' | 'note' | 'state' | 'edit' | 'decision' | 'reply' | 'attach' | 'link';
@@ -74,6 +84,10 @@ export interface BoardItem {
   stateAt: number;
   stewardEventAt?: number;
   ownerSeenAt?: number;
+  /** 主群（`oc_…`）。指向的群不在关联里时按第一条 chat 关联算，见 {@link effectivePrimaryChat}。 */
+  primaryChat?: string;
+  /** 确实没有群时管家写的原因；只在这一项没有 chat 关联时生效。 */
+  noChatReason?: string;
 }
 
 export interface BoardEvent {
@@ -179,11 +193,13 @@ export function parseOptionSpec(raw: string): BoardOption | { error: string } {
   return { key: key.toUpperCase(), label, ...(effect ? { effect } : {}) };
 }
 
+export const CHAT_REF_PATTERN = /^oc_[A-Za-z0-9_-]{1,128}$/;
+
 const LINK_REF_PATTERNS: Record<BoardLinkKind, RegExp> = {
   pr: /^[\w.-]+\/[\w.-]+#\d+$/,
   issue: /^[\w.-]+\/[\w.-]+#\d+$/,
   commit: /^[\w.-]+\/[\w.-]+@[0-9a-f]{7,40}$/i,
-  chat: /^oc_[A-Za-z0-9_-]{1,128}$/,
+  chat: CHAT_REF_PATTERN,
   thread: /^oc_[A-Za-z0-9_-]{1,128}\/omt_[A-Za-z0-9_-]{1,128}$/,
   session: /^[A-Za-z0-9-]{8,64}$/,
   doc: /^https?:\/\/\S+$/,
@@ -278,12 +294,28 @@ export function linkUrl(link: BoardLink, ctx: LinkRenderContext): string | undef
   }
 }
 
-export function linkDefaultLabel(link: BoardLink): string {
+/** 关联的展示文字：管家的标签 > 查到的群名 > 按类型的默认写法。 */
+export function linkText(link: BoardLink, locale: Locale = 'zh'): string {
+  return link.label ?? link.chatName ?? linkDefaultLabel(link, locale);
+}
+
+/**
+ * 查到的群名进看板前规整：控制字符和连续空白压成一个空格，截到短文本上限。群名会进标签位和批次
+ * 文本，不能带换行或超长（手写标签有同样的上限）。
+ */
+export function cleanChatName(raw: string): string {
+  // eslint-disable-next-line no-control-regex
+  const flat = raw.replace(/[\u0000-\u001f\u007f\s]+/g, ' ').trim();
+  return flat.length > BOARD_LIMITS.shortText ? `${flat.slice(0, BOARD_LIMITS.shortText - 1)}…` : flat;
+}
+
+export function linkDefaultLabel(link: BoardLink, locale: Locale = 'zh'): string {
   switch (link.kind) {
     case 'pr': return `PR ${link.ref.slice(link.ref.indexOf('#'))}`;
     case 'issue': return `issue ${link.ref.slice(link.ref.indexOf('#'))}`;
     case 'commit': return link.ref.slice(link.ref.indexOf('@') + 1, link.ref.indexOf('@') + 8);
-    case 'chat': return 'chat';
+    // 没有标签的群（核实功能上线前写的旧关联）：至少带上 ID 开头，几个群之间分得清。
+    case 'chat': return `${locale === 'en' ? 'Chat' : '群'} ${link.ref.length > 11 ? `${link.ref.slice(0, 11)}…` : link.ref}`;
     case 'thread': return 'thread';
     case 'session': return `session ${link.ref.slice(0, 8)}`;
     case 'doc':
@@ -291,6 +323,20 @@ export function linkDefaultLabel(link: BoardLink): string {
       try { return new URL(link.ref).host; } catch { return link.ref.slice(0, 40); }
     }
   }
+}
+
+/**
+ * 一项的主群：管家指定的主群还挂在关联里就用它，否则取第一条 chat 关联（按写入顺序）。
+ * 存量数据没有指定主群，也照这条规则有主群，不用迁移。没有 chat 关联时返回 undefined。
+ */
+export function effectivePrimaryChat(links: readonly BoardLink[], primaryChat?: string): BoardLink | undefined {
+  const chats = links.filter(l => l.kind === 'chat');
+  return (primaryChat ? chats.find(l => l.ref === primaryChat) : undefined) ?? chats[0];
+}
+
+/** 没有群、也没写无群原因：list / show / 页面据此标「缺群」，提醒管家补。 */
+export function itemMissingChat(item: Pick<BoardItem, 'noChatReason'>, links: readonly BoardLink[]): boolean {
+  return !links.some(l => l.kind === 'chat') && !item.noChatReason?.trim();
 }
 
 /** 单项详情页的路径入口；Dashboard 收到后 302 到 `/#/board/<app>/<seq>`。 */
@@ -423,8 +469,11 @@ const GUIDE_PRESET_ZH = `你是 owner 的管家，帮 owner 推进他交代的�
 - 每次开工先看 \`botmux board pending\`（owner 已提交、你还没标记执行的决定），再看 \`botmux board list\`。
 
 ## 接任务（owner 在管家群里交代事情时）
-- 每件要跟的事建一项：\`botmux board add <标题> --key <去重键> --link pr=owner/repo#12 --link chat=oc_…\`。
-  已经有的用 \`botmux board set\` 更新，不重复建。交代得不清楚的，先在群里问清楚。
+- 每件要跟的事建一项，**必须带上这件事所在的飞书群**：\`botmux board add <标题> --key <去重键> --link chat=oc_… --link pr=owner/repo#12\`。
+  群名会自动查出来当标签；挂多个群（任务群 + 几个 PR 评审群）时第一个是主群，owner 在看板上点「进群」打开的就是它，要换用 \`--primary-chat oc_…\`。
+  确实没有群（只有 issue、还没开工、你自己处理）：写明原因 \`--no-chat "<原因>"\`，看板上显示「无群：<原因>」。
+  群查不到时会拒绝写入：先核对群 ID；确实要先写上，加 \`--allow-unverified-chat\`（看板上标「未核实」）。
+- 已经有的用 \`botmux board set\` 更新，不重复建。\`botmux board list\` 里标「缺群」的项，补上群（\`set <编号> --link chat=oc_…\`）或无群原因。交代得不清楚的，先在群里问清楚。
 
 ## 推进
 - 默认用你自己的 bot 身份到相关群发消息推进：\`botmux send --chat-id <群> --top-level --mention <open_id:名字> "…"\`。
@@ -454,8 +503,11 @@ const GUIDE_PRESET_EN = `You are the owner's steward. You push forward the devel
 - Every time you start, check \`botmux board pending\` (decisions the owner submitted that you have not marked handled), then \`botmux board list\`.
 
 ## Taking a task (when the owner asks for something in the steward chat)
-- Create one item per thing to track: \`botmux board add <title> --key <dedupe key> --link pr=owner/repo#12 --link chat=oc_…\`.
-  Update existing items with \`botmux board set\` instead of creating duplicates. Ask in the chat first if the request is unclear.
+- Create one item per thing to track, and **always link the Feishu chat where the work happens**: \`botmux board add <title> --key <dedupe key> --link chat=oc_… --link pr=owner/repo#12\`.
+  The chat name is looked up and used as the label. With several chats (task chat plus PR review chats) the first one is the main chat, which the owner's "Open chat" button opens; change it with \`--primary-chat oc_…\`.
+  If there really is no chat (only an issue, not started yet, or you handle it yourself), say why: \`--no-chat "<reason>"\`; the board shows "No chat: <reason>".
+  A chat that cannot be found is rejected: check the chat ID first; to write it anyway, add \`--allow-unverified-chat\` (shown as "Unverified").
+- Update existing items with \`botmux board set\` instead of creating duplicates. For items marked "missing chat" in \`botmux board list\`, add the chat (\`set <n> --link chat=oc_…\`) or a no-chat reason. Ask in the chat first if the request is unclear.
 
 ## Pushing work forward
 - By default, post as your own bot in the relevant chat: \`botmux send --chat-id <chat> --top-level --mention <open_id:name> "…"\`.
@@ -535,6 +587,8 @@ export interface BatchMessageEntry {
   recommended?: boolean;
   text: string;
   fileCount: number;
+  /** 这一项的主群：管家群里的回显和批次消息都带上，点了直接进群。 */
+  primaryChat?: { text: string; url: string };
 }
 
 export interface BatchMessageInput {
@@ -560,37 +614,103 @@ function formatClock(ms: number, timeZone?: string): string {
 }
 
 /**
+ * 一批决定里逐项的那部分：编号、标题、状态、主群链接、选的选项（键 + 选项原文）、说明原文、附图数。
+ * 管家会话里的批次消息和管家群里的回显共用这一份，两边对 owner 写了什么的呈现逐字一致。
+ * 说明原文不改写、不截断、不缩进、不 trim：单行多行一样，「说明：」后另起一行原样接上
+ *（首尾空白留在原文里，不会挤在冒号后面像格式问题）。
+ */
+export function formatBatchEntries(
+  entries: readonly BatchMessageEntry[],
+  locale: Locale,
+  images: 'attached' | 'below',
+): string {
+  const zh = locale !== 'en';
+  const blocks = entries.map(e => {
+    const stateLabel = BOARD_STATE_LABELS[zh ? 'zh' : 'en'][e.state];
+    const lines = [`#${e.seq} ${e.title}（${stateLabel}${e.stage ? `·${e.stage}` : ''}）`];
+    // 主群紧跟标题：说明原文可能多行，放在它后面会像说明的一部分。群名 / 标签压成一行，不能借换行伪造下一行。
+    if (e.primaryChat) lines.push(`${zh ? '主群：' : 'Main chat: '}${e.primaryChat.text.replace(/\s+/g, ' ').trim()} ${e.primaryChat.url}`);
+    if (e.choice) {
+      const tag = e.recommended ? (zh ? '（管家推荐）' : ' (recommended)') : '';
+      lines.push(zh
+        ? `选：${e.choice}${e.choiceLabel ? ` ${e.choiceLabel}` : ''}${tag}`
+        : `Choice: ${e.choice}${e.choiceLabel ? ` ${e.choiceLabel}` : ''}${tag}`);
+    } else {
+      lines.push(zh ? '选：未选' : 'Choice: none');
+    }
+    if (e.text.trim()) {
+      lines.push(`${zh ? '说明：' : 'Note:'}\n${e.text}`);
+    }
+    if (e.fileCount > 0) {
+      lines.push(images === 'attached'
+        ? (zh ? `附图：${e.fileCount} 张（已随消息附上）` : `Images: ${e.fileCount} (attached)`)
+        : (zh ? `附图：${e.fileCount} 张（见下方图片）` : `Images: ${e.fileCount} (see below)`));
+    }
+    return lines.join('\n');
+  });
+  return blocks.join('\n\n');
+}
+
+/**
  * 送进管家会话的那一条消息。自带「先读 guide」的指引：零注入的管家看不到常驻提示，
  * 靠这条消息本身也能照规则执行。
  */
 export function formatBatchMessage(input: BatchMessageInput): string {
   const zh = input.locale !== 'en';
   const when = formatClock(input.createdAt, input.timeZone);
-  const lines: string[] = [];
-  lines.push(zh
+  const head = zh
     ? `【决策看板 · 批次 #${input.batchId}】${input.authorName} ${when} 提交了 ${input.entries.length} 项决定。`
       + '按 `botmux board guide` 里「执行一批决定」一节逐项执行，每项做完运行 `botmux board history <编号> --handled "做了什么、结果"`。'
     : `[Decision board · batch #${input.batchId}] ${input.authorName} submitted ${input.entries.length} decision(s) at ${when}. `
-      + 'Follow "Executing a batch" in `botmux board guide`; after each item run `botmux board history <n> --handled "what you did and the result"`.');
-  for (const e of input.entries) {
-    const stateLabel = BOARD_STATE_LABELS[zh ? 'zh' : 'en'][e.state];
-    lines.push('');
-    lines.push(`#${e.seq} ${e.title}（${stateLabel}${e.stage ? `·${e.stage}` : ''}）`);
-    if (e.choice) {
-      const tag = e.recommended ? (zh ? '（管家推荐）' : ' (recommended)') : '';
-      lines.push(zh
-        ? `  选：${e.choice}${e.choiceLabel ? ` ${e.choiceLabel}` : ''}${tag}`
-        : `  Choice: ${e.choice}${e.choiceLabel ? ` ${e.choiceLabel}` : ''}${tag}`);
-    } else {
-      lines.push(zh ? '  选：未选' : '  Choice: none');
+      + 'Follow "Executing a batch" in `botmux board guide`; after each item run `botmux board history <n> --handled "what you did and the result"`.';
+  return `${head}\n\n${formatBatchEntries(input.entries, input.locale, 'attached')}`;
+}
+
+/**
+ * 管家群里的回显：横幅一行 + 逐项内容（与批次消息同一份），不带给管家看的执行指令。
+ * 附图另外以图片消息发在后面，所以这里写「见下方图片」。
+ */
+export function formatBatchEcho(input: { header: string; entries: readonly BatchMessageEntry[]; locale: Locale }): string {
+  return `${input.header}\n\n${formatBatchEntries(input.entries, input.locale, 'below')}`;
+}
+
+/**
+ * 回显单条文本消息的上限（UTF-8 字节）。飞书文本消息请求体上限 150KB，正文还要经过
+ * JSON 转义（换行、引号会变长），取 30KB 留足余量；一批正常长度的决定落在一条消息里。
+ */
+export const BATCH_ECHO_MAX_BYTES = 30 * 1024;
+
+const utf8 = new TextEncoder();
+const byteLength = (text: string): number => utf8.encode(text).length;
+
+/**
+ * 把回显切成每条不超过 maxBytes 的几段，拼回去与原文逐字相同（不丢字、不加字）。
+ * 优先切在两项之间的空行后，其次换行后，都没有（单行就超长）才按字符硬切，且不切开代理对。
+ * 切点离段首太近（不到半段）时不迁就边界，避免切出零碎的小段。
+ */
+export function splitEchoText(text: string, maxBytes: number = BATCH_ECHO_MAX_BYTES): string[] {
+  if (maxBytes < 4) throw new RangeError('maxBytes must be at least 4');
+  const chunks: string[] = [];
+  let rest = text;
+  while (byteLength(rest) > maxBytes) {
+    // 二分出不超过上限的最长前缀（按 UTF-16 下标，再退开半个代理对）。
+    let lo = 1;
+    let hi = rest.length;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (byteLength(rest.slice(0, mid)) <= maxBytes) lo = mid; else hi = mid - 1;
     }
-    if (e.text.trim()) {
-      const body = e.text.trim().split('\n').join('\n    ');
-      lines.push(zh ? `  说明：${body}` : `  Note: ${body}`);
-    }
-    if (e.fileCount > 0) {
-      lines.push(zh ? `  附图：${e.fileCount} 张（已随消息附上）` : `  Images: ${e.fileCount} (attached)`);
-    }
+    let cut = lo;
+    const code = rest.charCodeAt(cut - 1);
+    if (code >= 0xd800 && code <= 0xdbff && cut > 1) cut -= 1;
+    const prefix = rest.slice(0, cut);
+    const blank = prefix.lastIndexOf('\n\n');
+    const line = prefix.lastIndexOf('\n');
+    if (blank >= 0 && blank + 2 >= cut / 2) cut = blank + 2;
+    else if (line >= 0 && line + 1 >= cut / 2) cut = line + 1;
+    chunks.push(rest.slice(0, cut));
+    rest = rest.slice(cut);
   }
-  return lines.join('\n');
+  if (rest) chunks.push(rest);
+  return chunks;
 }

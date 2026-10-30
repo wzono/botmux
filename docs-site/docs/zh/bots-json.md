@@ -61,7 +61,7 @@
 | `env` | 该 bot 的进程环境变量 `{ "KEY": "值" }`，注入到这个 bot 的 CLI 进程。最常见用途：让某个 bot 跑 GLM / 第三方 Anthropic·OpenAI 兼容服务商（见下方示例），也可设 `HTTPS_PROXY` 或 CLI 专属开关。值支持字符串 / 数字 / 布尔；`BOTMUX_` / `LARK_APP_` 等 botmux 保留键会被忽略。按**会话**注入（下个新会话生效），不写入共享 tmux server 全局、不会串到别的 bot。它就是「会话环境变量」Bot 层的「设置」，也可在 Dashboard「Bot 配置 → 高级 → 启动环境 → 会话环境变量」配置 |
 | `envUnset` | 在这个 bot 的会话里去掉的继承变量名列表，如 `["BYTECLOUD_AUTH_AS"]`（「会话环境变量」Bot 层的「去掉」，见下文）。botmux 保留变量与 `PATH` / `HOME` 不能去掉；同一个名字也写在 `env` 里时按 `env` 处理。下个新会话生效 |
 | `quotaFallbackBot` | CLI 额度耗尽后的可选自动交接：`{ "enabled": true, "targetAppId": "cli_...", "kinds"?: ["usage", "rate"], "message"?: "..." }`。默认关闭；可在 Dashboard「Bot 配置 → 高级」编辑。详见下方 |
-| `codexCapacityRecovery` | **默认关闭**。仅对托管 Codex 飞书会话的明确模型容量错误自动续跑，设为 `true` 开启；可用 `/botconfig set codexCapacityRecovery on` / `off` 在线切换。每个任务最多追加两条恢复输入，可能保留在原生模型上下文中，关闭不会删除已有历史；不针对特定 provider，普通限流与额度耗尽不适用。 |
+| `codexCapacityRecovery` | **默认关闭**。仅对托管 Codex / Codex App 飞书会话的明确模型容量错误自动续跑，设为 `true` 开启；可用 `/botconfig set codexCapacityRecovery on` / `off` 在线切换。每个任务最多追加两条恢复输入，可能保留在原生模型上下文中，关闭不会删除已有历史；不针对特定 provider，普通限流与额度耗尽不适用。 |
 | `suppressDeliveredFinalFailureNotice` | **实验性、默认关闭**。设为 `true` 后，结构化转写会话（如 Codex）中同一轮、同一次执行尝试已带飞书回执送达显式 final（`botmux send --response-kind final` 或托管 final 卡）时，收尾阶段再遇到模型服务错误（如 527）只记日志与失败终态，不再补发「模型连接失败」通知。该开关信任已送达的 final，不比对模型事后续写的文本；进度 / 补充消息、未带回执或跨轮次的发送不受影响。缺省 / `false` 与此前行为一致。可用 `/botconfig set suppressDeliveredFinalFailureNotice on` / `off` 切换，下个 worker 启动生效 |
 | `codexAppCleanInput` | **实验性**，且仅对 Botmux 托管、实际运行 `codex-app` 的 session 生效。设为 `true` 后，Codex App 的可见 / 持久化文本 `UserMessage` 只保留用户原始输入，消息级 Botmux 上下文主要改走 `additionalContext`；默认关闭，从下一次 turn 派发生效，不改已有历史。详见下方说明 |
 | `codexBrowser` | **实验性、默认关闭**。仅支持 `cliId: "codex-app"`。可在 Dashboard 的“高级 → Codex App”中开关；设为 `true` 后，新会话可通过本机已安装的 Codex Chrome 插件控制 Chrome。对象形式可指定 `{ "enabled": true, "family": "chrome" | "edge", "pluginRoot"?: "/绝对路径" }`，详见下方说明 |
@@ -223,7 +223,7 @@ Dashboard 保存后无需重启 daemon。模型、思考强度分别选择“继
 | `restrictGrantCommands` | `true` 时，仅靠 per-user 授权（`chatGrants` / `globalGrants`）放行的人禁用**所有斜杠命令**，只能普通对话；owner / `allowedUsers` / oncall / 整群成员不受影响。默认 `false` |
 | `autoGrantRequestCards` | 默认开启。显式设为 `false` 时，群里未授权的人或外部 bot @ 本 bot 但被对话权限闸挡住时，不再自动给 owner 发 `/grant` 申请卡，改为静默丢弃 |
 | `grantRequestToOwnerDm` | 默认关闭。设为 `true` 时，会话里没有管理员能点申请卡（群里查不到管理员，或私聊被挡）就把申请卡改发到主 owner 私聊，申请人只收到中性回执、处置结果回告原会话；有 owner 维度总量节流（每小时 20 张，发送失败不占名额），超限或发送失败时不发卡、下一条消息再重试。需 `autoGrantRequestCards` 未关闭。详见[权限与授权 · 授权申请卡](/permissions#授权申请卡) |
-| `trustSameOwnerBots` | 默认开启。管理员都是本 bot 管理员的同机 Bot（本机 `bots.json` 里的其它应用，按 union_id 识别）可以执行管理命令，@ 本 bot 时同一条消息里点名的人自动获得本群对话授权（额度 / 有效期同 `/grant` 默认值）。owner 不同的同机 Bot 不受影响。设为 `false` 时同机 Bot 只能对话。见 [权限与授权 · 同机 Bot](/permissions#同机-bot管理命令与点名授权-trustsameownerbots) |
+| `trustSameOwnerBots` | 默认开启。管理员都是本 bot 管理员的同机 Bot（本机 `bots.json` 里的其它应用，按 union_id 识别）可以执行管理命令、本 bot 还没认出它时也直接放行对话，@ 本 bot 时同一条消息里点名的人自动获得本群对话授权（额度 / 有效期同 `/grant` 默认值）。owner 不同的同机 Bot 不受影响。设为 `false` 时同机 Bot 只能对话，[决策看板](/decision-board)核实群时也不再借用其他 Bot 的凭据、只用本 Bot 自己查。见 [权限与授权 · 同机 Bot](/permissions#同机-bot管理命令与点名授权-trustsameownerbots) |
 | `grantDelegateBots` | 默认未配置（空名单 = 行为完全不变）。owner 显式列出的外部委托授权 bot 名单——同 owner 同机 Bot（`trustSameOwnerBots`）之外的第二条委托来源，两者互相独立。条目是受信 bot 在本 bot 视角的 `ou_` open_id，也接受 `cli_` app_id（trim、去空白项）。名单里的 bot 在群里发消息 @ 本 bot 时，同一条消息里被它 @ 的其他人自动获得**本群对话授权**（写 `chatGrants`，仅 talk、不授管理权），额度 / 有效期与 `/grant` 默认值一致（未配置时 3 条 / 1 小时），并回一张授权结果卡。适合外部平台用自己的 bot 建群、发开场卡点名提需求者的场景。已能对话者、发送方自己、@所有人、黑名单用户跳过（委托 bot 自己被拉黑时整条跳过）；不写 `allowedUsers` / `allowedChatGroups` / `globalGrants`。也可在 Dashboard「Bot 配置 → 授权与额度」或 `/botconfig set grantDelegateBots …` 配置。详见[权限与授权 · 委托授权 bot](/permissions#委托授权-bot-grantdelegatebots) |
 | `blockedUsers` | 黑名单（与 `allowedUsers` 同款标识：邮箱 / 手机号 / `on_xxx` / `ou_xxx`），sender 维度全局否决：群聊与私聊都生效，优先于 oncall / 整群放开 / 访客授权 / 团队信任等所有放行腿；被拉黑者被拦时不发授权申请卡。owner / 管理员不可被拉黑（写入口拒绝）。不影响消息监听器的监听匹配。也可在 Dashboard「Bot 配置」与群成员弹层维护。完整说明见[权限与授权 · 黑名单](/permissions#黑名单-blockedusers) |
 
@@ -247,6 +247,7 @@ Dashboard 保存后无需重启 daemon。模型、思考强度分别选择“继
 | 字段 | 说明 |
 |------|------|
 | `replyCardMode` | `legacy`（默认）分别发送进度与答复；`unified` 将同一轮公开进度、工具记录、执行状态和最终答复更新到同一张卡。支持未启用文件沙盒的 Claude Code / Codex / Grok 普通飞书会话，从下一轮生效。Grok 展示公开旁白和工具事件，不转发原始思考或 hook 内容；其他入口沿用默认路径。独立终端状态卡由 `disableStreamingCard` 单独控制。 |
+| `replyCardShowTools` | 仅用于 `unified` 回复卡。缺省显示工具调用；设为 `false` 时隐藏工具节点、命令、结果与折叠区标题的工具次数，仍显示思考摘要与主动发送的进度。原生 CoT 气泡不受影响，`/cot show` 也不会显示被隐藏的工具。可在 Dashboard「Bot 默认 → 卡片设置」配置，或执行 `/botconfig set replyCardShowTools off`；`legacy` 模式下无效，切换回答模式保留该设置。 |
 | `brandLabel` | 卡片底部品牌文案（仅在最终回答与顶层广播卡片中展示）。`undefined`=默认 `botmux` 链接；`""`=隐藏；其它字符串=原样渲染（支持 markdown）。另受机器级总开关 `dashboard.cardBrandLabel` 约束（Dashboard「设置 → 飞书卡片」，缺省开）：关闭后所有 Bot 一律不显示页脚签名，本字段在 Bot 配置页置灰。纯样式，不影响路由 / 权限 |
 | `showUsageInCardFooter` | 回复卡片页脚是否展示 Agent CLI 原生提供的 Context / Token 用量。缺省 / `true`=展示，`false`=同时隐藏两项；单项数据缺失时仍只省略缺失项。仅控制卡片展示，不停止 Usage Ledger 或其它统计 |
 | `cardFooterExtension` | 在卡片用量段末尾追加自定义文本。`{"command": "<shell 命令>", "refreshSeconds": 60}`：daemon 在卡片渲染时按 bot 懒执行命令（缓存到刷新间隔才在后台跑，同一 bot 的会话共用结果），输出接在用量后面，显示位置跟随 `usageDisplay`。详见 [卡片用量段自定义扩展](/cards#卡片用量段自定义扩展) |

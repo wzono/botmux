@@ -17,8 +17,8 @@
  *                                 显式 `/grant @x N` 恒生效，与此无关。
  *   • grantDefaultDurationMs    — 新授权卡默认有限时长。缺省 = 产品默认 1 小时；
  *                                 只接受授权卡已有的四个有限时长。
- *   • trustSameOwnerBots        — 信任同一 owner 的同机 Bot：可执行管理命令、@ 本 bot 时点名的人
- *                                 自动获本群对话授权（默认开启；false 显式关闭）。
+ *   • trustSameOwnerBots        — 信任同一 owner 的同机 Bot：可执行管理命令、未认出时也免授权
+ *                                 对话、@ 本 bot 时点名的人自动获本群对话授权（默认开启；false 显式关闭）。
  *   • grantDelegateBots         — 委托授权的外部 bot 显式名单（ou_ open_id / cli_ app_id）：
  *                                 名单里的 bot @ 本 bot 时点名的人自动获本群对话授权。
  *                                 同机 Bot 之外的第二条委托来源；默认空，空名单不写盘。

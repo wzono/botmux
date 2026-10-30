@@ -1,5 +1,6 @@
 import { parseGroupCreationDefaults } from './group-creation-options.js';
 import { normalizeStewardConfig } from '../core/decision-board/model.js';
+import { formatZcodeModelChoice, resolveZcodeModelReference, zcodeAmbiguousModelIds } from './zcode-models.js';
 import { parseSandboxNetworkPolicy, networkPolicySupportError } from '../core/sandbox-network-policy.js';
 /**
  * `/config` 远程编辑 bot 运营字段。与 oncall-store / grant-prefs-store / brand-store
@@ -51,6 +52,7 @@ import {
   cliModelSupportsReasoningEffort,
   isCodexReasoningEffort,
   isConfigurableReasoningCliId,
+  reasoningEffortsForCliModel,
 } from './codex-reasoning-effort.js';
 import { isCodexServiceTier, isCodexServiceTierCliId } from './codex-service-tier.js';
 import { validateCodexServiceTier } from './codex-service-tier-catalog.js';
@@ -146,6 +148,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'pinStreamingCard', configKey: 'pinStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '置顶当前公开实时卡片 on|off（失败不影响会话）' },
   { key: 'cotEnabled', configKey: 'cotEnabled', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '思考过程消息 on|off（默认 on）：turn 进行中把模型思考过程以飞书原生 CoT 消息（message_cot）流式展示（客户端需 PC ≥7.70 / 移动端 ≥7.74；支持 claude-code / codex / traex / pi 等适配器）。这是 bot 级总开关，单个群可用 /cot off 关闭' },
   { key: 'thinkingCardToolResult', configKey: 'thinkingCardToolResult', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '思考气泡是否贴工具输出 on|off（默认 on）：off 时气泡只保留思考段落与工具节点标题（工具名 · 命令/路径），不再附带命令输出/文件内容代码块，与 Claude Code 自身界面一致' },
+  { key: 'replyCardShowTools', configKey: 'replyCardShowTools', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '动态单卡是否显示工具调用 on|off（默认 on）：仅 replyCardMode=unified 时生效，legacy 模式无效（切换模式保留该值）；off 时卡片隐藏工具节点、命令、结果与工具次数，思考摘要和公开进度仍显示；不影响原生思考气泡，/cot show 也不会显示被隐藏的工具' },
   { key: 'silentTurnReactions', configKey: 'silentTurnReactions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭无卡片模式下的 GoGoGo/DONE reaction 和 Codex App 追加指令确认回执 on|off' },
   { key: 'writableTerminalLinkInCard', configKey: 'writableTerminalLinkInCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '卡片内嵌可写终端链接 on|off' },
   { key: 'privateCard', configKey: 'privateCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/card 发 owner-only 私有快照 on|off' },
@@ -172,7 +175,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'senderTag', configKey: 'senderTag', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '每轮注入 <sender> 发言人标签 on|off（默认 on）：标注本轮是谁在说话（open_id/姓名/邮箱）。关掉后模型看不到发言人身份，多人会话里无法区分谁说的；--mention-back 不受影响（走 daemon 侧独立记录）。代价：/adopt 少一条识别本 bot 自产会话的指纹，dashboard 洞察无法从标签判断发言人类型与 A2A 对方名字' },
   { key: 'restrictGrantCommands', configKey: 'restrictGrantCommands', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被授权人仅能纯对话、拦截斜杠命令 on|off' },
   { key: 'grantRequestToOwnerDm', configKey: 'grantRequestToOwnerDm', kind: 'boolean', effect: 'immediate', clearable: false, hint: '授权申请卡转投 owner 私聊 on|off（默认 off）：会话里没有管理员（群里查不到管理员、或私聊被挡）时，申请卡发到主 owner 私聊，申请人只收到中性回执；适合 owner 不进群的用法' },
-  { key: 'trustSameOwnerBots', configKey: 'trustSameOwnerBots', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '信任同一 owner 的同机 Bot on|off（默认 on）：本机 bots.json 里管理员都是本 bot 管理员的 bot 可执行管理命令，@ 本 bot 时同条消息点名的人自动获本群对话授权（额度/有效期同授权卡）；多一个本 bot 不认的管理员就不受信任；off 则同机 bot 只能对话' },
+  { key: 'trustSameOwnerBots', configKey: 'trustSameOwnerBots', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '信任同一 owner 的同机 Bot on|off（默认 on）：本机 bots.json 里管理员都是本 bot 管理员的 bot 可执行管理命令、未认出时也免授权对话，@ 本 bot 时同条消息点名的人自动获本群对话授权（额度/有效期同授权卡）；多一个本 bot 不认的管理员就不受信任；off 则同机 bot 只能对话' },
   { key: 'grantDelegateBots', configKey: 'grantDelegateBots', kind: 'stringList', effect: 'immediate', clearable: true, parseList: parseGrantDelegateBotsInput, hint: '委托授权的外部 bot 名单（发送方在本 bot 视角的 ou_ open_id 或 cli_ app_id，逗号/空格分隔）：名单里的 bot @ 本 bot 时同条消息点名的人自动获本群对话授权（talk-only，额度/有效期同授权卡）；同机 Bot 信任之外的第二条委托来源；unset 清空（默认空，行为与现状一致）' },
   { key: 'p2pOpen', configKey: 'p2pOpen', kind: 'boolean', effect: 'immediate', clearable: false, hint: '私聊对话全开 on|off：任何能看到本 bot 的人都可私聊（只放行对话；管理操作默认仍只认 allowedUsers，被 canTalkDaemonCommands 显式降级的命令除外）；不影响群聊' },
   { key: 'p2pMode', configKey: 'p2pMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['thread', 'chat', 'group'], hint: '私聊单聊模式 thread|chat|group；默认 chat=扁平连续会话，thread=每条 DM 独立会话，group=每条 DM 自动建专属会话群（chat/unset 回默认）' },
@@ -189,7 +192,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'codexAuthSync', configKey: 'codexAuthSync', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['shared', 'isolated'], hint: 'Codex 鉴权策略：shared=保持旧行为（非沙箱直接使用全局 ~/.codex；沙箱冷启动同步全局 auth 到 per-bot CODEX_HOME）｜isolated=无论是否启用沙箱都使用 per-bot CODEX_HOME，绝不复制全局凭证，需在该目录单独执行 codex login --with-api-key' },
   { key: 'credentialsSourceDir', configKey: 'credentialsSourceDir', kind: 'dir', effect: 'next-session', clearable: true, hint: 'CLI 凭证来源目录（如 ~/accounts/acct-b，内按 CLI 分子目录：claude/.credentials.json）：沙箱 bot 每次冷启动从这里复制凭证，而不是用本机共享登录；来源不可用即拒绝启动、绝不回退共享登录；目前仅支持 claude-code；完全未开沙箱的 bot 不生效（仍用全局登录），已开沙箱却无法重定向数据目录（wrapperCli / adapter 不支持 / 缺 SESSION_DATA_DIR）则拒绝启动；token 刷新由外部负责；unset 回共享登录' },
   { key: 'codexInstancePool', configKey: 'codexInstancePool', kind: 'json', effect: 'next-session', clearable: true, hint: '会话级 Codex 实例：显式 defaultInstanceId 与 instances[{id,codexHome,weight}]，weight默认1；scope=ordinary-feishu，strategy=random。仅新会话分配，已有会话保持绑定。使用 botmux codex-instances check 检查本机目录。' },
-  { key: 'triggerUserAuth', configKey: 'triggerUserAuth', kind: 'json', effect: 'next-session', clearable: true, hint: '按触发人身份调用 CLI（默认关闭）：开启后本 bot 调 lark-cli / bytedcli 用「发这条消息的人」自己的授权，而不是本机登录态。JSON 形如 {"enabled":true,"tools":["lark-cli","bytedcli"]}；tools 省略=全部。未授权时 lark-cli / bytedcli 一律拒绝（拒绝消息里会附授权链接，点开后重试即可），不会用 bot 或任何人的身份代跑；fallback 字段仅为兼容旧配置保留，当前不再改变行为。注意 bytedcli 没有 bot 身份，对它 fallback 恒等于失败。可选 credentialSource：auto（默认）：本机未绑定中心化平台时等同 local；已绑定时先向平台取该人的短期凭据（平台保管与续期），取不到则用本机已有的授权，再没有就拒绝并给平台授权链接，已绑定的机器绝不再自动发起本机扫码。platform：只用平台，未绑定或不可达一律拒绝。local：只用本机扫码，不咨询平台。非法取值会被拒绝保存。可选 gitHost（如 code.example.com）让该代码平台的 git 推送也按当轮身份鉴权，并把 SSH 远端改写成 HTTPS；可选 gitTokenExchangeUrl（https）作为 bytedcli 取不到 JWT 时的兜底换取端点。下个会话生效；unset 清除（关闭）' },
+  { key: 'triggerUserAuth', configKey: 'triggerUserAuth', kind: 'json', effect: 'next-session', clearable: true, hint: '按触发人身份调用 CLI（默认关闭）：开启后本 bot 调 lark-cli / bytedcli 用「发这条消息的人」自己的授权，而不是本机登录态。JSON 形如 {"enabled":true,"tools":["lark-cli","bytedcli"]}；tools 省略=全部。未授权时 lark-cli / bytedcli 一律拒绝（拒绝消息里会附授权链接，点开后重试即可），不会用 bot 或任何人的身份代跑；fallback 字段仅为兼容旧配置保留，当前不再改变行为。注意 bytedcli 没有 bot 身份，对它 fallback 恒等于失败。可选 credentialSource：auto（默认）：本机未绑定中心化平台时等同 local；已绑定时先向平台取该人的短期凭据（平台保管与续期），取不到则用本机已有的授权，再没有就拒绝并给平台授权链接，已绑定的机器绝不再自动发起本机扫码。platform：只用平台，未绑定或不可达一律拒绝。local：只用本机扫码，不咨询平台。非法取值会被拒绝保存。可选 delegateOnMention（默认 true）：本 bot 在真人直接发起的一轮里用 botmux send --mention 交接给同机 bot 时，对方以这位发起人的身份调用工具；设为 false 关闭。可选 gitHost（如 code.example.com）让该代码平台的 git 推送也按当轮身份鉴权，并把 SSH 远端改写成 HTTPS；可选 gitTokenExchangeUrl（https）作为 bytedcli 取不到 JWT 时的兜底换取端点。下个会话生效；unset 清除（关闭）' },
   { key: 'larkToolBinding', configKey: 'larkToolBinding', kind: 'boolean', defaultOn: true, effect: 'next-session', clearable: true, hint: 'lark-cli 绑定当前机器人应用身份 on|off（默认 on）：会话内 lark-cli 默认使用当前 bot 凭证并允许 --profile 切换宿主 profile；设为 off 则完全不注入当前 bot 凭据；需 /restart 重启或新建会话生效' },
   { key: 'backendType', configKey: 'backendType', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'riff', 'mojo', 'remote-runner'], hint: '会话后端类型：pty=本地 PTY 子进程（默认）｜tmux=tmux 会话｜herdr=herdr 终端复用｜zellij=zellij 多路复用｜zmx=ZMX >=0.7.0 纯文本持久会话（无 Web TUI）｜riff=远程 riff agent 服务｜mojo=远程 mojo agent（headless mojo CLI）｜remote-runner=外置 provider；选 riff 时需配置 riff 字段，mojo/remoteRunner 字段可选；unset 回 pty' },
   { key: 'riff', configKey: 'riff', kind: 'json', effect: 'next-session', clearable: true, hint: 'riff 后端配置 JSON（baseUrl/agent/model/jwt 等），仅 backendType=riff 时生效；多用户共享主机上，用 jwtHome 指向该 bot 归属用户的 home（绝对路径）以读到他自己的 ByteCloud 登录态；unset 清除' },
@@ -441,7 +444,10 @@ async function applyConfigFieldInternal(
   if (spec.configKey === 'sandboxNetworkPolicy' && value !== null) {
     try {
       value = parseSandboxNetworkPolicy(value);
-      const reason = networkPolicySupportError({ platform: process.platform, backendType: bot.config.backendType ?? 'pty', sandbox: bot.config.sandbox, policy: value });
+      // Judge the backend new sessions launch on: the override, else the
+      // daemon default (tmux unless BACKEND_TYPE says otherwise), CLI-paired.
+      const backendType = resolvePairedBackendId(bot.config.cliId, bot.config.backendType, config.daemon.backendType) ?? 'pty';
+      const reason = networkPolicySupportError({ platform: process.platform, backendType, sandbox: bot.config.sandbox, policy: value });
       if (reason) return { ok: false, reason };
     } catch (error) { return { ok: false, reason: (error as Error).message }; }
   }
@@ -1224,6 +1230,11 @@ export interface ConfigCardData {
   cliOptions: Array<{ id: string; label: string }>;
   model: string | null;
   modelChoices: string[];
+  /** Reasoning levels offered when this bot's CLI supports the control. */
+  reasoningEfforts?: string[];
+  /** Currently configured reasoning effort (null = CLI/model default). */
+  reasoningEffort?: string | null;
+  modelChoiceLabels?: Record<string, string>;
   lang: string | null;
   /** 私聊单聊模式 p2pMode（'chat' | 'thread' | 'group'）；null = 未设（默认 chat）。 */
   p2pMode: string | null;
@@ -1248,13 +1259,28 @@ export function getConfigCardData(larkAppId: string, modelChoices: readonly stri
   try { bot = getBot(larkAppId); } catch { return null; }
   const cfg = bot.config;
   const q = cfg.messageQuota?.defaultLimit;
+  let selectedModel = cfg.model ?? null;
+  const zcodeEnv = { ...process.env, ...cfg.env };
+  const modelChoiceLabels = cfg.cliId === 'zcode'
+    // Same model name behind two gateways must stay distinguishable in the card.
+    ? Object.fromEntries(modelChoices.map(m => [m, formatZcodeModelChoice(m, zcodeEnv, zcodeAmbiguousModelIds(zcodeEnv))])) : undefined;
+  if (cfg.cliId === 'zcode' && selectedModel) {
+    try { const ref = resolveZcodeModelReference(selectedModel, { ...process.env, ...cfg.env }); selectedModel = `${ref.providerId}/${ref.modelId}`; } catch { /* stale selections remain visible */ }
+  }
   return {
     larkAppId,
     botName: cfg.displayName ?? bot.botName ?? cfg.cliId,
     cliId: selectionKeyForBot(cfg.cliId, cfg.wrapperCli, cfg.cliLaunchMode),
     cliOptions: CLI_SELECT_OPTIONS.map(o => ({ id: o.key, label: o.label })),
-    model: cfg.model ?? null,
+    model: selectedModel,
+    ...(modelChoiceLabels ? { modelChoiceLabels } : {}),
     modelChoices: [...modelChoices],
+    ...(isConfigurableReasoningCliId(cfg.cliId)
+      ? {
+        reasoningEfforts: [...reasoningEffortsForCliModel(cfg.cliId, cfg.model)],
+        reasoningEffort: isCodexReasoningEffort(cfg.reasoningEffort) ? cfg.reasoningEffort : null,
+      }
+      : {}),
     lang: cfg.lang ?? null,
     p2pMode: cfg.p2pMode ?? null,
     brandLabel: cfg.brandLabel ?? null,

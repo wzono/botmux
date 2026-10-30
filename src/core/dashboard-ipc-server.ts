@@ -2,12 +2,18 @@ import { normalizeCodexProfile, scanCodexProfiles, validateCodexProfile, CodexPr
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } from '../services/reply-footer.js';
 import { boardErrorStatus, type BoardCliRequest, type DecisionBoardService } from './decision-board/service.js';
 import type { CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
+import { botHomeForSessionDataDir, botUsesIsolatedCodexHome, hostCodexConfigPath, isolatedCodexConfigPath, resyncIsolatedCodexConfig } from '../services/codex-isolated-config.js';
 import { readTurnRegistration } from './trigger-registration.js';
 import { lookupTurnResultRequest } from './turn-result-routes.js';
 import { normalizeCalendarBinding, normalizeCalendarDayType, listWorkCalendars, previewTaskCalendar } from '../services/work-calendar.js';
 import { resolveWorkspace } from './workspace-metadata.js';
 // src/core/dashboard-ipc-server.ts
 import { canOperate } from '../im/lark/event-dispatcher.js';
+import {
+  DASHBOARD_SCHEDULE_CREATOR_HEADER,
+  dashboardCreatorFromRequest,
+  resolveDashboardScheduleCreator,
+} from './dashboard-schedule-creator.js';
 import { parseHandoffCardEvent } from './handoff-card-lifecycle.js';
 import { updateHandoffLiveCard } from './worker-pool.js';
 import { authorizeOwnerlessScheduleCreator, authorizeScheduleOperator } from './schedule-creator-authorization.js';
@@ -16,7 +22,8 @@ import { createServer, type IncomingMessage, type ServerResponse, type Server } 
 import { randomBytes } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { readFileSync, unlinkSync } from 'node:fs';
+import { existsSync, readFileSync, unlinkSync } from 'node:fs';
+import { hostDnsServers, networkPolicyWarnings, proxyEnvKeys } from './sandbox-network-policy.js';
 import { join } from 'node:path';
 import { logger } from '../utils/logger.js';
 import type { DurableLarkOutboxTarget } from '../services/durable-lark-outbox.js';
@@ -26,7 +33,7 @@ import { WORKFLOW_DAEMON_IPC_ROUTE_PREFIX } from '../workflows/v3/daemon-ipc-aut
 import { DISPATCH_LAUNCH_IPC_ROUTE_PREFIX } from './dispatch-launch-ipc-auth.js';
 import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from '../workflows/v3/session-relay.js';
 import { REPORT_SESSION_RELAY_ROUTE } from './report-session-relay.js';
-import { DISPATCH_USER_DELIVERY_ROUTE } from './dispatch-user-delegation.js';
+import { DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from './dispatch-user-delegation.js';
 import { DISPATCH_REPORT_REGISTER_ROUTE } from './dispatch-report-binding.js';
 import { listenWithProbe } from '../utils/listen-with-probe.js';
 import { dashboardSecretPath } from './dashboard-secret.js';
@@ -48,7 +55,8 @@ import {
 } from '../services/codex-reasoning-effort.js';
 import { isCodexServiceTier, isCodexServiceTierCliId, type CodexServiceTier } from '../services/codex-service-tier.js';
 import { validateCodexServiceTier } from '../services/codex-service-tier-catalog.js';
-import { botOneShotProbeEnv } from './session-env-resolve.js';
+import { botOneShotProbeEnv, sessionNetworkPolicyEnvView } from './session-env-resolve.js';
+import { resolvePairedBackendId } from './remote-cli-ids.js';
 import {
   botSessionEnvView,
   globalSessionEnvView,
@@ -87,6 +95,7 @@ import { createGroupWithBots, transferGroupOwner } from '../services/group-creat
 import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
+import { findForbiddenReadWritePaths } from '../services/sandbox-path-guard.js';
 import { sandboxBoolValue } from '../adapters/cli/sandbox-mode.js';
 import * as backendTypeStore from '../services/backend-type-store.js';
 import { setGroupIdleClose } from '../services/group-idle-close-store.js';
@@ -98,6 +107,7 @@ import { setGroupDefaultModels } from '../services/group-default-models-store.js
 import { parseGroupDefaultModels } from './group-default-models.js';
 import { setChatStreamingCardPin } from '../services/pin-streaming-card-mode-store.js';
 import { isValidRiffBaseUrl, isValidRiffSandboxCluster } from '../adapters/backend/riff-backend.js';
+import { probeScratchCapability } from '../adapters/backend/scratch-capability.js';
 import { ensureBackendAvailable } from '../services/backend-availability.js';
 import type { BackendType } from '../adapters/backend/types.js';
 import * as persistentBackend from './persistent-backend.js';
@@ -117,6 +127,7 @@ import {
 } from '../cli/current-actor.js';
 import {
   CURRENT_EXECUTION_ROUTE,
+  CURRENT_EXECUTION_ORIGIN_FIELD,
   CURRENT_EXECUTION_SCHEMA,
   CURRENT_EXECUTION_IDENTITY_ROUTE,
   CURRENT_EXECUTION_IDENTITY_SCHEMA,
@@ -224,7 +235,7 @@ import {
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
-import { deleteMessage, getChatMode, getChatModeStrict, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, getMessageDetail, type ChatBotMember } from '../im/lark/client.js';
+import { deleteMessage, getChatMode, getChatModeStrict, replyMessage, sendMessage, resolveUnionIdFromOpenId, resolveTargetAppOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, getMessageDetail, type ChatBotMember } from '../im/lark/client.js';
 import { fillNativeTopicId, isNativeTopicId } from './native-topic-id.js';
 import { parseProjectCoordinatorAction } from '../services/project-coordinator.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
@@ -257,6 +268,7 @@ import {
   type AppSlashCommandSyncResult,
   type AppSlashCommandUnavailable,
 } from '../im/lark/app-slash-commands.js';
+import { pluginCommandGateway } from './plugins/commands/runtime.js';
 import { buildScopeDeepLink } from '../setup/verify-permissions.js';
 import { sessionConfiguredRuntimeDisplayName } from './cli-runtime-display.js';
 import { locateLimiter } from './dashboard-locate.js';
@@ -480,7 +492,9 @@ import {
   type SessionRow,
 } from './dashboard-rows.js';
 import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
-import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
+import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, isUsableOpenId, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
+import { queryTriggerUserAuthStatus } from '../services/trigger-user-auth-status.js';
+import { revokeTriggerUserAuth } from '../services/revoke-trigger-user-auth.js';
 import { tokenStoreProtection, triggerUserAuthApplies, credentialSourceOf, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from '../services/credential-bearing-mcp.js';
@@ -1126,7 +1140,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // exceptions: a receiver that learned another session id could otherwise
   // forge readiness or an ask for that session.
   if (method === 'POST' && pathname === '/api/session-ready') return true;
-  if (method === 'POST' && pathname === '/api/asks') return true;
+  if (method === 'POST' && (pathname === '/api/asks' || pathname === '/api/asks/form-v1')) return true;
   // The dsh-tui wrapper plugin's structured end-of-turn report (`botmux
   // __turn-idle-v2`) runs INSIDE the CLI process, so it cannot read the host
   // secret either. The handler verifies this session's rotating per-turn
@@ -1158,6 +1172,18 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   if (method === 'POST' && pathname === REPORT_SESSION_RELAY_ROUTE) return true;
   if (method === 'POST' && pathname === DISPATCH_REPORT_REGISTER_ROUTE) return true;
   if (method === 'POST' && pathname === DISPATCH_USER_DELIVERY_ROUTE) return true;
+  // `botmux send --mention` handoff: an isolated CLI (macOS read isolation)
+  // has no host secret either; both handlers verify the live turn capability.
+  if (method === 'POST' && pathname === DISPATCH_USER_MENTION_PREPARE_ROUTE) return true;
+  if (method === 'POST' && pathname === DISPATCH_USER_MENTION_BIND_ROUTE) return true;
+  // `botmux schedule add` / `update|remove|pause|resume|run` run inside the CLI
+  // process and, in a sandboxed / read-isolated session, cannot read the host
+  // secret. Both handlers already authenticate through authorizeSessionScopedIpc
+  // (rotating per-turn capability bound to body.sessionId) and derive creator /
+  // operator identity from the live turn; without this aperture the outer 401
+  // makes those checks unreachable and scheduling is dead for every sandboxed bot.
+  if (method === 'POST' && pathname === SCHEDULE_DELEGATED_ADD_ROUTE) return true;
+  if (method === 'POST' && pathname === SCHEDULE_MANAGED_MUTATE_ROUTE) return true;
   // macOS read-isolated `botmux send` presents a rotating worker capability;
   // the handler writes the authoritative tuple into a host-owned read-only
   // proof sidecar, so loopback response spoofing cannot confer authority.
@@ -1446,11 +1472,17 @@ ipcRoute('POST', CURRENT_EXECUTION_ROUTE, async (req, res) => {
   const sessionId = body && typeof body === 'object' && !Array.isArray(body)
     ? (body as Record<string, unknown>).sessionId : undefined;
   if (typeof sessionId !== 'string' || !sessionId || sessionId.length > 256) return jsonRes(res, 400, blocked);
+  // Opt-in, so a CLI with the original strict key check never sees new keys.
+  const fields = (body as Record<string, unknown>).fields;
+  const includeOrigin = Array.isArray(fields) && fields.includes(CURRENT_EXECUTION_ORIGIN_FIELD);
   const peer = resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
   });
   if (!peer.ok) return jsonRes(res, 403, blocked);
-  const document = resolveDaemonCurrentExecution({ sessionId, peer: peer.peer, findSession: findActiveBySessionId });
+  const document = resolveDaemonCurrentExecution(
+    { sessionId, peer: peer.peer, findSession: findActiveBySessionId },
+    { includeOrigin },
+  );
   return document ? jsonRes(res, 200, document) : jsonRes(res, 403, blocked);
 });
 
@@ -1600,6 +1632,19 @@ function composeDashboardSessionRows(
 // endpoints below which proxy calls into groups-store on this bot's behalf.
 let cachedLarkAppId = '';
 export function setLarkAppId(id: string): void { cachedLarkAppId = id; }
+
+export type CardClickTurnPostResult =
+  | { ok: true; messageId: string; exp: number }
+  | { ok: false; status: number; error: string };
+
+let cardClickTurnPoster: ((larkAppId: string, body: unknown) => Promise<CardClickTurnPostResult>) | null = null;
+
+/** Daemon injects the signer that posts a single-use card into a chat. */
+export function setCardClickTurnPoster(
+  poster: ((larkAppId: string, body: unknown) => Promise<CardClickTurnPostResult>) | null,
+): void {
+  cardClickTurnPoster = poster;
+}
 
 let decisionBoardService: DecisionBoardService | null = null;
 /** daemon 启动时注入（只有 daemon 进程会写看板；core-only / 测试缺省为 null → 503）。 */
@@ -3209,6 +3254,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   // app's availability range normally excludes them.
   const resolved = await resolveBoundLarkUserCredential({
     bot, openId: sender, sessionId: params.sessionId, turnId, delegated: !!delegated,
+    ...(delegated ? { unionId: delegated.unionId } : {}),
     botAppToken: openId => resolveUserToken(bot.larkAppId, bot.larkAppSecret, normalizeBrand(bot.brand), openId),
   });
   if (findActiveBySessionId(params.sessionId) !== ds || ds.session.status !== 'active'
@@ -4518,6 +4564,17 @@ ipcRoute('POST', '/api/sessions/spawn', requireBoundBot(async (req, res) => {
   }
   jsonRes(res, 200, r);
   });
+}, NOT_BOUND_BODY.botNotFound));
+
+// Local integrator: post a signed single-use card. The click, not this call,
+// starts the turn, and the clicker — not the session owner — is the sender.
+ipcRoute('POST', '/api/cards/click-turn', requireBoundBot(async (req, res) => {
+  if (!cardClickTurnPoster) return jsonRes(res, 503, { ok: false, error: 'card_click_turn_unavailable' });
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const result = await cardClickTurnPoster(cachedLarkAppId, body);
+  if (!result.ok) return jsonRes(res, result.status, { ok: false, error: result.error });
+  return jsonRes(res, 200, { ok: true, messageId: result.messageId, exp: result.exp });
 }, NOT_BOUND_BODY.botNotFound));
 
 function parseHeadlessCreateBody(body: unknown): {
@@ -6143,6 +6200,41 @@ ipcRoute('POST', '/api/schedules/:id/delivery', async (req, res, p) => {
 // Create a new scheduled task from the dashboard. chatIds selects one or more
 // chats owned by this bot; legacy clients may keep sending only chatId.
 // workingDir defaults to the daemon's cwd.
+/** The person a Dashboard schedule write is recorded as (see
+ *  core/dashboard-schedule-creator), or undefined when the write keeps the
+ *  token-login attribution. Every outcome is logged: this decides whose
+ *  identity the task will later run with. */
+async function dashboardScheduleCreator(
+  req: IncomingMessage,
+  appId: string,
+  chatId: string,
+  action: 'create' | 'update',
+  taskId?: string,
+): Promise<{ openId: string; unionId: string } | undefined> {
+  const unionId = dashboardCreatorFromRequest(
+    isTrustedHostIpcRequest(req),
+    req.headers[DASHBOARD_SCHEDULE_CREATOR_HEADER],
+  );
+  if (!unionId) return undefined;
+  const creator = await resolveDashboardScheduleCreator({
+    appId,
+    chatId,
+    unionId,
+    resolveOpenId: async (app, union) => {
+      const resolved = await resolveTargetAppOpenId(app, union);
+      return resolved.status === 'resolved' ? resolved.openId : undefined;
+    },
+    canOperate: (app, chat, openId, union) => canOperate(app, chat, openId, union),
+  });
+  const subject = `action=${action} app=${appId}${taskId ? ` task=${taskId}` : ''} chat=${chatId} union=${unionId}`;
+  if (!creator.ok) {
+    logger.warn(`[schedule-creator] dashboard feishu login not recorded (${creator.reason}) ${subject}`);
+    return undefined;
+  }
+  logger.info(`[schedule-creator] dashboard feishu login recorded as creator ${subject} open=${creator.openId}`);
+  return { openId: creator.openId, unionId: creator.unionId };
+}
+
 ipcRoute('POST', '/api/schedules', requireBoundBot(async (req, res) => {
   let body: unknown;
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
@@ -6253,9 +6345,13 @@ ipcRoute('POST', '/api/schedules', requireBoundBot(async (req, res) => {
   // a clear lastError, which is the pre-existing behavior for CLI-created
   // tasks. Adding a flaky gate here would block valid creates.
   try {
-    const ownerOpenId = getOwnerOpenId(cachedLarkAppId);
-    let ownerUnionId: string | undefined;
-    if (ownerOpenId) {
+    // Signed in through the platform with Feishu: that person is the creator.
+    // Otherwise (token login, or the person cannot operate this bot) keep the
+    // historical attribution to the bot owner below.
+    const dashboardCreator = await dashboardScheduleCreator(req, cachedLarkAppId, chatId, 'create');
+    let ownerOpenId = dashboardCreator?.openId ?? getOwnerOpenId(cachedLarkAppId);
+    let ownerUnionId: string | undefined = dashboardCreator?.unionId;
+    if (!dashboardCreator && ownerOpenId) {
       const deploymentOwnerUnionId = getDeploymentIdentity(config.session.dataDir).ownerUnionId;
       const bot = getBot(cachedLarkAppId);
       // The deployment identity is tenant-stable, but it is authoritative for
@@ -6282,9 +6378,9 @@ ipcRoute('POST', '/api/schedules', requireBoundBot(async (req, res) => {
       topicTitle: topicTitle || undefined,
       chatType: 'group',
       larkAppId: cachedLarkAppId,
-      // Stamp the bot owner as creator: dashboard is local + token-protected,
-      // and the daemon re-checks the owner is still allowed at every run
-      // mutation (scheduled-turn-provenance).
+      // The Feishu-login person, else the bot owner (token login: the dashboard
+      // is local + token-protected). Either way the daemon re-checks the
+      // creator is still allowed at every run (scheduled-turn-provenance).
       ownerOpenId,
       ownerUnionId,
       deliver,
@@ -6319,6 +6415,7 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
     executionPosition?: ScheduleExecutionPosition; rootMessageId?: string; topicTitle?: string;
     chatId?: string; chatIds?: readonly string[] | null;
     model?: string | null; reasoningEffort?: ScheduleReasoningEffort | null;
+    creator?: { openId: string; unionId: string };
   } = {};
   const chatTargets = parseScheduleChatTargets(b, false);
   if (chatTargets && !chatTargets.ok) {
@@ -6405,6 +6502,21 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
     }
     if (modelWrite.model !== undefined) updates.model = modelWrite.model;
     if (modelWrite.reasoningEffort !== undefined) updates.reasoningEffort = modelWrite.reasoningEffort;
+  }
+  // The chat the creator check runs against comes from the host authority;
+  // schedules.json is writable from inside a sandbox.
+  const existingTask = scheduler.getRuntimeTask(p.id, cachedLarkAppId);
+  if (existingTask && !scheduler.taskAcceptsRecordedCreator(p.id, cachedLarkAppId)) {
+    // Delegated task, or creator captured under another app: a Dashboard edit
+    // here leaves who it runs as untouched (see taskAcceptsRecordedCreator).
+    if (dashboardCreatorFromRequest(isTrustedHostIpcRequest(req), req.headers[DASHBOARD_SCHEDULE_CREATOR_HEADER])) {
+      logger.warn(`[schedule-creator] dashboard feishu login not recorded (task_keeps_identity) action=update app=${cachedLarkAppId} task=${p.id}`);
+    }
+  } else if (existingTask) {
+    const creator = await dashboardScheduleCreator(
+      req, cachedLarkAppId, updates.chatId ?? existingTask.chatId, 'update', p.id,
+    );
+    if (creator) updates.creator = creator;
   }
   let result;
   try {
@@ -7753,7 +7865,11 @@ ipcRoute('POST', '/api/role-profiles/:profileId/apply', requireBoundBot(async (r
 // 批量同步只增不删；删除只走逐条显式 route，且服务端按命令名重新解析远端 ID。
 function currentAppSlashCommandCatalog(): AppSlashCommandSpec[] {
   const config = getBot(cachedLarkAppId).config;
-  return buildAppSlashCommandCatalog({ cliId: config.cliId, locale: localeForBot(cachedLarkAppId) });
+  return buildAppSlashCommandCatalog({
+    cliId: config.cliId,
+    locale: localeForBot(cachedLarkAppId),
+    pluginCommands: pluginCommandGateway.list(cachedLarkAppId),
+  });
 }
 
 function appSlashCommandPermissionUrls(): { read: string; write: string } {
@@ -8084,6 +8200,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     displayName = bot.config.displayName ?? null;
     larkBotName = bot.botName ?? null;
   } catch { /* none */ }
+  const sandboxPathsForDashboard = sandboxStore.getBotSandboxPaths(cachedLarkAppId);
   jsonRes(res, 200, {
     larkAppId: cachedLarkAppId,
     botName: getBotName(),
@@ -8132,11 +8249,30 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     scratchTmpfsSizeMb: (() => { try { return getBot(cachedLarkAppId).config.scratchTmpfsSizeMb ?? null; } catch { return null; } })(),
     scratchDenyPaths: (() => { try { return getBot(cachedLarkAppId).config.scratchDenyPaths ?? null; } catch { return null; } })(),
     scratchSupported: process.platform === 'linux' || process.platform === 'darwin',
+    // Read-only host probe (no mounts, no bwrap): what scratch storage can work
+    // on THIS daemon. Advice next to the choice; saving is never blocked on it.
+    scratchCapability: (() => { try { return probeScratchCapability(); } catch { return null; } })(),
     codexAuthSync,
     envPolicy: (() => { try { return getBot(cachedLarkAppId).config.envPolicy ?? { mode: 'inherit' }; } catch { return { mode: 'inherit' }; } })(),
-    sandboxPaths: sandboxStore.getBotSandboxPaths(cachedLarkAppId) ?? null,
+    sandboxPaths: sandboxPathsForDashboard ?? null,
+    // Already-stored readWrite entries the save path would now refuse; the
+    // worker runs them as readOnly. Shown on the sandbox-paths section.
+    sandboxPathsForbiddenReadWrite: findForbiddenReadWritePaths(
+      sandboxPathsForDashboard?.readWrite,
+    ),
     sandboxNetworkPolicy: (() => { try { return getBot(cachedLarkAppId).config.sandboxNetworkPolicy ?? null; } catch { return null; } })(),
     sandboxNetworkPolicyPlatform: process.platform,
+    // Inputs for the policy editor's starting template and its proxy hint.
+    sandboxNetworkHostDns: process.platform === 'linux' ? hostDnsServers(path => readFileSync(path, 'utf8')) : [],
+    sandboxNetworkProxyEnv: (() => {
+      try {
+        const botConfig = getBot(cachedLarkAppId).config;
+        const backendType = (resolvePairedBackendId(botConfig.cliId, botConfig.backendType, config.daemon.backendType) ?? 'pty') as BackendType;
+        // Same env view the worker's policy pre-check sees, so the template's
+        // proxy hint includes the global sessionEnv layer and is never stale.
+        return proxyEnvKeys(sessionNetworkPolicyEnvView(process.env, botConfig, backendType));
+      } catch { return proxyEnvKeys(process.env); }
+    })(),
     readIsolation: sandboxStore.getBotReadIsolation(cachedLarkAppId),
     // Full enforceability (adapter support + no wrapperCli + macOS) — the UI
     // disables the toggle wherever the worker would fail-close on it.
@@ -8163,6 +8299,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     privateCard: cardPrefs.privateCard,
     replyCardActions: cardPrefs.replyCardActions,
     cotEnabled: cardPrefs.cotEnabled,
+    replyCardShowTools: cardPrefs.replyCardShowTools,
     senderTag: cardPrefs.senderTag,
     senderTagHideEmail: cardPrefs.senderTagHideEmail,
     overloadAlert: cardPrefs.overloadAlert,
@@ -8313,6 +8450,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     replyFooterVoice?: unknown;
     showReplyTiming?: unknown;
     thinkingCardToolResult?: unknown;
+    replyCardShowTools?: unknown;
     usageDisplay?: unknown;
     replyCardMode?: unknown;
     disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; replyCardActions?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
@@ -8330,6 +8468,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   const patch: ReplyFooterPreferences & {
     showReplyTiming?: boolean;
     thinkingCardToolResult?: boolean;
+    replyCardShowTools?: boolean;
     usageDisplay?: UsageDisplayMode;
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
     disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; replyCardActions?: boolean; cotEnabled?: boolean;
@@ -8378,6 +8517,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     patch.codexBrowser = body.codexBrowser;
   }
   if (typeof body.thinkingCardToolResult === 'boolean') patch.thinkingCardToolResult = body.thinkingCardToolResult;
+  if (typeof body.replyCardShowTools === 'boolean') patch.replyCardShowTools = body.replyCardShowTools;
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
   if (typeof body.replyCardActions === 'boolean') patch.replyCardActions = body.replyCardActions;
@@ -9114,9 +9254,10 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       if (nextRuntime && selected.wrapperCli) return { write: false, result: { error: 'runtime_wrapper_conflict' } };
       if (nextRuntime && selected.cliLaunchMode) return { write: false, result: { error: 'runtime_launch_mode_conflict' } };
       if (selected.wrapperCli && selected.cliLaunchMode) return { write: false, result: { error: 'wrapper_launch_mode_conflict' } };
-      if (selected.wrapperCli && sandboxBoolValue(entry.sandbox)) {
-        return { write: false, result: { error: 'wrapper_sandbox_conflict' } };
-      }
+      // wrapperCli + file sandbox is supported: the wrapper runs inside the
+      // sandbox (worker.ts wrapperInsideSandbox). Read isolation still
+      // conflicts — a wrapper may replace the env, so CLAUDE_CONFIG_DIR /
+      // CODEX_HOME cannot be proven to reach the real CLI.
       if (selected.wrapperCli && entry.readIsolation === true) {
         return { write: false, result: { error: 'wrapper_read_isolation_conflict' } };
       }
@@ -9929,6 +10070,41 @@ ipcRoute('PUT', '/api/bot-codex-auth-sync', requireBoundBot(async (req, res) => 
   jsonRes(res, 200, { ok: true, codexAuthSync: body.codexAuthSync });
 }));
 
+// GET /api/bot-codex-config — where this bot's isolated Codex config.toml lives
+// (`<BOT_HOME>/codex/config.toml`, seeded ONCE from ~/.codex/config.toml by the
+// worker) and whether new sessions use it. Paths only, never file contents.
+ipcRoute('GET', '/api/bot-codex-config', requireBoundBot(async (_req, res) => {
+  let cfg;
+  try { cfg = getBot(cachedLarkAppId).config; } catch { return jsonRes(res, 404, { ok: false, error: 'bot_not_found' }); }
+  const path = isolatedCodexConfigPath(config.session.dataDir, cachedLarkAppId);
+  const hostPath = hostCodexConfigPath();
+  jsonRes(res, 200, {
+    ok: true,
+    isolated: botUsesIsolatedCodexHome(cfg),
+    path,
+    exists: existsSync(path),
+    hostPath,
+    hostExists: existsSync(hostPath),
+  });
+}));
+
+// POST /api/bot-codex-config/resync — back the per-bot config.toml up to
+// `config.toml.bak-<timestamp>` and replace it with the host copy (both 0600).
+// Only for bots whose new sessions use the isolated CODEX_HOME; running
+// sessions keep the config their Codex already loaded.
+ipcRoute('POST', '/api/bot-codex-config/resync', requireBoundBot(async (_req, res) => {
+  let cfg;
+  try { cfg = getBot(cachedLarkAppId).config; } catch { return jsonRes(res, 404, { ok: false, error: 'bot_not_found' }); }
+  if (!botUsesIsolatedCodexHome(cfg)) return jsonRes(res, 409, { ok: false, error: 'codex_home_not_isolated' });
+  try {
+    const result = resyncIsolatedCodexConfig({ botHome: botHomeForSessionDataDir(config.session.dataDir, cachedLarkAppId) });
+    if (!result.ok) return jsonRes(res, result.error === 'host_config_missing' ? 404 : 409, result);
+    jsonRes(res, 200, result);
+  } catch (error) {
+    jsonRes(res, 500, { ok: false, error: 'resync_failed', message: (error as Error).message });
+  }
+}));
+
 // PUT /api/bot-trigger-user-auth — 按触发人身份调用 CLI 的开关。Body
 // `{ triggerUserAuth: object | null }`：null → 清除（关闭）。
 //
@@ -9943,6 +10119,10 @@ ipcRoute('PUT', '/api/bot-codex-auth-sync', requireBoundBot(async (req, res) => 
 //   • 下次 daemon 重启时 bot-registry 的 parser 抛 "must be an object"，整个
 //     bots.json 加载失败 —— 一个开关把 daemon 拒启了。
 const TRIGGER_USER_AUTH_UI_EDITABLE_KEYS = new Set(['enabled', 'tools', 'fallback', 'credentialSource']);
+// delegateOnMention is NOT in the set above: a save that does not mention it
+// (an older Dashboard bundle) keeps the stored value through the merge below,
+// so a deliberate `false` is never silently turned back on. The current page
+// always sends it, which overrides the preserved value.
 
 ipcRoute('PUT', '/api/bot-trigger-user-auth', requireBoundBot(async (req, res) => {
   let body: { triggerUserAuth?: unknown };
@@ -9998,11 +10178,32 @@ botConfigPutRoute<{ enabled?: unknown; larkToolBinding?: unknown }>('/api/bot-la
 // GET /api/bot-trigger-user-auth-status — 当前策略 + 已授权人数 + 两条如实的
 // 边界提示（token 存储保护程度、自带凭证的 MCP server）。
 // 只回人数不回名单：谁授权过是成员关系，dashboard 没有理由把它摊给所有能登录的人。
-ipcRoute('GET', '/api/bot-trigger-user-auth-status', requireBoundBot(async (_req, res) => {
+//
+// `?openId=` 是给已经知道 open_id 的集成方（例如管共享机器的 device daemon）
+// 按人查询的入口。不带这个参数时响应与以前完全一致。带了且格式合法时，在同一
+// 份聚合字段之外追加 `user`：
+//   • `coverage` 恒为 `local-stores`。平台签发的授权（credentialSource 为
+//     platform / auto）不在 `tools` 里；这里的 needs-login 不等于 turn 会被拒。
+//   • `tools.bytedcli.basis=provider-probe`：实时 `bytedcli auth status`。
+//   • `tools['lark-cli']`：有设备登录文件则为 authorized / file-present（不读
+//     密文、不轮询进行中的 device flow）；否则若该人 legacy user-token 仍可用
+//     （access 有效或还可刷新）则为 authorized / expiry-check，与 turn 的
+//     lark-cli 回落一致。两者都没有才是 needs-login。
+//   • `tools['user-token'].basis=expiry-check`：只看该人自己的 token 文件。
+// 已知过期时间才带 expiresAt / refreshExpiresAt。不回 token 内容，也不因为
+// 查询一个人而列出其他人。非法 open_id 直接 400，避免拼进文件路径。
+ipcRoute('GET', '/api/bot-trigger-user-auth-status', requireBoundBot(async (req, res) => {
   try {
+    const openIdRaw = new URL(req.url ?? '/', 'http://localhost').searchParams.get('openId');
+    const openId = openIdRaw?.trim() ?? '';
+    if (openId && !isUsableOpenId(openId)) {
+      jsonRes(res, 400, { ok: false, error: 'invalid_open_id' });
+      return;
+    }
     const cfg = getBot(cachedLarkAppId).config;
     const policy = cfg.triggerUserAuth ?? null;
-    const authorizedCount = listAuthorizedUsers(cfg.larkAppId, normalizeBrand(cfg.brand)).length;
+    const brand = normalizeBrand(cfg.brand);
+    const authorizedCount = listAuthorizedUsers(cfg.larkAppId, brand).length;
     // Oncall (legacy true) provides the OS-enforced credential boundary that
     // makes other people's token files unreadable. scratch is NOT counted here:
     // it is write-integrity COW, not a read/credential boundary, so the agent
@@ -10012,6 +10213,9 @@ ipcRoute('GET', '/api/bot-trigger-user-auth-status', requireBoundBot(async (_req
     // Platform-backed source: tell the UI whether this machine is bound so the
     // picker can say what `auto` / `platform` will actually do here.
     const platformUrl = platformCredentialsUrl();
+    const user = openId
+      ? await queryTriggerUserAuthStatus({ appId: cfg.larkAppId, brand, openId })
+      : undefined;
     jsonRes(res, 200, {
       ok: true,
       policy,
@@ -10022,10 +10226,29 @@ ipcRoute('GET', '/api/bot-trigger-user-auth-status', requireBoundBot(async (_req
       tokenStoreEnforced: protection.enforced,
       ...(protection.advisory ? { tokenStoreAdvisory: protection.advisory } : {}),
       ...(mcpAdvisory ? { mcpAdvisory } : {}),
+      ...(user ? { user } : {}),
     });
   } catch (e: any) {
     jsonRes(res, 500, { ok: false, error: e?.message ?? String(e) });
   }
+}));
+
+// DELETE /api/bot-trigger-user-auth/users/:openId — 撤销这一个成员在本机上的
+// 触发人凭据（本 daemon 所属应用的 user token、该 open_id 的 lark-cli / bytedcli
+// HOME、已经发布的轮次身份）。平台侧 grant 不在本进程里，撤不掉。
+ipcRoute('DELETE', '/api/bot-trigger-user-auth/users/:openId', requireBoundBot(async (_req, res, params) => {
+  const openId = params.openId ?? '';
+  if (!isUsableOpenId(openId)) return jsonRes(res, 400, { ok: false, error: 'invalid_open_id' });
+  let cfg;
+  try { cfg = getBot(cachedLarkAppId).config; }
+  catch { return jsonRes(res, 404, { ok: false, error: 'bot_not_found' }); }
+  const result = await revokeTriggerUserAuth({
+    openId,
+    appId: cfg.larkAppId,
+    brand: normalizeBrand(cfg.brand),
+    sessionDataDir: config.session.dataDir,
+  });
+  jsonRes(res, result.ok ? 200 : 400, result);
 }));
 
 // Per-bot riff 后端配置。Body `{ riff: string }`（原始 JSON 文本，如
@@ -10156,8 +10379,8 @@ botConfigPutRoute('/api/bot-skills', 'skills', {
 //   { mode: 'off'|'oncall'|'scratch',    — tri-state + scratch sub-options
 //     scratchStorage?, scratchTmpfsSizeMb?, scratchDenyPaths? }
 // oncall = per-session bwrap/Seatbelt whitelist for bots shared with
-// semi-trusted users; scratch = Linux-only full-root COW throwaway sandbox for
-// the owner's own disposable experiments.
+// semi-trusted users; scratch = full-root COW throwaway sandbox (Linux) or an
+// APFS clone of $HOME/project (macOS) for the owner's own disposable experiments.
 ipcRoute('PUT', '/api/bot-sandbox', requireBoundBot(async (req, res) => {
   const body = await readJsonBodyOrBadJson<{ enabled?: unknown; mode?: unknown; scratchStorage?: unknown; scratchTmpfsSizeMb?: unknown; scratchDenyPaths?: unknown }>(req, res);
   if (body === BAD_JSON) return;
@@ -10236,7 +10459,14 @@ botConfigPutRoute<{ policy?: unknown }>('/api/bot-sandbox-network-policy', 'sand
     || Object.keys(body).some(key => key !== 'policy') || !Object.hasOwn(body, 'policy')
     ? fieldInvalid('policy_required')
     : fieldOk(body.policy),
-  respond: () => ({ ok: true, sandboxNetworkPolicy: getBot(cachedLarkAppId).config.sandboxNetworkPolicy ?? null }),
+  respond: () => {
+    const botConfig = getBot(cachedLarkAppId).config;
+    const policy = botConfig.sandboxNetworkPolicy;
+    // Same env view the worker's policy pre-check evaluates (daemon env +
+    // composed global/bot session overlay), so warnings predict the refusal.
+    const backendType = (resolvePairedBackendId(botConfig.cliId, botConfig.backendType, config.daemon.backendType) ?? 'pty') as BackendType;
+    return { ok: true, sandboxNetworkPolicy: policy ?? null, warnings: policy ? networkPolicyWarnings(policy, sessionNetworkPolicyEnvView(process.env, botConfig, backendType)) : [] };
+  },
 });
 
 ipcRoute('PUT', '/api/bot-sandbox-paths', requireBoundBot(async (req, res) => {
@@ -10249,7 +10479,15 @@ ipcRoute('PUT', '/api/bot-sandbox-paths', requireBoundBot(async (req, res) => {
     readOnly: asList(body.readOnly),
     deny: asList(body.deny),
   });
-  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  if (!r.ok) {
+    // `reason` carries the human-readable text the dashboard shows verbatim.
+    return jsonRes(res, 400, {
+      ok: false,
+      error: r.reason,
+      ...(r.message ? { reason: r.message } : {}),
+      ...(r.forbiddenReadWrite ? { forbiddenReadWrite: r.forbiddenReadWrite } : {}),
+    });
+  }
   jsonRes(res, 200, { ok: true, sandboxPaths: r.sandboxPaths ?? null });
 }));
 

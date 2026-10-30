@@ -225,6 +225,43 @@ describe('zero injection with structured final reply adapters', () => {
   }
 });
 
+// Input submitted while Pi is busy is written to the session only when Pi
+// dequeues it; the extension records the acceptance at submit time instead.
+describe('pi turn-boundary extension: queued input marker', () => {
+  for (const [name, load] of [
+    ['typed twin', async () => (await import('../src/adapters/cli/pi-turn-boundary-extension.js')).default],
+    ['runtime source', async () => (await import('../src/adapters/cli/pi-turn-boundary-extension.mjs' as string)).default],
+  ] as const) {
+    it(`${name}: marks input Pi will queue, and nothing for idle input`, async () => {
+      const register = await load();
+      const handlers: Record<string, (event?: any) => any> = {};
+      const appendEntry = vi.fn();
+      register({ on: (event: string, handler: any) => { handlers[event] = handler; }, appendEntry } as any);
+      expect(handlers.input({ type: 'input', text: 'idle', source: 'interactive' })).toBeUndefined();
+      expect(appendEntry).not.toHaveBeenCalled();
+      handlers.input({ type: 'input', text: 'busy', source: 'interactive', streamingBehavior: 'steer' });
+      handlers.input({ type: 'input', text: 'later', source: 'interactive', streamingBehavior: 'followUp' });
+      expect(appendEntry.mock.calls).toEqual([
+        ['botmux-input-queued', { behavior: 'steer' }],
+        ['botmux-input-queued', { behavior: 'followUp' }],
+      ]);
+    });
+
+    it(`${name}: still registers every other handler when the input event is rejected`, async () => {
+      const register = await load();
+      const handlers: Record<string, (event?: any) => any> = {};
+      register({
+        on: (event: string, handler: any) => {
+          if (event === 'input') throw new Error('unknown event');
+          handlers[event] = handler;
+        },
+        appendEntry: vi.fn(),
+      } as any);
+      expect(Object.keys(handlers).sort()).toEqual(['agent_end', 'agent_settled', 'before_agent_start', 'session_start']);
+    });
+  }
+});
+
 describe('claude-code buildArgs', () => {
   it('zero injection omits Botmux system prompts and both plugin directories on fresh and resumed CLI launches', () => {
     for (const resume of [false, true]) {
@@ -2089,8 +2126,9 @@ describe('opencode buildArgs', () => {
 
   it('keeps the whole opencode data dir real in the sandbox (SQLite needs fcntl locks the home overlay lacks)', () => {
     // Not just auth.json: opencode's global opencode.db (WAL) lives here and
-    // can't lock on the overlayfs home — same failure mode as codex.
-    expect(adapter.authPaths).toEqual(['~/.local/share/opencode']);
+    // can't lock on the overlayfs home — same failure mode as codex. (The
+    // config dir next to it is covered in fs-policy.test.ts.)
+    expect(adapter.authPaths).toContain('~/.local/share/opencode');
   });
 
   it('returns empty args for basic case', () => {
@@ -4007,11 +4045,12 @@ describe('buildResumeCommand', () => {
     expect(a.buildResumeCommand?.({ sessionId: 'bm-cp' })).toBeNull();
   });
 
-  it('kimi emits `kimi --resume <cliSessionId>` when known, null otherwise', () => {
+  it('kimi emits `kimi --session <id>` for a Kimi session id it knows, null otherwise', () => {
+    // Kimi 0.31 has no --resume; -S/--session resumes an existing session_<uuid>.
     const a = createKimiAdapter('/usr/bin/kimi');
-    expect(a.buildResumeCommand?.({ sessionId: 'bm-kimi', cliSessionId: 'kimi-sess-1' }))
-      .toBe('kimi --resume kimi-sess-1');
-    expect(a.buildResumeCommand?.({ sessionId: 'bm-kimi' })).toBeNull();
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-kimi', cliSessionId: 'session_0a1b2c3d-0000-4000-8000-000000000000' }))
+      .toBe('kimi --session session_0a1b2c3d-0000-4000-8000-000000000000');
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-kimi-not-found-anywhere' })).toBeNull();
   });
 
   it('grok emits `grok --resume <id>` preferring cliSessionId, falling back to sessionId', () => {
@@ -4399,10 +4438,11 @@ describe('kimi buildArgs', () => {
     expect(args).not.toContain('--resume');
   });
 
-  it('resumes the provided cli session id when available', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-1', resume: true, resumeSessionId: 'kimi-session-123' });
-    expect(args).toContain('--resume');
-    expect(args[args.indexOf('--resume') + 1]).toBe('kimi-session-123');
+  it('resumes a known Kimi session id with --session (Kimi 0.31 has no --resume)', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-1', resume: true, resumeSessionId: 'session_0a1b2c3d-0000-4000-8000-000000000000' });
+    expect(args).toContain('--session');
+    expect(args[args.indexOf('--session') + 1]).toBe('session_0a1b2c3d-0000-4000-8000-000000000000');
+    expect(args).not.toContain('--resume');
     expect(args).not.toContain('--continue');
   });
 
@@ -4438,7 +4478,8 @@ describe('resume without cliSessionId — cross-session isolation (cursor / copi
       expect(args).not.toContain('--resume');
     });
 
-    it(`${name}: resume=true WITH resumeSessionId still resumes the exact session`, () => {
+    // Kimi resumes with --session and finds its id itself (kimi-session.test.ts).
+    it.skipIf(name === 'kimi')(`${name}: resume=true WITH resumeSessionId still resumes the exact session`, () => {
       const adapter = factory();
       const args = adapter.buildArgs({
         sessionId: 'bm-session-b',
@@ -4469,7 +4510,10 @@ describe('resumeRequiresCliSessionId capability', () => {
   it('cursor / copilot / kimi declare the capability (resume without an id starts fresh)', () => {
     expect(createCursorAdapter('/usr/bin/cursor-agent').resumeRequiresCliSessionId).toBe(true);
     expect(createCopilotAdapter('/usr/bin/copilot').resumeRequiresCliSessionId).toBe(true);
-    expect(createKimiAdapter('/usr/bin/kimi').resumeRequiresCliSessionId).toBe(true);
+    // Kimi no longer needs a captured id: it finds its own session by the
+    // botmux session id (kimi-session.ts) and checks the target before resume.
+    expect(createKimiAdapter('/usr/bin/kimi').resumeRequiresCliSessionId).toBeUndefined();
+    expect(createKimiAdapter('/usr/bin/kimi').checkResumeTargetExists).toBeTypeOf('function');
   });
 
   it('adapters whose botmux sessionId IS the CLI session id do not declare it', () => {
@@ -4643,6 +4687,14 @@ describe('reasonix buildArgs', () => {
 });
 
 describe('traex/coco sandbox authPaths', () => {
+  const home = (...parts: string[]) => join(homedir(), '.trae', ...parts);
+  let previousTraeHome: string | undefined;
+  beforeEach(() => { previousTraeHome = process.env.TRAE_HOME; delete process.env.TRAE_HOME; });
+  afterEach(() => {
+    if (previousTraeHome === undefined) delete process.env.TRAE_HOME;
+    else process.env.TRAE_HOME = previousTraeHome;
+  });
+
   it('traex keeps ~/.trae/cli real (RW SQLite state) and exposes migration markers READ-ONLY (not the whole ~/.trae)', () => {
     // authPaths (readWrite) stays scoped to cli/ — widening to the whole ~/.trae
     // would give a chat-driven sandbox RW to sibling hooks/plugins/skills/config
@@ -4650,10 +4702,15 @@ describe('traex/coco sandbox authPaths', () => {
     // migration prompt (which wedges goal-mode's human-less PTY) is instead
     // silenced by exposing the done-markers READ-ONLY via sandboxReadonlyPaths.
     const adapter = createTraexAdapter('/bin/traex');
-    expect(adapter.authPaths).toEqual(['~/.trae/cli']);
+    expect(adapter.authPaths).toEqual([home('cli')]);
+    expect(adapter.mcpGateway).toEqual({
+      configPath: home('traecli.toml'),
+      format: 'codex-toml',
+    });
     expect(adapter.sandboxReadonlyPaths?.()).toEqual([
-      '~/.trae/.coco-rollouts-migrated',
-      '~/.trae/.coco-migrated',
+      home('traecli.toml'),
+      home('.coco-rollouts-migrated'),
+      home('.coco-migrated'),
     ]);
   });
 
@@ -4662,10 +4719,35 @@ describe('traex/coco sandbox authPaths', () => {
     // exposed read-only, authPaths NOT widened past cli/ (+ the coco cache the
     // transcript bridge reads).
     const adapter = createCocoAdapter('/bin/coco');
-    expect(adapter.authPaths).toEqual(['~/.trae/cli', '~/.cache/coco']);
+    expect(adapter.authPaths).toEqual([home('cli'), '~/.cache/coco']);
+    expect(adapter.mcpGateway).toEqual({
+      configPath: home('traecli.toml'),
+      format: 'codex-toml',
+    });
     expect(adapter.sandboxReadonlyPaths?.()).toEqual([
-      '~/.trae/.coco-rollouts-migrated',
-      '~/.trae/.coco-migrated',
+      home('traecli.toml'),
+      home('.coco-rollouts-migrated'),
+      home('.coco-migrated'),
     ]);
+  });
+
+  it.each([
+    ['traex', () => createTraexAdapter('/bin/traex'), (root: string) => [join(root, 'cli')]],
+    ['coco', () => createCocoAdapter('/bin/coco'), (root: string) => [join(root, 'cli'), '~/.cache/coco']],
+  ])('%s follows a bot-specific TRAE_HOME for its sandbox binds', (_id, create, expectedAuth) => {
+    const custom = '/srv/bot-a/trae';
+    const adapter = create();
+    // Read-only binds come from the child's env (the worker passes the per-bot
+    // env); the worker's own process.env still has no TRAE_HOME here.
+    expect(adapter.sandboxReadonlyPaths?.({ TRAE_HOME: custom })).toEqual([
+      join(custom, 'traecli.toml'),
+      home('.coco-rollouts-migrated'),
+      home('.coco-migrated'),
+      join(custom, '.coco-rollouts-migrated'),
+      join(custom, '.coco-migrated'),
+    ]);
+    // The RW state dir follows the TRAE_HOME the worker pins for the spawn.
+    process.env.TRAE_HOME = custom;
+    expect(adapter.authPaths).toEqual(expectedAuth(custom));
   });
 });

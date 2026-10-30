@@ -62,12 +62,16 @@ vi.mock('../src/bot-registry.js', () => {
 
 const lark = vi.hoisted(() => ({
   chatMode: 'group' as 'group' | 'topic' | 'p2p',
-  sendMessage: vi.fn(async () => 'om_banner'),
+  sendMessage: vi.fn(async (..._args: unknown[]) => 'om_banner'),
+  replyMessage: vi.fn(async (..._args: unknown[]) => 'om_reply'),
+  uploadImage: vi.fn(async (_app: string, path: string) => `img_${path.split('/').pop()}`),
 }));
 
 vi.mock('../src/im/lark/client.js', () => ({
   getChatMode: vi.fn(async () => lark.chatMode),
   sendMessage: lark.sendMessage,
+  replyMessage: lark.replyMessage,
+  uploadImage: lark.uploadImage,
   downloadMessageResource: vi.fn(),
   listChatBotMembers: vi.fn(),
 }));
@@ -96,7 +100,7 @@ const INPUT = {
   chatId: 'oc_steward',
   turnId: 'board:app_s:1',
   prompt: '【决策看板 · 批次 #1】owner 提交了 1 项决定。',
-  banner: '📥 收到 1 项',
+  announcement: { texts: ['📥 收到 1 项'], images: [] as Array<{ type: 'image'; path: string; name: string }> },
   attachments: [{ type: 'image' as const, path: '/tmp/x.png', name: 'x.png' }],
   ownerOpenId: 'ou_owner',
   ownerName: 'owner',
@@ -110,6 +114,8 @@ beforeEach(() => {
   wp.forkWorker.mockClear();
   wp.sendWorkerInput.mockClear();
   lark.sendMessage.mockClear();
+  lark.replyMessage.mockClear();
+  lark.uploadImage.mockClear();
   vi.mocked(sessionActivity.markSessionActivity).mockClear();
   vi.mocked(sessionActivity.clearAgentAttention).mockClear();
   vi.mocked(sessionActivity.stampHumanActivity).mockClear();
@@ -207,5 +213,56 @@ describe('deliverOwnerBatchTurn', () => {
     await deliverOwnerBatchTurn({ ...INPUT, ownerOpenId: undefined, ownerName: undefined }, map, () => false);
     const call = (sessionActivity.markSessionActivity as any).mock.calls[0];
     expect(call?.[2]?.human).toBeFalsy();
+  });
+});
+
+describe('管家群里的回显', () => {
+  const ECHO = {
+    ...INPUT,
+    announcement: {
+      texts: ['📥 收到 2 项\n\n#1 a（待拍板）\n选：A 合\n附图：2 张（见下方图片）', '#2 b（待拍板）\n说明：\n续写的第二段'],
+      images: [
+        { type: 'image' as const, path: '/tmp/b1/001-1-a.png', name: '001-1-a.png' },
+        { type: 'image' as const, path: '/tmp/b1/001-2-b.png', name: '001-2-b.png' },
+      ],
+    },
+  };
+
+  it('普通群：各段文字和附图按顺序发在群里，内容原样', async () => {
+    const map = new Map<string, any>();
+    liveSession(map);
+    await deliverOwnerBatchTurn(ECHO, map, () => false);
+    expect(lark.sendMessage.mock.calls.map(c => [c[2], c[3] ?? 'text'])).toEqual([
+      [ECHO.announcement.texts[0], 'text'],
+      [ECHO.announcement.texts[1], 'text'],
+      [JSON.stringify({ image_key: 'img_001-1-a.png' }), 'image'],
+      [JSON.stringify({ image_key: 'img_001-2-b.png' }), 'image'],
+    ]);
+    expect(lark.uploadImage.mock.calls.map(c => c[1])).toEqual(['/tmp/b1/001-1-a.png', '/tmp/b1/001-2-b.png']);
+    expect(lark.replyMessage).not.toHaveBeenCalled();
+  });
+
+  it('话题群：第一段开话题，其余段落和附图都回复在这个话题里，不另开话题', async () => {
+    lark.chatMode = 'topic';
+    const map = new Map<string, any>();
+    await deliverOwnerBatchTurn(ECHO, map, () => false);
+    expect(lark.sendMessage).toHaveBeenCalledTimes(1);
+    expect(lark.sendMessage.mock.calls[0][2]).toBe(ECHO.announcement.texts[0]);
+    expect(lark.replyMessage.mock.calls.map(c => [c[1], c[2], c[3], c[4]])).toEqual([
+      ['om_banner', ECHO.announcement.texts[1], 'text', true],
+      ['om_banner', JSON.stringify({ image_key: 'img_001-1-a.png' }), 'image', true],
+      ['om_banner', JSON.stringify({ image_key: 'img_001-2-b.png' }), 'image', true],
+    ]);
+  });
+
+  it('某张图上传失败只跳过那一张，其余照发，批次照常投递', async () => {
+    lark.uploadImage.mockImplementationOnce(async () => { throw new Error('upload 500'); });
+    const map = new Map<string, any>();
+    const ds = liveSession(map);
+    const res = await deliverOwnerBatchTurn(ECHO, map, () => false);
+    expect(res.sessionId).toBe(ds.session.sessionId);
+    expect(lark.sendMessage.mock.calls.filter(c => c[3] === 'image').map(c => c[2]))
+      .toEqual([JSON.stringify({ image_key: 'img_001-2-b.png' })]);
+    expect(wp.sendWorkerInput).toHaveBeenCalledTimes(1);
   });
 });
