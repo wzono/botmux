@@ -15455,7 +15455,7 @@ export async function forkWorkerBlank(
 ): Promise<boolean> {
   if (permit.sessionId !== ds.session.sessionId) return false;
   const transition = await permitStore.beginSpawn(permit);
-  if (transition.status !== 'spawning') return false;
+  if (transition.status !== 'acquired') return false;
   return forkWorker(ds, '', permit.turnId);
 }
 
@@ -15469,9 +15469,9 @@ export async function submitBusinessInput(
 ): Promise<boolean> {
   if (permit.sessionId !== ds.session.sessionId
     || permit.workerGeneration !== (ds.session.workerGeneration ?? 0)) return false;
-  const consumed = await permitStore.consumeBusiness(permit, payloadDigest);
-  if (consumed.status === 'duplicate') return true;
-  if (consumed.status !== 'consumed') return false;
+  const dispatch = await permitStore.consumeBusiness(permit, payloadDigest);
+  if (dispatch.status === 'duplicate') return true;
+  if (dispatch.status !== 'dispatching') return false;
   return sendWorkerInput(ds, payload, permit.turnId);
 }
 

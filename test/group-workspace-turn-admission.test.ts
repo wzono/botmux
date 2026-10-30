@@ -59,13 +59,16 @@ describe('durable turn permits', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'turn-permit-')); const store = new TurnPermitStore(dataDir, { now: () => 100 });
     const first = await store.issueBlank({ ...base, reservedGeneration: 4 });
     expect(await store.issueBlank({ ...base, reservedGeneration: 99 })).toEqual(first);
-    expect((await store.beginSpawn(first)).status).toBe('spawning');
+    expect((await store.beginSpawn(first)).status).toBe('acquired');
+    expect((await new TurnPermitStore(dataDir, { now: () => 100 }).beginSpawn(first)).status).toBe('observing');
     const business = await store.proveReady(first, { actualGeneration: 4, cwd: identity, backend: identity });
     expect(business.status).toBe('issued'); if (business.status !== 'issued') throw new Error('expected business permit');
     const restarted = new TurnPermitStore(dataDir, { now: () => 100 });
-    expect((await restarted.consumeBusiness(business.permit, 'digest-a')).status).toBe('consumed');
-    expect(await restarted.consumeBusiness(business.permit, 'digest-a')).toMatchObject({ status: 'duplicate', receipt: { payloadDigest: 'digest-a' } });
-    expect((await restarted.consumeBusiness(business.permit, 'digest-b')).status).toBe('rejected');
+    expect((await restarted.beginBusinessDispatch(business.permit, 'digest-a')).status).toBe('acquired');
+    expect((await restarted.beginBusinessDispatch(business.permit, 'digest-a')).status).toBe('observing');
+    expect((await restarted.markBusinessDelivered(business.permit, 'digest-a', { downstreamReceiptId: 'turn:t1' })).status).toBe('delivered');
+    expect(await restarted.beginBusinessDispatch(business.permit, 'digest-a')).toMatchObject({ status: 'delivered', receipt: { payloadDigest: 'digest-a', downstreamReceiptId: 'turn:t1' } });
+    expect((await restarted.beginBusinessDispatch(business.permit, 'digest-b')).status).toBe('rejected');
   });
   it('fails closed on expiry, mismatched proof and terminal failure', async () => {
     let now = 100; const store = new TurnPermitStore(mkdtempSync(join(tmpdir(), 'turn-permit-')), { now: () => now });
