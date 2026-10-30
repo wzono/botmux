@@ -233,10 +233,6 @@ const DIR_BINDING = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=[^;]*(?:fileURLTo
  * checking is how the gate stops protecting anything.
  */
 const READER_EXEMPTIONS = [
-  {
-    file: 'src/core/lark-tool-binding.ts',
-    reason: 'tsconfig is only used by the source-mode runner when moduleDir ends in /src/core; compiled /$bunfs/root and dist runners never enter that branch',
-  },
   // NOTE: `src/dashboard.ts` is deliberately NOT listed. It does build paths from
   // `__dirname` (`WEB_DIR`, plus two dev-reload markers), but those markers carry no
   // asset extension so nothing here matches them, and the compiled build serves the
