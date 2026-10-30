@@ -1,209 +1,208 @@
-# 群级工作目录绑定设计
+# 群级工作目录绑定：统一准入架构修订
 
-## 目标 / Goal
+## 状态与审查边界
 
-为普通飞书群增加一份独立于单个 Bot 配置的宿主机本地工作目录绑定，使同一宿主机上的所有 Bot 在创建群顶层会话或通过 `/th` 新开话题时得到一致、持久且可追踪的目录；同时保持话题会话任务隔离、现有 per-Bot `oncallChats` 授权语义和显式会话选仓能力。
+- 固定实现基线：`85fa2fdd9ed135967281b85138474bcc488e5275`。
+- **当前代码仍为 NO-GO / DO NOT MERGE。** 本文是对已批准目标的重新设计，不是实现批准、合并批准或部署批准。
+- 本轮只修订架构、迁移协议、计划和覆盖证据；不改实现或测试，不部署、不重启。
+- 新方案审查预算固定为 R1–R3：R1 全面审查本文与覆盖矩阵；R2 只复核 R1 blocker 和其触达边界；R3 必须给终态 GO/NO-GO，不开启 R4。
+- 分级、范围或取舍争议的 arbiter 是**原始需求的决策 owner**；reviewer 和实现者均不能自行改写目标。
 
-## 背景 / Context
+## 冻结目标、范围与非目标
 
-当前 `oncallChats` 位于每个 Bot 的 `bots.json`，实际语义是 “Bot × 群 → workingDir”，不是群内所有 Bot 共享的绑定。普通群 chat-scope 会话可临时继承其他 Bot 的 active 会话，但会随会话关闭而消失；`/th` 找不到当前 Bot 的 oncall 绑定或 active peer 时会拒绝启动。编队/profile 重写还可能覆盖 `bots.json` 中的运行态 `oncallChats`。
+### 目标
 
-工作目录是宿主机绝对路径。同一飞书群可能连接多台机器，不能把一台机器的路径复制到其他机器。
+在同一宿主机上提供跨 Bot、按 `chatId` 共享的群工作目录。群顶层 `/repo X` 更新它；Bot A/B 的新 chat session 与 `/th` 一致消费它；话题内 `/repo` 仍只影响话题；显式 oncall 覆盖仍优先；所有业务输入只能在已证明的有效工作目录与 worker generation 上执行。
 
-## 已确认决策 / Confirmed decisions
+### 范围
 
-### 状态边界与目录优先级
+1. 统一所有离散业务 turn 的准入与实际派发边界。
+2. 统一 daemon、external trigger、Dashboard、新建/恢复/启动的异步工作目录解析和消费。
+3. 统一跨 app 真人身份、tenant 来源、授权和提交前复验。
+4. 将目录实体 `{path, dev, ino}` 从 prepare 贯穿 switch、spawn、ready、CAS 与恢复。
+5. 为 group store、operation journal/receipt、follow journal、session row 定义 schema v2 兼容和回滚。
+6. 明确 saga/follow 启动恢复、同源并发 winner adoption、Riff/Mojo 有效执行上下文证明。
 
-新增宿主机本地、跨 Bot 共享的群状态，逻辑键为 `chatId`；物理存储天然位于当前 Botmux 宿主机，不跨机器同步。平台 `machineId` 只用于展示，未绑定平台时功能仍可用。
-
-新会话解析目录的优先级为：
-
-1. 当前会话或指令显式指定的目录；
-2. 当前 Bot 对该群的**显式/人工** `oncallChats` 专用覆盖；
-3. 当前宿主机的有效群级目录；
-4. 当前 Bot 的 `defaultWorkingDir` / `defaultOncall.workingDir`；
-5. 仓库选择卡。
-
-`oncallChats` 继续承担 per-Bot 对话授权，不自动迁移、不改义。为避免 `defaultOncall` 的自动绑定遮蔽已存在的群目录，cwd 来源必须区分：
-
-- `oncall-explicit`：人工配置或明确选定的专用覆盖，优先于群目录；
-- `oncall-default-auto`：`ensureDefaultOncallBound` 为授权/兼容自动生成的记录；它保留 oncall 授权效果，但在 cwd resolver 中不作为显式覆盖。存在有效群目录时取群目录，不存在群目录时才使用其 `defaultOncall` 目录。
-
-新写入记录必须带来源；历史 `oncallChats` 没有来源时不猜测、不批量迁移，按既有显式覆盖处理，避免改变已运行部署。授权判定仍看原有 oncall 绑定，不因 cwd resolver 跳过 `oncall-default-auto` 而缩小权限。
-
-### `/repo` 与会话范围对齐
-
-- 普通群顶层（`scope='chat'`）执行 `/repo <path|name|index>` 或选择 repo 卡：执行下述两阶段操作；会话切换成功后才尝试提交群目录。
-- 话题内相同操作只切当前话题，不写群状态。
-- `/repo wt ...` 属于显式会话 worktree，不写群状态。
-- `/repo here` 复用当前目录，不制造群写入；若当前目录来自群绑定，状态不变。
-- `/repo show` 只读展示 session、显式 per-Bot oncall、自动 defaultOncall、group、bot default、最终来源、群 revision/状态和更新时间。
-- `/repo unbind` 只允许普通群顶层执行：提交 tombstone，不修改当前会话、ACL 或 `oncallChats`。
-
-不同事件的并发写入使用 group revision/CAS；先提交者成功，后提交者返回冲突和当前值，不自动 rebase 或覆盖。重放由持久 operation receipt 判定，而不是只比较当前 binding 的 message id。
-
-### 稳定人类身份与权限入口
-
-群管理主体统一为 `TenantHumanId = { tenantKey, unionId }`。`open_id (ou_*)` 只在签发 app 内用于事件解析，禁止跨 app 直接比较；`union_id (on_*)` 只有在同租户边界内才稳定。无法取得 tenant 或 union_id、来源为 Bot、身份转换不确定时，群状态写入 fail closed。
-
-默认管理者集合来自宿主机的管理员 union 快照：对所有已注册 Bot 的 `resolvedAllowedUsers`，通过各自 app 将真人归一化为 `TenantHumanId`，去重后持久化/缓存。每次授权必须同时校验快照的 `configFingerprint` 与当前参与计算的 Bot 配置指纹一致；配置变化、快照过期、转换失败或租户不一致时先刷新，无法得到 fresh snapshot 则拒绝，不使用旧管理员资格。`workspaceManagers` 也存同一 `TenantHumanId` 类型；非空时完全替代默认并集。
-
-文本命令和卡片动作在接收 Bot 的通用 `canRunDaemonCommand` / repo-card gate **之前**增加窄路由：仅当事件已经解析为普通群的 `/repo <selection>` 或 `/repo unbind`（卡片则为该群原始 repo 请求对应的 selection/unbind action），且 `canManageGroupWorkspace(chatId, TenantHumanId, freshSnapshot)` 通过时，允许到达 group-workspace 操作路径。该例外：
-
-- 不授予普通对话、其他 daemon 命令、thread `/repo`、`/repo wt`、`/repo here` 或跨群卡片权限；
-- 不绕过目标路径校验、operation journal、CAS 或 session switch 的原有安全检查；
-- 对仅有群管理权、没有接收 Bot 权限的人，只允许这次群操作。若会话切换需要接收 Bot 的额外能力而不具备，则不得降级为普通 switch；应明确拒绝且不写群状态。
-
-飞书群主/群管理员不自动获得本地文件系统控制权。受信任 Bot 代办必须携带并验证原始真人的 `TenantHumanId`；首版无法验证时拒绝群写入。所有终态收据记录稳定 `actor`、源事件、旧/新值和 revision。
-
-### 持久状态模型：单调群版本、ACL 与历史收据
-
-共享 store 位于 `SESSION_DATA_DIR/group-workspaces.json`，使用现有跨进程锁和原子写模式。目录状态、ACL 和版本生命周期分离：
-
-```ts
-type TenantHumanId = { tenantKey: string; unionId: string };
-
-type GroupDirectoryState =
-  | { kind: 'bound'; workingDir: string }
-  | { kind: 'unbound' }; // tombstone
-
-interface GroupWorkspaceRecord {
-  chatId: string;
-  revision: number;              // set/unbind 均严格递增，永不因重绑归零
-  directory: GroupDirectoryState;
-  workspaceManagers?: TenantHumanId[]; // unbind 后保留
-  updatedAt: number;
-  updatedBy: TenantHumanId;
-}
-
-type GroupOperationKind = 'set' | 'unbind';
-interface GroupOperationReceipt {
-  operationKey: string;          // digest(sourceEventId, kind)
-  sourceEventId: string;         // 下述文本/卡片 canonical source identity 的稳定 digest
-  originMessageId?: string;      // 卡片原始请求/卡片消息，参与卡片 source identity 并供审计
-  kind: GroupOperationKind;
-  payloadDigest: string;         // 首次请求的 canonical semantic intent；明确不含 expectedRevision
-  chatId: string;
-  outcome: 'committed' | 'conflict' | 'invalid_dir' | 'unauthorized' | 'store_unavailable';
-  resultingRevision?: number;
-  resultingDirectory?: GroupDirectoryState;
-  actor: TenantHumanId;
-  completedAt: number;
-}
-```
-
-`sourceEventId` 必须是跨接收 Bot、跨实时投递与历史恢复都相同的 canonical stable identity：
-
-- 文本命令使用带版本的 tuple/digest `(stableTenantIdentity, chatId, originalImmutableLarkMessageId)`。`originalImmutableLarkMessageId` 只取飞书原始 `message_id`；投递 `event_id`、delivery/attempt id 仅写审计字段，绝不进入 `sourceEventId`、`operationKey` 或其他幂等键。`stableTenantIdentity` 优先取事件中可信的 tenant key；缺失时只允许回退到已通过飞书身份转换验证、且在各接收 app 下解析为同一 tenant key 的宿主机 tenant 映射。无法建立这种稳定 tenant identity 时 fail closed，不读取/创建 operation，也不执行 session/group 副作用；app id、Bot id 或 app-scoped `open_id` 不能充当回退值。
-- 卡片动作保留独立的 source identity：使用带版本的 tuple/digest `(stableTenantIdentity, chatId, originalImmutableRequestOrCardMessageId, immutableActionIdentity)`；其中 immutable action identity 是飞书 action event id（或平台明确保证不可变且全局唯一的等价 action id）。原始请求/card 与 action identity 都参与 canonical source identity，投递 attempt id 仍只供审计，因此同一张卡的两个独立 action 不会被误合并，单个 action 的重复投递会命中同一 operation。
-
-收据跨重启持久保留（首版不做自动清理）。幂等查找的唯一顺序不变量是：**在读取当前 group revision、重新解析 repo target 或执行任何副作用之前**，先按 `(canonical sourceEventId, operation kind)` 查 journal/receipt。若已存在，先将本次请求的 canonical semantic intent 与首次操作冻结的 `payloadDigest` 比较；该 digest 覆盖 `chatId + kind + normalized selection/requested path`（unbind 为 tombstone），明确排除 `expectedRevision` 以及任何当前状态。digest 不同即以 protocol conflict 拒绝；digest 相同则复用首次 journal 冻结的 canonical target、`expectedRevision` 和 expected session generation，禁止重新解析 target 或重读 revision 来改写它们。只有首次看见 `(sourceEventId, kind)` 时才解析 canonical target、读取当前 revision/session generation，并把 semantic payload digest、target、`expectedRevision`、session generation 一次性持久化。这样介入写入改变 revision 后的重放仍返回首次操作结果，`payloadDigest` 不会因 revision 重读而变化。解绑自身也有 receipt，并提交 `revision + 1` 的 tombstone；后续重绑继续递增。解绑不删除 `workspaceManagers`，因此不会扩大 ACL。
-
-共享 store 损坏、lock/read/write/fsync/rename 失败均 fail closed；不能解释成“没有绑定”。
-
-### 两阶段操作 journal 与成功响应边界
-
-顶层 `/repo` 是跨 session store 与 group store 的持久 saga，不宣称文件级原子。副作用前先持久化 journal：
-
-```ts
-type RepoGroupOperationPhase =
-  | 'prepared'
-  | 'session_committed'
-  | 'group_committed'
-  | 'conflict'
-  | 'store_unavailable'
-  | 'unknown';
-
-interface RepoGroupOperationJournal {
-  operationKey: string;
-  sourceEventId: string;
-  payloadDigest: string;          // 首次 semantic intent，不含 expectedGroupRevision
-  chatId: string;
-  sessionId: string;
-  expectedSessionGeneration: number;
-  expectedGroupRevision: number;
-  targetWorkingDir: string;
-  actor: TenantHumanId;
-  phase: RepoGroupOperationPhase;
-  sessionGenerationAfter?: number;
-  groupRevisionAfter?: number;
-}
-```
-
-状态转移：
-
-1. 入口先用 canonical `sourceEventId + kind` 查 journal/receipt，并按上节校验 semantic intent；命中时复用冻结的 target、expected revision 与 session generation。只有首次操作才解析 target、读取当前 revision/session generation；授权、路径可用性与 revision 校验后，在任何 session/worker 副作用前把这些值连同不含 expectedRevision 的 payload digest 写入 `prepared`。
-2. 重放/恢复不得先重读 revision 或重新解析 target；终态 receipt 直接返回，`prepared` 使用冻结值读回 session generation/cwd，只有能证明未提交时才执行一次 switch，能证明已提交则推进，无法证明则置 `unknown` 并停止人工可见操作。
-3. session 安全切换及持久化完成后写 `session_committed`，记录新 generation。此时会话目标目录的 provenance 是 `explicit`，直到 group CAS 成功；这样群提交失败时不会被后续 auto-follow 覆盖。
-4. 以 journal 的 expected revision 做 group CAS。成功时在同一 group-store 锁/原子写中写 record 与 operation receipt；receipt 是群提交的权威证明。释放 group 锁后再将 journal 标记 `group_committed`，并把该 session provenance 收敛为 `group` + 新 revision；任一后续写入结果未知时，恢复均以 receipt + session generation 读回收敛，不重复 group CAS。
-5. CAS 冲突写 `conflict` receipt；store 明确失败写 `store_unavailable` receipt（若底层提交结果不确定则 journal 为 `unknown`，不得伪造失败 receipt）。两者都保留已切换会话为 `explicit`，明确提示“会话已切换，群目录未更新”及当前群值/修复方式，不自动重基。
-6. `unknown` 恢复先在锁内按 operation key 读 receipt 和 group record：有 receipt 即收敛；无 receipt 且 record 精确证明该 operation 已提交时补 receipt；否则保持 unknown、拒绝再次切 session 或覆盖群值，提示管理员重试新的事件或检查状态。
-
-“群目录更新成功”的最终回复只能在 `group_committed` receipt 可读回后发送。现有 session-switch 成功文案必须延迟/改为中间结果，不能在 group CAS 前让用户误认整体成功。若进程在提交后、回复前退出，重放直接使用 receipt 发相同终态回复，不重启 worker、不增加 revision。`/repo unbind` 没有 session 阶段，但也先 journal、CAS 后 receipt，再发送成功。
-
-### 路径可用性与 TOCTOU
-
-set 写入前以及每次消费（新会话、`/th`、恢复、auto-follow、worker spawn 前）均以 daemon 的实际 uid/gid 执行：规范化绝对路径、`stat` 确认为目录，并通过独立 fd 或受控子进程实际 `chdir`/打开目录探测搜索权限。只 `stat` 成功不算可用。不要求目录可写。
-
-校验与 worker 启动之间仍有 TOCTOU：worker 必须以目标 cwd 启动并回报实际 cwd/ready，任一 chdir、挂载、权限或 realpath 变化失败都终止本 turn，不能回退到 `~`、Bot 默认目录或 picker。绑定记录保留，管理员用新的顶层 `/repo` 修复或 `/repo unbind` 解除。
-
-### 运行中会话、provenance 与安全跟随
-
-群更新不强切正在执行的会话。所有 cwd mutation 入口必须原子更新 `{workingDir, workingDirSource, groupWorkspaceRevision}`：
-
-- 顶层 group 解析/成功收敛：`source='group'` 并记录 revision；
-- `/repo`、`/cd`、worktree、人工 IPC repin 等显式操作：`source='explicit'`，清除 group revision；
-- 显式 oncall：`source='oncall-explicit'`；自动 defaultOncall：`source='oncall-default-auto'`；Bot 默认：`source='bot-default'`；
-- resume/recovery/session restore 必须恢复已持久化来源，不得仅恢复 path；跨进程 IPC 必须传递并校验 source/revision；
-- 历史无 provenance 的 session 标为 `legacy-unknown`，即使路径恰好等于群目录也不猜为 group，不自动跟随。
-
-其他 Bot 的既有 chat-scope session 仅在 `source='group'`、revision 落后且进入**下一业务 turn 之前**跟随。安全切换契约是：保持 turn admission/FIFO 锁，确认 idle 且非 busy/streaming/needs_user；真实 suspend 当前 CLI（若适配器要求）、kill 并等待旧 worker/PTY 退出，持久化新 cwd/provenance/generation，重新 spawn worker，以目标 cwd 到达 ready 并回报一致后，才把尚未投递的业务消息交给新 worker。任何一步失败都不投递该 turn，并给出一次可恢复提示；不得只 repin session 记录。
-
-thread、`explicit`、两种 oncall、bot-default、legacy-unknown 都不自动跟随。remote/adopt 或不支持可靠 suspend/kill/restart/ready 确认的 backend fail closed，保持原 session 并阻止该业务 turn，不能假装已迁移。崩溃恢复根据 generation 和 journal 读回，确保最多一个 worker；旧 worker 未确认退出时不得启动新 worker。
-
-## 非目标 / Non-goals
+### 非目标
 
 - 不跨宿主机同步或映射绝对路径。
-- 不自动迁移、合并或删除现有 `oncallChats`；只给新自动绑定写来源，历史值保守兼容。
-- 不改变 oncall 对话授权语义。
-- 不让 `/repo wt` 自动成为群默认目录。
-- 首个 PR 不要求 Dashboard 编辑界面。
-- 不清理历史 worktree，不改变 worktree 生命周期。
+- 不新增 Dashboard 群目录编辑 UI。
+- 不自动迁移、合并或删除既有 `oncallChats`；历史无 provenance 仍保守视为显式。
+- 不改变 oncall 对话授权语义、worktree 生命周期或 `/repo wt` 语义。
+- 不把 Dashboard 终端逐字节输入伪装成离散业务 turn；它继续走终端写权限，但在 group-sourced session 落后或 follow 未收敛时必须拒绝写入。
+- 不把输出投递 `/durable-send` 当成业务输入准入。
 
-## 验收标准 / Acceptance criteria
+## 总体不变量
 
-1. Bot A 顶层 `/repo X` 后，Bot B 新 chat session 和 `/th` 使用 X；daemon 重启后仍成立。
-2. thread `/repo Y` 只影响该 thread；`/repo wt`、`/repo here` 不写群。
-3. 显式 oncall Z 优先于 group X；defaultOncall 自动目录 Z 不遮蔽 X，但 oncall 授权不变；历史无来源 oncall 保守保持旧行为。
-4. 同一真人在 A/B app 下不同 open_id 均归一到同租户 union_id，文本和卡片可管理；普通成员、Bot、租户不符、旧配置指纹快照、收紧名单均拒绝。窄 bypass 不放行任何其他命令/范围。
-5. 文本 M1 的 canonical source ID 在不同接收 Bot、实时投递与历史恢复中都由同一 tenant/chat/original message tuple 得到；delivery event/attempt 变化不影响它。`M1 set X@r0 → M2 set Y@r1 → replay M1` 必须在重读 revision/重解析 target 前命中 M1，复用首次冻结的 X、r0 和 session generation，返回 M1 收据且 Y/r2 不变；payload digest 不含 expectedRevision。同 source 不同 semantic intent 拒绝；跨 Bot/重启同样成立。卡片则由原始请求/card + immutable action identity 区分 source。
-6. `set → unbind → set → 旧 CAS` 中 revision 单调且旧 CAS 失败；unbind 重放幂等，ACL 在 tombstone 上保留。
-7. 在 switch 前、session committed 后、group commit 结果未知、group committed 后回复前分别崩溃，恢复/重放不重复 switch/worker，不误报成功；CAS/ENOSPC/锁失败明确区分，最终回复只在 receipt 可证明后发出。
-8. group→`/cd`/显式 IPC→群更新不自动跟随；restart/resume 保留 provenance；legacy unknown 不误跟随。
-9. 支持的本地 PTY CLI 在安全边界确实 suspend/kill/restart，下一消息实际 cwd 为新目录且只有一个 worker；busy/FIFO/needs_user 延后；remote/adopt fail closed。
-10. 目录存在但不可进入、校验后撤权/卸载、消费时失效均停止，不回退；`/repo show` 给出修复信息。
-11. profile 重写 `bots.json` 不改变共享群状态；store 损坏/锁失败 fail closed。
-12. 现有 thread `/repo`、pending repo card、mid-session switch、worktree、oncall 授权和 command router 无回归。
+1. **先准入，后占位/租约/attempting/发送。** 任何业务输入在 Turn Admission 返回 `admitted` 前，不得取得业务 lease、把 durable head 标为 attempting、调用 `sendWorkerInput`/`forkWorker` 或 backend `writeBusinessInput`。
+2. **一次解析，多点证明。** Resolver 产生的 `WorkspaceIdentity` 是本 turn/session 的冻结目标；消费点只复验，不自行重算或回退。
+3. **故障不是“无绑定”。** group store、identity probe、authority 或 backend proof 不可用时 fail closed。
+4. **目录身份而非路径字符串。** 相同 path 但 `{dev, ino}` 改变即不同目录。
+5. **持久化先于内存发布。** journal/follow/session 的 next state 先 CAS 落盘，成功后才替换 live object。
+6. **恢复先于 ingress。** 启动恢复完成前不开普通业务入口；不可证明的状态 quarantine，绝不猜测重放。
 
-## 风险与 Gate / Risks and gates
+## A. Unified Turn Admission
 
-- 这是跨进程持久状态语义变更，必须覆盖人工中途干预、两阶段半写入、长等待与并发重入，并按仓库规则做独立对抗复核和变异复验。
-- operation journal、group record/receipt 与 session generation 的锁顺序必须固定，避免跨 store 死锁；不得持 group 文件锁等待 worker。
-- store 损坏或结果未知必须 fail closed，不得当作无绑定或自动重试覆盖。
-- Draft PR 可在规格和计划提交后创建；实现、自测、独立审查完成前不得合并或部署。
-- 部署/重启由维护者另行授权，本 PR 不包含生产切换。
+### 契约
 
-## AI Agent 执行指引 / Implementation guidance
+新增 `src/core/turn-admission.ts`，唯一公开入口：
 
-优先新增聚焦的 group workspace store、operation journal 和纯策略模块，不把共享状态塞入 `bot-registry.ts` 或 `oncall-store.ts`。文本与卡片必须复用同一 saga；目录解析返回 discriminated result，失效/不可访问/store unavailable 不得折成 `undefined`。
+```ts
+type TurnKind = 'management' | 'business' | 'terminal_bytes' | 'output_delivery';
+type TurnAdmissionResult =
+  | { status: 'admitted'; session: DaemonSession; workspace: WorkspaceConsumptionProof }
+  | { status: 'deferred'; reason: 'busy' | 'fifo_owned' | 'needs_user' | 'startup_recovery' }
+  | { status: 'rejected'; reason: WorkspaceFailure | 'unsupported_backend' | 'stale_owner' };
 
-关键调用链：
+async function admitTurn(request: TurnAdmissionRequest): Promise<TurnAdmissionResult>;
+```
 
-- `src/daemon.ts`：新会话、`/th`、turn admission、resume/recovery 与 worker 生命周期。
-- `src/core/command-handler.ts`：`/repo`、`/cd`、show/unbind、成功响应边界。
-- `src/im/lark/card-handler.ts`：repo card action 来源事件与窄权限入口。
-- `src/im/lark/event-dispatcher.ts`：接收 Bot gate、defaultOncall 自动来源、真人身份解析。
-- `src/core/session-cwd.ts` / session IPC：所有 cwd mutation 的 provenance。
-- `src/services/bot-admin-unions-store.ts`：fresh config fingerprint 管理员 union snapshot。
+`admitTurn` 在既有 `withBotTurnAdmission`（或 failed-turn recovery 的更强 `withBotTurnMutation`）内部运行，并按固定顺序：
 
-测试先写失败行为，再做最小实现；至少运行定向 Vitest、build 和受影响命令/路由测试。PR 描述记录故障注入序列、影响面、回退方式和独立复核结果。
+1. 分类 management/business；
+2. 恢复或解析 session；
+3. 调用 Workspace Resolver；
+4. 若 group-sourced session 落后，持 admission/FIFO owner 执行 follow；
+5. 复验 workspace identity 与 backend effective-context capability；
+6. 返回 proof；调用方随后才可领取细粒度 principal/XPI lease、改变 durable head、send/fork。
+
+### management 与 business 分类
+
+- `management`：`/repo show`、授权失败回复、repo picker 展示、`/repo unbind` 的 group-only CAS、关闭/暂停/rename 等不向 CLI 提交用户业务内容的动作。它们不触发 follow，但修改 cwd/session/group 的动作仍走各自 mutation/saga gate。
+- `business`：普通消息、listener 生成 prompt、external trigger、Dashboard create/start 的 opening prompt、Dashboard trigger/chat、`/queue` payload、principal-lane/XPI durable head、scheduler task、failed-turn retry/fresh、automatic continuation/recovery 中将再次送入 CLI 的内容。
+- `terminal_bytes`：不是离散 turn；若 session 是 group source 且 revision/identity 未证明为 current，worker terminal WS 必须拒绝写入并要求先通过 resume/follow。
+- `output_delivery`：model→Lark/Dashboard 输出，不进 admission。
+
+### 生产 ingress 与旁路清单
+
+| ingress | 当前链 | 修订适配点 | 业务发送前要求 |
+|---|---|---|---|
+| 普通 new topic | `dispatchHumanMessageViaHandlers → handleNewTopic → handleNewTopicAdmitted` | `handleNewTopicAdmitted` 在 session side effect 前调用 `admitTurn` | proof 后 `forkWorker` |
+| thread/existing | `handleThreadReply → handleThreadReplyAdmitted` | 替换局部 follow 检查为 `admitTurn` | proof 后 queue/send/fork |
+| realtime/polled listener | 最终汇入普通 handlers | 无独立 resolver；携带 origin adapter | 同普通消息 |
+| external trigger | `triggerSessionTurn → triggerSessionTurnAdmitted` | trigger adapter 在 `beginAsyncTrigger`、lease、send/fork 前调用 | store error 禁止 fallback |
+| Dashboard create/start/board/resume | IPC routes → `spawnDashboardSession`/`activateQueuedSession`/`resumeSession` | IPC gate 内调用 admission；create 先 async resolve 再注册 | proof 后 opening prompt/fork |
+| `/queue` | `handleCommand → submitQueuedMessage` | 命令复用已持有 admission；submit 再要求 proof token | deferred/rejected 不返回 accepted |
+| principal lane | live route → lane FIFO → `driveNextPrincipalLaneTurn` | materialization 可先做；head attempting/发送前 admission | 失败保留 durable head |
+| XPI | `driveNextXpiSharedCwdTurn` | workspace admission 先于 exact XPI lease/attempting | 失败保留 queue/lease 未取 |
+| scheduler | callback → `executeScheduledTask` | 现有 bot gate 内、session send/fork 前 admission | 目标 identity 不一致拒绝 |
+| failed-turn recovery | `recoverFailedTurn`（mutation gate） | 使用 `admitTurnUnderMutation`，不嵌套 shared gate | receipt attempting 前完成 |
+| ordinary continuation | worker-pool recovery send/fork | 已 admitted logical turn仅可重放同 proof；generation 变化则重新 admission | 禁止跨 generation 沿用 proof |
+| startup saga/follow recovery | boot barrier | recovery 自身是 management；不得发送业务内容 | barrier 完成后开 ingress |
+| terminal WS | proxy → worker `cp.write` | 加 `canAcceptTerminalBytes` fence | stale group session 拒绝 |
+| durable output send | `/durable-send` | `output_delivery`，明确不适用 | 无业务 admission |
+
+任何新增调用 `sendWorkerInput`、`forkWorker`、backend `writeBusinessInput` 或 durable head `attempting` 的生产节点，必须接受不可伪造、绑定 `{sessionId, workerGeneration, WorkspaceIdentity, turnId}` 的 `WorkspaceConsumptionProof`；结构测试只检查 API 依赖，行为测试证明拒绝绕过。
+
+## B. Async Workspace Resolver / Consumption
+
+新增 `src/core/workspace-resolver.ts` 与 `src/core/workspace-consumption.ts`：
+
+```ts
+type WorkspaceIdentity = { path: string; dev: string; ino: string };
+type WorkspaceResolution =
+  | { status: 'resolved'; source: WorkingDirSource; identity: WorkspaceIdentity; groupRevision?: number }
+  | { status: 'needs_picker'; candidates: RepoCandidate[] }
+  | { status: 'unbound' }
+  | { status: 'store_unavailable'; detail: string }
+  | { status: 'invalid_dir'; detail: string }
+  | { status: 'inaccessible'; detail: string }
+  | { status: 'identity_changed'; expected: WorkspaceIdentity; actual?: WorkspaceIdentity };
+
+async function resolveWorkspace(input: WorkspaceResolveInput): Promise<WorkspaceResolution>;
+async function consumeWorkspace(input: WorkspaceConsumeInput): Promise<WorkspaceConsumptionResult>;
+```
+
+优先级固定为：turn/session 显式 > `oncall-explicit` > group > `oncall-default-auto`/Bot default > picker。legacy oncall 无 provenance 按 explicit；`legacy-unknown` 不自动 follow。
+
+Resolver 由 daemon ordinary、trigger、Dashboard create/start/resume、new `/th`、scheduler、restore/recovery 调用。`store_unavailable`、损坏、锁失败、path probe 失败均原样传播，禁止折成 `undefined` 或 fallback。Consumption 在 session commit、spawn 前、worker ready、每次 remote backend business submit 前复验同一 identity；ready proof 必须匹配冻结 identity。
+
+路径 probe 使用 daemon 实际 uid/gid，要求绝对 canonical path、目录、可进入，并返回字符串化 `dev/ino`（避免 JSON number 精度差异）。probe 不要求写权限。
+
+## C. Workspace Authority
+
+新增 `src/core/workspace-authority.ts`，并收敛 `bot-admin-unions-store.ts`：
+
+```ts
+type AuthorityRouteResult =
+  | { status: 'not_applicable' }
+  | { status: 'recognized_denied'; reason: 'identity_unavailable' | 'stale_config' | 'unauthorized' | 'tenant_mismatch' }
+  | { status: 'authorized'; actor: TenantHumanId; configFingerprint: string };
+
+async function authorizeWorkspaceOperation(input: WorkspaceAuthorityInput): Promise<AuthorityRouteResult>;
+async function revalidateWorkspaceCommit(proof: WorkspaceAuthorityProof): Promise<AuthorityCommitResult>;
+```
+
+- 每个注册 Bot 的 tenant 必须来自其签名 app 的可信 tenant 发现/缓存，记录 `{appId, tenantKey, verifiedAt, source}`；禁止用当前请求 tenant 给其他 Bot 贴标签。
+- `TenantHumanId={tenantKey,unionId}`；`ou_*` 只在接收 app 内解析。
+- 卡片 tenant 从经过签名验证的 callback header/app tenant 映射取得，不读取不存在的 synthetic `data.tenant_key`。
+- fresh snapshot 计算后、发布前、首次授权前和 group CAS 提交前都重取 live config fingerprint；变化即丢弃并刷新/拒绝。
+- 顶层 group `/repo` 已被识别但身份/授权失败时返回 `recognized_denied` 并消费事件；只有 `not_applicable` 可以进入 legacy route。
+- prepared 后权限收紧必须在 session switch 前及 group CAS 前被发现；若 session 已切换而 commit 被拒，保持 explicit provenance，写 `unauthorized` receipt，不误报成功。
+
+## D. Workspace Identity 与 schema v2
+
+### v2 持久模型
+
+- `group-workspaces.json` v2：bound record 与 committed set receipt 都要求 `workspaceIdentity`。
+- `group-workspace-operations.json` v2：set journal 要求 `targetWorkspaceIdentity`；winner 冻结 path/dev/ino、expected revision/generation；unbind 明确无 identity，不再用 `/` 哨兵表达目录。
+- session row：新增 `workspaceSchemaVersion: 2`；group source 必须有 `groupWorkspaceIdentity`；launch guard 与 proof 使用同一 identity。
+- follow journal v2：新增 `schemaVersion:2`、target identity 和 journal revision；每次 phase CAS 使用 immutable next object。
+
+identity 必须贯穿：target resolve/probe → prepared → session switch → session row → spawn opts → worker ready proof → group CAS/receipt → recovery。任一点不匹配均 fail closed，且不能重新解析成“当前 path 的新 inode”继续旧操作。
+
+### 迁移、兼容与回滚
+
+1. 启动时先只读扫描四类状态并写 migration manifest；未知未来版本 fail closed，不覆盖文件。
+2. v1 group bound record：对 path 做一次 probe；成功后生成 v2 identity；失败则保留 v1 文件并 quarantine，管理员修复前不消费。
+3. v1 set journal/receipt 只有 path：未终态操作不能安全补 identity，标记 `migration_blocked_identity_missing`，不重放 switch/CAS；已终态 receipt 可由当前 record identity补齐，但必须证明 revision/target/actor 一致。
+4. v1 follow journal：若 phase 为 prepared 且旧 worker仍可证明未退出，可 probe 并升级；其它 phase 无 identity 则 quarantine，禁止 spawn。
+5. legacy session：group source 且可由同 revision group record证明时补 identity；否则降为 `legacy-unknown` 并禁止自动 follow，不猜测。
+6. 迁移以 sibling v2 temp + fsync + rename 发布；原 v1 文件保留为 `.v1.rollback`，migration manifest 记录 hash。SQLite session migration在事务内写 v2，导出只读 rollback snapshot。
+7. forward rollback：旧 binary 看到 v2 必须 fail closed，不能重写；运维回滚代码时继续保留 v2、journal、receipt、session 数据，通过显式 migrator 生成 v1 兼容副本，绝不删除审计文件。
+
+## Saga、follow 与启动恢复
+
+启动 barrier 顺序：加载/迁移 schema → 恢复 session stores → 枚举所有 operation journal（包括 `group_committed` 但 session 未 convergence）→ 以 receipt/session generation/identity 收敛 → 恢复 follow journal → 证明最多一个 worker → 驱动 principal/XPI durable queues → 开启 ingress。
+
+operation recovery 不依赖原事件重投。无法证明 switched/not-switched、committed/not-committed 或 worker owner 的 journal 进入 quarantine。group lock 期间不得等待 worker。
+
+follow 每个 phase 使用 `next = structuredClone(current)`，CAS 持久化成功后才发布内存；旧 worker 未确认退出不得 spawn。`spawned` 恢复只在 pid/generation/identity proof 匹配时采用；否则先持久化 rebase generation，再 spawn 一次。
+
+## 同 canonical source 并发
+
+首次同源同 kind 同 semantic intent 的两个请求可并发解析，但只有 journal-lock winner 可冻结 target/revision/generation/identity。loser 在 lock 内按 request-intent digest 采用 winner journal，随后 single-flight join 同一 operation promise/receipt；不得因 winner 已推进 phase 返回 `protocol_conflict` 或 `unknown`。同 source 不同 intent/kind 仍 protocol conflict。
+
+## Remote backend 有效上下文证明
+
+- **Riff**：host path 不能等同 remote absolute cwd。proof 必须绑定由 `WorkspaceIdentity` 推导出的 primary repo identity（repo remote/name + exact branch/commit/worktree mapping）及实际提交给 `createTask/followUp` 的首个 repo；worker `onData` 始终接线。无法从 group target 唯一推导 repo，或显式 `riffRepoDirs` 覆盖 target 时拒绝 group business turn。
+- **Mojo**：group provenance 禁止 `mojo.cwd` 覆盖 session target。host isolation 模式必须由 adapter 明确证明 repository context 被挂载/传给 agent 且与 target identity一致；仅 prompt 要求 `cd` 不算证明。cloud 模式若 provider 不返回可验证 repository identity，则对 group provenance返回 `unsupported_backend`。
+- backend proof 在 ready 和每次 business submit 前复验；path 可访问性不是 effective-context proof。
+
+## 验收标准（冻结）
+
+AC-01 Bot A 顶层 `/repo X` 后，Bot B 新 chat、`/th`、trigger 和 Dashboard create 使用 X；重启后成立。
+
+AC-02 thread `/repo Y` 仅影响 thread；`/repo wt`、`/repo here` 不写 group。
+
+AC-03 显式 oncall > group > 自动 defaultOncall/Bot default；授权语义不变；历史 oncall 保守兼容。
+
+AC-04 跨 app 真人身份、真实卡片 tenant、per-app tenant、fresh fingerprint 和 manager override 正确；recognized denial 不落 legacy route。
+
+AC-05 文本/卡片 canonical source、历史重放、payload digest 和 frozen target/revision/generation/identity正确；同源并发采用 winner。
+
+AC-06 set→unbind→set revision 单调、旧 CAS 失败、ACL 保留。
+
+AC-07 四个 crash boundary、明确/未知写失败、startup recovery 与最终回复边界正确且不重复 switch/worker/CAS。
+
+AC-08 group→`/cd`/IPC 后不跟随；restart/resume保留 provenance；legacy unknown 不误跟随。
+
+AC-09 本地 PTY 安全 retire/spawn/ready；busy/FIFO/needs_user延后；Riff/Mojo 必须证明有效上下文，否则拒绝。
+
+AC-10 不可进入、inode 替换、撤权/卸载、store failure 均停止且无 fallback；show 提供修复信息。
+
+AC-11 profile rewrite 不影响 group store；v1→v2、未来版本、向后/向前回滚保留文件并 fail closed。
+
+AC-12 现有 command router、repo card、worktree、oncall、thread、mid-session switch 无回归；所有生产 business ingress 均由统一 admission 覆盖。
+
+详细的 17-P1 ledger、调用链与逐项验证见 `2026-10-30-group-workspace-architecture-coverage.md`。

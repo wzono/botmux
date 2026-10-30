@@ -1,214 +1,257 @@
-# Group Workspace Binding Implementation Plan
+# Group Workspace Unified Admission Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a host-local, cross-Bot group working-directory binding with stable cross-app authorization, durable two-phase `/repo` outcomes, monotonic history, and safe worker-level auto-follow.
+**Goal:** Make every Botmux business turn execute only after one unified admission proves the current session, immutable workspace identity, authorization, worker generation, and backend effective context.
 
-**Architecture:** Separate group record/ACL/revision, historical operation receipts, and the session→group saga journal. Normalize humans to tenant-scoped union IDs using a fresh configuration-fingerprinted admin snapshot; route only authorized group `/repo` operations around the receiving Bot gate. Every cwd mutation carries provenance, and group auto-follow replaces the real worker before admitting the next business turn.
+**Architecture:** Four foundational contracts are implemented before production adapters: Turn Admission, async Workspace Resolver/Consumption, Workspace Identity schema v2, and Workspace Authority. Production ingress adapters then converge before lease/attempting/send/fork; startup recovery converges sagas and follow journals before ingress opens. Current code at `85fa2fdd9` remains NO-GO until all tasks and R1–R3 gates pass.
 
-**Tech Stack:** TypeScript, Bun, Vitest, Botmux daemon/session store, Lark event/card handlers, atomic JSON storage and cross-process file locks.
+**Tech Stack:** TypeScript, Bun 1.4.3, Vitest, SQLite session store, atomic JSON stores, Lark event/card handlers, PTY/Riff/Mojo backends.
 
 ---
 
-## File map
+## Review and execution rules
 
-- Create `src/services/group-workspace-store.ts`: monotonic record/tombstone, retained ACL, durable receipts, CAS, corruption fail-closed.
-- Create `src/services/group-workspace-operation-store.ts`: durable session→group saga journal and recovery queries.
-- Create `src/core/group-workspace-policy.ts`: precedence, stable actor authorization, narrow route eligibility, follow decisions.
-- Create `src/core/path-usability.ts`: actual-identity stat + chdir/access probe used at write and consumption.
-- Modify `src/services/bot-admin-unions-store.ts`: tenant-scoped identity snapshot freshness and config fingerprint contract.
-- Modify `src/im/lark/event-dispatcher.ts`: stable actor extraction, narrow pre-gate dispatch, defaultOncall provenance.
-- Modify `src/core/command-handler.ts`: text `/repo` saga, delayed success response, `/repo show`/`unbind`, `/cd` provenance.
-- Modify `src/im/lark/card-handler.ts`: action-event identity/idempotency and the same saga.
-- Modify `src/core/session-cwd.ts`, `src/services/session-store.ts`, `src/types.ts`: atomic cwd provenance and IPC/recovery schema.
-- Modify `src/daemon.ts`: resolver, consumption probe, saga recovery, safe pre-turn worker replacement.
-- Modify `src/i18n/zh.ts`, `src/i18n/en.ts`: conflict, partial, unknown, invalid path and follow results.
-- Add focused behavior tests under `test/group-workspace-*.test.ts`; extend existing route/session suites where their real harness is required.
+- Do not merge or deploy on task completion. New architecture review budget is R1–R3; R3 is terminal. Arbiter is the original requirement decision owner.
+- Implement foundational contracts (Tasks 1–5) before production ingress/migration adapters (Tasks 6–10).
+- Every code task is TDD: add the named failing behavior test, run the exact focused command and observe FAIL, implement, rerun and observe PASS, then commit.
+- Never run `bun install` in this worktree. Use the existing dependency link.
+- Coverage IDs and all 17 P1s are normative in `docs/superpowers/specs/2026-10-30-group-workspace-architecture-coverage.md`.
 
-### Task 1: Stable cross-app actor and fresh administrator snapshot
+## File structure
 
-**Files:**
-- Modify: `src/services/bot-admin-unions-store.ts`
-- Create: `src/core/group-workspace-policy.ts`
-- Create: `test/group-workspace-identity-policy.test.ts`
+**Create**
 
-- [ ] Write failing tests with two Bot configs whose app-scoped `ou_*` values map to one `{tenantKey, unionId}`. Assert `computeBotAdminUnions` deduplicates that human, `workspaceManagers` uses the same type, tenant mismatch/absent union rejects, and a snapshot whose `configFingerprint` differs from the current registered-Bot fingerprint is unusable until refreshed.
-- [ ] Add negative cases for a removed administrator retained only in an old snapshot, an unresolved allowed-user entry, a Bot actor, and a non-empty `workspaceManagers` list that excludes an otherwise default administrator.
-- [ ] Run `bunx vitest run test/group-workspace-identity-policy.test.ts`; expect failures at the missing stable identity/freshness API.
-- [ ] Implement `TenantHumanId`, canonical equality by `(tenantKey, unionId)`, deterministic fingerprinting over every registered Bot’s identity-relevant configuration, and `loadFreshBotAdminUnionSnapshot`: reuse only an exact fingerprint match; otherwise recompute through each signing app; any inconclusive conversion makes group authorization unavailable rather than partially accepting a union.
-- [ ] Implement pure `canManageGroupWorkspace({ actor, freshSnapshot, workspaceManagers })`; a non-empty manager list replaces the default union.
-- [ ] Rerun the suite; mutate the fingerprint equality and tenant equality guards separately and confirm each mutation makes its negative test fail, then restore.
-- [ ] Commit: `feat(workspace): 统一跨应用群管理员身份`.
+- `src/core/turn-admission.ts` — management/business classification, admission result and proof token, ordering before leases/sends.
+- `src/core/workspace-resolver.ts` — async precedence and discriminated outcomes.
+- `src/core/workspace-consumption.ts` — path/inode/backend proof and proof-token issuance.
+- `src/core/workspace-authority.ts` — verified tenant/actor authorization and commit revalidation.
+- `src/services/workspace-schema-migrator.ts` — v1→v2 scan/migrate/manifest/rollback export.
+- Focused tests listed per task.
 
-### Task 2: Monotonic group state, retained ACL, and historical receipts
+**Modify**
+
+- `src/services/group-workspace-store.ts`, `src/services/group-workspace-operation-store.ts`, `src/services/session-store.ts`, `src/types.ts` — v2 codecs and migrations.
+- `src/core/group-workspace-operation.ts`, `src/core/session-cwd.ts` — identity-bearing saga/follow and boot recovery.
+- `src/services/bot-admin-unions-store.ts`, `src/core/group-workspace-route-runtime.ts`, Lark handlers — trusted authority.
+- `src/daemon.ts`, `src/core/trigger-session.ts`, `src/core/session-manager.ts`, `src/core/command-handler.ts`, `src/core/worker-pool.ts` — adapters and enforced proof boundary.
+- `src/worker.ts`, Riff/Mojo backends — output and effective-context proof.
+
+### Task 1: Turn Admission contract and proof-enforced send boundary (P1-12, P1-16, P1-17)
 
 **Files:**
-- Create: `src/services/group-workspace-store.ts`
-- Create: `test/group-workspace-store.test.ts`
+- Create: `src/core/turn-admission.ts`
+- Create: `test/group-workspace-turn-admission.test.ts`
+- Modify: `src/core/worker-pool.ts`
 
-- [ ] Write failing tests for missing-file read, bound round-trip, canonical path, malformed store, interrupted atomic replacement, lock failure, and parallel writers.
-- [ ] Add canonical text-source tests where the same original immutable Lark `message_id` arrives through Bot A, Bot B, and historical recovery with different delivery `event_id`/attempt IDs. Assert all derive the same versioned digest of `(stable tenant identity, chatId, original message_id)` and hit one operation; delivery IDs remain audit-only. Cover tenant-key fallback through a verified cross-app tenant mapping, and assert missing/unverifiable stable tenant fails closed before journal lookup or side effects.
-- [ ] Add the concrete history sequence `M1:set X@r0 → M2:set Y@r1 → replay M1 after current revision is r2`; assert lookup by `(canonical sourceEventId, kind)` occurs before revision read/target resolution, replay reuses M1’s frozen canonical X, expected revision r0 and session generation, returns M1’s durable receipt, and leaves Y/r2 unchanged. Repeat after store reload, historical recovery, and from a second Bot/store instance sharing `dataDir`; assert `payloadDigest` excludes expectedRevision and is unchanged by the intervening revision.
-- [ ] Add `same sourceEventId + set + different semantic intent`; assert protocol conflict and no mutation, while identical intent reuses the first frozen payload/target. For cards, derive source identity from one original request/card plus immutable action identity: two distinct action IDs are independent operations, while redelivery of one action under different delivery attempt IDs is one operation.
-- [ ] Add `set X@r0 → unbind@r1 → set Y@r2 → delayed set Z expected r1`; assert revisions are 1/2/3, delayed CAS conflicts with r3, unbind replay is idempotent, and revision never resets after tombstone/rebind.
-- [ ] Configure `workspaceManagers=[U]`, unbind, reload, and assert tombstone still carries `[U]` and default administrator V still cannot set.
-- [ ] Run `bunx vitest run test/group-workspace-store.test.ts`; expect missing module failure.
-- [ ] Implement schema `{schemaVersion, records, receipts}`. Under one cross-process lock, validate the whole file, compare expected revision, write bound/tombstone plus a strictly incremented revision, preserve ACL unless a separately authorized ACL operation changes it, and atomically append the terminal receipt. Receipts/journals are looked up by digest of canonical source identity plus operation kind; validate semantic intent against the first operation’s frozen payload digest (excluding expectedRevision), and reject conflicting intent/source-kind reuse.
-- [ ] Return discriminated outcomes `committed | conflict | invalid_dir | unauthorized | store_unavailable | protocol_conflict`; expose no API that deletes a record/revision on unbind.
-- [ ] Rerun; invert the revision guard and remove receipt lookup in isolated mutations, confirming the delayed-CAS and M1 replay tests fail, then restore.
-- [ ] Commit: `feat(workspace): 持久化群目录版本与操作收据`.
+- [ ] Add tests for `classifyTurn` with ordinary/listener/trigger/Dashboard opening/queue/principal/XPI/scheduler/recovery as `business`; show/unbind-without-CLI as `management`; terminal bytes and durable output as their explicit classes.
+- [ ] Add an ordering harness whose trace must be `bot_gate → workspace_resolve → follow → consume → admitted → resource_lease → attempting → send`. Inject each resolver/follow/consume outcome and assert no later trace event occurs.
+- [ ] Add compile/runtime tests that `sendWorkerInput`, business `forkWorker`, and queued-activation dispatch reject an absent, stale-generation, wrong-session, wrong-turn or wrong-identity `WorkspaceConsumptionProof`; allow an explicitly typed management-only blank spawn.
+- [ ] Run `bunx vitest run test/group-workspace-turn-admission.test.ts`; expect missing module/signature failures.
+- [ ] Implement `TurnKind`, `TurnAdmissionRequest`, `TurnAdmissionResult`, opaque proof branding, `classifyTurn`, `admitTurn`, and `admitTurnUnderMutation`. Bind proof to session id, turn id, worker generation, workspace identity and expiration at the next generation change.
+- [ ] Change the central worker-pool business APIs to require and validate the proof; preserve later remote-retirement, XPI and dedupe fences.
+- [ ] Rerun the focused test; expect PASS. Mutate the proof check and ordering guard separately; each targeted case must fail.
+- [ ] Commit `feat(workspace): 建立统一业务回合准入契约`.
 
-### Task 3: Path usability probe at write and consumption
+### Task 2: Async resolver and consumption outcomes (P1-11, P1-13)
 
 **Files:**
-- Create: `src/core/path-usability.ts`
-- Create: `test/group-workspace-path-usability.test.ts`
-- Modify: `src/services/group-workspace-store.ts`
-
-- [ ] Write failing tests for nonexistent path, regular file, traversable directory, directory that still passes `stat` but cannot be entered by the daemon identity, and a probe that succeeds at set then fails after permission removal/path replacement.
-- [ ] Run `bunx vitest run test/group-workspace-path-usability.test.ts`; expect missing export.
-- [ ] Implement normalization plus `stat` and an actual `chdir`/directory-open probe in an isolated controlled subprocess or fd-based helper running with daemon uid/gid. Restore cwd unconditionally; do not require write access. Return structured `missing | not_directory | inaccessible | changed | io_error`.
-- [ ] Call the probe before store `set`; keep a separate consumption API so callers must re-probe before session creation, `/th`, recovery, auto-follow, and worker spawn.
-- [ ] Rerun; replace the chdir probe with stat-only in a mutation and confirm the inaccessible-directory case fails, then restore.
-- [ ] Commit: `feat(workspace): 严格校验群目录可进入性`.
-
-### Task 4: Narrow receiving-Bot gate bypass for group `/repo`
-
-**Files:**
-- Modify: `src/im/lark/event-dispatcher.ts`
-- Modify: `src/im/lark/card-handler.ts`
+- Create: `src/core/workspace-resolver.ts`
+- Create: `src/core/workspace-consumption.ts`
+- Create: `test/group-workspace-resolver-contract.test.ts`
 - Modify: `src/core/group-workspace-policy.ts`
-- Create: `test/group-workspace-route-authorization.test.ts`
+- Modify: `src/core/path-usability.ts`
 
-- [ ] Build a real route-harness test where U is administrator only through Bot A, sends top-level `/repo X` to Bot B using B’s `ou_*`, and maps to the same tenant union. Assert text reaches the group operation route despite B’s generic command gate. Add the equivalent repo-card action case.
-- [ ] Assert the bypass does not admit U’s ordinary message, `/help`, `/cd`, thread `/repo X`, `/repo wt`, `/repo here`, a card from another chat, a stale/fabricated card, or a group `/repo` when stable identity/fresh snapshot is unavailable.
-- [ ] Assert a user with group authority but without session-switch capability receives a clear denial and neither switch nor group write occurs; no fallback to an ordinary unauthorized repo switch.
-- [ ] Run `bunx vitest run test/group-workspace-route-authorization.test.ts test/card-action-routes.test.ts test/command-router-oracle-diff.test.ts`; expect new route cases to fail.
-- [ ] Add a pre-gate classifier that accepts only ordinary-group set/unbind text commands and matching original repo-card actions. Resolve the actor to `TenantHumanId`, load a fresh snapshot, authorize the exact chat, then dispatch through a dedicated group-workspace route. Leave all other traffic on existing gates.
-- [ ] Rerun; broaden the classifier to accept one forbidden command in a mutation and confirm the negative test fails, then restore.
-- [ ] Commit: `feat(repo): 收窄群目录管理命令授权入口`.
+- [ ] Add a table test for `explicit > oncall-explicit > group > oncall-default-auto/bot-default > picker`, including legacy oncall as explicit and legacy session as `legacy-unknown`.
+- [ ] Add discriminated cases `resolved`, `needs_picker`, `unbound`, `store_unavailable`, `invalid_dir`, `inaccessible`, `identity_changed`; assert only `unbound` may advance to lower precedence and all error outcomes prohibit fallback.
+- [ ] Add consumption tests that probe under daemon uid/gid, compare canonical path plus string `dev/ino`, and revalidate at session commit, spawn, ready and backend submit.
+- [ ] Run `bunx vitest run test/group-workspace-resolver-contract.test.ts test/group-workspace-path-usability.test.ts`; expect missing APIs.
+- [ ] Implement async `resolveWorkspace` and `consumeWorkspace`; make `path-usability` return canonical `WorkspaceIdentity` and use `path.isAbsolute` for platform correctness.
+- [ ] Remove the overloaded synchronous resolver from the shared contract; adapters are migrated in Tasks 8–9, so keep a temporary internal compatibility wrapper that cannot collapse error outcomes.
+- [ ] Rerun focused suites; mutate `store_unavailable` into `unbound` and verify the test fails.
+- [ ] Commit `feat(workspace): 统一异步目录解析与消费结果`.
 
-### Task 5: Durable session-to-group operation journal
-
-**Files:**
-- Create: `src/services/group-workspace-operation-store.ts`
-- Create: `src/core/group-workspace-operation.ts`
-- Create: `test/group-workspace-operation.test.ts`
-
-- [ ] Write state-machine tests for legal transitions `prepared → session_committed → group_committed`, `session_committed → conflict/store_unavailable`, and any unresolved I/O → `unknown`; reject skipped or backward transitions.
-- [ ] Before any fake session side effect, assert the durable journal contains operation key, actor, target, expected group revision, session id and expected generation.
-- [ ] Assert coordinator ordering explicitly: derive canonical source identity, query journal/receipt by `(sourceEventId, kind)`, and validate the incoming semantic-intent digest before reading current group revision or resolving the target. Only a miss may resolve the canonical target/read revision and then atomically freeze payload digest, target, expected revision and expected session generation.
-- [ ] After an intervening operation advances the group revision and changes repo resolution inputs, replay the first source ID. Assert recovery does not call target resolution or current-revision acquisition, reuses the first frozen target/revision/generation, and does not change payloadDigest; submit different semantic intent under that source ID and assert protocol conflict.
-- [ ] Inject crashes at four exact boundaries: after `prepared` before switch; after persisted session switch before journal advance; after group atomic commit before journal convergence; after terminal receipt before response. On recovery/replay assert session switch count, worker start count and group revision each remain one.
-- [ ] Inject CAS conflict, definite ENOSPC/lock failure, and ambiguous atomic-write result. Assert conflict/definite failure retain the switched session as explicit and produce terminal receipts; ambiguous result stays unknown and first reads receipt/current record under lock instead of retrying CAS or session switch.
-- [ ] Run `bunx vitest run test/group-workspace-operation.test.ts`; expect missing modules.
-- [ ] Implement journal persistence and a coordinator that never holds the group file lock while waiting for a worker. Recovery reads journal + session generation/cwd + group receipt: prove not switched then switch once; prove switched then advance; terminal receipt converges immediately; irreducibly ambiguous remains unknown and blocks replay.
-- [ ] Ensure the group record and terminal group receipt are one atomic group-store update. CAS conflict never rebases. A failed group phase leaves session provenance explicit and clears group revision.
-- [ ] Rerun; mutate recovery to repeat session switch and confirm crash-boundary tests catch extra generation/worker, then restore.
-- [ ] Commit: `feat(workspace): 增加选仓两阶段操作日志`.
-
-### Task 6: Text and card `/repo` share the saga and response boundary
-
-**Files:**
-- Modify: `src/core/command-handler.ts`
-- Modify: `src/im/lark/card-handler.ts`
-- Modify: `src/im/lark/card-builder.ts`
-- Modify: `src/i18n/zh.ts`, `src/i18n/en.ts`
-- Create: `test/group-workspace-repo-entrypoints.test.ts`
-
-- [ ] Add failing text/card parity tests for chat set, thread isolation, `/repo wt`, `/repo here`, stale revision, unauthorized actor, replay, source-event payload conflict, aborted session commit, and `/repo unbind` without a session phase.
-- [ ] Capture emitted messages in `session committed → group pending`, conflict, store unavailable, unknown, committed, and `committed then crash before reply` sequences. Assert no “群目录更新成功” response appears until a readable `group_committed` receipt exists; replay after reply crash emits the receipt-derived success without switch/write.
-- [ ] Assert text idempotency uses the canonical tenant/chat/original immutable Lark message tuple across Bots and historical recovery, never delivery event/attempt IDs. Assert card source identity separately combines the originating request/card ID with immutable action identity; delivery attempts are audit-only.
-- [ ] Run `bunx vitest run test/group-workspace-repo-entrypoints.test.ts test/command-handler.test.ts test/card-handler-repo-select.test.ts`; expect failures.
-- [ ] Route text and card through the Task 5 coordinator. Delay/replace existing early success messages. Implement show output for all provenance layers and group state/revision; implement unbind as journal→CAS tombstone+receipt→success.
-- [ ] Rerun with `test/command-schema.test.ts test/command-router-oracle-diff.test.ts test/card-action-routes.test.ts`; expect PASS.
-- [ ] Commit: `feat(repo): 统一群选仓持久操作与回执`.
-
-### Task 7: defaultOncall provenance without authorization regression
-
-**Files:**
-- Modify: `src/im/lark/event-dispatcher.ts`
-- Modify: `src/core/group-workspace-policy.ts`
-- Modify: `src/services/session-store.ts`
-- Create: `test/group-workspace-default-oncall.test.ts`
-
-- [ ] Through the real dispatcher, configure group X and `defaultOncall.workingDir=Z`. Trigger `ensureDefaultOncallBound`; assert oncall authorization still succeeds but cwd resolution chooses X and records `oncall-default-auto` rather than `oncall-explicit`.
-- [ ] Assert a manually configured oncall Z chooses Z over X. Load a historical oncall entry without provenance and assert conservative legacy behavior still chooses Z; do not auto-reclassify it.
-- [ ] Run `bunx vitest run test/group-workspace-default-oncall.test.ts`; expect resolver/source failures.
-- [ ] Persist provenance on newly auto-created defaultOncall entries. Make cwd resolution ignore that entry as an explicit layer while leaving the existing authorization lookup intact; treat missing legacy provenance as explicit for compatibility.
-- [ ] Rerun relevant oncall tests plus the new suite; mutate resolver to let auto Z shadow X and confirm the real-entry regression test fails, then restore.
-- [ ] Commit: `fix(workspace): 区分自动与显式值班目录`.
-
-### Task 8: Complete cwd provenance across every mutation path
+### Task 3: Workspace Identity schema v2 codecs (P1-06, P1-14; P2-04, P2-06)
 
 **Files:**
 - Modify: `src/types.ts`
-- Modify: `src/core/session-cwd.ts`
+- Modify: `src/services/group-workspace-store.ts`
+- Modify: `src/services/group-workspace-operation-store.ts`
 - Modify: `src/services/session-store.ts`
+- Modify: `src/core/session-cwd.ts`
+- Create: `test/group-workspace-schema-v2.test.ts`
+
+- [ ] Add codec tests requiring identity on v2 bound records, committed set receipts, set journals, group session rows and follow journals; unbind carries no fake `/` identity.
+- [ ] Add impossible-pair tests: group source without revision/identity; non-group with group identity; path equal but dev/ino different; unsafe JSON numeric inode; unsupported future version.
+- [ ] Add follow phase tests where persist throws after next state construction. Assert the live object and durable row remain old; same-process retry performs the omitted step exactly once.
+- [ ] Run `bunx vitest run test/group-workspace-schema-v2.test.ts test/group-workspace-provenance.test.ts test/group-workspace-session-follow.test.ts`; expect v2 failures.
+- [ ] Define `WorkspaceIdentity`, `workspaceSchemaVersion`, v2 registry/journal/follow codecs, one provenance normalizer and immutable `nextJournal` transitions with row CAS.
+- [ ] Keep v1 readers read-only and discriminated for Task 6 migration; unknown future versions return unavailable without rewrite.
+- [ ] Rerun and mutation-test persist-before-publish and identity equality.
+- [ ] Commit `feat(workspace): 冻结目录实体并升级持久模型`.
+
+### Task 4: Verified Workspace Authority (P1-02, P1-03, P1-04, P1-08, P1-09)
+
+**Files:**
+- Create: `src/core/workspace-authority.ts`
+- Modify: `src/services/bot-admin-unions-store.ts`
+- Modify: `src/core/group-workspace-route-runtime.ts`
+- Create: `test/group-workspace-authority-v2.test.ts`
+
+- [ ] Add two-app/two-tenant fixtures where each app tenant comes from its own verified source. Assert equal union strings across tenants never merge and request tenant cannot relabel candidates.
+- [ ] Add authentic Lark card callback fixture using verified callback header/app mapping and no synthetic `data.tenant_key`; assert text/card produce the same `TenantHumanId`.
+- [ ] Add config-race tests that change allowed users during conversion, before publish, before session switch and before CAS. Assert stale proof is discarded and removed actor receives `unauthorized`.
+- [ ] Add classifier tests: unrelated route=`not_applicable`; recognized top-level group operation with missing/stale/unauthorized identity=`recognized_denied`; only authorized result reaches saga. Assert denial never enters legacy `/repo`.
+- [ ] Run `bunx vitest run test/group-workspace-authority-v2.test.ts test/group-workspace-route-authorization.test.ts`; expect failures.
+- [ ] Implement verified app-tenant records, live config fingerprint supplier, `authorizeWorkspaceOperation`, `revalidateWorkspaceCommit`, and three-state route result.
+- [ ] Rerun; invert tenant/fingerprint/recognized-denial guards one at a time and confirm red tests.
+- [ ] Commit `fix(workspace): 核验跨应用租户与提交权限`.
+
+### Task 5: Same-source winner adoption and identity-bearing saga (P1-07, P1-10, P1-14; P2-01)
+
+**Files:**
+- Modify: `src/services/group-workspace-operation-store.ts`
+- Modify: `src/core/group-workspace-operation.ts`
+- Modify: `src/services/group-workspace-store.ts`
+- Create: `test/group-workspace-operation-v2.test.ts`
+
+- [ ] Add barrier-controlled concurrent first-delivery test: both miss, resolve different transient generation/revision values, one prepares; loser with same source/kind/request-intent adopts exact winner target/revision/generation/identity and joins one terminal receipt. Assert one switch, worker and group revision.
+- [ ] Add changed semantic intent and opposite kind cases; assert protocol conflict without adoption.
+- [ ] Replace path inode between prepared, switch, spawn, ready and CAS in separate tests. Assert identity_changed, no old-operation re-resolution, no group success.
+- [ ] Add in-place `DaemonSession` update test proving switch by durable session id/owner/generation/cwd/identity, not object inequality.
+- [ ] Add outcome parity for `unauthorized`, `invalid_dir`, `store_unavailable`, `conflict`, `unknown`.
+- [ ] Run `bunx vitest run test/group-workspace-operation-v2.test.ts test/group-workspace-operation.test.ts`; expect failures.
+- [ ] Implement `prepareOrAdopt`, keyed single-flight, frozen `WorkspaceIdentity`, durable session proof and commit-time authority/identity validation. Keep group lock free while awaiting worker.
+- [ ] Rerun; remove adoption and durable proof guards in isolated mutations and confirm red.
+- [ ] Commit `fix(workspace): 收敛同源并发与目录实体事务`.
+
+### Task 6: Schema migration, rollback, and startup convergence (P1-05, P1-06, P1-14)
+
+**Files:**
+- Create: `src/services/workspace-schema-migrator.ts`
+- Create: `test/group-workspace-migration.test.ts`
+- Modify: `src/core/group-workspace-operation.ts`
+- Modify: `src/core/session-cwd.ts`
+- Modify: `src/daemon.ts`
+
+- [ ] Create fixtures for group store, operation journal/receipt, follow journal and SQLite session rows in v1, v2, malformed and future-version forms.
+- [ ] Test v1 bound record probe→v2, terminal receipt exact adoption, unresolved set without identity quarantine, prepared follow safe upgrade, post-retirement follow quarantine, and provable/unprovable group session migration.
+- [ ] Test interrupted temp write/rename/SQLite transaction: original bytes remain; `.v1.rollback` and manifest hash are preserved; rerun is idempotent.
+- [ ] Test forward rollback: a v1 reader refuses v2 and does not rewrite; explicit downgrade export writes a separate compatibility file and leaves v2/journals/receipts/session snapshot untouched.
+- [ ] Add boot test without event redelivery: migrate → restore sessions → recover unresolved plus `group_committed` pending convergence → recover follow → prove worker cardinality → drive durable queues → open ingress.
+- [ ] Run `bunx vitest run test/group-workspace-migration.test.ts test/group-workspace-follow-real-worker.integration.test.ts`; expect failures.
+- [ ] Implement scan manifest, atomic migrator, quarantine records, rollback exporter, `listRecoverable`, saga/follow recovery and daemon startup barrier in the tested order.
+- [ ] Rerun; inject failure at each publish boundary and expect PASS with preserved originals.
+- [ ] Commit `feat(workspace): 迁移并恢复群目录持久状态`.
+
+### Task 7: `/repo` text/card saga adapters and response boundary (P1-04, P1-07, P1-14)
+
+**Files:**
+- Modify: `src/daemon.ts`
+- Modify: `src/core/command-handler.ts`
+- Modify: `src/im/lark/card-handler.ts`
+- Modify: `src/im/lark/event-dispatcher.ts`
+- Modify: `src/core/group-workspace-route-runtime.ts`
+- Modify: `src/i18n/zh.ts`
+- Modify: `src/i18n/en.ts`
+- Create: `test/group-workspace-entrypoints-v2.test.ts`
+
+- [ ] Add text/card parity tests for authorized set, recognized denial, revoke at each boundary, inode replacement, in-place switch success, conflict, unknown, replay and unbind.
+- [ ] Assert no success response before readable committed receipt plus session provenance convergence; replay after reply crash emits receipt-derived terminal response without worker/CAS repeat.
+- [ ] Run `bunx vitest run test/group-workspace-entrypoints-v2.test.ts test/group-workspace-repo-entrypoints.test.ts`; expect failures.
+- [ ] Wire authority v2, saga v2 and discriminated outcomes; remove legacy fallthrough for recognized denial; derive show data from resolver outcomes.
+- [ ] Rerun with `test/command-schema.test.ts test/command-router-oracle-diff.test.ts test/card-action-routes.test.ts`; expect PASS.
+- [ ] Commit `fix(repo): 接入目录实体事务与终态回执`.
+
+### Task 8: Ordinary, trigger, Dashboard, listener and scheduler adapters (P1-11, P1-12, P1-13; P2-07, P2-08)
+
+**Files:**
+- Modify: `src/daemon.ts`
+- Modify: `src/core/trigger-session.ts`
+- Modify: `src/core/session-manager.ts`
+- Modify: `src/core/dashboard-ipc-server.ts`
+- Modify: `src/core/scheduler.ts`
+- Modify: `src/im/lark/event-dispatcher.ts`
+- Create: `test/group-workspace-ingress-adapters.test.ts`
+
+- [ ] Build one parameterized real adapter harness for ordinary new/existing, realtime listener, polled listener, trigger new/existing, Dashboard create/start/board/resume, scheduler tick/manual and failed-turn retry/fresh.
+- [ ] For each row assert resolver parity, proof before lease/attempting/send/fork, no fallback on store/path/identity error, and no business delivery before successful follow.
+- [ ] Add leading `@Bot /repo` parity and Dashboard show provenance cases.
+- [ ] Run `bunx vitest run test/group-workspace-ingress-adapters.test.ts test/trigger-session-root-message.test.ts`; expect failures.
+- [ ] Replace `trigger-session.resolveWorkingDir` and `resolveDashboardSpawnWorkingDir` with shared async adapters; route failed-turn recovery through `admitTurnUnderMutation`; listeners keep ordinary adapter origin.
+- [ ] Rerun `bunx vitest run test/dashboard-managed-spawn.test.ts test/scheduler-authority-integration.test.ts test/scheduler-execution-context.test.ts test/scheduler.test.ts`; expect PASS.
+- [ ] Commit `feat(workspace): 统一消息触发与面板目录准入`.
+
+### Task 9: `/queue`, principal lane, XPI, terminal and continuation adapters (P1-16, P1-17; P2-02)
+
+**Files:**
 - Modify: `src/core/command-handler.ts`
 - Modify: `src/daemon.ts`
-- Create: `test/group-workspace-provenance.test.ts`
+- Modify: `src/core/xpi-shared-cwd-admission.ts`
+- Modify: `src/core/worker-pool.ts`
+- Modify: `src/worker.ts`
+- Create: `test/group-workspace-durable-ingress.test.ts`
 
-- [ ] Add table-driven tests for group resolver, `/repo`, `/cd`, worktree, explicit IPC repin, oncall explicit, defaultOncall auto, Bot default, resume, recovery and session-store reload. Assert each atomically writes the expected source and sets/clears `groupWorkspaceRevision`.
-- [ ] Add `group X/r1 → /cd Y → group r2 → next turn`; assert Y remains explicit before and after restart. Repeat for explicit IPC. Assert resume/recovery preserves persisted source rather than deriving it from path equality.
-- [ ] Load a legacy session with no provenance whose path equals group X; assert migration yields `legacy-unknown`, never `group`, and does not auto-follow.
-- [ ] Run `bunx vitest run test/group-workspace-provenance.test.ts test/session-cwd.test.ts`; expect missing schema/source behavior.
-- [ ] Replace path-only cwd mutation with one API requiring `{workingDir, source, groupWorkspaceRevision}`; update every enumerated caller and IPC payload. Validate impossible pairs (`group` without revision; non-group with revision). Migrate absent fields to `legacy-unknown`.
-- [ ] Rerun; deliberately omit `/cd` source update in a mutation and confirm the group→cd test fails, then restore.
-- [ ] Commit: `feat(workspace): 完整记录会话目录来源`.
+- [ ] Add `/queue` test at stale r1: deferred/failure leaves unaccepted; success follows then returns accepted and sends once.
+- [ ] Add principal/XPI durable FIFO tests proving admission precedes head attempting and exact lease. On rejection, retain head, do not consume retry budget as dispatched, and retry only by bounded policy.
+- [ ] Add continuation test: same logical turn can reuse proof only while generation/identity match; stale proof re-enters admission or quarantines ambiguous dispatch.
+- [ ] Add terminal WS test: current group identity allows authorized bytes; stale revision/identity rejects bytes without treating each key as a new business turn. Assert `/durable-send` never invokes turn admission.
+- [ ] Run `bunx vitest run test/group-workspace-durable-ingress.test.ts`; expect failures.
+- [ ] Wire proof-aware queue, lane, XPI, continuation and terminal fences; add per-session+generation admission single-flight.
+- [ ] Rerun `bunx vitest run test/principal-lane-live-acceptance.test.ts test/principal-lane-recovery.test.ts test/xpi-shared-cwd-admission.test.ts test/xpi-shared-cwd-daemon-callbacks.test.ts test/message-queue.test.ts test/terminal-write-frame.test.ts`; expect PASS.
+- [ ] Commit `fix(workspace): 封闭持久队列与终端输入旁路`.
 
-### Task 9: Resolution and consumption fail closed
-
-**Files:**
-- Modify: `src/daemon.ts`
-- Modify: `src/core/group-workspace-policy.ts`
-- Create: `test/group-workspace-daemon-resolution.test.ts`
-
-- [ ] Test `explicit > oncall-explicit > group > oncall-default-auto/bot-default > picker`, Bot B reading Bot A’s binding, `/th` without peer, tombstone fallback, and group-store corruption/lock failure.
-- [ ] At each consumption point—new chat session, `/th`, resume/recovery, pre-spawn—make X pass initial validation then replace/revoke/unmount it. Assert the turn/session stops with a repair message and does not use home/default/picker.
-- [ ] Make worker launch report a cwd different from requested X; assert readiness is rejected as TOCTOU failure.
-- [ ] Run `bunx vitest run test/group-workspace-daemon-resolution.test.ts test/daemon-pinned-working-dir.test.ts test/inherit-peer.test.ts`; expect failures.
-- [ ] Return a discriminated resolver result including invalid/inaccessible/store-unavailable. Re-probe immediately before spawn and require ready cwd confirmation; preserve invalid binding for administrator repair.
-- [ ] Rerun and expect PASS.
-- [ ] Commit: `feat(workspace): 新会话安全消费群级目录`.
-
-### Task 10: Real worker replacement before auto-follow turn
+### Task 10: Riff/Mojo effective-context and output proof (P1-01, P1-15; P2-05)
 
 **Files:**
-- Modify: `src/daemon.ts`
-- Modify: `src/core/session-cwd.ts`
-- Create: `test/group-workspace-session-follow.test.ts`
+- Modify: `src/worker.ts`
+- Modify: `src/adapters/backend/riff-backend.ts`
+- Modify: `src/adapters/backend/mojo-backend.ts`
+- Modify: `src/adapters/backend/mojo-isolated-workspace.ts`
+- Create: `test/group-workspace-remote-backend.test.ts`
 
-- [ ] Build fake-clock/real worker-harness sequences for an idle group-sourced chat session at r1 receiving a business message after group r2. Assert order: acquire admission/FIFO → suspend → kill → await old exit → persist cwd/source/revision/new generation → spawn at X2 → ready cwd X2 → deliver message. Assert one old exit, one new worker and one message delivery.
-- [ ] Run the same behavior for two different local PTY-family CLI adapters. Assert the business message observes X2, not only the session record.
-- [ ] Add busy, streaming, FIFO-active and needs_user cases; assert no force switch and no message delivered until a later safe boundary. Add thread, explicit, both oncall sources, bot-default and legacy-unknown cases; assert no auto-follow.
-- [ ] Inject suspend, kill timeout, persist, spawn, ready and cwd-mismatch failures. Assert the turn fails closed with one notice, never delivers to old/new worker ambiguously, and never starts a new worker before confirmed old exit.
-- [ ] Add remote and adopt sessions; assert they fail closed and retain old state because reliable lifecycle replacement is unsupported.
-- [ ] Simulate crash after old exit and after new spawn; recover by generation/journal and assert at most one worker before any business delivery.
-- [ ] Run `bunx vitest run test/group-workspace-session-follow.test.ts test/session-cwd.test.ts test/daemon-rename-route.test.ts`; expect failures.
-- [ ] Implement pre-turn follow using existing suspend/kill/spawn primitives and generation checks, not path-only repin. Emit the one-time notice only after confirmed migration or a fail-closed result.
-- [ ] Rerun; mutate away `await old exit` and confirm the worker-count/order test fails, then restore.
-- [ ] Commit: `feat(workspace): 安全重启会话跟随群目录`.
+- [ ] Add real backend harness assertions that group-bound Riff and Mojo always deliver progress/final/error through `onData` while cwd validation is enabled.
+- [ ] For Riff, test primary repo derived from target identity, explicit repo override mismatch rejection, non-git target rejection, and proof attached to `createTask/followUp` input.
+- [ ] For Mojo, test `mojo.cwd` override rejection for group provenance, isolation repository mapping proof, and cloud/provider-no-proof=`unsupported_backend`; prompt guidance alone must fail.
+- [ ] Run `bunx vitest run test/group-workspace-remote-backend.test.ts test/riff-backend.test.ts test/mojo-backend.test.ts`; expect the new suite to fail at missing effective-context/output guarantees while existing suites retain their baseline.
+- [ ] Separate output listener ownership from cwd guard; implement backend `effectiveWorkspaceProof()` and validate it at ready plus every business submit.
+- [ ] Rerun; remove output binding/effective proof in mutations and confirm targeted failures.
+- [ ] Commit `fix(workspace): 证明远程后端有效目录并恢复输出`.
 
-### Task 11: Cross-Bot restart integration and regression gates
+### Task 11: Full migration and ingress E2E gates (all P1, AC-01–AC-12)
 
 **Files:**
-- Create: `test/group-workspace-e2e.test.ts`
+- Modify: `test/group-workspace-e2e.test.ts`
+- Modify: `test/group-workspace-follow-real-worker.integration.test.ts`
+- Create: `test/group-workspace-architecture-e2e.test.ts`
 - Modify: `docs-site/docs/zh/slash-commands.md`
 - Modify: `docs-site/docs/en/slash-commands.md`
 
-- [ ] Add a two-Bot shared-dataDir sequence: A receives U through app A and commits X; the identical original text message is recovered through B with a different delivery event/attempt ID and must derive the same canonical source ID/receipt. Restart stores/daemon harness; B sees U through app B and resolves `/th` to X. Include verified tenant fallback, unavailable stable-tenant fail-closed, fresh fingerprint, manager override, inaccessible X, and profile rewrite negatives.
-- [ ] Add one end-to-end crash matrix covering prepared, session committed, group unknown and reply pending; assert actual session cwd, group value/revision, journal/receipt phase, worker count and emitted terminal result after replay.
-- [ ] Add end-to-end `M1@r0→M2@r1→replay M1 at r2`: prove replay lookup precedes revision/target access, M1 reuses its frozen canonical target/expectedRevision/session generation, payloadDigest excludes expectedRevision, and M2’s current value remains unchanged. Also cover different intent under M1 rejection, `set→unbind→set→old CAS`, ACL-after-unbind, defaultOncall auto versus group, `/cd` provenance, and local-worker follow sequences.
-- [ ] Run `bunx vitest run 'test/group-workspace-*.test.ts'`; expect PASS.
-- [ ] Document host-local scope, precedence and defaultOncall distinction, tenant-union managers, show/unbind, receipt/replay behavior, invalid-path fail closed, thread/worktree isolation and safe follow.
-- [ ] Run `bun run build`, `bunx vitest run test/command-schema.test.ts test/command-router-oracle-diff.test.ts test/card-action-routes.test.ts`, then `bun run test`; record exact baseline-only failures, if any.
-- [ ] Commit: `docs(repo): 说明群级工作目录协议`.
+- [ ] Add shared-dataDir, two-Bot, authentic identity E2E covering ordinary, `/th`, trigger, Dashboard, listener, scheduler, queue, principal and XPI with one group revision update.
+- [ ] Restart at each saga/follow/migration phase without source redelivery; assert one worker, one business delivery, exact v2 identity and terminal receipt.
+- [ ] Add backward/forward rollback matrix and verify original files/hashes remain; future schema fails closed.
+- [ ] Add path permission/inode/unmount/store corruption/config revoke and same-source concurrency fault matrix.
+- [ ] Run `bunx vitest run 'test/group-workspace-*.test.ts'`; expect all PASS and record counts.
+- [ ] Run `bun run build`; expect PASS.
+- [ ] Run `bunx vitest run test/command-schema.test.ts test/command-router-oracle-diff.test.ts test/card-action-routes.test.ts test/test-hygiene.test.ts`; expect PASS.
+- [ ] Run `bun run test`; record exact baseline-only failures. Do not label a retry-only pass stable; eliminate the prompt-ready flake or document it as blocking.
+- [ ] Update user docs with host-local scope, unified admission, fail-closed outcomes, v2 migration/rollback and unsupported remote proof behavior.
+- [ ] Commit `test(workspace): 覆盖统一准入迁移与恢复矩阵`.
 
-### Task 12: Independent adversarial review and Draft PR evidence
+### Task 12: Self-review, independent adversarial review, and R1–R3 evidence
 
-- [ ] Freeze review to this design and execute real-component probes with controlled waits/fake clock for: administrator removed during prepared operation; session commit followed by group failure/unknown; delayed pre-unbind CAS; repeated tick/business arrival during worker replacement; permission loss between probe and spawn.
-- [ ] For each probe record actual session cwd/source/generation, group record/revision/ACL, journal/receipt, worker PID/count and emitted response. A read-code-only conclusion is insufficient.
-- [ ] Mutate each new identity, CAS, receipt, provenance, response-boundary, chdir and old-worker-exit guard; confirm its targeted test fails before restoring.
-- [ ] Resolve every P0/P1 as fixed/wontfix/deferred with evidence. Update Draft PR sections `Summary`, `Evidence`, and `Merge Danger`, including two-way rollback and blast radius `会话路由`; do not name internal collaborators.
-- [ ] Run `git diff --check`, confirm only intended files changed, push `topic/group-workspace-binding` to `fork`; do not merge, deploy, install dependencies or restart daemons.
+- [ ] Cross-reference every AC row and P1-01…P1-17 to at least one passing behavior test; no source-text assertions except repository-approved structural K-gates.
+- [ ] Run adversarial probes for config removal mid-refresh/after prepared, two simultaneous first deliveries, crash at every saga/follow/migration publish boundary, queue tick overlap, permission loss, Riff/Mojo output and effective-context mismatch.
+- [ ] Mutate authority, admission ordering, proof token, winner adoption, identity compare, persist-before-publish, startup barrier, output listener and backend effective proof; each targeted suite must turn red.
+- [ ] R1: full design/spec/coverage review. Resolve every blocker as fixed/wontfix/deferred with arbiter evidence.
+- [ ] R2: only R1 blockers and touched boundaries. No new unrelated expansion.
+- [ ] R3: terminal GO/NO-GO. Do not request R4.
+- [ ] Run `git diff --check`, `git status --short`, and `git diff --name-only <implementation-base>...HEAD`; verify no generated dist, dependency or deployment files.
+- [ ] Update Draft PR with neutral Summary/Evidence/Merge Danger, migration rollback and blast radius. Do not push, merge, deploy or restart unless separately authorized.
+
+## Plan self-review result
+
+- Spec coverage: AC-01–AC-12 and P1-01–P1-17 each map to tasks and matrix rows.
+- Type consistency: `WorkspaceIdentity`, `WorkspaceConsumptionProof`, `AuthorityRouteResult`, `prepareOrAdopt` and v2 version names are stable across tasks.
+- Completeness scan: every implementation step names its concrete behavior, file and command. Provider-controlled cwd remains explicitly `unknown`, with fail-closed behavior and a named verification task.
+- Sequence: contracts → v2 persistence/authority/saga → migration/recovery → production adapters → remote backends → E2E/review.
