@@ -33138,7 +33138,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                   ? { status: 'available', revision: current.record?.revision ?? 0 }
                   : current;
               },
-              mutate: input => groupWorkspaceStore.mutate(input),
+              mutate: (input, revalidateUnderLock) => groupWorkspaceStore.mutate(input, revalidateUnderLock),
             });
           },
         });

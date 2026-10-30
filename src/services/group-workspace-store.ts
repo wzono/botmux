@@ -126,7 +126,7 @@ export type GroupWorkspaceMutation = GroupWorkspaceSetMutation | GroupWorkspaceU
 export type GroupWorkspaceMutationResult =
   | { outcome: GroupOperationTerminalOutcome; receipt: GroupOperationReceipt }
   | { outcome: 'protocol_conflict'; existingReceipt: GroupOperationReceipt }
-  | { outcome: 'store_unavailable' | 'unknown' };
+  | { outcome: 'authorization_revoked' | 'store_unavailable' | 'unknown' };
 
 export type GroupWorkspaceReadResult =
   | { status: 'available'; record: GroupWorkspaceRecord | undefined }
@@ -621,7 +621,10 @@ export class GroupWorkspaceStore {
     }
   }
 
-  async mutate(input: GroupWorkspaceMutation): Promise<GroupWorkspaceMutationResult> {
+  async mutate(
+    input: GroupWorkspaceMutation,
+    revalidateUnderLock?: () => Promise<{ status: 'authorized' | 'unauthorized' }>,
+  ): Promise<GroupWorkspaceMutationResult> {
     if (!validMutation(input)) return { outcome: 'store_unavailable' };
     const operationKey = groupWorkspaceOperationKey(input.sourceEventId, input.kind);
     const payloadDigest = canonicalGroupOperationPayloadDigest(input);
@@ -650,6 +653,10 @@ export class GroupWorkspaceStore {
             outcome: 'protocol_conflict' as const,
             existingReceipt: structuredClone(conflictingKind),
           };
+        }
+
+        if (revalidateUnderLock && (await revalidateUnderLock()).status !== 'authorized') {
+          return { outcome: 'authorization_revoked' as const };
         }
 
         const current = own(registry.records, input.chatId);

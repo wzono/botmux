@@ -256,6 +256,23 @@ describe('executeGroupWorkspaceUnbind', () => {
     expect((await h.deps.readReceipt(groupWorkspaceOperationKey(h.request.sourceEventId, 'unbind'))).status).toBe('missing');
   });
 
+  it('terminalizes authority revoked by the under-lock group write guard', async () => {
+    const h = unbindHarness();
+    let checks = 0;
+    h.deps.mutate = async (_input, revalidateUnderLock) => {
+      expect(await revalidateUnderLock()).toEqual({ status: 'unauthorized' });
+      return { outcome: 'authorization_revoked' as const };
+    };
+    h.deps.revalidateAuthority = async () => ({
+      status: ++checks === 1 ? 'authorized' as const : 'unauthorized' as const,
+    });
+    await expect(executeGroupWorkspaceUnbind(h.request, h.deps)).resolves.toEqual({ status: 'unauthorized' });
+    expect(checks).toBe(2);
+    await expect(h.journalStore.getByIntent(h.request.sourceEventId, 'unbind')).resolves.toMatchObject({
+      status: 'found', journal: { phase: 'unauthorized' },
+    });
+  });
+
   it('restarts from a persistent prepared unbind and performs exactly one group mutation', async () => {
     const dataDir = dir();
     const journalStore = new GroupWorkspaceOperationStore(dataDir);

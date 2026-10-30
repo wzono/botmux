@@ -241,7 +241,10 @@ export interface GroupWorkspaceUnbindDependencies {
     | { status: 'missing' | 'store_unavailable' }
   >;
   readCurrentRevision(chatId: string): Promise<{ status: 'available'; revision: number } | { status: 'store_unavailable' }>;
-  mutate(input: GroupWorkspaceUnbindMutation): Promise<GroupWorkspaceMutationResult>;
+  mutate(
+    input: GroupWorkspaceUnbindMutation,
+    revalidateUnderLock: () => Promise<{ status: 'authorized' | 'unauthorized' }>,
+  ): Promise<GroupWorkspaceMutationResult>;
   now(): number;
   afterBoundary?(boundary: 'commit_before_readback' | 'readback_before_convergence' | 'convergence_before_persisted_readback'): Promise<void>;
 }
@@ -306,7 +309,13 @@ export async function executeGroupWorkspaceUnbind(
       return denied.status === 'updated' ? { status: 'unauthorized' } : { status: 'unknown' };
     }
     const mutation = { ...intent, expectedRevision: journal.expectedGroupRevision, authorized: true, now: dependencies.now() };
-    const result = await dependencies.mutate(mutation);
+    const result = await dependencies.mutate(mutation, () => dependencies.revalidateAuthority(journal));
+    if (result.outcome === 'authorization_revoked') {
+      const denied = await dependencies.journalStore.transition(operationKey, 'unauthorized', {
+        updatedAt: dependencies.now(),
+      });
+      return denied.status === 'updated' ? { status: 'unauthorized' } : { status: 'unknown' };
+    }
     if (result.outcome === 'protocol_conflict') return { status: 'protocol_conflict' };
     if (result.outcome === 'unknown') {
       await dependencies.journalStore.transition(operationKey, 'unknown', { updatedAt: dependencies.now() });
