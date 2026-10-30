@@ -101,7 +101,7 @@ import { CODEX_REASONING_EFFORTS, isBackendVariantCliId, isCodexReasoningEffort,
 import { lookupCliSelection } from '../../setup/cli-selection.js';
 import { cliSupportsConfigDir } from '../../core/cli-config-dir.js';
 import { fetchAgents } from './agents-api.js';
-import { normalizeTraexAutoModelConfig, resolveTraexAutoModelSettings } from '../../services/traex-auto-model.js';
+import { normalizeTraexAutoModelConfig, resolveTraexAutoModelSettings, type TraexAutoModelPreviousSettings } from '../../services/traex-auto-model.js';
 import { TraexAutoModelEditor } from './traex-auto-model-editor.js';
 import {
   autoModelDraftFromConfig, readAutoModelDraft, writeAutoModelDraft, clearAutoModelDraft,
@@ -671,9 +671,17 @@ export function readBotDefaultsDeepLink(): BotDefaultsDeepLink | null {
   return tab ? { tab, section, field: field && section?.fieldKeys?.includes(field) ? field : null } : null;
 }
 
-/** 区块里文字恰好是 label 的标题（区块标题 / 配置项标题 / 选项组标题）。 */
+/**
+ * 区块里文字恰好是 label 的标题（区块标题 / 配置项标题 / 选项组标题）。
+ * 候选除了两套 FieldTitle 渲染出的 class（页面 bd-* 与共享组件 ui-*）和 h3/h4，
+ * 还包括 label/span/strong/small：部分配置行直接用 `<label><span>{tr()}</span><input/></label>`
+ * 或 `<span>{tr()}</span><DropdownField/>`，没有专门的标题 class；少了它们深链会落到
+ * 「当前 Bot 不显示该项」的假提示。文字全等匹配保证不会撞到按钮或说明文案。
+ */
 function findLabeledElement(root: HTMLElement, label: string): HTMLElement | null {
-  const candidates = root.querySelectorAll<HTMLElement>('.bd-field-title-text, .bd-mode-group-title, h3, h4');
+  const candidates = root.querySelectorAll<HTMLElement>(
+    '.bd-field-title-text, .bd-mode-group-title, .ui-field-title-text, h3, h4, label, span, strong, small',
+  );
   return [...candidates].find(el => el.textContent?.trim() === label) ?? null;
 }
 
@@ -696,7 +704,11 @@ export function resolveBotDefaultsTarget(
   if (!link.field) return { target: sectionEl, block: 'start', missing: null };
   const label = findLabeledElement(sectionEl, tr(link.field));
   if (!label) return { target: sectionEl, block: 'start', missing: tr(link.field) };
-  const row = label.closest<HTMLElement>('.toggle-row, .bd-row, .bd-field, .bd-mode-group, .bd-subsection') ?? label;
+  // settings-field-row 是共享编辑器（如 prompt-cache）的行容器，bd-sg-tag-name 是会话群标签输入行；
+  // 这两类行的标题是裸 label/span，closest 到行容器后整行高亮，找不到时退回标题元素本身。
+  const row = label.closest<HTMLElement>(
+    '.toggle-row, .settings-field-row, .bd-sg-tag-name, .bd-row, .bd-field, .bd-mode-group, .bd-subsection',
+  ) ?? label;
   return { target: row, block: 'center', missing: null };
 }
 
@@ -2380,6 +2392,9 @@ export function BotAgentSection(props: {
   const autoDraftRef = useRef<TraexAutoModelDraft>(autoModelDraftFromConfig(bot.traexAutoModel, {
       reasoningEffort: bot.reasoningEffort, modelBackendVariant: bot.modelBackendVariant ?? undefined,
     }, initialAutoDraft.current, selectedAgentCliId(initialKey) === 'traex' && bot.model?.toLowerCase() === 'auto'));
+  // Kept separately from pool drafts: reordering a pool or reloading a stale
+  // local draft must never change the normal settings captured before Auto.
+  const previousAutoSettings = useRef<TraexAutoModelPreviousSettings>({ ...bot.traexAutoModel?.previousSettings });
   const [cliKey, setCliKey] = useState(initialKey);
   const [cliSelectionTouched, setCliSelectionTouched] = useState(false);
   const [model, setModel] = useState(autoDraftRef.current.enabled ? 'auto'
@@ -2470,6 +2485,7 @@ export function BotAgentSection(props: {
       reasoningEffort: bot.reasoningEffort, modelBackendVariant: bot.modelBackendVariant ?? undefined,
     }, stored, selectedAgentCliId(agentSelectionKey(bot, props.sessionFallback)) === 'traex' && bot.model?.toLowerCase() === 'auto');
     applyAutoDraft(draft);
+    previousAutoSettings.current = { ...bot.traexAutoModel?.previousSettings };
     setModel(draft.enabled ? 'auto' : typeof bot.model === 'string' ? bot.model : '');
     setAutoModelTouched(!!stored && JSON.stringify(stored) !== savedAutoPreferences.current);
     setAutoDraftStorageFailed(false);
@@ -2692,6 +2708,7 @@ export function BotAgentSection(props: {
       enabled: true, models: autoModels, queueTimeoutMs: Number(autoTimeoutSeconds) * 1_000,
       reselectPerTurn: autoReselectPerTurn,
       switchCooldownMs: Number(autoCooldownSeconds) * 1_000,
+      previousSettings: previousAutoSettings.current,
       modelSettings: Object.fromEntries(autoModels.filter(Boolean).map(model => [model,
         resolveTraexAutoModelSettings({ enabled: true, models: autoModels, queueTimeoutMs: 30_000, modelSettings: autoModelSettings },
           model, { reasoningEffort: reasoningEffort || undefined, modelBackendVariant: modelBackendVariant || undefined }),
@@ -3276,6 +3293,13 @@ export function BotAgentSection(props: {
             let nextModels = current.models;
             let nextSettings = current.modelSettings;
             if (enabled) {
+              if (!current.enabled) {
+                previousAutoSettings.current = {
+                  ...(model.trim() && model.trim().toLowerCase() !== 'auto' ? { model: model.trim() } : {}),
+                  ...(reasoningEffort ? { reasoningEffort } : {}),
+                  ...(modelBackendVariant ? { modelBackendVariant } : {}),
+                };
+              }
               if (autoModels.length === 0) {
                 const preferred = model && model !== 'auto' ? model : modelCandidates[0] ?? '';
                 nextModels = [preferred];
@@ -3286,9 +3310,10 @@ export function BotAgentSection(props: {
               setModel('auto');
               setReasoningEffort('');
             } else if (model === 'auto') {
-              setModel(autoModels[0] ?? '');
-              setReasoningEffort(autoModelSettings[autoModels[0] ?? '']?.reasoningEffort ?? '');
-              setModelBackendVariant(autoModelSettings[autoModels[0] ?? '']?.modelBackendVariant ?? '');
+              const previous = previousAutoSettings.current;
+              setModel(previous.model ?? '');
+              setReasoningEffort(previous.reasoningEffort ?? '');
+              setModelBackendVariant(previous.modelBackendVariant ?? '');
               setModelBackendVariantTouched(true);
             }
             editAutoDraft({ enabled, models: nextModels, modelSettings: nextSettings });
@@ -4051,6 +4076,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   const tools = policy?.tools ?? ['lark-cli', 'bytedcli'];
   const fallback = policy?.fallback ?? 'bot-identity';
   const credentialSource = policy?.credentialSource ?? 'auto';
+  const delegateOnMention = policy?.delegateOnMention !== false;
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [info, setInfo] = useState<{
@@ -4092,11 +4118,15 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
 
   function toggleTool(tool: 'lark-cli' | 'bytedcli', on: boolean): void {
     const next = on ? [...new Set([...tools, tool])] : tools.filter(t => t !== tool);
-    void save({ enabled: true, tools: next, fallback, credentialSource });
+    void save({ enabled: true, tools: next, fallback, credentialSource, delegateOnMention });
   }
 
   function setCredentialSource(next: 'auto' | 'platform' | 'local'): void {
-    void save({ enabled: true, tools, fallback, credentialSource: next });
+    void save({ enabled: true, tools, fallback, credentialSource: next, delegateOnMention });
+  }
+
+  function setDelegateOnMention(next: boolean): void {
+    void save({ enabled: true, tools, fallback, credentialSource, delegateOnMention: next });
   }
 
   return (
@@ -4109,7 +4139,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
         title={tr('botDefaults.triggerUserAuthToggle')}
         help={tr('botDefaults.triggerUserAuthHelp')}
         onChange={checked => void save(
-          checked ? { enabled: true, tools, fallback, credentialSource } : null,
+          checked ? { enabled: true, tools, fallback, credentialSource, delegateOnMention } : null,
         )}
       />
       {enabled ? (
@@ -4156,6 +4186,14 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
               <a href={info.platformCredentialsUrl} target="_blank" rel="noreferrer">{info.platformCredentialsUrl}</a>
             </p>
           ) : null}
+          <ToggleRow
+            checked={delegateOnMention}
+            disabled={busy}
+            dataAction="toggle-trigger-user-auth-delegate-on-mention"
+            title={tr('botDefaults.triggerUserAuthDelegateOnMention')}
+            help={tr('botDefaults.triggerUserAuthDelegateOnMentionHelp')}
+            onChange={checked => setDelegateOnMention(checked)}
+          />
           <p className="bd-section-note">{tr('botDefaults.triggerUserAuthFallbackNote')}</p>
           {tools.includes('bytedcli') ? (
             <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>

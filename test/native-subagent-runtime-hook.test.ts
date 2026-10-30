@@ -227,11 +227,11 @@ async function runHook(
       timedOut = true;
       child.kill('SIGKILL');
     }, options.exitTimeoutMs ?? (
-      // `trackTranscriptAccess` eval-imports the whole CLI after patching fs.
-      // Under a loaded shard that spawn regularly exceeds 5s (CI shard 3:
-      // hostile case 5074ms → SIGKILL → status null). Hang protection stays;
-      // the bound just has to outlast a cold CLI import, not win a race.
-      options.trackTranscriptAccess ? 20_000 : 5_000
+      // Every case cold-imports the whole CLI, not only the fs-patched eval.
+      // A loaded shard can exceed 5s before the hook starts (including the
+      // malformed-input case). Keep a finite hang bound above import time;
+      // cases testing stdin deadlines still set their own explicit bound.
+      20_000
     ));
     child.once('exit', code => {
       clearTimeout(timer);
@@ -262,17 +262,16 @@ describe('native-subagent-runtime-hook CLI', () => {
     expect(capturedRequests).toHaveLength(0);
   });
 
-  it('is a no-op for malformed or oversized stdin', async () => {
-    for (const input of [
-      '{bad json',
-      JSON.stringify({ ...spawnPayload, padding: 'secret-never-echo'.repeat(100_000) }),
-    ]) {
-      const result = await runHook(input, { startServer: false });
-      expect(result.status).toBe(0);
-      expect(result.stdout).toBe('');
-      expect(result.stderr.length).toBeLessThanOrEqual(1024);
-      expect(result.stderr).not.toContain('secret-never-echo');
-    }
+  it.each([
+    ['malformed', '{bad json'],
+    ['oversized', JSON.stringify({ ...spawnPayload, padding: 'secret-never-echo'.repeat(100_000) })],
+  ])('is a no-op for %s stdin', async (_kind, input) => {
+    const result = await runHook(input, { startServer: false });
+    expect(result.timedOut).toBe(false);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr.length).toBeLessThanOrEqual(1024);
+    expect(result.stderr).not.toContain('secret-never-echo');
   });
 
   it('stops reading oversized stdin without waiting for EOF', async () => {

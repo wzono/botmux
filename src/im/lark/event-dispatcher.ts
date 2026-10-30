@@ -1446,6 +1446,12 @@ export function isTrustedSameOwnerSiblingBot(
   return true;
 }
 
+type BotsInfoNameEntry = { larkAppId?: unknown; botName?: unknown };
+
+function isBotsInfoNameEntry(entry: unknown): entry is BotsInfoNameEntry {
+  return typeof entry === 'object' && entry !== null;
+}
+
 /**
  * 同 owner 腿（evaluateTalk 的 sameOwnerBot）放行的，是本 bot 还没学到 open_id 的兄弟 bot：它绕过了
  * @ 闸门里的冷启动自愈，就在这里替自愈做它会做的那件事——把「名字 → 本 bot 视角的 open_id」记进
@@ -1463,16 +1469,18 @@ export function learnSameOwnerSiblingCrossRef(
   if (!senderOpenId) return false;
   const sibling = resolveLocalSiblingBotByUnionId(dataDir, larkAppId, senderUnionId);
   if (!sibling) return false;
-  let entries: Array<{ larkAppId?: string; botName?: string | null }> = [];
+  let entries: BotsInfoNameEntry[] = [];
   try {
     const raw = readBotsInfoJson(dataDir);
-    if (Array.isArray(raw)) entries = raw;
+    if (Array.isArray(raw)) entries = raw.filter(isBotsInfoNameEntry);
   } catch {
     return false;
   }
-  const name = entries.find(e => e.larkAppId === sibling.larkAppId)?.botName?.trim();
+  const rawName = entries.find(e => e.larkAppId === sibling.larkAppId)?.botName;
+  const name = typeof rawName === 'string' ? rawName.trim() : '';
   if (!name) return false;
-  const sameName = entries.filter(e => e.botName?.trim().toLowerCase() === name.toLowerCase()).length;
+  const sameName = entries.filter(e => typeof e.botName === 'string'
+    && e.botName.trim().toLowerCase() === name.toLowerCase()).length;
   if (sameName !== 1) return false;
   updateBotOpenIdCrossRef(dataDir, larkAppId, [{ name, id: { open_id: senderOpenId } }]);
   return isKnownPeerBot(dataDir, larkAppId, senderOpenId);
@@ -1542,8 +1550,9 @@ export function resolveSiblingBotNameByUnionId(
 
   // appId → current botName from the shared, rename-fresh bots-info.json.
   try {
-    const entries = readBotsInfoJson(dataDir) as Array<{ larkAppId?: string; botName?: string | null }> | undefined;
-    if (entries) {
+    const raw = readBotsInfoJson(dataDir);
+    if (Array.isArray(raw)) {
+      const entries = raw.filter(isBotsInfoNameEntry);
       const name = entries.find(e => e.larkAppId === siblingAppId)?.botName;
       if (typeof name === 'string' && name.trim()) return name.trim();
     }
@@ -1598,10 +1607,13 @@ export function updateBotOpenIdCrossRef(
   // Read known bot names from bots-info.json
   const knownBotNames = new Set<string>();
   try {
-    const entries = readBotsInfoJson(dataDir) as Array<{ botName: string | null }> | undefined;
-    if (entries) {
+    const raw = readBotsInfoJson(dataDir);
+    if (Array.isArray(raw)) {
+      const entries = raw.filter(isBotsInfoNameEntry);
       for (const e of entries) {
-        if (e.botName) knownBotNames.add(e.botName.toLowerCase());
+        if (typeof e.botName === 'string' && e.botName) {
+          knownBotNames.add(e.botName.toLowerCase());
+        }
       }
     }
   } catch { /* ignore */ }
@@ -2810,6 +2822,8 @@ export interface RoutingContext {
   ingressAdmission?: { admitted: boolean; retryReason?: string };
   /** Ephemeral durable-primary claim identity; never persisted in Session. */
   durablePrimaryDispatch?: { attempt: number; signal: AbortSignal };
+  /** Preserve confirmed command state while its task remains in the Inbox. */
+  checkpointPreAdmissionSession?: (session: Session, isCurrent?: () => boolean) => Promise<void>;
   /** Durable-primary only: queue one provider effect behind fenced Session admission. */
   queuePostAdmissionOutput?: (output: DurableLarkPostAdmissionOutput) => void;
   /** Durable-primary only: queue one lifecycle control after Session admission. */
@@ -4986,6 +5000,9 @@ export function createLarkEventDispatcherRuntime(
     if (typeof primary.context.queuePostAdmissionControl === 'function') {
       ctx.queuePostAdmissionControl = primary.context.queuePostAdmissionControl;
     }
+    if (typeof primary.context.checkpointPreAdmissionSession === 'function') {
+      ctx.checkpointPreAdmissionSession = primary.context.checkpointPreAdmissionSession;
+    }
   };
 
   const assertPrimaryRouteOwner = async (
@@ -6116,6 +6133,9 @@ export function createLarkEventDispatcherRuntime(
                 queuePostAdmissionControl: (
                   primary.context as DurableLarkCanonicalHandlerContext
                 ).queuePostAdmissionControl,
+                checkpointPreAdmissionSession: (
+                  primary.context as DurableLarkCanonicalHandlerContext
+                ).checkpointPreAdmissionSession,
               }
             : {}
         ),

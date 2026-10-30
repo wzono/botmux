@@ -32,6 +32,7 @@ export const LOCAL_CLI_IDS = [
   'oh-my-pi',
   'kimi',
   'grok',
+  'zcode',
 ] as const satisfies readonly CliId[];
 
 export type LocalCliId = typeof LOCAL_CLI_IDS[number];
@@ -58,6 +59,7 @@ const RESUME_COMMAND_PREFIXES: Record<Exclude<LocalCliId, 'oh-my-pi'>, string> =
   'copilot': 'copilot --resume',
   'kimi': 'kimi --resume',
   'grok': 'grok --resume',
+  'zcode': 'zcode --resume',
 };
 
 type AdoptedMetadata = NonNullable<DaemonSession['adoptedFrom']> | NonNullable<DaemonSession['session']['adoptedFrom']>;
@@ -200,6 +202,16 @@ function quoteKnownResumeCommand(cliId: LocalCliId, raw: string): string | null 
       return isAbsolute(value) && shellQuote(value) === token ? value : null;
     };
     return decodePath(match[1]) !== null && decodePath(match[2]) !== null ? raw : null;
+  }
+  if (cliId === 'pi' && raw.includes(' --session-dir ')) {
+    // A session that keeps its history in its own dir (it ran under the file
+    // sandbox): both values come quoted from the adapter.
+    const quoted = String.raw`'(?:[^']|'\\'')*'`;
+    const match = new RegExp(`^pi --session-id (${quoted}) --session-dir (${quoted})(?![\\s\\S])`).exec(raw);
+    if (!match) return null;
+    const decode = (token: string): string => token.slice(1, -1).split("'\\''").join("'");
+    const dir = decode(match[2]);
+    return decode(match[1]) && isAbsolute(dir) && shellQuote(dir) === match[2] ? raw : null;
   }
   const prefix = `${RESUME_COMMAND_PREFIXES[cliId]} `;
   if (!raw.startsWith(prefix)) return null;
