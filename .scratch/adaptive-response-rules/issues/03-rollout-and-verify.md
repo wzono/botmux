@@ -4,7 +4,9 @@
 
 **Blocked by:** 02: 扩展到全席与未来席位.
 
-**Status:** claimed
+**Status:** resolved
+
+**Resolution:** 全量发布健康；当前群 27 个可触达非本人机器人均取得至少一条真实可确认回复，5 类场景及破坏性确认、独立审查边界、解释展开、真实附件交付均有证据。Remy、Enya、Gus 因不在当前群保持未验证，未宣称 32/32 完成。
 
 **Release gate:** Ticket 01 与 Ticket 02 的实现审查已通过；用户已授权固定候选 `1b9028e` 交 DevOps 合入 dev、加入 manifest 并全量发布。任何回滚仍需用户再次确认。
 
