@@ -106,7 +106,7 @@ import { readPrincipalLaneTurnBinding } from '../../core/principal-lane-turn.js'
 import { buildTerminalUrl, platformTerminalReadEntryActive } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, restoreDeletedWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
-import { repinSessionWorkingDir } from '../../core/session-cwd.js';
+import { repinSessionWorkingDir, setSessionWorkingDirMetadata } from '../../core/session-cwd.js';
 import { answerRestartWithoutWorkingDir, reclaimUnstartedOpening, recoveryCardForm, workingDirRecoveryPending } from '../../core/working-dir-recovery.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
 import { handleCommand } from '../../core/command-handler.js';
@@ -135,6 +135,12 @@ import { hasProtectedSessionMutationOwnership } from '../../core/session-mutatio
 import { persistPendingRepoCardMessageId } from '../../core/pending-repo-journal.js';
 import { runDetachedBotTurnAdmission, withBotTurnMutation, tryWithBotTurnMutation } from '../../core/bot-turn-mutation-gate.js';
 import { isSharedAdoptSession } from '../../core/shared-adopt.js';
+import {
+  authorizeGroupWorkspaceRoute,
+  classifyGroupWorkspaceCardRoute,
+  type GroupWorkspaceRouteAuthority,
+  type GroupWorkspaceRouteIntent,
+} from '../../core/group-workspace-policy.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -189,6 +195,9 @@ export interface CardHandlerDeps {
     payload?: string;
     sig?: string;
   }) => Promise<{ ok: true; chatId: string; run: () => Promise<unknown> } | { ok: false; reason: string }>;
+  /** Task-4 authorization/classification seam; the operation saga is wired later. */
+  resolveGroupWorkspaceRouteAuthority?: GroupWorkspaceCardRouteDeps['resolveAuthority'];
+  handleGroupWorkspaceRoute?: GroupWorkspaceCardRouteDeps['handleRoute'];
 }
 
 /**
@@ -291,6 +300,64 @@ export async function resolveCardOperatorUnionId(
   } catch {
     return { openId };
   }
+}
+
+export interface GroupWorkspaceCardRouteInput {
+  repoKey?: string;
+  selection?: string;
+  chatId: string;
+  callbackChatId?: string;
+  rootId?: string;
+  chatType: 'group' | 'p2p';
+  cardMessageId?: string;
+  currentRepoCardMessageId?: string;
+  operatorOpenId?: string;
+  operatorUnionId?: string;
+  tenantKey?: string;
+  actionId?: string;
+  humanProvenance?: boolean;
+}
+
+export interface GroupWorkspaceCardRouteDeps {
+  resolveAuthority: (input: GroupWorkspaceCardRouteInput) => Promise<GroupWorkspaceRouteAuthority | undefined>;
+  handleRoute: (route: GroupWorkspaceRouteIntent & {
+    source: 'card'; chatId: string; actor: import('../../services/bot-admin-unions-store.js').TenantHumanId;
+    actorOpenId?: string; originMessageId: string; actionId: string;
+  }) => Promise<void> | void;
+  canRunGenericCardAction: () => boolean;
+}
+
+/** Narrow card counterpart of the text pre-gate seam. It performs no saga/store write. */
+export async function tryDispatchGroupWorkspaceCardRoute(
+  input: GroupWorkspaceCardRouteInput,
+  deps: GroupWorkspaceCardRouteDeps,
+): Promise<{ status: 'dispatched' | 'switch_denied' | 'not_authorized' | 'not_applicable'; toast?: string }> {
+  const intent = classifyGroupWorkspaceCardRoute(input);
+  if (!intent) {
+    deps.canRunGenericCardAction();
+    return { status: 'not_applicable' };
+  }
+  const authority = await deps.resolveAuthority(input);
+  if (!authorizeGroupWorkspaceRoute(authority)) {
+    deps.canRunGenericCardAction();
+    return { status: 'not_authorized' };
+  }
+  if (intent.kind === 'set' && !authority.canSwitchSession) {
+    return {
+      status: 'switch_denied',
+      toast: '你有群目录管理权限，但没有接收机器人的会话切换权限；本次未切换会话，也未写入群目录。',
+    };
+  }
+  await deps.handleRoute({
+    ...intent,
+    source: 'card',
+    chatId: input.chatId,
+    actor: authority.actor,
+    actorOpenId: input.operatorOpenId,
+    originMessageId: input.cardMessageId!,
+    actionId: input.actionId!,
+  });
+  return { status: 'dispatched' };
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -570,7 +637,7 @@ async function moveSessionForRecovery(
     if (hasProtectedSessionMutationOwnership(current)) return 'pending' as const;
     const suspended = !current.adoptedFrom && suspendWorker(current, 'working_dir_changed');
     if (!suspended) killWorker(current);
-    repinSessionWorkingDir(current, dirPath);
+    repinSessionWorkingDir(current, { workingDir: dirPath, source: 'explicit' });
     current.session.riffRepoDirs = riffRepoDirs;
     sessionStore.updateSession(current.session);
     markRepoCardConsumed(current, cardToWithdraw);
@@ -697,8 +764,7 @@ export async function commitRepoSelection(
       // "Start directly" launches in the resolved default cwd without pinning
       // HOME onto the session for sibling-bot inheritance.
       if (pinWorkingDir) {
-        ds.workingDir = dirPath;
-        ds.session.workingDir = dirPath;
+        repinSessionWorkingDir(ds, { workingDir: dirPath, source: 'explicit' });
       }
       // riff 多仓 stamp：只有多仓 worktree 流显式传入（保留用户选择顺序，首仓=primary）；
       // 其它选仓路径一律清除旧 stamp——workingDir 变了，旧的多仓组合不再成立。
@@ -813,7 +879,7 @@ export async function commitRepoSelection(
       // the user can retry this exact selection without losing the first turn.
       const pendingTurnId = ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId;
       if (!emptyStart && pendingTurnId) await prepareTurn?.(ds, pendingTurnId);
-      forkWorker(
+      const accepted = forkWorker(
         ds,
         prompt,
         !emptyStart && !pendingRawInput && pendingTurnId ? {
@@ -821,6 +887,7 @@ export async function commitRepoSelection(
           ...(ds.pendingTrustedCaller ? { trustedCaller: ds.pendingTrustedCaller } : {}),
         } : false,
       );
+      if (accepted === false) return false;
       ds.pendingRepo = false;
       // A queued activation owns the route through its adapter-level ACK. Every
       // buffer below was synchronously folded into prompt N and is safe to clear;
@@ -987,7 +1054,7 @@ export async function commitRepoSelection(
         current.lastUserPrompt = undefined;
         current.lastCliInput = undefined;
         current.workingDir = dirPath;
-        session.workingDir = dirPath;
+        setSessionWorkingDirMetadata(session, { workingDir: dirPath, source: 'explicit' });
         session.larkAppId = current.larkAppId;
         session.chatDisplayName = oldSession.chatDisplayName;
         session.ownerOpenId = oldSession.ownerOpenId;
@@ -1006,7 +1073,9 @@ export async function commitRepoSelection(
         current.lastScreenContent = undefined;
         current.lastScreenStatus = undefined;
         activeSessions.set(key, current);
-        forkWorker(current, '', false);
+        if (forkWorker(current, '', false) === false) {
+          return { ok: false as const, reason: 'start_refused' as const };
+        }
         // Brand-new CLI in a brand-new session record: the next real business
         // message is its new-topic first turn (same invariant as the pending path).
         markInitialUserTurnPending(current);
@@ -2440,8 +2509,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       // have reported success for a fork that never happened, with the
       // one-shot follow-up token already consumed and no retry affordance.
       else {
-        forkWorker(ds, cliInput, ds.hasHistory);
-        accepted = true;
+        accepted = forkWorker(ds, cliInput, ds.hasHistory);
       }
     } catch (err) {
       logger.warn(`[${tag(ds)}] /quote injection threw: ${err instanceof Error ? err.message : String(err)}`);
@@ -3321,8 +3389,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       try {
         if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, voiceInput);
         else {
-          forkWorker(ds, voiceInput, ds.hasHistory);
-          accepted = true;
+          accepted = forkWorker(ds, voiceInput, ds.hasHistory);
         }
       } catch (err) {
         logger.warn(
@@ -3788,8 +3855,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       try {
         if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput);
         else {
-          forkWorker(ds, retryInput, ds.hasHistory);
-          accepted = true;
+          accepted = forkWorker(ds, retryInput, ds.hasHistory);
         }
       } catch (err) {
         logger.warn(
@@ -3921,8 +3987,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       try {
         if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput);
         else {
-          forkWorker(ds, retryInput, ds.hasHistory);
-          accepted = true;
+          accepted = forkWorker(ds, retryInput, ds.hasHistory);
         }
       } catch (err) {
         logger.warn(
@@ -5247,9 +5312,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     return;
   }
 
-  // Handle dropdown selections (option-based)
-  const option = action?.option;
-  if (!option) {
+  // Handle dropdown selections (option-based). The reserved group-unbind
+  // callback is button-shaped and therefore intentionally carries no option.
+  const reservedGroupWorkspaceUnbind = action?.value?.key === 'group_workspace_unbind';
+  const option = reservedGroupWorkspaceUnbind ? '' : action?.option;
+  if (!reservedGroupWorkspaceUnbind && !option) {
     logger.warn('Card action received but no option or action value');
     return;
   }
@@ -5323,19 +5390,22 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
 
   // Handle repo select card (option-based dropdowns: plain switch, or
   // `repo_worktree` = create a worktree from the picked repo and open that).
+  // `group_workspace_unbind` is a reserved authenticated callback contract for
+  // Task 4. It intentionally reuses the exact current repo-card capability and
+  // does not appear in the UI until the later operation coordinator exists.
   // Require an explicit, recognized key: botmux's own dropdowns always set
   // `repo_switch` / `repo_worktree` (card-builder.ts). Treating a keyless
   // `option + root_id` as a plain switch let a hand-crafted card drive the
   // session's working dir to an arbitrary path — reject anything unrecognized.
   const repoKey = action?.value?.key;
-  if (repoKey !== 'repo_switch' && repoKey !== 'repo_worktree') {
+  if (repoKey !== 'repo_switch' && repoKey !== 'repo_worktree' && repoKey !== 'group_workspace_unbind') {
     logger.warn(`Card action: unrecognized repo dropdown key ${repoKey ?? '(none)'} — ignoring`);
     return;
   }
   const isWorktreeOpen = repoKey === 'repo_worktree';
   const selectedPath = option;
   const rootId = action?.value?.root_id;
-  logger.info(`Card action: repo ${isWorktreeOpen ? 'worktree-open' : 'switch'} to ${selectedPath} (root_id: ${rootId})`);
+  logger.info(`Card action: repo ${repoKey === 'group_workspace_unbind' ? 'group-unbind' : isWorktreeOpen ? 'worktree-open' : 'switch'} to ${selectedPath} (root_id: ${rootId})`);
 
   if (!rootId) {
     logger.warn('Card action: no root_id in action value');
@@ -5364,6 +5434,39 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         content: t('card.repo.toast_stale_picker', undefined, localeForBot(targetDs.larkAppId)),
       },
     };
+  }
+
+  // A top-level regular-group picker may use the same stable-human pre-gate as
+  // text `/repo`. Exact current-card capability was proven above. The dedicated
+  // route owns the action completely; non-matches retain the existing gate.
+  if (deps.resolveGroupWorkspaceRouteAuthority && deps.handleGroupWorkspaceRoute && larkAppId) {
+    const groupRoute = await tryDispatchGroupWorkspaceCardRoute({
+      repoKey,
+      selection: selectedPath,
+      chatId: targetDs.chatId,
+      callbackChatId: data.context?.open_chat_id,
+      rootId,
+      chatType: targetDs.chatType,
+      cardMessageId,
+      currentRepoCardMessageId: targetDs.repoCardMessageId,
+      operatorOpenId,
+      operatorUnionId: data.operator?.union_id,
+      tenantKey: (data as CardActionData & { tenant_key?: string }).tenant_key,
+      actionId: data.event_id ?? data.header?.event_id ?? data.event?.event_id,
+      // Card callbacks expose an SDK-verified human operator envelope rather than sender_type.
+      humanProvenance: !!operatorOpenId,
+    }, {
+      resolveAuthority: deps.resolveGroupWorkspaceRouteAuthority,
+      handleRoute: deps.handleGroupWorkspaceRoute,
+      canRunGenericCardAction: () => false,
+    });
+    if (groupRoute.status === 'dispatched') return;
+    if (groupRoute.status === 'switch_denied') {
+      return { toast: { type: 'error', content: groupRoute.toast } };
+    }
+  }
+  if (repoKey === 'group_workspace_unbind') {
+    return { toast: { type: 'error', content: '群目录解绑未通过专用授权路由，本次未写入群目录。' } };
   }
 
   // 权限边界：pendingRepo（首次选 repo 才能 spawn）放行「会话发起人 或 canOperate」，

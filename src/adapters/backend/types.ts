@@ -198,6 +198,10 @@ export type SessionProbe = 'exists' | 'missing' | 'unknown';
 
 export interface SpawnOpts {
   cwd: string;
+  /** Immutable host path identity for a group-bound launch. Local-process
+   * backends are verified through their child cwd; deferred/remote backends
+   * retain this contract and validate it at the business-input boundary. */
+  expectedWorkingDirIdentity?: { dev: string; ino: string };
   cols: number;
   rows: number;
   env: Record<string, string>;
@@ -331,6 +335,19 @@ export interface SessionBackend {
   /** Permanently destroy the backing session (e.g. kill tmux session).
    *  Called only on explicit /close. Default: same as kill(). */
   getAttachInfo?(): { type: 'tmux'; sessionName: string } | null;
+  /** Validate a deferred/remote backend's authoritative host-side contract
+   * before the worker dequeues business input. Omitted means startup requires
+   * proof from a real child process cwd. */
+  validateWorkingDirBeforeBusinessInput?(): boolean;
+  /** Queue one business input and resolve only when its serialized dispatch edge
+   * either begins remote I/O or rejects before dispatch. */
+  writeBusinessInput?(data: string): Promise<'submitted' | 'retryable_pre_dispatch_rejection'>;
+  /** Exact host contract proof, freshly validated for worker readiness. Remote
+   * backends use this instead of a child cwd; absence never proves readiness. */
+  validatedHostWorkingDirContract?(): {
+    workingDir: string;
+    identity: { dev: string; ino: string };
+  } | undefined;
   /** PID of the CLI process running inside the backend. */
   getChildPid?(): number | null;
   captureCurrentScreen?(): string;

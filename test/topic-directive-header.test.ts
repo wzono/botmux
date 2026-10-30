@@ -35,7 +35,10 @@ const mocks = vi.hoisted(() => {
     resolveSender: vi.fn(async (_appId: string, openId?: string) => (
       openId ? { openId, type: 'user' as const } : undefined
     )),
-    forkWorker: vi.fn((..._args: any[]) => undefined),
+    forkWorker: vi.fn((ds: any, ..._args: any[]) => {
+      ds.worker = { killed: false, send: vi.fn() };
+      return true;
+    }),
     sendWorkerInput: vi.fn((..._args: any[]) => true),
     downloadResources: vi.fn(async (..._args: any[]) => ({ attachments: [] as unknown[], needLogin: false })),
     createdSessions: [] as any[],
@@ -211,6 +214,10 @@ beforeEach(() => {
   mocks.getChatMode.mockResolvedValue('group');
   mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
   mocks.sendWorkerInput.mockReturnValue(true);
+  mocks.forkWorker.mockImplementation((ds: any) => {
+    ds.worker = { killed: false, send: vi.fn() };
+    return true;
+  });
   registerAppBot();
 });
 
@@ -438,6 +445,89 @@ describe('指令头：向后兼容（D9）', () => {
     expect(sentContents().join('\n')).toContain('话题已就绪');
   });
 
+  it.each([
+    { name: 'pinned raw', bot: () => registerAppBot({ defaultWorkingDir: botmuxRepo }), opening: '/t /goal ship the fix', raw: true },
+    { name: 'no-project raw', bot: () => registerAppBot({ workingDirs: [] }), opening: '/t /goal ship the fix', raw: true },
+    { name: 'pinned idle', bot: () => registerAppBot({ defaultWorkingDir: botmuxRepo }), opening: '/t /repo botmux', raw: false },
+    { name: 'no-project idle', bot: () => registerAppBot({ workingDirs: [] }), opening: '标题 /t /model sonnet', raw: false },
+  ])('$name guarded rejection stays retryable and admits only after repaired resend', async ({ bot, opening, raw }) => {
+    bot();
+    const rootId = `om_retry_${raw ? 'raw' : 'idle'}_${mocks.createdSessions.length}`;
+    mocks.forkWorker.mockReturnValueOnce(false);
+    const firstCtx = groupCtx(rootId);
+
+    await handleNewTopic(groupEvent(opening, rootId), firstCtx);
+
+    const ds = mocks.forkWorker.mock.calls[0][0];
+    expect(ds.worker).toBeNull();
+    expect(ds.initialStartPending).toBe(true);
+    expect(ds.initialGuardedLaunchRetry).toBe(raw ? 'raw' : 'idle');
+    expect(firstCtx.ingressAdmission?.admitted).not.toBe(true);
+    if (raw) expect(ds.pendingRawInput).toBe('/goal ship the fix');
+    else expect(ds.session.initialUserTurnPending).toBeUndefined();
+
+    // Simulate repairing the guarded workspace/backend between attempts. The
+    // next same-topic message is both the retry probe and the ordered follower.
+    const retryCtx = threadCtxAt(rootId, `${rootId}_retry`);
+    await handleThreadReply(
+      threadEventAt(rootId, 'retry after repair', retryCtx.messageId),
+      retryCtx,
+    );
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(2);
+    expect(ds.worker).toBeTruthy();
+    expect(ds.initialGuardedLaunchRetry).toBeUndefined();
+    expect(retryCtx.ingressAdmission?.admitted).toBe(true);
+    if (raw) {
+      expect(ds.pendingRawInput).toBe('/goal ship the fix');
+      expect(ds.pendingFollowUpInput?.cliInput).toContain('retry after repair');
+    } else {
+      const retriedOpening = mocks.forkWorker.mock.calls[1][1];
+      expect(typeof retriedOpening === 'string' ? retriedOpening : retriedOpening.content)
+        .toContain('retry after repair');
+    }
+  });
+
+  it('serializes concurrent repaired resends into one successful retry start', async () => {
+    registerAppBot({ defaultWorkingDir: botmuxRepo });
+    const rootId = 'om_retry_concurrent';
+    mocks.forkWorker.mockReturnValueOnce(false);
+    await handleNewTopic(groupEvent('/t /goal ship the fix', rootId), groupCtx(rootId));
+
+    await Promise.all([
+      handleThreadReply(threadEventAt(rootId, 'retry one', 'om_retry_one'), threadCtxAt(rootId, 'om_retry_one')),
+      handleThreadReply(threadEventAt(rootId, 'retry two', 'om_retry_two'), threadCtxAt(rootId, 'om_retry_two')),
+    ]);
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(2);
+    expect(mocks.sendWorkerInput).toHaveBeenCalledTimes(1);
+    const ds = mocks.forkWorker.mock.calls[0][0];
+    expect(ds.pendingFollowUpInput?.cliInput).toContain('retry one');
+    expect(JSON.stringify(mocks.sendWorkerInput.mock.calls[0])).toContain('retry two');
+  });
+
+  it('keeps a repeatedly rejected guarded opening retryable without duplicating it', async () => {
+    registerAppBot({ defaultWorkingDir: botmuxRepo });
+    const rootId = 'om_retry_rejected_twice';
+    mocks.forkWorker.mockReturnValueOnce(false).mockReturnValueOnce(false);
+    await handleNewTopic(groupEvent('/t /goal ship the fix', rootId), groupCtx(rootId));
+
+    const secondCtx = threadCtxAt(rootId, 'om_retry_second');
+    await handleThreadReply(threadEventAt(rootId, 'retry one', secondCtx.messageId), secondCtx);
+    const ds = mocks.forkWorker.mock.calls[0][0];
+    expect(ds.initialGuardedLaunchRetry).toBe('raw');
+    expect(secondCtx.ingressAdmission?.admitted).not.toBe(true);
+
+    const thirdCtx = threadCtxAt(rootId, 'om_retry_third');
+    await handleThreadReply(threadEventAt(rootId, 'retry two', thirdCtx.messageId), thirdCtx);
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(3);
+    expect(ds.pendingRawInput).toBe('/goal ship the fix');
+    expect(ds.pendingFollowUpInput?.cliInput).not.toContain('retry one');
+    expect(ds.pendingFollowUpInput?.cliInput.match(/retry two/g)).toHaveLength(1);
+    expect(thirdCtx.ingressAdmission?.admitted).toBe(true);
+  });
+
   it('/t /goal … 这类既有冷启动用法不被解析器提前拒掉', async () => {
     await handleNewTopic(groupEvent('/t /goal 修一下登录', 'om_legacy_goal'), groupCtx('om_legacy_goal'));
     // 未被指令头拒绝：要么走 passthrough 冷启动、要么当普通文案 spawn，总之有会话产生。
@@ -545,12 +635,22 @@ function threadEvent(text: string, messageId: string): any {
 }
 
 function threadCtx(messageId: string): RoutingContext {
+  return threadCtxAt(THREAD_ROOT, messageId);
+}
+
+function threadEventAt(rootId: string, text: string, messageId: string): any {
+  const event = threadEvent(text, messageId);
+  event.message.root_id = rootId;
+  return event;
+}
+
+function threadCtxAt(rootId: string, messageId: string): RoutingContext {
   return {
     chatId: GROUP,
     messageId,
     chatType: 'group',
     scope: 'thread',
-    anchor: THREAD_ROOT,
+    anchor: rootId,
     larkAppId: APP,
   } as RoutingContext;
 }

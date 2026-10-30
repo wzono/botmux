@@ -39,6 +39,10 @@ import { stagePendingRepoSetup } from './pending-repo-journal.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
 import { headlessChatId, isHeadlessId, newHeadlessId, saveHeadlessSession, updateHeadlessSession } from '../services/headless-session-store.js';
+import { config } from '../config.js';
+import { GroupWorkspaceStore } from '../services/group-workspace-store.js';
+import { resolveGroupWorkspaceCwd } from './group-workspace-policy.js';
+import { setSessionWorkingDirMetadata, type SessionWorkingDirMutation } from './session-cwd.js';
 
 export interface TriggerSessionDeps {
   larkAppId: string;
@@ -232,18 +236,28 @@ export function externalEventOpensOwnTopic(chatMode: ChatMode, regularGroupMode:
   return chatMode === 'topic' || regularGroupMode === 'new-topic';
 }
 
-function resolveWorkingDir(larkAppId: string, chatId: string): { ok: true; workingDir: string; fromBotDefault: boolean } | { ok: false; error: string } {
+async function resolveWorkingDir(larkAppId: string, chatId: string): Promise<
+  { ok: true; mutation: SessionWorkingDirMutation; fromBotDefault: boolean }
+  | { ok: false; error: string }
+> {
   const bot = getBot(larkAppId);
-  const oncall = oncallStore.getOncallStatus(larkAppId, chatId)?.workingDir;
+  const oncall = oncallStore.getOncallStatus(larkAppId, chatId);
+  const group = await new GroupWorkspaceStore(config.session.dataDir).read(chatId);
+  const workspace = resolveGroupWorkspaceCwd({
+    oncall,
+    groupWorkingDir: group.status === 'available' && group.record?.directory.kind === 'bound'
+      ? group.record.directory.workingDir
+      : undefined,
+    groupWorkspaceRevision: group.status === 'available' ? group.record?.revision : undefined,
+  });
   const botDefault = effectiveDefaultWorkingDir(bot.config);
-  const candidate = oncall || botDefault || bot.config.workingDir || '~';
+  const candidate = workspace?.workingDir || botDefault || bot.config.workingDir || '~';
   const v = validateWorkingDir(candidate, localeForBot(larkAppId));
   if (!v.ok) return { ok: false, error: v.error };
-  // 仅当命中本 bot 自己的 defaultWorkingDir（layer 3，非 oncall 绑定）时才允许 auto-worktree。
-  // 无 oncall 时 candidate 就是 botDefault（它排在 bot.config.workingDir/'~' 之前），故
-  // `!oncall && botDefault` 即可刻画"来自本 bot 默认目录"。
-  const fromBotDefault = !oncall && !!botDefault;
-  return { ok: true, workingDir: v.resolvedPath, fromBotDefault };
+  const mutation: SessionWorkingDirMutation = workspace?.source === 'group'
+    ? { workingDir: v.resolvedPath, source: 'group', groupWorkspaceRevision: workspace.groupWorkspaceRevision! }
+    : { workingDir: v.resolvedPath, source: workspace?.source ?? (botDefault ? 'bot-default' : 'legacy-unknown') };
+  return { ok: true, mutation, fromBotDefault: !workspace && !!botDefault };
 }
 
 function activeBySessionId(activeSessions: Map<string, DaemonSession>, sessionId: string): DaemonSession | undefined {
@@ -1717,7 +1731,7 @@ async function triggerSessionTurnAdmitted(
 
   if (ds) return deliverToExisting(ds);
 
-  const wd = resolveWorkingDir(larkAppId, chatId);
+  const wd = await resolveWorkingDir(larkAppId, chatId);
   if (!wd.ok) {
     return { ok: false, errorCode: 'trigger_failed', error: wd.error };
   }
@@ -1790,7 +1804,7 @@ async function triggerSessionTurnAdmitted(
       };
     }
     session.lastMessageAt = nowIso;
-    session.workingDir = wd.workingDir;
+    setSessionWorkingDirMetadata(session, wd.mutation);
     session.cliId = bot.config.cliId;
     // Per-turn model / reasoning-effort override — scoped to CLIs with an
     // explicit reasoning control and to a freshly-created trigger session.
@@ -1820,7 +1834,7 @@ async function triggerSessionTurnAdmitted(
         sessionId: session.sessionId,
         larkAppId,
         title: session.title,
-        workingDir: wd.workingDir,
+        workingDir: wd.mutation.workingDir,
         model: req.options?.model,
         reasoningEffort: req.options?.reasoningEffort,
         createdAt: nowIso,
@@ -1844,7 +1858,7 @@ async function triggerSessionTurnAdmitted(
       cliVersion: getCurrentCliVersion(),
       lastMessageAt: now,
       hasHistory: false,
-      workingDir: wd.workingDir,
+      workingDir: wd.mutation.workingDir,
       ...(triggerModelOverride ? { spawnModelOverride: triggerModelOverride } : {}),
     };
     // Retain the complete opening input until a worker or repo workflow has
@@ -1859,7 +1873,7 @@ async function triggerSessionTurnAdmitted(
       try {
         stagePendingRepoSetup(newDs, {
           mode: 'auto_worktree',
-          baseDir: wd.workingDir,
+          baseDir: wd.mutation.workingDir,
           turnId: triggerId,
         });
       } catch (err) {
@@ -1917,7 +1931,7 @@ async function triggerSessionTurnAdmitted(
     armLoudFinalSuppression(newDs);
     const { runAutoWorktreeCommit } = await import('../im/lark/card-handler.js');
     void runAutoWorktreeCommit({
-      ds: newDs, anchor, larkAppId, baseDir: wd.workingDir, title: triggerTitle(req),
+      ds: newDs, anchor, larkAppId, baseDir: wd.mutation.workingDir, title: triggerTitle(req),
       operatorOpenId: session.ownerOpenId, activeSessions: deps.activeSessions,
       // Thread-scope anchor is a topic-root message id (om_…) → reply-in-thread;
       // chat-scope anchor is a chat_id → plain send. (Fixes the om_→chat_id misroute.)

@@ -9,6 +9,8 @@ import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath }
 import {claudeActionPrompt} from './services/claude-action-prompt.js';
 import { GOAL_ENV } from './workflows/v3/contract.js';
 import { supportsZeroPromptInjection } from './core/prompt-injection.js';
+import { probePathUsability } from './core/path-usability.js';
+import { awaitAuthoritativeWorkerCwd } from './core/worker-cwd-launch-guard.js';
 import { SCHEDULE_PROMPT_UNDELIVERED_ERROR_CODE } from './core/deferred-schedule-settlement.js';
 import { supportsTranscriptReplyDeliveryForBot } from './core/reply-delivery.js';
 import { TurnProgressNotice, progressNoticeIntervalMinutes } from './utils/turn-progress-notice.js';
@@ -427,6 +429,7 @@ import {
   bareShellLaunchKind,
   bareShellLaunchGuidance,
   settleLaunchComm,
+  readCwd,
 } from './core/session-discovery.js';
 import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay } from './utils/timing.js';
@@ -780,6 +783,7 @@ scrubClaudeSessionMarkerEnv(process.env);
 let cliAdapter: CliAdapter | null = null;
 let codexCleanupLaunchTarget: { codexBin: string; codexHome: string } | undefined;
 let backend: SessionBackend | null = null;
+let replacementRetirementExitResolve: (() => void) | undefined;
 let backendScreenRevision = 0;
 let idleScreenSettleTask: {
   backend: SessionBackend;
@@ -16120,6 +16124,10 @@ function adapterInputHandle(target: SessionBackend): PtyHandle {
     : target;
 }
 
+function writeBackendWorkingDirRejected(target: SessionBackend): boolean {
+  return target.validateWorkingDirBeforeBusinessInput?.() === false;
+}
+
 function adoptComposerConflict(target: SessionBackend): string | undefined {
   if (target instanceof OrcaBackend) {
     const state = target.inspectDraftSync();
@@ -18614,6 +18622,16 @@ async function flushPending(): Promise<void> {
       if (activeTurnBlocks(pendingMessages[0]!)) break;
       if (traexAutoModelRuntimeEligible()
         && !(await admitTraexAutoModelPendingInput(pendingMessages[0]!))) break;
+      const nextItem = pendingMessages[0]!;
+      if (writeBackendWorkingDirRejected(backend)) {
+        send({
+          type: 'user_notify',
+          message: `${effectiveBackendType === 'riff' ? 'Riff' : 'Mojo'} 工作目录绑定已变化，业务输入未发送；原消息已保留，请修复目录后重试。`,
+          turnId: nextItem.turnId,
+          ...(nextItem.dispatchAttempt !== undefined ? { dispatchAttempt: nextItem.dispatchAttempt } : {}),
+        });
+        break;
+      }
       const item = freshnessInputQueue.takeNormal();
       if (!item) break;
       attachDeferredPluginSkillCatalog(item);
@@ -19374,7 +19392,22 @@ async function flushPending(): Promise<void> {
         // and continually replaces their deferred confirmation timer. Only the
         // adapter's explicit safe non-submission disposition permits retry.
         if (!recoveryFailureReason && codexAppSafeNonSubmission) {
-          requeueUnsubmittedQueuedActivation(item);
+          if (item.queuedActivationToken) {
+            requeueUnsubmittedQueuedActivation(item);
+          } else {
+            inflightInputs.forget(item);
+            pendingMessages.unshift(item);
+            log('Retained definitely-unwritten input at queue head for retry');
+            if (writeBackend.validateWorkingDirBeforeBusinessInput) {
+              send({
+                type: 'user_notify',
+                message: `${effectiveBackendType === 'riff' ? 'Riff' : 'Mojo'} 工作目录绑定已变化，业务输入未发送；原消息已保留，请修复目录后重试。`,
+                turnId: item.turnId,
+                ...(item.dispatchAttempt !== undefined ? { dispatchAttempt: item.dispatchAttempt } : {}),
+              });
+              markPromptReady();
+            }
+          }
         }
         if (deliveryQuarantine) break;
       } else if (item.queuedActivationToken) {
@@ -20429,6 +20462,8 @@ async function spawnCli(
   if (proxyError) throw new Error(proxyError);
   const spawnGeneration = ++cliSpawnGeneration;
   const spawnStartedAtMs = Date.now();
+  let cwdGuardOutputPending = false;
+  const cwdGuardOutput: string[] = [];
   restartInterruptionScanBeforeMs = undefined;
   // Every spawn is a new CLI process that can show the picker again. Not all
   // respawns pass through killCli() (e.g. the retry after a crash-loop park),
@@ -22575,7 +22610,8 @@ async function spawnCli(
     : cfg.deferredScheduleRun && cliAdapter.findInitialPromptArgSubmission
       ? cliAdapter.captureInitialPromptArgSubmission?.() ?? null
       : null;
-  const deferInitialPrompt = shouldDeferInitialPromptForStartup({
+  const deferInitialPrompt = cfg.expectedWorkingDirIdentity !== undefined
+    || shouldDeferInitialPromptForStartup({
     hasStartupCommands: spawnHasStartupWork(cfg.startupCommands, cfg.initialNativeRename),
     adoptMode: cfg.adoptMode === true,
     passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
@@ -24840,8 +24876,12 @@ async function spawnCli(
         log('[program-status] relay entry not runnable from this install; launching CLI directly (no OSC 7501 handshake under tmux)');
       }
     }
+    cwdGuardOutputPending = cfg.expectedWorkingDirIdentity !== undefined;
     backend.spawn(spawnBin, spawnArgs, {
       cwd: spawnCwd,
+      ...(cfg.expectedWorkingDirIdentity
+        ? { expectedWorkingDirIdentity: cfg.expectedWorkingDirIdentity }
+        : {}),
       cols: PTY_COLS,
       rows: PTY_ROWS,
       env: childEnv as Record<string, string>,
@@ -24898,6 +24938,51 @@ async function spawnCli(
   cliOutlivesWorker = cliSurvivesWorkerExit({ backendType: effectiveBackendType, persistentSessionName });
   const actuallyReattachedPersistent = 'isReattach' in backend
     && backend.isReattach === true;
+  // Group-bound launches carry an immutable directory identity on every init
+  // generation, including in-worker restarts. The backend must first create (or
+  // reattach) the real CLI process; only its authoritative /proc cwd can satisfy
+  // this gate. No pending business input, startup command, or ready hook is
+  // materialized before the gate succeeds.
+  if (cfg.expectedWorkingDirIdentity
+    && !backend.validateWorkingDirBeforeBusinessInput) {
+    const guardedBackend = backend;
+    guardedBackend.onData(data => {
+      if (backend !== guardedBackend) return;
+      if (cwdGuardOutputPending) cwdGuardOutput.push(data);
+      else onPtyData(data);
+    });
+    const cwdGuard = await awaitAuthoritativeWorkerCwd({
+      expectedWorkingDir: cfg.workingDir,
+      expectedIdentity: cfg.expectedWorkingDirIdentity,
+      getChildPid: () => guardedBackend === backend ? guardedBackend.getChildPid?.() : null,
+      readCwd,
+      probe: (path, expectedIdentity) => {
+        const result = probePathUsability(path, { expectedIdentity });
+        return result.ok;
+      },
+    });
+    if (!cwdGuard.ok) {
+      cwdGuardOutputPending = false;
+      try {
+        if (guardedBackend.destroySession) await guardedBackend.destroySession();
+        else guardedBackend.kill();
+      } catch (error) {
+        throw new Error(
+          `[workspace-cwd] refusing generation ${spawnGeneration}: ${cwdGuard.reason}; `
+          + `authoritative teardown failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      } finally {
+        if (backend === guardedBackend) backend = null;
+      }
+      throw new Error(
+        `[workspace-cwd] refusing generation ${spawnGeneration}: ${cwdGuard.reason}`
+        + `${cwdGuard.cwd ? ` (${cwdGuard.cwd})` : ''}`,
+      );
+    }
+    cwdGuardOutputPending = false;
+    for (const data of cwdGuardOutput.splice(0)) onPtyData(data);
+    log(`Workspace cwd validated for generation ${spawnGeneration}: ${cwdGuard.cwd}`);
+  }
   prepareDeploymentContinuationForSpawn(cfg, actuallyReattachedPersistent);
   // A NEW process resuming the same conversation — not a re-attach, whose CLI
   // never stopped: the transcript bridge's baseline reads what the previous
@@ -25621,10 +25706,12 @@ async function spawnCli(
     });
   }
 
-  observedBackend.onData((data) => {
-    if (backend !== observedBackend) return;
-    onPtyData(data);
-  });
+  if (!cfg.expectedWorkingDirIdentity) {
+    observedBackend.onData((data) => {
+      if (backend !== observedBackend) return;
+      onPtyData(data);
+    });
+  }
   if (observedBackend instanceof HerdrBackend) {
     const transcriptSettle = makeBridgeTranscriptSettle(
       () => bridgeHeadTurnAwaitingTerminal(),
@@ -25855,6 +25942,10 @@ async function spawnCli(
     restoreHerdrWebBindings();
   }
   backend.onExit((code, signal) => {
+    if (replacementRetirementExitResolve && backend === observedBackend) {
+      replacementRetirementExitResolve();
+      replacementRetirementExitResolve = undefined;
+    }
     const intentionalRestart = intentionalRestartBackend === observedBackend;
     if (intentionalRestart) intentionalRestartBackend = null;
     // destroySession()/kill() may report exit after the 500ms replacement spawn
@@ -29225,11 +29316,14 @@ const TRANSFER_DETACH_ACK_FLUSH_MS = 250;
  * so a wedged process.send callback must not keep this old worker alive and
  * strand the daemon behind its detach fence indefinitely.
  */
-async function flushTransferDetachAck(requestId: string): Promise<void> {
+async function flushRetirementAck(
+  requestId: string,
+  type: 'transfer_detached' | 'replacement_retired' = 'transfer_detached',
+): Promise<void> {
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
     await Promise.race([
-      sendAndFlush({ type: 'transfer_detached', requestId }),
+      sendAndFlush({ type, requestId }),
       new Promise<void>((resolve) => {
         timeout = setTimeout(resolve, TRANSFER_DETACH_ACK_FLUSH_MS);
         timeout.unref?.();
@@ -29854,8 +29948,13 @@ process.on('message', async (raw: unknown) => {
           flushPending();
         }
 
+        const backendPid = backend?.getChildPid?.() ?? undefined;
+        const observedCwd = backendPid ? readCwd(backendPid) : undefined;
+        const hostWorkingDirContract = backend?.validatedHostWorkingDirContract?.();
         send({
           type: 'ready',
+          ...(observedCwd ? { cwd: observedCwd } : {}),
+          ...(hostWorkingDirContract ? { hostWorkingDirContract } : {}),
           port,
           token: writeToken,
           viewToken,
@@ -31075,7 +31174,7 @@ process.on('message', async (raw: unknown) => {
       // gate would need preserveCliPidMarker here too.
       killCli({ preserveSandbox: true });
       cleanup();
-      await flushTransferDetachAck(msg.requestId);
+      await flushRetirementAck(msg.requestId);
       // NOTE: process.exit(0) can wedge in node-pty's native teardown when a
       // web-terminal client PTY was attached (the reader-thread join blocks and
       // the JS event loop is already stopped, so this process cannot self-kill
@@ -31293,6 +31392,33 @@ process.on('message', async (raw: unknown) => {
         ...(abortError ? { error: abortError } : {}),
       });
       break;
+    }
+
+    case 'retire_for_replacement': {
+      if (isRemoteBackendType(effectiveBackendType)) {
+        log(`Refused unsafe ${effectiveBackendType} replacement retirement`);
+        break;
+      }
+      log('Replacement retirement requested');
+      stopScreenshotLoop();
+      stopBridgeWatcher();
+      destroyCrashDiagnosticTerminal('replacement retirement');
+      revokeManagedTurnOriginForRestart();
+      const retiringBackend = backend;
+      const exited = retiringBackend
+        ? new Promise<void>(resolve => { replacementRetirementExitResolve = resolve; })
+        : Promise.resolve();
+      try { (retiringBackend?.destroySession ?? retiringBackend?.kill)?.call(retiringBackend); } catch { /* daemon timeout stays authoritative */ }
+      if (retiringBackend) await exited;
+      stopOwnedSessionScope('replacement retirement');
+      backend = null;
+      isPromptReady = false;
+      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } sandboxStopWatcher = null; }
+      sandboxCleanup = null;
+      sandboxTeardownDone = true;
+      await flushRetirementAck(msg.requestId, 'replacement_retired');
+      cleanup();
+      process.exit(0);
     }
 
     case 'suspend': {

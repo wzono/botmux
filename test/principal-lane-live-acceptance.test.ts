@@ -479,6 +479,10 @@ describe('principal lane production live acceptance', () => {
     expect(b.workingDir).not.toBe(repo);
     expect(c.workingDir).not.toBe(repo);
     expect(b.workingDir).not.toBe(c.workingDir);
+    expect(hydratedB.session).toMatchObject({ workingDirSource: 'worktree' });
+    expect(hydratedC.session).toMatchObject({ workingDirSource: 'worktree' });
+    expect(hydratedB.session.groupWorkspaceRevision).toBeUndefined();
+    expect(hydratedC.session.groupWorkspaceRevision).toBeUndefined();
     expect(hydratedB.worktree.worktreeGitCommonDir).toBe(hydratedC.worktree.worktreeGitCommonDir);
 
     const db = new DatabaseSync(join(mocks.dataDir, 'session-stores', appId, 'sessions.db'));

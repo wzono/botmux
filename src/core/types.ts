@@ -100,6 +100,12 @@ export interface DaemonSession {
    * separate from workerPort because backends without a Web Terminal still
    * emit screen/idle/screenshot updates and support native local attach. */
   workerReady?: boolean;
+  /** Task9 launch-only fence; set by the daemon's immediate pre-spawn group probe
+   * and consumed by the matching worker-ready cwd confirmation. */
+  groupWorkspaceLaunchGuard?: {
+    workingDir: string;
+    identity?: { dev: string; ino: string };
+  };
   /** True while the CURRENT CLI generation's prompt is known idle/ready.
    *  Set by the worker's `prompt_ready` IPC; cleared on spawn / restart /
    *  `claude_exit` / worker retirement. Deliberately NOT cleared by the
@@ -271,6 +277,10 @@ export interface DaemonSession {
    * reached the first fork yet. Same-anchor turns must buffer into the opening
    * input instead of reforking worker:null and overtaking it. In-memory only. */
   initialStartPending?: boolean;
+  /** A guarded first fork synchronously refused before consuming its opening.
+   * The opening buffers remain authoritative, but no handler owns a live start
+   * claim; the next same-anchor turn may claim and retry this exact launch. */
+  initialGuardedLaunchRetry?: 'raw' | 'idle';
   /** Restore quarantine: a durable activation-tail promotion failed transiently
    * during restoreActiveSessions, so the row was registered with its tail
    * un-promoted. The next fork boundary (toReattach blank fork / daemon inbound

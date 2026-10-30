@@ -80,6 +80,7 @@ import type { Readable } from 'node:stream';
 import { locateOnPath } from '../cli/registry.js';
 import { buildWrappedLaunch } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
+import { HostWorkingDirContract } from './host-working-dir-contract.js';
 import type {
     SessionBackend,
     SessionAbortDestroyResult,
@@ -342,6 +343,7 @@ export class MojoBackend implements SessionBackend {
      * an explicit bots.json override remains authoritative.
      */
     private spawnOpts: SpawnOpts | null = null;
+    private readonly hostWorkingDirContract = new HostWorkingDirContract();
     /**
      * Resolved launch PREFIX from BotConfig.wrapperCli (e.g. `env VAR=x mojo`,
      * a ttadk gateway). The worker resolves the prefix into a real bin + args and
@@ -419,6 +421,7 @@ export class MojoBackend implements SessionBackend {
         // once per turn — but the spawn contract is still where the worker hands
         // over the authoritative cwd/env, so keep them for buildEnv()/runTurn().
         this.spawnOpts = opts;
+        this.hostWorkingDirContract.capture(opts);
 
         // FAIL CLOSED on a launch prefix we did not ask for.
         //
@@ -635,36 +638,46 @@ export class MojoBackend implements SessionBackend {
         return this.isolatedWorkspace;
     }
 
+    validateWorkingDirBeforeBusinessInput(): boolean {
+        return this.hostWorkingDirContract.matches();
+    }
+
+    validatedHostWorkingDirContract() {
+        return this.hostWorkingDirContract.validatedProof();
+    }
+
     write(data: string): boolean {
-        if (this.killed || this.closing || this.shutdownDetaching) return false;
-        if (this.containmentUnrecorded) {
-            // A prior turn's subtree could not be recorded AND could not be proven
-            // terminated. Running another credentialed turn on top of a possibly
-            // live, undescribed tree is exactly the fail-open the latch exists to
-            // prevent — refuse until a close proves (or contains) it.
-            this.emitLine('❌ mojo 进程围栏存在未登记的残留子进程，已拒绝新一轮，请先 /close 本会话。', 'err');
-            return false;
+        if (this.killed || this.closing || this.shutdownDetaching || this.containmentUnrecorded || !data.trim()) return false;
+        if (!this.cliSessionId) this.acceptedWriteWithoutLineage = true;
+        void this.writeBusinessInput(data);
+        return true;
+    }
+
+    writeBusinessInput(data: string): Promise<'submitted' | 'retryable_pre_dispatch_rejection'> {
+        if (this.killed || this.closing || this.shutdownDetaching || this.containmentUnrecorded) {
+            return Promise.resolve('retryable_pre_dispatch_rejection');
         }
         const text = data.trim();
-        if (!text) return false;
-        if (!this.cliSessionId) this.acceptedWriteWithoutLineage = true;
-        // Capture the credential snapshot BEFORE serialization. The writeChain
-        // defers the actual spawn, so a second write() + applyLivePatch() can
-        // overwrite this.liveJwt before the first turn's buildEnv() reads it.
-        // Without the snapshot, two queued credential turns run A/C/C instead of
-        // A/B/C (see mojo-cross-boundary.test.ts §1).
+        if (!text) return Promise.resolve('retryable_pre_dispatch_rejection');
         const turnLiveJwt = this.liveJwt;
-        // Serialize turns: mojo rejects a concurrent turn on the same session,
-        // and a second message arriving before the first init event would fork a
-        // duplicate session (cliSessionId still null).
+        let resolveResult!: (result: 'submitted' | 'retryable_pre_dispatch_rejection') => void;
+        const result = new Promise<'submitted' | 'retryable_pre_dispatch_rejection'>(resolve => { resolveResult = resolve; });
         this.writeChain = this.writeChain
-            .then(() => (this.killed || this.closing) ? undefined : this.runTurnWithBusyRetry(text, turnLiveJwt))
+            .then(() => {
+                if (this.killed || this.closing || !this.hostWorkingDirContract.matches()) {
+                    resolveResult('retryable_pre_dispatch_rejection');
+                    return undefined;
+                }
+                if (!this.cliSessionId) this.acceptedWriteWithoutLineage = true;
+                resolveResult('submitted');
+                return this.runTurnWithBusyRetry(text, turnLiveJwt);
+            })
             .catch((err: unknown) => {
                 logger.warn(`[mojo] turn failed: ${String(err)}`);
                 this.emitLine(`❌ mojo 执行失败：${this.fmtErr(err)}`, 'err');
                 this.settleTurn();
             });
-        return true;
+        return result;
     }
 
     /**

@@ -2,7 +2,18 @@ import { recordDeploymentContinuation, cancelDeploymentContinuation } from './se
 import { deploymentContinuationAuthority } from './core/deployment-continuation-authority.js';
 import { shareVcMeetingSummary } from './services/vc-meeting-summary-share.js';
 import { isCurrentBotInChat, resolveUnionIdFromOpenIdStrict } from './im/lark/client.js';
-import { createBotAdminUnionsPublisher, readBotAdminUnions } from './services/bot-admin-unions-store.js';
+import { createBotAdminUnionsPublisher, readBotAdminUnions, type BotAdminIdentityConfig } from './services/bot-admin-unions-store.js';
+import {
+  GroupWorkspaceStore,
+  canonicalGroupWorkspaceRequestIntentDigest,
+  groupWorkspaceOperationKey,
+} from './services/group-workspace-store.js';
+import { GroupWorkspaceOperationStore } from './services/group-workspace-operation-store.js';
+import { probePathUsability, type PathIdentity } from './core/path-usability.js';
+import {
+  createGroupWorkspaceSetCoordinator,
+  executeGroupWorkspaceUnbind,
+} from './core/group-workspace-operation.js';
 import { DecisionBoardService } from './core/decision-board/service.js';
 import { lookupChatAcrossBots } from './core/decision-board/chat-lookup.js';
 import { createBoardChatProbes, sameOwnerAs } from './services/board-chat-probes.js';
@@ -88,7 +99,7 @@ import { botmuxVersion } from './utils/install-info.js';
 import { SESSION_STORE_PROTOCOL } from './utils/daemon-version-display.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
-import { addReaction, deleteMessage, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageUpdateExpiredError, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { addReaction, deleteMessage, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageUpdateExpiredError, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, resolveUserUnionId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -420,6 +431,7 @@ import {
   sendPromptCacheKeepalive,
   sendWorkerSessionInput,
   killWorker,
+  retireWorkerForReplacement,
   retireWorkerProcessOnly,
   retiringWorkersForSession,
   reapOrphanWorkers,
@@ -525,7 +537,11 @@ import {
   readGroupCollaborationMode,
 } from './services/group-collaboration-mode-store.js';
 import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.js';
-import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
+import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, runGroupWorkspaceRepoEntrypoint } from './core/command-handler.js';
+import { resolveGroupWorkspaceRepoSelection } from './core/repo-selection.js';
+import { resolveGroupWorkspaceCwd } from './core/group-workspace-policy.js';
+import { applySessionWorkingDir, resolveGroupWorkspaceFollowTarget, runGroupWorkspaceSessionFollow, setSessionWorkingDirMetadata, type SessionWorkingDirMutation } from './core/session-cwd.js';
+import { createGroupWorkspaceRouteRuntime } from './core/group-workspace-route-runtime.js';
 import { classifySlash, isCommandDecision, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
 import { deriveSessionPhase } from './core/session-phase.js';
 import { noteObservedCliVersion } from './core/cli-version-history.js';
@@ -1225,6 +1241,14 @@ async function restoreSessionsAndScheduleStartupRecovery(opts: {
   driveRestoredPrincipalLane: (ds: DaemonSession) => void;
 }): Promise<Array<XpiSharedCwdStartupNotice | PrincipalLaneStartupNotice>> {
   const restoredQuarantineNotices = await opts.restoreSessions();
+  // Reconcile every persisted follow journal while ingress is still fenced. This
+  // includes workerless PTY rows and rows restored after the replacement spawn.
+  for (const ds of activeSessions.values()) {
+    if (ds.larkAppId !== opts.larkAppId || !ds.session.groupWorkspaceFollow) continue;
+    if (await followGroupWorkspaceBeforeBusinessTurn(ds) === 'stop') {
+      throw new Error(`workspace follow startup reconciliation failed for ${ds.session.sessionId}`);
+    }
+  }
   const restoredAt = Date.now();
   const quarantineNotices = restoredQuarantineNotices ?? [];
   scheduleRestoredStreamingCardPinRecovery(opts.larkAppId);
@@ -3276,7 +3300,7 @@ async function ensureVcMeetingReceiverSession(
       memberEpoch: request.member.epoch,
     };
     session.lastMessageAt = new Date(now).toISOString();
-    session.workingDir = workingDir.resolvedPath;
+    setSessionWorkingDirMetadata(session, { workingDir: workingDir.resolvedPath, source: 'legacy-unknown' });
     session.cliId = bot.config.cliId;
     // Freeze the security-critical launch decision at creation.  A later live
     // Bot-config edit must neither weaken this session nor make an old
@@ -6209,11 +6233,7 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
   ds.lastMessageAt = Date.now();
   ds.session.lastMessageAt = new Date(ds.lastMessageAt).toISOString();
   if (sub.workingDir && (!ds.worker || ds.worker.killed)) {
-    ds.workingDir = sub.workingDir;
-    ds.session.workingDir = sub.workingDir;
-    // An explicit doc-watch cwd replaces the previous repo selection. Keeping
-    // a multi-Riff stamp would make the cold refork ignore this new directory.
-    ds.session.riffRepoDirs = undefined;
+    applySessionWorkingDir(ds, { workingDir: sub.workingDir, source: 'explicit' });
   }
 
   if (ds.worker && !ds.worker.killed) {
@@ -6336,6 +6356,104 @@ async function submitQueuedMessage(
   return true;
 }
 
+const GROUP_WORKSPACE_FOLLOW_READY_TIMEOUT_MS = 30_000;
+
+type FollowPersistedSession = Session;
+
+async function waitForFollowWorkerReady(ds: DaemonSession, generation: number): Promise<{ ready: boolean; workingDir?: string }> {
+  const deadline = Date.now() + GROUP_WORKSPACE_FOLLOW_READY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (ds.workerGeneration === generation && ds.workerReady && ds.cliReady) {
+      return { ready: true, workingDir: getSessionWorkingDir(ds) };
+    }
+    if (!ds.worker || ds.worker.killed || (ds.workerGeneration ?? 0) > generation) return { ready: false };
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  return { ready: false };
+}
+
+/** Called only while the ordinary same-anchor FIFO/admission lock is held. */
+async function followGroupWorkspaceBeforeBusinessTurn(
+  ds: DaemonSession,
+): Promise<'continue' | 'stop'> {
+  if (ds.scope !== 'chat' || ds.session.workingDirSource !== 'group') return 'continue';
+  const group = await groupWorkspaceStore.read(ds.chatId);
+  const followJournal = (ds.session as FollowPersistedSession).groupWorkspaceFollow;
+  const resolution = resolveGroupWorkspaceFollowTarget({
+    journal: followJournal,
+    group,
+    currentRevision: ds.session.groupWorkspaceRevision,
+  });
+  if (resolution.kind === 'store_unavailable') {
+    await sessionReply(ds.session.rootMessageId, '群目录状态暂不可用，本条消息未投递；请稍后重试。', 'text', ds.larkAppId);
+    return 'stop';
+  }
+  if (resolution.kind === 'continue') return 'continue';
+  // A durable journal freezes the migration target across later bind/unbind
+  // changes. Only a proven ready worker at that cwd may terminalize it.
+  const target = { kind: 'bound' as const, workingDir: resolution.target.workingDir };
+  const targetRevision = resolution.target.revision;
+  const frozenTargetUsability = followJournal
+    ? probePathUsability(target.workingDir, followJournal.targetDirectoryIdentity
+      ? { expectedIdentity: followJournal.targetDirectoryIdentity }
+      : {})
+    : undefined;
+  const health = frozenTargetUsability
+    ? (frozenTargetUsability.ok
+      ? { status: 'usable' as const, usability: frozenTargetUsability }
+      : { status: 'unusable' as const })
+    : await groupWorkspaceStore.probeBoundDirectoryForConsumption(ds.chatId);
+  if (health.status !== 'usable') {
+    await sessionReply(ds.session.rootMessageId, '群目录当前不可进入，本条消息未投递；请管理员修复绑定。', 'text', ds.larkAppId);
+    return 'stop';
+  }
+  const journalGeneration = ds.session.groupWorkspaceFollow?.nextGeneration;
+  let reservedGeneration = journalGeneration ?? (ds.session.workerGeneration ?? 0) + 1;
+  let admission: WorkerForkAdmission | undefined;
+  const outcome = await runGroupWorkspaceSessionFollow(ds, {
+    workingDir: target.workingDir,
+    revision: targetRevision,
+    directoryIdentity: health.usability.identity,
+  }, {
+    isIdle: current => !!current.worker && !current.worker.killed
+      && current.cliReady === true && current.lastScreenStatus === 'idle'
+      && !current.activeInteractiveTurn && !current.agentAttention
+      && !current.cascadeInFlight && !hasProtectedSessionMutationOwnership(current)
+      && (current.backgroundTaskCount ?? 0) === 0,
+    supportsReplacement: current => {
+      const backend = current.initConfig?.backendType ?? current.session.backendType;
+      return backend !== undefined && !isRemoteBackendType(backend);
+    },
+    isWorkerLive: current => !!current.worker && !current.worker.killed,
+    persist: input => {
+      const next = { ...ds.session } as FollowPersistedSession;
+      if (input.source && input.workingDir) {
+        setSessionWorkingDirMetadata(next, input as SessionWorkingDirMutation);
+      }
+      next.groupWorkspaceFollow = input.journal;
+      sessionStore.updateSession(next);
+      Object.assign(ds.session, next);
+      if (input.workingDir) ds.workingDir = input.workingDir;
+    },
+    retire: current => retireWorkerForReplacement(current),
+    spawn: (current, onGenerationReserved) => forkWorker(current, '', {
+      resume: current.hasHistory,
+      onWorkerGenerationReserved: generation => {
+        reservedGeneration = generation;
+        onGenerationReserved(generation);
+      },
+    }, { onAdmission: value => { admission = value; } }) && admission !== 'rejected' && admission !== 'deferred',
+    awaitReady: current => waitForFollowWorkerReady(current, reservedGeneration),
+    notice: kind => {
+      const text = kind === 'migrated'
+        ? `群目录已更新到 ${target.workingDir}，会话已安全重启。`
+        : '群目录跟随失败，本条消息未投递；请重试或检查会话状态。';
+      void sessionReply(sessionAnchorId(ds), text, 'text', ds.larkAppId);
+    },
+  });
+  return outcome.kind === 'migrated' || outcome.kind === 'unchanged' ? 'continue' : 'stop';
+}
+
 // Dependencies passed to command-handler
 const commandDeps: CommandHandlerDeps = {
   activeSessions,
@@ -6345,6 +6463,40 @@ const commandDeps: CommandHandlerDeps = {
   prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
   prewarmDocCommentSession,
   submitQueuedMessage,
+  readGroupWorkspaceShow: async ds => {
+    const group = await groupWorkspaceStore.read(ds.chatId);
+    const oncall = findOncallChat(ds.larkAppId, ds.chatId);
+    const botConfig = getBot(ds.larkAppId).config;
+    const botDefault = botConfig.defaultWorkingDir;
+    const defaultOncall = botConfig.defaultOncall?.enabled ? botConfig.defaultOncall.workingDir : undefined;
+    const persistedWorkingDir = ds.session.workingDir;
+    const runtimeWorkingDir = ds.workingDir ? expandHome(ds.workingDir) : undefined;
+    const resolvedWorkingDir = getSessionWorkingDir(ds);
+    const resolvedSource = runtimeWorkingDir && resolvedWorkingDir === runtimeWorkingDir
+      ? 'runtime-session'
+      : persistedWorkingDir && resolvedWorkingDir === expandHome(persistedWorkingDir)
+        ? 'session-persisted'
+        : 'current-policy (legacy/unknown provenance)';
+    return {
+      session: { workingDir: persistedWorkingDir ?? resolvedWorkingDir,
+        source: persistedWorkingDir ? 'session-persisted (legacy/unknown provenance)' : 'not-persisted' },
+      ...(oncall?.workingDir ? { explicitOncall: { workingDir: oncall.workingDir, source: 'oncall-explicit' } } : {}),
+      ...(defaultOncall ? { defaultOncall: { workingDir: defaultOncall, source: 'default-oncall-config' } } : {}),
+      group: group.status === 'store_unavailable'
+        ? { state: 'unavailable', health: 'store_unavailable' }
+        : !group.record ? { state: 'missing', health: 'available' }
+          : group.record.directory.kind === 'unbound'
+            ? { state: 'unbound', revision: group.record.revision, source: 'group', health: 'tombstone',
+              updatedAt: group.record.updatedAt,
+              managers: group.record.workspaceManagers?.map(manager => `${manager.tenantKey}/${manager.unionId}`) }
+            : { state: 'bound', workingDir: group.record.directory.workingDir, revision: group.record.revision,
+              source: 'group', updatedAt: group.record.updatedAt,
+              managers: group.record.workspaceManagers?.map(manager => `${manager.tenantKey}/${manager.unionId}`),
+              health: (await groupWorkspaceStore.probeBoundDirectoryForConsumption(ds.chatId)).status },
+      ...(botDefault ? { botDefault: { workingDir: botDefault, source: 'bot-default-config' } } : {}),
+      resolved: { workingDir: resolvedWorkingDir, source: resolvedSource },
+    };
+  },
 };
 
 /** Bind every reply produced by one slash-command invocation to the routing
@@ -6890,7 +7042,7 @@ async function adoptCodexNotifierEvent(
     session.ownerOpenId = ownerOpenId;
     session.lastCallerOpenId = ownerOpenId;
     session.lastMessageAt = new Date(now).toISOString();
-    session.workingDir = event.cwd;
+    setSessionWorkingDirMetadata(session, { workingDir: event.cwd, source: 'explicit' });
     session.cliId = 'codex-app';
     sessionStore.updateSession(session);
     messageQueue.ensureQueue(anchor);
@@ -7171,8 +7323,25 @@ const cardClickTurns = createCardClickTurnBinder({
 });
 setCardClickTurnPoster((larkAppId, body) => cardClickTurns.post(larkAppId, body));
 
+const groupWorkspaceStore = new GroupWorkspaceStore(config.session.dataDir);
+const groupWorkspaceOperationStore = new GroupWorkspaceOperationStore(config.session.dataDir);
+const groupWorkspaceRouteRuntimes = new Map<string, ReturnType<typeof createGroupWorkspaceRouteRuntime>>();
+
 const cardDeps: CardHandlerDeps = {
   activeSessions,
+  resolveGroupWorkspaceRouteAuthority: input => {
+    const runtime = selfDaemonLarkAppId
+      ? groupWorkspaceRouteRuntimes.get(selfDaemonLarkAppId)
+      : undefined;
+    return runtime ? runtime.resolveAuthority(input) : Promise.resolve(undefined);
+  },
+  handleGroupWorkspaceRoute: route => {
+    const runtime = selfDaemonLarkAppId
+      ? groupWorkspaceRouteRuntimes.get(selfDaemonLarkAppId)
+      : undefined;
+    if (!runtime) throw new Error('group workspace route runtime unavailable');
+    return runtime.handleRoute(route);
+  },
   sessionReply,
   lastRepoScan,
   vcMeetingCardAction: (data, appId) => handleVcMeetingCardAction(data, appId),
@@ -20168,6 +20337,10 @@ async function resolvePinnedWorkingDir(ctx: {
   chatType: 'group' | 'p2p';
   larkAppId: string;
   listenerWorkingDir?: string;
+  /** A route that will pin its own directory after this lookup (`/repo X`,
+   * `/th`/`/tw`, or an explicit topic-header repository). It must not touch an
+   * older group binding: that binding may be exactly what this route repairs. */
+  explicitRepairIntent?: boolean;
 }) {
   if (ctx.listenerWorkingDir) {
     const resolved = expandHome(ctx.listenerWorkingDir);
@@ -20175,6 +20348,7 @@ async function resolvePinnedWorkingDir(ctx: {
       if (statSync(resolved).isDirectory()) {
         return {
           pinnedWorkingDir: resolved,
+          workingDirMutation: { workingDir: resolved, source: 'explicit' } as SessionWorkingDirMutation,
           oncallEntry: undefined,
           inheritedFrom: null,
           pinnedFromBotDefault: false,
@@ -20187,33 +20361,128 @@ async function resolvePinnedWorkingDir(ctx: {
   if (!oncallEntry) {
     oncallEntry = await maybeAutoBindDefaultOncall(ctx.larkAppId, ctx.chatId, ctx.chatType);
   }
-  // Resolve the bot default first so we know whether inheritance is only the
-  // ordinary last-resort fallback or must preempt an auto-created worktree.
-  const botDefaultWorkingDir = !oncallEntry
-    ? resolveBotDefaultWorkingDir(ctx.larkAppId)
+  const group = ctx.explicitRepairIntent
+    ? { status: 'available' as const, record: undefined }
+    : ctx.chatType === 'group'
+      ? await groupWorkspaceStore.probeBoundDirectoryForConsumption(ctx.chatId)
+      : { status: 'available' as const, record: undefined };
+  const groupLayer = group.status === 'usable'
+    ? {
+        status: 'usable' as const,
+        workingDir: group.usability.normalizedPath,
+        revision: group.record.revision,
+        directoryIdentity: group.record.directoryIdentity ?? group.usability.identity,
+      }
+    : group.status === 'unusable'
+      ? {
+          status: group.usability.reason === 'inaccessible' ? 'inaccessible' as const : 'invalid' as const,
+          workingDir: group.record.directory.kind === 'bound' ? group.record.directory.workingDir : group.usability.normalizedPath,
+          revision: group.record.revision,
+        }
+      : group.status === 'store_unavailable'
+        ? { status: 'store-unavailable' as const }
+        : { status: 'unbound' as const };
+  // Bot defaults are evaluated only as the final selected layer; a broken group
+  // binding must remain visible and must never silently fall through to them.
+  const botDefaultWorkingDir = resolveBotDefaultWorkingDir(ctx.larkAppId);
+  const resolution = resolveGroupWorkspaceCwd({
+    oncall: oncallEntry,
+    group: groupLayer,
+    botDefaultWorkingDir,
+  });
+  if (resolution.status !== 'selected' && resolution.status !== 'picker') {
+    const path = 'workingDir' in resolution ? resolution.workingDir : '';
+    await sessionReply(
+      ctx.anchor,
+      tr('daemon.group_workspace_repair_required', { path }, localeForBot(ctx.larkAppId)),
+      'text',
+      ctx.larkAppId,
+    ).catch(error => logger.warn(`[group-workspace] repair notice failed: ${error instanceof Error ? error.message : String(error)}`));
+    throw new Error(`group_workspace_${resolution.status}`);
+  }
+  const workspaceCwd = resolution.status === 'selected' && resolution.source !== 'bot-default'
+    ? resolution
     : undefined;
-  const preferPeerOverAutoWorktree = !oncallEntry
-    && !!botDefaultWorkingDir
+  const resolvedBotDefaultWorkingDir = resolution.status === 'selected' && resolution.source === 'bot-default'
+    ? resolution.workingDir
+    : undefined;
+  const explicitOncallEntry = workspaceCwd?.source === 'oncall-explicit' ? oncallEntry : undefined;
+  const preferPeerOverAutoWorktree = !workspaceCwd
+    && !!resolvedBotDefaultWorkingDir
     && botAutoWorktreeEnabled(ctx.larkAppId);
   // Peer inheritance is normally the fallback after this bot's own default. When
   // that default would create a fresh worktree, however, "bot@bot 同目录拉起"
   // takes priority: a valid same-anchor peer suppresses auto-worktree for this
   // session. The per-bot gate is enforced inside findInheritablePeer.
-  const inheritedFrom = (!oncallEntry && (!botDefaultWorkingDir || preferPeerOverAutoWorktree))
+  const inheritedFrom = (!workspaceCwd
+    && (resolution.status === 'selected' || resolution.status === 'picker')
+    && (!resolvedBotDefaultWorkingDir || preferPeerOverAutoWorktree))
     ? findInheritablePeer({
         scope: ctx.scope, anchor: ctx.anchor, chatId: ctx.chatId, chatType: ctx.chatType,
         selfAppId: ctx.larkAppId,
         botToBotSameDir: getBot(ctx.larkAppId).config.botToBotSameDir !== false,
       })
     : null;
-  const pinnedWorkingDir = oncallEntry?.workingDir ?? inheritedFrom?.workingDir ?? botDefaultWorkingDir;
+  const pinnedWorkingDir = workspaceCwd?.workingDir ?? inheritedFrom?.workingDir ?? resolvedBotDefaultWorkingDir;
+  const workingDirMutation: SessionWorkingDirMutation | undefined = workspaceCwd
+    ? workspaceCwd.source === 'group'
+      ? {
+          workingDir: workspaceCwd.workingDir,
+          source: 'group',
+          groupWorkspaceRevision: workspaceCwd.groupWorkspaceRevision!,
+          groupWorkspaceDirectoryIdentity: workspaceCwd.groupWorkspaceDirectoryIdentity,
+        }
+      : { workingDir: workspaceCwd.workingDir, source: workspaceCwd.source }
+    : inheritedFrom
+      ? { workingDir: inheritedFrom.workingDir, source: 'legacy-unknown' }
+      : resolvedBotDefaultWorkingDir
+        ? { workingDir: resolvedBotDefaultWorkingDir, source: 'bot-default' }
+        : undefined;
   // Only the bot-default winner opts into auto-worktree. A same-dir peer winner
   // keeps its exact workingDir and therefore suppresses worktree creation.
-  const pinnedFromBotDefault = !oncallEntry && !inheritedFrom && !!botDefaultWorkingDir;
-  return { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault };
+  const pinnedFromBotDefault = !workspaceCwd && !inheritedFrom && !!botDefaultWorkingDir;
+  return { resolution, pinnedWorkingDir, workingDirMutation, oncallEntry: explicitOncallEntry, inheritedFrom, pinnedFromBotDefault };
+
+}
+
+function probeWorkspaceBeforeSpawn(path: string, expectedIdentity?: PathIdentity) {
+  return probePathUsability(path, expectedIdentity ? { expectedIdentity } : undefined);
+}
+
+function confirmWorkerReadyCwd(requested: string, actual: string, expectedIdentity?: PathIdentity): boolean {
+  const requestedProbe = probePathUsability(requested, expectedIdentity ? { expectedIdentity } : undefined);
+  const actualProbe = probePathUsability(actual, expectedIdentity ? { expectedIdentity } : undefined);
+  return requestedProbe.ok && actualProbe.ok
+    && requestedProbe.normalizedPath === actualProbe.normalizedPath
+    && requestedProbe.identity.dev === actualProbe.identity.dev
+    && requestedProbe.identity.ino === actualProbe.identity.ino;
+}
+
+function prepareGroupWorkspaceLaunch(ds: DaemonSession): boolean {
+  if (ds.session.workingDirSource !== 'group') {
+    ds.groupWorkspaceLaunchGuard = undefined;
+    return true;
+  }
+  const path = ds.session.workingDir ?? ds.workingDir;
+  const probe = path
+    ? probeWorkspaceBeforeSpawn(path, ds.session.groupWorkspaceDirectoryIdentity)
+    : undefined;
+  if (!probe?.ok) {
+    void sessionReply(
+      sessionAnchorId(ds),
+      tr('daemon.group_workspace_repair_required', { path: path ?? '' }, localeForBot(ds.larkAppId)),
+      'text',
+      ds.larkAppId,
+    );
+    return false;
+  }
+  ds.groupWorkspaceLaunchGuard = { workingDir: probe.normalizedPath, identity: probe.identity };
+  return true;
 }
 
 export const __testOnly_resolvePinnedWorkingDir = resolvePinnedWorkingDir;
+export const __testOnly_probeWorkspaceBeforeSpawn = probeWorkspaceBeforeSpawn;
+export const __testOnly_confirmWorkerReadyCwd = confirmWorkerReadyCwd;
 // Production message routes (function declarations hoist, so the references
 // are valid here). Exposed for route-level regression tests — e.g. asserting
 // that `/rename` in a fresh topic/thread does NOT pre-create a phantom session,
@@ -22653,6 +22922,13 @@ async function dispatchApprovedCrossPrincipalSuggestion(
   record: CrossPrincipalInterruption,
 ): Promise<boolean> {
   if (ds.activeInteractiveTurn) return false;
+  // XPI admission intentionally happens while the old owner is busy. The
+  // approved record becomes executable only here, so enforce group follow at
+  // this execution boundary and retain the FIFO head on defer/failure.
+  if (await followGroupWorkspaceBeforeBusinessTurn(ds) === 'stop') {
+    scheduleCrossPrincipalOwnerWait(ds, Date.now() + 5_000);
+    return false;
+  }
   const ownerId = record.owner.requestUserOpenId;
   if (!ownerId) return false;
   const loc = localeForBot(ds.larkAppId);
@@ -23039,7 +23315,11 @@ async function prepareIndependentCrossPrincipalSession(
       child.ownerUnionId = record.proposer.senderType === 'user' ? record.proposer.requestUserUnionId : undefined;
       child.creatorOpenId = proposerId;
       child.lastCallerOpenId = proposerId;
-      child.workingDir = workingDir;
+      setSessionWorkingDirMetadata(child, isolatedWorktree
+        ? { workingDir, source: 'worktree' }
+        : sourceDs.session.workingDirSource === 'group'
+          ? { workingDir, source: 'group', groupWorkspaceRevision: sourceDs.session.groupWorkspaceRevision! }
+          : { workingDir, source: sourceDs.session.workingDirSource ?? 'legacy-unknown' });
       child.nativeSessionTitle = title;
       child.nativeSessionTitleUserDefined = false;
       cloneIndependentLaunchPosture(sourceDs.session, child);
@@ -23652,19 +23932,24 @@ function hasBufferedOpeningInput(ds: DaemonSession): boolean {
  * card-handler 的 commitRepoSelection）：空 prompt fork + markInitialUserTurnPending，
  * 用户下一条真消息才是这个会话的开场。
  */
-function forkReservedIdleSession(ds: DaemonSession): void {
-  forkWorker(ds, '', false);
+function forkReservedIdleSession(ds: DaemonSession): boolean {
+  if (forkWorker(ds, '', false) === false) {
+    ds.initialGuardedLaunchRetry = 'idle';
+    return false;
+  }
+  ds.initialGuardedLaunchRetry = undefined;
   markInitialUserTurnPending(ds);
   ds.pendingTurnId = undefined;
   ds.initialStartPending = ds.session.queuedActivationPending === true;
   clearInitialStartBuffers(ds);
+  return true;
 }
 
 /** Raw slash-command cold starts type the raw command only after prompt_ready.
  * Buffer later same-anchor messages into the ordered follow-up payload carried
  * on that same raw_input IPC; a separate worker message could overtake the
  * command's text→Enter beat. */
-function forkReservedInitialRawSession(ds: DaemonSession, availableBots: AvailableBot[]): void {
+function forkReservedInitialRawSession(ds: DaemonSession, availableBots: AvailableBot[]): boolean {
   const hasBufferedInput =
     (ds.pendingPrompt?.trim().length ?? 0) > 0
     || (ds.pendingAttachments?.length ?? 0) > 0
@@ -23705,7 +23990,14 @@ function forkReservedInitialRawSession(ds: DaemonSession, availableBots: Availab
       || hasPendingSessionTurns(ds.session.sessionId));
   if (armRawActivationAck) ds.session.queued = true;
   try {
-    forkWorker(ds, '', false);
+    if (forkWorker(ds, '', false) === false) {
+      if (armRawActivationAck && ds.session.queued === true) {
+        ds.session.queued = false;
+        sessionStore.updateSession(ds.session);
+      }
+      ds.initialGuardedLaunchRetry = 'raw';
+      return false;
+    }
   } catch (err) {
     // forkWorker's pre-init compensation restores its queued snapshot. This
     // synthetic marker belongs only to the raw ACK fence, not the Dashboard
@@ -23716,11 +24008,13 @@ function forkReservedInitialRawSession(ds: DaemonSession, availableBots: Availab
     }
     throw err;
   }
+  ds.initialGuardedLaunchRetry = undefined;
   // Raw text and Enter are a single adapter-submission boundary. When this
   // cold start came through the durable pendingRepo fallback, retain the gate
   // through that ACK so a follower cannot be sent between those two beats.
   ds.initialStartPending = ds.session.queuedActivationPending === true;
   clearInitialStartBuffers(ds);
+  return true;
 }
 
 async function replyInvalidWorkingDirs(
@@ -24132,6 +24426,7 @@ async function startInitialPassthroughSession(args: {
       type: resolvedSenderIsBot ? 'bot' as const : 'user' as const,
     }
     : undefined);
+  const resolution = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
   const rootIdForStore = scope === 'thread' ? anchor : messageId;
   const session = sessionStore.createSession(chatId, rootIdForStore, commandContent.substring(0, 50), chatType, undefined, { source: 'ordinary-feishu' });
   const now = Date.now();
@@ -24150,7 +24445,7 @@ async function startInitialPassthroughSession(args: {
   fillNativeTopicId(session, scope, parsed.threadId);
   sessionStore.updateSession(session);
 
-  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+  const { pinnedWorkingDir, workingDirMutation, oncallEntry, inheritedFrom, pinnedFromBotDefault } = resolution;
   // Auto-worktree: register PENDING (router buffers, no force-fork) and build the
   // worktree off the critical path (see willAutoWorktree / runAutoWorktreeCommit).
   const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
@@ -24177,8 +24472,8 @@ async function startInitialPassthroughSession(args: {
     currentTurnTitle: commandContent.substring(0, 50),
     workingDir: pinnedWorkingDir,
   };
-  if (pinnedWorkingDir) {
-    ds.session.workingDir = pinnedWorkingDir;
+  if (workingDirMutation) {
+    setSessionWorkingDirMetadata(ds.session, workingDirMutation);
     sessionStore.updateSession(ds.session);
   }
   const initialWindow = buildTurnParticipants(larkAppId, senderOpenId, resolvedSenderIsBotTriState, undefined, initialPassthroughSender?.name);
@@ -24231,8 +24526,8 @@ async function startInitialPassthroughSession(args: {
       messageId,
     });
     const availableBots = await getAvailableBots(larkAppId, chatId);
-    forkReservedInitialRawSession(ds, availableBots);
-    // fork 成功即开场已交给 CLI；fork 抛错则本轮只存在于内存，保持重发提示。
+    if (!forkReservedInitialRawSession(ds, availableBots)) return;
+    // fork 成功即开场已交给 CLI；fork 拒绝/抛错则保留 opening，保持可修复后重试。
     onDurablyAdmitted?.();
     const reason = oncallEntry
       ? `oncall-bound chat ${chatId}`
@@ -24284,9 +24579,10 @@ async function startInitialPassthroughSession(args: {
     // fall through to the no-card opening below
   }
 
-  // 已 durable staging（picker，含 rawInput）且通过放弃闸：fork 失败后本条 raw
-  // passthrough 仍 durable 挂在会话上，重发会重复执行非幂等命令——先打接纳标。
-  onDurablyAdmitted?.();
+  // The picker staging still owns the opening bytes, but once we choose the
+  // no-project direct-launch route the guarded fork is the admission boundary.
+  // A synchronous refusal remains retryable and must still ask the sender to
+  // resend after repair; mark admitted only after that retry actually starts.
   ds.pendingRepo = false;
   await maybeSeedCardlessForceTopicTurn({
     ds,
@@ -24295,7 +24591,8 @@ async function startInitialPassthroughSession(args: {
     messageId,
   });
   const availableBots = await getAvailableBots(larkAppId, chatId);
-  forkReservedInitialRawSession(ds, availableBots);
+  if (!forkReservedInitialRawSession(ds, availableBots)) return;
+  onDurablyAdmitted?.();
   logger.info(`[${tag(ds)}] ${repoCardDegraded ? 'Repo card unavailable' : 'No projects to select'}, queued initial raw passthrough ${commandContent.substring(0, 40)}`);
 }
 
@@ -25231,6 +25528,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // first-message `/repo` command branch so both paths stay consistent.
   const {
     pinnedWorkingDir: configPinnedWorkingDir,
+    workingDirMutation: configWorkingDirMutation,
     oncallEntry,
     inheritedFrom,
     pinnedFromBotDefault: configPinnedFromBotDefault,
@@ -25241,6 +25539,12 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     chatType,
     larkAppId,
     listenerWorkingDir: messageListener?.workingDir,
+    explicitRepairIntent: !!forceTopic && (
+      forceTopicMode !== 'default'
+      || topicSpec?.workingDir !== undefined
+      || topicSpec?.worktree !== undefined
+      || topicSpec?.repoStartInDefaultDir === true
+    ),
   });
   // 指令头里的 `/repo X` 是**用户显式选仓**，与点选仓卡片上的项目按钮同义：钉目录、
   // 跳过卡片，并且不建 worktree —— auto-worktree 的触发条件是「没人选、目录来自 bot 自己的
@@ -25290,6 +25594,13 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // 裸 `/repo` 兜底到的默认目录刻意不写 —— 与卡片「直接开始」的 pinWorkingDir: false
   // 同一条理由，也与今天 `/t /repo` 的落点逐字一致（那条路只在 pinned 存在时才写）。
   const persistedWorkingDir = lifecycleWorkingDir ?? headerWorktree?.repoPath ?? topicSpec?.workingDir ?? configPinnedWorkingDir;
+  const persistedWorkingDirMutation: SessionWorkingDirMutation | undefined = lifecycleWorkingDir
+    ? { workingDir: lifecycleWorkingDir, source: 'explicit' }
+    : headerWorktree?.repoPath
+      ? { workingDir: headerWorktree.repoPath, source: 'explicit' }
+      : topicSpec?.workingDir
+        ? { workingDir: topicSpec.workingDir, source: 'explicit' }
+        : configWorkingDirMutation;
   // A text-only bare `/t` is topic setup, not an empty CLI turn. Preserve the
   // repo-picker path when no cwd is pinned; a pinned cwd needs no setup owner,
   // so one visible reply can materialize the Lark thread and the first real
@@ -25478,8 +25789,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // resolveSessionLaunchModel 把它排在最高优先级。
     ...(topicSpec?.model ? { spawnModelOverride: topicSpec.model } : {}),
   };
-  if (persistedWorkingDir) {
-    ds.session.workingDir = persistedWorkingDir;
+  if (persistedWorkingDir && persistedWorkingDirMutation) {
+    setSessionWorkingDirMetadata(ds.session, persistedWorkingDirMutation);
     sessionStore.updateSession(ds.session);
   }
   const substituteReplyMode = substituteTrigger
@@ -25583,7 +25894,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // 指令头只交代规格、没写任务：空跑 CLI 等下一条（详见 forkReservedIdleSession）。
     // 这条路径不产生 AI 回合、也没有流式卡片，所以用一句确认回显真正钉下去的东西。
     if (topicHeaderIdleStart && !hasBufferedOpeningInput(ds)) {
-      forkReservedIdleSession(ds);
+      if (!forkReservedIdleSession(ds)) return;
       // 与下面常规 pinned 分支同序，刻意不提前打标：这条路没有 pendingRepo 那种 durable
       // staging，fork 抛错时 forkWorker 的 pre-init 补偿已经杀掉子进程并回滚，本轮既没进
       // worker 也没有兜底，应当保持「请重发」。空跑成功之后 ready 回复失败才是「已接收，
@@ -25668,15 +25979,17 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // selection, spawn directly.
     // 已 durable staging（picker）且通过放弃闸：即使下面 fork 失败，opening 仍由
     // 会话 durable 持有（pre-init 回滚恢复 queued journal，重启复活），重发会
-    // 重复执行——先打接纳标。
-    markIngressAdmitted(ctx);
+    // 重复执行——业务 opening 在 fork 前打接纳标；纯 setup 没有业务输入，只有 guarded
+    // fork 真正成功后才接纳并发送 ready。
     ds.pendingRepo = false;
     if (topicHeaderIdleStart && !hasBufferedOpeningInput(ds)) {
-      forkReservedIdleSession(ds);
+      if (!forkReservedIdleSession(ds)) return;
+      markIngressAdmitted(ctx);
       await sessionReply(anchor, topicHeaderReadyText(topicSpec!, localeForBot(larkAppId), ds.workingDir), 'text', larkAppId);
       logger.info(`[${tag(ds)}] topic header → idle start (no projects to select), waiting for the first task`);
       return;
     }
+    markIngressAdmitted(ctx);
     ensureSessionWhiteboard(ds);
     await maybeSeedCardlessForceTopicTurn({
       ds,
@@ -25960,6 +26273,11 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       // thread-scope MUST anchor on the thread root or sessionAnchorId() will
       // disagree with activeSessions's key and downstream card buttons silently
       // break. Chat-scope keeps the inbound messageId as audit only.
+      const cwdResolution = await resolvePinnedWorkingDir({
+        scope, anchor, chatId, chatType, larkAppId,
+        explicitRepairIntent: cmd === '/repo'
+          && commandContent.replace(/^\/repo\s*/i, '').trim().length > 0,
+      });
       const cmdRootIdForStore = scope === 'thread' ? anchor : messageId;
       const session = sessionStore.createSession(chatId, cmdRootIdForStore, cmdContent.substring(0, 50), chatType, undefined, { source: cmd === '/adopt' ? 'external' : 'ordinary-feishu' });
       const now = Date.now();
@@ -25991,7 +26309,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       // spawn path" (see resolvePinnedWorkingDir) — skipping it here also left
       // that write undone for the whole life of the chat, since later turns
       // reuse this session and never re-enter a spawn path.
-      const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+      const { pinnedWorkingDir, workingDirMutation, pinnedFromBotDefault } = cwdResolution;
       // …EXCEPT when that dir would have triggered auto-worktree. There the bot
       // default is a worktree BASE, not a launch dir: the ordinary spawn paths
       // answer it with `pendingRepo` + a detached worktree build, which a daemon
@@ -26004,7 +26322,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       // its handler re-decides the dir straight away.
       const cmdAutoWorktree = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
       const cmdPinnedWorkingDir = cmd === '/repo' || !cmdAutoWorktree ? pinnedWorkingDir : undefined;
-      if (cmdPinnedWorkingDir) session.workingDir = cmdPinnedWorkingDir;
+      if (cmdPinnedWorkingDir && workingDirMutation) setSessionWorkingDirMetadata(session, workingDirMutation);
       let cmdPending: Partial<DaemonSession> | undefined;
       if (cmd === '/repo') {
         // First-message `/repo`: seed the same pending-repo state the card flow
@@ -26395,7 +26713,7 @@ async function handleBotAdded(
     const needsSharedReply = mode === 'group'
       && regularGroupMode === 'shared';
 
-    const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+    const { pinnedWorkingDir, workingDirMutation, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
     const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
     refreshCliVersion(botCfg);
 
@@ -26406,7 +26724,7 @@ async function handleBotAdded(
     session.lastCallerOpenId = humanOperatorOpenId;
     session.lastMessageAt = new Date(now).toISOString();
     session.scope = scope;
-    if (pinnedWorkingDir) session.workingDir = pinnedWorkingDir;
+    if (workingDirMutation) setSessionWorkingDirMetadata(session, workingDirMutation);
     sessionStore.updateSession(session);
     messageQueue.ensureQueue(anchor);
 
@@ -27763,7 +28081,8 @@ async function handleThreadReplyAdmitted(
       || !ds
       || (ds.worker && !ds.worker.killed)
       || ds.pendingRepo
-      || ds.initialStartPending === true) return;
+      || ds.initialStartClaimToken !== undefined
+      || (ds.initialStartPending === true && ds.initialGuardedLaunchRetry === undefined)) return;
     initialStartClaimToken = randomUUID();
     ds.initialStartClaimToken = initialStartClaimToken;
     ds.initialStartPending = true;
@@ -27874,6 +28193,93 @@ async function handleThreadReplyAdmitted(
   // preparation. Re-check once at the final routing boundary so the oldest
   // surviving follower atomically takes over instead of proceeding unclaimed.
   tryAcquireInitialStartClaim();
+
+  // A guarded initial fork can reject synchronously after the session has been
+  // published. Its original opening remains in the source buffers, but unlike a
+  // normal initialStartPending owner there is no in-flight handler to consume
+  // them. The first later turn claims that retry generation, folds itself behind
+  // the retained opening, and retries the same guarded route. The token keeps
+  // concurrent resends out of this branch until the fork result is known.
+  if (ds && ownsInitialStartClaim() && ds.initialGuardedLaunchRetry) {
+    const retryKind = ds.initialGuardedLaunchRetry;
+    if (retryKind === 'raw') {
+      const pendingBot = getBot(ds.larkAppId);
+      // This resend is not admitted until the guarded fork accepts it. Snapshot
+      // every source/destination buffer touched by forkReservedInitialRawSession
+      // so a repeated rejection does not execute old unadmitted probes later.
+      const retryBufferSnapshot = {
+        pendingFollowUps: ds.pendingFollowUps,
+        pendingCodexAppFollowUps: ds.pendingCodexAppFollowUps,
+        pendingCodexAppFollowUpContexts: ds.pendingCodexAppFollowUpContexts,
+        pendingCodexAppFollowUpGateAccepted: ds.pendingCodexAppFollowUpGateAccepted,
+        pendingFollowUpInput: ds.pendingFollowUpInput,
+      };
+      const followUpSender = callerOpenId
+        ? { openId: callerOpenId, type: isForeignBot ? 'bot' as const : 'user' as const }
+        : undefined;
+      const followUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
+        attachments,
+        mentions: parsed.mentions,
+        isAdoptMode: false,
+        cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? pendingBot.config.cliId,
+        cliPathOverride: ds.session.cliPathOverride ?? pendingBot.config.cliPathOverride,
+        sender: followUpSender,
+        larkAppId,
+        chatId: ds.session.chatId,
+        whiteboardId: ds.session.whiteboardId,
+        substituteTrigger,
+        codexAppText: parsed.content,
+        codexAppApplicationContext,
+        codexAppMessageContext,
+        solo: ds.soloSession,
+        selfMention: { name: pendingBot.botName, openId: pendingBot.botOpenId },
+        sessionBackendType: ds.session.backendType,
+        promptInjection: sessionPromptInjection(ds),
+        turnId: parsed.messageId,
+        linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
+      });
+      ds.pendingFollowUps ??= [];
+      ds.pendingFollowUps.push(followUp.content);
+      ds.pendingCodexAppFollowUps ??= [];
+      ds.pendingCodexAppFollowUps.push(parsed.content);
+      ds.pendingCodexAppFollowUpContexts ??= [];
+      ds.pendingCodexAppFollowUpContexts.push(codexAppMessageContext ?? '');
+      ds.pendingCodexAppFollowUpGateAccepted ??= [];
+      ds.pendingCodexAppFollowUpGateAccepted.push(codexAppCleanInputAcceptedForSession(ds));
+      const availableBots = await getAvailableBots(larkAppId, ds.chatId);
+      if (!forkReservedInitialRawSession(ds, availableBots)) {
+        ds.pendingFollowUps = retryBufferSnapshot.pendingFollowUps;
+        ds.pendingCodexAppFollowUps = retryBufferSnapshot.pendingCodexAppFollowUps;
+        ds.pendingCodexAppFollowUpContexts = retryBufferSnapshot.pendingCodexAppFollowUpContexts;
+        ds.pendingCodexAppFollowUpGateAccepted = retryBufferSnapshot.pendingCodexAppFollowUpGateAccepted;
+        ds.pendingFollowUpInput = retryBufferSnapshot.pendingFollowUpInput;
+        return;
+      }
+    } else {
+      ds.pendingPrompt = promptContent;
+      ds.pendingTurnId = parsed.messageId;
+      ds.pendingAttachments = attachments.length > 0 ? attachments : undefined;
+      ds.pendingMentions = parsed.mentions;
+      ds.pendingSender = callerOpenId
+        ? { openId: callerOpenId, type: isForeignBot ? 'bot' : 'user' }
+        : undefined;
+      const availableBots = await getAvailableBots(larkAppId, ds.chatId);
+      if (hasBufferedOpeningInput(ds)) {
+        if (!forkReservedInitialSession(ds, availableBots)) {
+          ds.initialGuardedLaunchRetry = 'idle';
+          return;
+        }
+        ds.initialGuardedLaunchRetry = undefined;
+      } else if (!forkReservedIdleSession(ds)) {
+        return;
+      }
+    }
+    markIngressAdmitted(ctx);
+    if (ds.initialStartPending || (ds.session.queuedActivationTail?.length ?? 0) > 0) {
+      retainInitialStartClaim = true;
+    }
+    return;
+  }
 
   // A published worker:null owner is not necessarily ready to refork: its
   // opening turn may still be preparing. Buffer both repo-pending and
@@ -28226,6 +28632,13 @@ async function handleThreadReplyAdmitted(
     // For thread-scope: rootMessageId = anchor (real thread root).
     // For chat-scope:   rootMessageId = the message_id that triggered this auto-create
     //                   (used as audit trail; routing key is chatId).
+    const cwdResolution = await resolvePinnedWorkingDir({
+      scope,
+      anchor,
+      chatId: autoCreateChatId,
+      chatType: autoCreateChatType,
+      larkAppId,
+    });
     const rootIdForStore = scope === 'thread' ? anchor : parsed.messageId;
     const session = sessionStore.createSession(autoCreateChatId, rootIdForStore, parsed.content.substring(0, 50), autoCreateChatType, undefined, { source: 'ordinary-feishu' });
     const now = Date.now();
@@ -28272,13 +28685,7 @@ async function handleThreadReplyAdmitted(
 
     // Use the same layered oncall / inherit / default lookup as handleNewTopic
     // so stale inherited peers are ignored consistently in both spawn paths.
-    const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({
-      scope,
-      anchor,
-      chatId: autoCreateChatId,
-      chatType: autoCreateChatType,
-      larkAppId,
-    });
+    const { pinnedWorkingDir, workingDirMutation, oncallEntry, inheritedFrom, pinnedFromBotDefault } = cwdResolution;
     const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
     // Now we know the message will spawn or pend a real session — resolve
     // sender (may await contact API budget) since every downstream branch
@@ -28320,8 +28727,8 @@ async function handleThreadReplyAdmitted(
       currentTurnTitle: parsed.content.substring(0, 50),
       workingDir: pinnedWorkingDir,
     };
-    if (pinnedWorkingDir) {
-      newDs.session.workingDir = pinnedWorkingDir;
+    if (workingDirMutation) {
+      setSessionWorkingDirMetadata(newDs.session, workingDirMutation);
       sessionStore.updateSession(newDs.session);
     }
     const substituteReplyMode = substituteTrigger
@@ -28511,6 +28918,14 @@ async function handleThreadReplyAdmitted(
         mentions: parsed.mentions,
       },
     });
+    return;
+  }
+
+  // Auto-follow is part of the admitted same-anchor FIFO and runs before any
+  // queue append, turn mutation, or worker delivery. A deferred/failed follow
+  // leaves this business message unadmitted so the ingress retry can preserve it.
+  if (await followGroupWorkspaceBeforeBusinessTurn(ds) === 'stop') {
+    retryDurablePrimaryIngress(ctx, 'group workspace follow is waiting for a safe worker boundary');
     return;
   }
 
@@ -29704,6 +30119,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       // would be a phantom conversation that only exists to be renamed. Let
       // handleCommand's `!ds` branch reply no_active_session instead.
       if (chatId && slashDecision.sessionPolicy === 'precreate') {
+        const cwdResolution = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
         const session = sessionStore.createSession(chatId, anchor, cmdContent.substring(0, 50), chatType, undefined, { source: cmd === '/adopt' ? 'external' : 'ordinary-feishu' });
         const now = Date.now();
         if (chatType === 'p2p') {
@@ -29731,10 +30147,10 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
         // EVERY session-needing daemon command, not just `/repo`, and skip the
         // pin when it would have meant auto-worktree. This record becomes the
         // thread's real session.
-        const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+        const { pinnedWorkingDir, workingDirMutation, pinnedFromBotDefault } = cwdResolution;
         const cmdAutoWorktree = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
         const cmdPinnedWorkingDir = cmd === '/repo' || !cmdAutoWorktree ? pinnedWorkingDir : undefined;
-        if (cmdPinnedWorkingDir) session.workingDir = cmdPinnedWorkingDir;
+        if (cmdPinnedWorkingDir && workingDirMutation) setSessionWorkingDirMetadata(session, workingDirMutation);
         let cmdPending: Partial<DaemonSession> | undefined;
         if (cmd === '/repo') {
           cmdPending = { pendingRepo: true, pendingPrompt: '', workingDir: pinnedWorkingDir };
@@ -29858,7 +30274,10 @@ async function autoCreateDocSession(
   session.larkAppId = larkAppId;
   session.scope = 'chat';
   session.lastMessageAt = new Date(now).toISOString();
-  session.workingDir = workingDir;
+  setSessionWorkingDirMetadata(session, {
+    workingDir,
+    source: sub.workingDir ? 'explicit' : effectiveDefaultWorkingDir(botCfg) ? 'bot-default' : 'legacy-unknown',
+  });
   session.cliId = botCfg.cliId;
   session.ownerOpenId = ctx.authorOpenId || sub.ownerOpenId;
   sessionStore.updateSession(session);
@@ -31437,6 +31856,22 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     sessionReply,
     onZeroPromptFinal: reportZeroPromptFinal,
     getSessionWorkingDir,
+    authorizeWorkingDirLaunch: prepareGroupWorkspaceLaunch,
+    confirmWorkerReadyCwd: (ds, actualCwd) => !!actualCwd
+      && !!ds.groupWorkspaceLaunchGuard
+      && confirmWorkerReadyCwd(
+        ds.groupWorkspaceLaunchGuard.workingDir,
+        actualCwd,
+        ds.groupWorkspaceLaunchGuard.identity,
+      ),
+    onWorkerReadyCwdMismatch(ds) {
+      void sessionReply(
+        sessionAnchorId(ds),
+        tr('daemon.group_workspace_repair_required', { path: getSessionWorkingDir(ds) }, localeForBot(ds.larkAppId)),
+        'text',
+        ds.larkAppId,
+      );
+    },
     onMissingWorkingDir(ds, path, ctx) {
       void publishWorkingDirRecovery(ds, path, { sessionReply, lastRepoScan }, ctx).catch(err => {
         logger.warn(`[${tag(ds)}] working-dir recovery notice failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -32541,7 +32976,168 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     });
     setInputCaptureRuntime(cfg.larkAppId, inputCapture);
     inputCapture.start();
+    const groupWorkspaceRouteRuntime = createGroupWorkspaceRouteRuntime({
+      larkAppId: cfg.larkAppId,
+      activeSessions,
+      sessionKey,
+      registeredBots: tenantKey => getAllBots()
+        .filter(candidate => !candidate.config.apiOnly)
+        .map((candidate): BotAdminIdentityConfig => ({
+          larkAppId: candidate.config.larkAppId,
+          tenantKey,
+          brand: candidate.config.brand,
+          resolvedAllowedUsers: candidate.config.allowedUsers ?? candidate.resolvedAllowedUsers,
+        })),
+      resolveAllowedUser: async (candidate, allowedUser) => {
+        const state = getBot(candidate.larkAppId);
+        const openId = state.rawAllowedUserResolution.get(allowedUser)
+          ?? (allowedUser.startsWith('ou_') ? allowedUser : undefined);
+        if (!openId) return undefined;
+        const resolved = await resolveUserUnionId(candidate.larkAppId, openId);
+        return resolved.unionId?.startsWith('on_')
+          ? { tenantKey: candidate.tenantKey, unionId: resolved.unionId }
+          : undefined;
+      },
+      resolveActorUnion: async openId => {
+        const resolved = await resolveUnionIdFromOpenIdStrict(cfg.larkAppId, openId);
+        return resolved.status === 'resolved' && resolved.unionId.startsWith('on_')
+          ? resolved.unionId
+          : undefined;
+      },
+      readWorkspace: chatId => groupWorkspaceStore.read(chatId),
+      canSwitchSession: (ds, actor) => actor.humanProvenance === true
+        && canOperate(cfg.larkAppId, ds.chatId, actor.openId, actor.unionId)
+        && !isRemoteBackendSession(ds)
+        && !ds.worktreeCreating
+        && !ds.pendingRepoCommitInFlight
+        && !hasProtectedSessionMutationOwnership(ds),
+      executeGroupWorkspaceRoute: async (route, ds) => {
+        const reply = async (message: string): Promise<void> => {
+          await sessionReply(route.chatId, message, undefined, cfg.larkAppId);
+        };
+        await runGroupWorkspaceRepoEntrypoint({
+          kind: route.kind,
+          source: route.source,
+          chatId: route.chatId,
+          actor: route.actor,
+          ...(route.kind === 'set' ? { selection: route.selection } : {}),
+          ...(route.messageId ? { messageId: route.messageId } : {}),
+          ...(route.originMessageId ? { originMessageId: route.originMessageId } : {}),
+          ...(route.actionId ? { actionId: route.actionId } : {}),
+        }, {
+          locale: localeForBot(cfg.larkAppId),
+          reply,
+          executeSet: async request => {
+            if (!ds || !request.selection) return { status: 'aborted' };
+            const requestIntentDigest = canonicalGroupWorkspaceRequestIntentDigest({
+              kind: 'set', chatId: request.chatId, selection: request.selection,
+            });
+            const coordinator = createGroupWorkspaceSetCoordinator({
+              journalStore: groupWorkspaceOperationStore,
+              groupStore: groupWorkspaceStore,
+              now: Date.now,
+              ...(route.originMessageId ? { originMessageId: route.originMessageId } : {}),
+              resolveCanonicalTarget: async () => {
+                const resolved = resolveGroupWorkspaceRepoSelection(
+                  request.selection!, getProjectScanDirs(ds), lastRepoScan.get(ds.chatId),
+                );
+                return resolved ? { status: 'resolved', workingDir: resolved.path } : { status: 'store_unavailable' };
+              },
+              readSession: async sessionId => {
+                const current = activeSessions.get(sessionId);
+                return current
+                  ? { status: 'available', generation: current.workerGeneration ?? 0, workingDir: getSessionWorkingDir(current) }
+                  : { status: 'store_unavailable' };
+              },
+              switchSession: async input => {
+                const before = ds.workerGeneration ?? 0;
+                if (before !== input.expectedGeneration
+                  || activeSessions.get(sessionKey(ds.chatId, cfg.larkAppId)) !== ds) {
+                  return { status: 'unknown' };
+                }
+                const messageId = route.messageId ?? route.originMessageId ?? randomUUID();
+                await handleCommand('/repo', ds.chatId, {
+                  messageId, rootId: ds.chatId, chatId: ds.chatId, chatType: 'group',
+                  senderId: route.actorOpenId ?? '', senderUnionId: route.actor.unionId,
+                  senderType: 'user', msgType: 'text', content: `/repo ${input.targetWorkingDir}`,
+                  createTime: String(Date.now()),
+                }, {
+                  ...commandDepsForInvocation({ scope: 'chat', chatId: ds.chatId, anchor: ds.chatId, messageId }),
+                  // The saga owns the user-visible result; suppress legacy early switch success.
+                  sessionReply: async () => '',
+                }, cfg.larkAppId);
+                const current = activeSessions.get(sessionKey(ds.chatId, cfg.larkAppId));
+                if (!current || current === ds || getSessionWorkingDir(current) !== input.targetWorkingDir) {
+                  return { status: 'unknown' };
+                }
+                const generation = current.workerGeneration ?? before + 1;
+                current.workerGeneration = generation;
+                return { status: 'committed', generation };
+              },
+              convergeSession: async input => {
+                const current = activeSessions.get(sessionKey(ds.chatId, cfg.larkAppId));
+                if (!current || (current.workerGeneration ?? 0) !== input.expectedGeneration) {
+                  throw new Error('session provenance convergence lost generation ownership');
+                }
+                applySessionWorkingDir(current, input.source === 'group'
+                  ? { workingDir: getSessionWorkingDir(current), source: 'group', groupWorkspaceRevision: input.groupRevision! }
+                  : { workingDir: getSessionWorkingDir(current), source: 'explicit' });
+              },
+            });
+            const result = await coordinator.execute({
+              operationKey: groupWorkspaceOperationKey(request.sourceEventId, 'set'),
+              sourceEventId: request.sourceEventId, kind: 'set', requestIntentDigest,
+              chatId: request.chatId, sessionId: sessionKey(request.chatId, cfg.larkAppId), actor: request.actor,
+            });
+            return result.status === 'group_committed'
+              ? { status: 'group_committed', groupRevision: result.groupRevision }
+              : { status: result.status };
+          },
+          executeUnbind: async request => {
+            return executeGroupWorkspaceUnbind({
+              sourceEventId: request.sourceEventId, chatId: request.chatId, actor: request.actor,
+              ...(route.originMessageId ? { originMessageId: route.originMessageId } : {}),
+            }, {
+              journalStore: groupWorkspaceOperationStore,
+              now: Date.now,
+              readReceipt: operationKey => groupWorkspaceStore.readReceipt(operationKey),
+              readCurrentRevision: async chatId => {
+                const current = await groupWorkspaceStore.read(chatId);
+                return current.status === 'available'
+                  ? { status: 'available', revision: current.record?.revision ?? 0 }
+                  : current;
+              },
+              mutate: input => groupWorkspaceStore.mutate(input),
+            });
+          },
+        });
+      },
+      dispatchRepo: async (ds, selection, context) => {
+        const messageId = context.messageId ?? randomUUID();
+        await handleCommand('/repo', ds.chatId, {
+          messageId,
+          rootId: ds.chatId,
+          chatId: ds.chatId,
+          chatType: 'group',
+          senderId: context.actorOpenId ?? '',
+          senderUnionId: context.actor.unionId,
+          senderType: 'user',
+          msgType: 'text',
+          content: `/repo ${selection}`,
+          createTime: String(Date.now()),
+        }, commandDepsForInvocation({
+          scope: 'chat', chatId: ds.chatId, anchor: ds.chatId, messageId,
+        }), cfg.larkAppId);
+      },
+      reply: async (chatId, message) => {
+        await sessionReply(chatId, message, undefined, cfg.larkAppId);
+      },
+    });
+    groupWorkspaceRouteRuntimes.set(cfg.larkAppId, groupWorkspaceRouteRuntime);
+
     const botEventHandlers: EventHandlers = {
+      resolveGroupWorkspaceRouteAuthority: groupWorkspaceRouteRuntime.resolveAuthority,
+      handleGroupWorkspaceRoute: groupWorkspaceRouteRuntime.handleRoute,
       captureHumanInput: data => captureInboundText(data, inputCapture,
         id => isKnownPeerBot(config.session.dataDir, cfg.larkAppId, id)),
       handleCardAction: (data, appId) => withBotTurnAdmission(

@@ -73,6 +73,8 @@ describe('controlled failed-turn recovery', () => {
   });
   it('rebuilds a clean native conversation in the original topic with fresh prompt context', async () => {
     ds.session.cliSessionId = 'poisoned-native';
+    Object.assign(ds.session, { workingDir: '/tmp/stale', workingDirSource: 'group', groupWorkspaceRevision: 9 });
+    ds.workingDir = '/tmp/work';
     const result = await recoverFailedTurn('old', { ...request, mode: 'fresh' });
     expect(result).toMatchObject({ ok: true, state: 'accepted', sessionId: 'new' });
     const target = [...registry.values()][0];
@@ -81,6 +83,9 @@ describe('controlled failed-turn recovery', () => {
     expect(target.session.larkAppId).toBe('cli_app');
     expect(target.session.ownerOpenId).toBe('ou_owner_b');
     expect(target.session.failedTurnRecovery?.caller.requestUserOpenId).toBe('ou_user_a');
+    expect(target.session).toMatchObject({
+      workingDir: '/tmp/work', workingDirSource: 'group', groupWorkspaceRevision: 9,
+    });
     expect(pool.forkWorker).toHaveBeenCalledWith(target, { content: 'new:original task' }, expect.objectContaining({ resume: false, atMostOnce: true }), expect.anything());
     expect(order.indexOf('persist')).toBeLessThan(order.indexOf('close'));
     expect(order.indexOf('close')).toBeLessThan(order.indexOf('fork'));

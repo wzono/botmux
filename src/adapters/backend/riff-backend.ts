@@ -15,6 +15,7 @@ import { escapeXmlTagLikeTokens } from '../../utils/xml.js';
 import { detectImageFormat } from '../../core/attachment-image-format.js';
 import { shellQuote } from '../../core/cli-launch-mode.js';
 import type { RiffHostBinding } from '../../services/riff-host-tools.js';
+import { HostWorkingDirContract } from './host-working-dir-contract.js';
 
 /**
  * Fallback system prompt injected into every riff task when no explicit
@@ -1062,6 +1063,7 @@ export class RiffBackend implements SessionBackend {
    *  arriving before the first task-execute HTTP returns would see
    *  currentTaskId === null and create a duplicate task. */
   private writeChain: Promise<void> = Promise.resolve();
+  private readonly hostWorkingDirContract = new HostWorkingDirContract();
 
   constructor(config: RiffBackendConfig, sessionId: string) {
     this.config = config;
@@ -1233,43 +1235,48 @@ export class RiffBackend implements SessionBackend {
     return readBytecloudKeychainJwt(home, env);
   }
 
-  spawn(_bin: string, _args: string[], _opts: SpawnOpts): void {
+  spawn(_bin: string, _args: string[], opts: SpawnOpts): void {
+    this.hostWorkingDirContract.capture(opts);
     logger.info(`[riff] spawn (ignoring bin/args, using config: ${this.config.baseUrl})`);
     // No actual process to spawn. Task creation happens on first write().
   }
 
+  validateWorkingDirBeforeBusinessInput(): boolean {
+    return this.hostWorkingDirContract.matches();
+  }
+
+  validatedHostWorkingDirContract() {
+    return this.hostWorkingDirContract.validatedProof();
+  }
+
   write(data: string): boolean {
-    if (this.killed) return false;
-    if (this.shutdownDetaching) {
-      logger.warn('[riff] write rejected while graceful shutdown detach is preparing/prepared');
-      return false;
-    }
-    if (this.closing) {
-      logger.warn('[riff] write rejected while explicit close is preparing/prepared');
-      return false;
-    }
+    if (this.killed || this.shutdownDetaching || this.closing) return false;
+    void this.writeBusinessInput(data);
+    return true;
+  }
 
+  writeBusinessInput(data: string): Promise<'submitted' | 'retryable_pre_dispatch_rejection'> {
+    if (this.killed || this.shutdownDetaching || this.closing) {
+      return Promise.resolve('retryable_pre_dispatch_rejection');
+    }
     const { text, attachments } = this.extractAttachments(data);
-
+    let resolveResult!: (result: 'submitted' | 'retryable_pre_dispatch_rejection') => void;
+    const result = new Promise<'submitted' | 'retryable_pre_dispatch_rejection'>(resolve => { resolveResult = resolve; });
     this.writeChain = this.writeChain
       .then(async () => {
-        // closing 也要在链内复查：write 可能在 close 之前就排进了队列。
-        if (this.killed || this.closing) return;
-        // Route by task lineage only: task-follow-up is exactly the "continue
-        // the conversation after the parent finished" API, so a completed task
-        // (taskDone) must still route to followUp — spinning up a fresh task
-        // per turn would cold-boot a new sandbox (minutes) and drop context.
-        this.taskDone = false;
-        if (!this.currentTaskId) {
-          await this.createTask(text, attachments);
-        } else {
-          await this.followUp(text, attachments);
+        if (this.killed || this.closing || !this.hostWorkingDirContract.matches()) {
+          resolveResult('retryable_pre_dispatch_rejection');
+          return;
         }
+        resolveResult('submitted');
+        this.taskDone = false;
+        if (!this.currentTaskId) await this.createTask(text, attachments);
+        else await this.followUp(text, attachments);
       })
       .catch((err) => {
         logger.warn(`[riff] queued write failed: ${err}`);
       });
-    return true;
+    return result;
   }
 
   resize(_cols: number, _rows: number): void {

@@ -2677,7 +2677,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) =
   // Revive it the same way the Feishu card restart does (forkWorker), so the
   // dashboard isn't a dead-end: a 409 here would leave NO working control to
   // bring the CLI back (the resume button only shows for closed sessions).
-  forkWorker(ds, '', ds.hasHistory);
+  if (forkWorker(ds, '', ds.hasHistory) === false) {
+    return jsonRes(res, 409, { ok: false, error: 'restart_refused' });
+  }
   postRestartNotice(ds, true);
   jsonRes(res, 200, { ok: true, sessionId: params.sessionId, cliId, revived: true });
   });
@@ -4158,7 +4160,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
     }
     return jsonRes(res, forbidden ? 403 : 400, { ok: false, error: v.error });
   }
-  repinSessionWorkingDir(ds, v.resolvedPath);
+  repinSessionWorkingDir(ds, { workingDir: v.resolvedPath, source: 'explicit' });
   // ds.initConfig 与 repin 同步，且**无条件**（不只在 live-worker 分支里）：下次
   // forkWorker 用 initConfig 重建 init 消息，只在有活 worker 时更新的话，no-worker /
   // worker.killed 两条分支会留下「记录新、initConfig 旧」的分裂状态，冷启动把会话
@@ -5485,8 +5487,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   // materializes its provider immediately inside resumeSession, so an optional
   // wake request only applies when that path did not already create a worker.
   const woke = wake && (!ds.worker || ds.worker.killed);
-  if (woke) {
-    forkWorker(ds, '', true);
+  if (woke && forkWorker(ds, '', true) === false) {
+    return jsonRes(res, 409, { ok: false, error: 'wake_refused' });
   }
 
   jsonRes(res, 200, {

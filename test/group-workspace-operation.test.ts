@@ -1,0 +1,570 @@
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { describe, expect, it } from 'vitest';
+import type { TenantHumanId } from '../src/services/bot-admin-unions-store.js';
+import {
+  canonicalGroupOperationPayloadDigest,
+  GroupWorkspaceStore,
+  groupWorkspaceOperationKey,
+} from '../src/services/group-workspace-store.js';
+import { atomicWriteFileSync } from '../src/utils/atomic-write.js';
+import {
+  GroupWorkspaceOperationStore,
+  type RepoGroupOperationJournal,
+} from '../src/services/group-workspace-operation-store.js';
+import {
+  GroupWorkspaceOperationCoordinator,
+  executeGroupWorkspaceUnbind,
+  isPreparedNoSessionUnbindJournal,
+  type GroupCommitReceipt,
+  type GroupCommitResult,
+  type GroupWorkspaceOperationDependencies,
+} from '../src/core/group-workspace-operation.js';
+
+const ACTOR: TenantHumanId = { tenantKey: 'tenant-a', unionId: 'on_user' };
+const SOURCE_EVENT_ID = 'group-workspace-text-source-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+const BASE = {
+  operationKey: groupWorkspaceOperationKey(SOURCE_EVENT_ID, 'set'), sourceEventId: SOURCE_EVENT_ID, kind: 'set' as const,
+  requestIntentDigest: 'request-intent-X', payloadDigest: canonicalGroupOperationPayloadDigest({
+    kind: 'set', chatId: 'chat-1', sourceEventId: SOURCE_EVENT_ID, requestedWorkingDir: '/repo/X',
+    expectedRevision: 2, actor: ACTOR, authorized: true, directoryValid: true, now: 0,
+  }), chatId: 'chat-1', sessionId: 'session-1',
+  expectedSessionGeneration: 4, expectedGroupRevision: 2,
+  targetWorkingDir: '/repo/X', actor: ACTOR,
+};
+
+function dir(): string { return mkdtempSync(join(tmpdir(), 'botmux-operation-')); }
+function journal(phase: RepoGroupOperationJournal['phase'] = 'prepared'): RepoGroupOperationJournal {
+  return { ...BASE, phase, updatedAt: 1 };
+}
+
+describe('GroupWorkspaceOperationStore', () => {
+  it('persists legal transitions and rejects skipped or backward transitions', async () => {
+    const dataDir = dir();
+    const store = new GroupWorkspaceOperationStore(dataDir);
+    expect((await store.prepare(journal())).status).toBe('created');
+    await expect(store.transition(BASE.operationKey, 'group_committed', { updatedAt: 2 })).resolves.toMatchObject({ status: 'invalid_transition' });
+    await expect(store.transition(BASE.operationKey, 'session_committed', { sessionGenerationAfter: 5, updatedAt: 3 })).resolves.toMatchObject({ status: 'updated' });
+    await expect(store.transition(BASE.operationKey, 'group_committed', { groupRevisionAfter: 3, updatedAt: 4 })).resolves.toMatchObject({ status: 'updated' });
+    await expect(store.transition(BASE.operationKey, 'session_committed', { updatedAt: 5 })).resolves.toMatchObject({ status: 'invalid_transition' });
+    await expect(new GroupWorkspaceOperationStore(dataDir).get(BASE.operationKey)).resolves.toMatchObject({ status: 'found', journal: { phase: 'group_committed', sessionGenerationAfter: 5, groupRevisionAfter: 3 } });
+  });
+
+  it.each(['conflict', 'store_unavailable'] as const)('allows session_committed to terminate as %s', async phase => {
+    const store = new GroupWorkspaceOperationStore(dir());
+    await store.prepare(journal());
+    await store.transition(BASE.operationKey, 'session_committed', { sessionGenerationAfter: 5, updatedAt: 2 });
+    await expect(store.transition(BASE.operationKey, phase, { updatedAt: 3 })).resolves.toMatchObject({ status: 'updated', journal: { phase } });
+  });
+
+  it('allows unresolved I/O to become unknown and only explicit receipt convergence can terminate it', async () => {
+    const dataDir = dir();
+    const store = new GroupWorkspaceOperationStore(dataDir);
+    await store.prepare(journal());
+    await expect(store.transition(BASE.operationKey, 'unknown', { sessionGenerationAfter: 5, updatedAt: 2 })).resolves.toMatchObject({ status: 'updated' });
+    await expect(store.transition(BASE.operationKey, 'session_committed', { updatedAt: 3 })).resolves.toMatchObject({ status: 'invalid_transition' });
+    await expect(store.transition(BASE.operationKey, 'group_committed', { groupRevisionAfter: 3, updatedAt: 3 })).resolves.toMatchObject({ status: 'invalid_transition' });
+    await expect(store.convergeReceipt(BASE.operationKey, 'group_committed', { groupRevisionAfter: 3, updatedAt: 4 })).resolves.toMatchObject({ status: 'updated', journal: { phase: 'group_committed' } });
+    await expect(new GroupWorkspaceOperationStore(dataDir).get(BASE.operationKey)).resolves.toMatchObject({ status: 'found', journal: { phase: 'group_committed' } });
+  });
+
+  it('surfaces real journal writer and lock failures without a partial journal', async () => {
+    const writeDir = dir();
+    const writeStore = new GroupWorkspaceOperationStore(writeDir, {
+      writer: () => { const error = new Error('disk full') as NodeJS.ErrnoException; error.code = 'ENOSPC'; throw error; },
+    });
+    await expect(writeStore.prepare(journal())).resolves.toEqual({ status: 'store_unavailable' });
+    await expect(new GroupWorkspaceOperationStore(writeDir).get(BASE.operationKey)).resolves.toEqual({ status: 'missing' });
+
+    const lockDir = dir();
+    writeFileSync(join(lockDir, 'group-workspace-operations.json.lock'), String(process.pid));
+    const lockStore = new GroupWorkspaceOperationStore(lockDir, { lockTimeoutMs: 0 });
+    await expect(lockStore.prepare(journal())).resolves.toEqual({ status: 'store_unavailable' });
+  });
+
+  it('fails closed on a legacy journal that cannot prove the frozen request intent', async () => {
+    const dataDir = dir();
+    const path = join(dataDir, 'group-workspace-operations.json');
+    const legacy = journal() as Partial<RepoGroupOperationJournal>;
+    delete legacy.requestIntentDigest;
+    writeFileSync(path, JSON.stringify({ schemaVersion: 1, operations: { [BASE.operationKey]: legacy } }));
+    await expect(new GroupWorkspaceOperationStore(dataDir).getByIntent(BASE.sourceEventId, BASE.kind))
+      .resolves.toEqual({ status: 'store_unavailable' });
+  });
+
+  it('looks up the canonical source/kind index and rejects a corrupt index', async () => {
+    const dataDir = dir();
+    const store = new GroupWorkspaceOperationStore(dataDir);
+    await store.prepare(journal());
+    await expect(store.getByIntent(BASE.sourceEventId, BASE.kind)).resolves.toMatchObject({ status: 'found', journal: { operationKey: BASE.operationKey } });
+    const path = join(dataDir, 'group-workspace-operations.json');
+    const registry = JSON.parse(readFileSync(path, 'utf8'));
+    registry.sourceIndex[JSON.stringify([BASE.sourceEventId, BASE.kind])] = 'wrong';
+    writeFileSync(path, JSON.stringify(registry));
+    await expect(new GroupWorkspaceOperationStore(dataDir).getByIntent(BASE.sourceEventId, BASE.kind)).resolves.toEqual({ status: 'store_unavailable' });
+  });
+});
+
+interface Harness {
+  coordinator: GroupWorkspaceOperationCoordinator;
+  store: GroupWorkspaceOperationStore;
+  calls: string[];
+  session: { generation: number; workingDir: string };
+  readonly revision: number;
+  readonly switches: number;
+  readonly workers: number;
+  readonly commits: number;
+  receipts: Map<string, GroupCommitReceipt>;
+}
+
+function receipt(result: Exclude<GroupCommitResult, { status: 'unknown' }>, patch: Partial<GroupCommitReceipt> = {}): GroupCommitReceipt {
+  return {
+    ...result,
+    operationKey: BASE.operationKey,
+    payloadDigest: BASE.payloadDigest,
+    chatId: BASE.chatId,
+    targetWorkingDir: BASE.targetWorkingDir,
+    ...patch,
+  };
+}
+
+function harness(options: {
+  dataDir?: string;
+  crashAt?: string;
+  commitResult?: GroupCommitResult;
+  target?: string;
+  revision?: number;
+} = {}): Harness {
+  const store = new GroupWorkspaceOperationStore(options.dataDir ?? dir());
+  const calls: string[] = [];
+  const session = { generation: 4, workingDir: '/old' };
+  const receipts = new Map<string, GroupCommitResult>();
+  let revision = options.revision ?? 2;
+  let switches = 0, workers = 0, commits = 0;
+  const deps: GroupWorkspaceOperationDependencies = {
+    journalStore: store,
+    now: () => calls.length + 10,
+    lookupGroupReceipt: async key => {
+      calls.push('receipt');
+      const receipt = receipts.get(key);
+      return receipt && receipt.status !== 'unknown'
+        ? { status: 'found', receipt }
+        : { status: 'missing' };
+    },
+    reconcileUnknownGroupReceipt: async journal => {
+      calls.push('unknown-readback');
+      const receipt = receipts.get(journal.operationKey);
+      return receipt && receipt.status !== 'unknown'
+        ? { status: 'found', receipt }
+        : { status: 'missing' };
+    },
+    readCurrentGroupRevision: async () => { calls.push('revision'); return { status: 'available', revision }; },
+    resolveCanonicalTarget: async () => { calls.push('target'); return { status: 'resolved', workingDir: options.target ?? '/repo/X' }; },
+    readSession: async () => { calls.push('session-read'); return { status: 'available', ...session }; },
+    switchSession: async input => {
+      calls.push('switch'); switches += 1; workers += 1;
+      session.generation = input.expectedGeneration + 1; session.workingDir = input.targetWorkingDir;
+      return { status: 'committed', generation: session.generation };
+    },
+    commitGroup: async input => {
+      calls.push('group-commit'); commits += 1;
+      const result = options.commitResult ?? { status: 'committed', resultingRevision: input.expectedGroupRevision + 1 };
+      if (result.status !== 'unknown') receipts.set(input.operationKey, receipt(result));
+      if (result.status === 'committed') revision = result.resultingRevision;
+      return result;
+    },
+    convergeSession: async input => { calls.push(`converge:${input.source}:${input.groupRevision ?? 'none'}`); },
+    afterBoundary: async boundary => {
+      calls.push(`boundary:${boundary}`);
+      if (options.crashAt === boundary) throw new Error(`crash:${boundary}`);
+    },
+  };
+  return {
+    coordinator: new GroupWorkspaceOperationCoordinator(deps), store, calls, session,
+    get revision() { return revision; }, get switches() { return switches; },
+    get workers() { return workers; }, get commits() { return commits; }, receipts,
+  };
+}
+
+const REQUEST = {
+  operationKey: BASE.operationKey, sourceEventId: BASE.sourceEventId, kind: BASE.kind,
+  requestIntentDigest: BASE.requestIntentDigest, chatId: BASE.chatId, sessionId: BASE.sessionId, actor: ACTOR,
+};
+
+describe('executeGroupWorkspaceUnbind', () => {
+  function unbindHarness(crashAt?: string) {
+    const dataDir = dir();
+    const journalStore = new GroupWorkspaceOperationStore(dataDir);
+    const receipts = new Map<string, any>();
+    let revision = 2;
+    const sourceEventId = BASE.sourceEventId;
+    const operationKey = groupWorkspaceOperationKey(sourceEventId, 'unbind');
+    const deps = {
+      journalStore,
+      now: () => 100,
+      readCurrentRevision: async () => ({ status: 'available' as const, revision }),
+      readReceipt: async (key: string) => receipts.has(key)
+        ? { status: 'found' as const, receipt: receipts.get(key) }
+        : { status: 'missing' as const },
+      mutate: async (input: any) => {
+        revision += 1;
+        const receipt = { operationKey, sourceEventId, kind: 'unbind', payloadDigest: input.payloadDigest
+          ?? 'unused', chatId: BASE.chatId, outcome: 'committed', resultingRevision: revision,
+          resultingDirectory: { kind: 'unbound' }, actor: ACTOR, completedAt: input.now,
+          expectedRevision: input.expectedRevision };
+        const { canonicalGroupOperationPayloadDigest } = await import('../src/services/group-workspace-store.js');
+        receipt.payloadDigest = canonicalGroupOperationPayloadDigest(input);
+        receipts.set(operationKey, receipt);
+        return { outcome: 'committed' as const, receipt };
+      },
+      afterBoundary: async (boundary: string) => { if (boundary === crashAt) throw new Error(boundary); },
+    };
+    const request = { sourceEventId, chatId: BASE.chatId, actor: ACTOR };
+    return { deps, request, journalStore };
+  }
+
+  it.each(['commit_before_readback', 'readback_before_convergence', 'convergence_before_persisted_readback'])
+  ('returns success only after replay converges and re-reads the journal after %s', async boundary => {
+    const h = unbindHarness(boundary);
+    await expect(executeGroupWorkspaceUnbind(h.request, h.deps)).rejects.toThrow(boundary);
+    h.deps.afterBoundary = async () => undefined;
+    await expect(executeGroupWorkspaceUnbind(h.request, h.deps)).resolves.toMatchObject({
+      status: 'group_committed', groupRevision: 3,
+    });
+    await expect(h.journalStore.getByIntent(h.request.sourceEventId, 'unbind')).resolves.toMatchObject({
+      status: 'found', journal: { phase: 'group_committed', groupRevisionAfter: 3 },
+    });
+  });
+
+  it('restarts from a persistent prepared unbind and performs exactly one group mutation', async () => {
+    const dataDir = dir();
+    const journalStore = new GroupWorkspaceOperationStore(dataDir);
+    const groupStore = new GroupWorkspaceStore(dataDir);
+    const sourceEventId = 'group-workspace-text-source-v1:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    const operationKey = groupWorkspaceOperationKey(sourceEventId, 'unbind');
+    const intent = { kind: 'unbind' as const, chatId: BASE.chatId, sourceEventId, actor: ACTOR };
+    expect(await journalStore.prepare({
+      operationKey, sourceEventId, kind: 'unbind',
+      requestIntentDigest: canonicalGroupOperationPayloadDigest({
+        ...intent, expectedRevision: 0, authorized: true, now: 0,
+      }),
+      payloadDigest: canonicalGroupOperationPayloadDigest({
+        ...intent, expectedRevision: 0, authorized: true, now: 0,
+      }),
+      chatId: BASE.chatId, sessionId: 'group-workspace-unbind', expectedSessionGeneration: 0,
+      expectedGroupRevision: 0, targetWorkingDir: '/', actor: ACTOR, phase: 'prepared', updatedAt: 1,
+    })).toMatchObject({ status: 'created' });
+
+    let mutations = 0;
+    const result = await executeGroupWorkspaceUnbind({ sourceEventId, chatId: BASE.chatId, actor: ACTOR }, {
+      journalStore: new GroupWorkspaceOperationStore(dataDir),
+      readReceipt: key => groupStore.readReceipt(key),
+      readCurrentRevision: async () => { throw new Error('prepared replay must use frozen revision'); },
+      mutate: async input => { mutations += 1; return groupStore.mutate(input); },
+      now: () => 10,
+    });
+
+    expect(result).toEqual({ status: 'group_committed', groupRevision: 1 });
+    expect(mutations).toBe(1);
+    await expect(new GroupWorkspaceStore(dataDir).readReceipt(operationKey)).resolves.toMatchObject({
+      status: 'found', receipt: { kind: 'unbind', outcome: 'committed', resultingRevision: 1 },
+    });
+    await expect(new GroupWorkspaceOperationStore(dataDir).get(operationKey)).resolves.toMatchObject({
+      status: 'found', journal: { phase: 'group_committed', sessionGenerationAfter: 0, groupRevisionAfter: 1 },
+    });
+  });
+
+  it.each([
+    ['set operation', { kind: 'set' }],
+    ['real session', { sessionId: 'session-1' }],
+    ['nonzero generation', { expectedSessionGeneration: 1 }],
+    ['non-sentinel target', { targetWorkingDir: '/repo/X' }],
+    ['non-prepared phase', { phase: 'session_committed', sessionGenerationAfter: 0 }],
+  ] as const)('never classifies a %s as a prepared no-session unbind', (_case, patch) => {
+    const candidate = {
+      ...journal(), kind: 'unbind' as const,
+      operationKey: groupWorkspaceOperationKey(BASE.sourceEventId, 'unbind'),
+      sessionId: 'group-workspace-unbind', expectedSessionGeneration: 0, targetWorkingDir: '/',
+      ...patch,
+    } as RepoGroupOperationJournal;
+    expect(isPreparedNoSessionUnbindJournal(candidate)).toBe(false);
+  });
+
+  it('classifies only the prepared unbind sentinel as no-session', () => {
+    expect(isPreparedNoSessionUnbindJournal({
+      ...journal(), kind: 'unbind', operationKey: groupWorkspaceOperationKey(BASE.sourceEventId, 'unbind'),
+      sessionId: 'group-workspace-unbind', expectedSessionGeneration: 0, targetWorkingDir: '/',
+    })).toBe(true);
+  });
+
+  it.each(['before_write', 'after_write'] as const)
+  ('fails closed when the prepared transition write fails %s and a later restart recovers', async failure => {
+    const dataDir = dir();
+    const sourceEventId = failure === 'before_write'
+      ? 'group-workspace-text-source-v1:sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
+      : 'group-workspace-text-source-v1:sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd';
+    const operationKey = groupWorkspaceOperationKey(sourceEventId, 'unbind');
+    const intent = { kind: 'unbind' as const, chatId: BASE.chatId, sourceEventId, actor: ACTOR };
+    const seed = new GroupWorkspaceOperationStore(dataDir);
+    await seed.prepare({
+      operationKey, sourceEventId, kind: 'unbind',
+      requestIntentDigest: canonicalGroupOperationPayloadDigest({
+        ...intent, expectedRevision: 0, authorized: true, now: 0,
+      }),
+      payloadDigest: canonicalGroupOperationPayloadDigest({
+        ...intent, expectedRevision: 0, authorized: true, now: 0,
+      }),
+      chatId: BASE.chatId, sessionId: 'group-workspace-unbind', expectedSessionGeneration: 0,
+      expectedGroupRevision: 0, targetWorkingDir: '/', actor: ACTOR, phase: 'prepared', updatedAt: 1,
+    });
+    let writes = 0;
+    const failingStore = new GroupWorkspaceOperationStore(dataDir, {
+      writer: (path, data, options) => {
+        writes += 1;
+        if (failure === 'after_write') atomicWriteFileSync(path, data, options);
+        throw new Error('transition write failed');
+      },
+    });
+    const groupStore = new GroupWorkspaceStore(dataDir);
+    let mutations = 0;
+    const dependencies = {
+      journalStore: failingStore,
+      readReceipt: (key: string) => groupStore.readReceipt(key),
+      readCurrentRevision: async () => ({ status: 'available' as const, revision: 0 }),
+      mutate: async (input: any) => { mutations += 1; return groupStore.mutate(input); },
+      now: () => 10,
+    };
+
+    await expect(executeGroupWorkspaceUnbind({ sourceEventId, chatId: BASE.chatId, actor: ACTOR }, dependencies))
+      .resolves.toEqual({ status: 'unknown' });
+    expect(writes).toBe(1);
+    expect(mutations).toBe(0);
+
+    const recovered = await executeGroupWorkspaceUnbind({ sourceEventId, chatId: BASE.chatId, actor: ACTOR }, {
+      ...dependencies, journalStore: new GroupWorkspaceOperationStore(dataDir),
+    });
+    expect(recovered).toEqual({ status: 'group_committed', groupRevision: 1 });
+    expect(mutations).toBe(1);
+    await expect(new GroupWorkspaceOperationStore(dataDir).listUnresolved()).resolves.toEqual({
+      status: 'available', journals: [],
+    });
+  });
+});
+
+describe('GroupWorkspaceOperationCoordinator', () => {
+  it('rejects unbind at the session-to-group coordinator seam', async () => {
+    const h = harness();
+    await expect(h.coordinator.execute({ ...REQUEST, kind: 'unbind' } as any)).resolves.toMatchObject({ status: 'protocol_conflict' });
+    expect(h.switches).toBe(0);
+  });
+
+  it('freezes the complete journal before any session side effect', async () => {
+    const h = harness({ crashAt: 'prepared_before_switch' });
+    await expect(h.coordinator.execute(REQUEST)).rejects.toThrow('crash:prepared_before_switch');
+    expect(h.switches).toBe(0);
+    await expect(h.store.get(BASE.operationKey)).resolves.toMatchObject({ status: 'found', journal: BASE });
+    expect(h.calls.slice(0, 4)).toEqual(['receipt', 'revision', 'target', 'session-read']);
+  });
+
+  it('derives the canonical operation key and rejects noncanonical replay intent before mutable reads', async () => {
+    const dataDir = dir();
+    const first = harness({ dataDir, crashAt: 'prepared_before_switch' });
+    await expect(first.coordinator.execute(REQUEST)).rejects.toThrow();
+    const replay = harness({ dataDir });
+    await expect(replay.coordinator.execute({
+      ...REQUEST, operationKey: 'caller-controlled', requestIntentDigest: 'different-intent',
+    })).resolves.toMatchObject({ status: 'protocol_conflict' });
+    expect(replay.calls).toEqual(['receipt']);
+  });
+
+  it('replays a committed receipt through a different receiver-local session using the frozen journal', async () => {
+    const dataDir = dir();
+    const first = harness({ dataDir });
+    await expect(first.coordinator.execute(REQUEST)).resolves.toMatchObject({ status: 'group_committed' });
+    const replay = harness({ dataDir });
+    for (const [key, value] of first.receipts) replay.receipts.set(key, value);
+    await expect(replay.coordinator.execute({ ...REQUEST, sessionId: 'bot-b-session' }))
+      .resolves.toMatchObject({ status: 'group_committed', groupRevision: 3 });
+    expect(replay.switches).toBe(0);
+    expect(replay.commits).toBe(0);
+  });
+
+  it('does not let a foreign receiver advance or poison a prepared journal before a receipt exists', async () => {
+    const dataDir = dir();
+    const first = harness({ dataDir, crashAt: 'prepared_before_switch' });
+    await expect(first.coordinator.execute(REQUEST)).rejects.toThrow();
+    const foreign = harness({ dataDir });
+    await expect(foreign.coordinator.execute({ ...REQUEST, sessionId: 'bot-b-session' }))
+      .resolves.toMatchObject({ status: 'unknown' });
+    expect(foreign.switches).toBe(0);
+    expect(foreign.commits).toBe(0);
+    await expect(foreign.store.get(BASE.operationKey)).resolves.toMatchObject({
+      status: 'found', journal: { phase: 'prepared', sessionId: BASE.sessionId },
+    });
+  });
+
+  it('looks up prior intent before target/revision and reuses frozen values after intervening change', async () => {
+    const dataDir = dir();
+    const first = harness({ dataDir, crashAt: 'prepared_before_switch' });
+    await expect(first.coordinator.execute(REQUEST)).rejects.toThrow();
+    const replay = harness({ dataDir, target: '/repo/changed', revision: 99 });
+    await replay.coordinator.execute(REQUEST);
+    expect(replay.calls).not.toContain('target');
+    expect(replay.calls).not.toContain('revision');
+    expect(replay.calls).toContain('group-commit');
+    expect(await replay.store.get(BASE.operationKey)).toMatchObject({ journal: {
+      targetWorkingDir: '/repo/X', expectedGroupRevision: 2, expectedSessionGeneration: 4,
+      requestIntentDigest: 'request-intent-X', payloadDigest: BASE.payloadDigest,
+    } });
+    await expect(replay.coordinator.execute({ ...REQUEST, requestIntentDigest: 'different-intent' }))
+      .resolves.toMatchObject({ status: 'protocol_conflict' });
+  });
+
+  it.each([
+    'prepared_before_switch',
+    'session_persisted_before_advance',
+    'group_committed_before_convergence',
+    'receipt_before_response',
+  ] as const)('recovers crash at %s without duplicate switch, worker, or revision', async crashAt => {
+    const dataDir = dir();
+    const first = harness({ dataDir, crashAt });
+    await expect(first.coordinator.execute(REQUEST)).rejects.toThrow();
+    const second = harness({ dataDir, revision: first.revision });
+    second.session.generation = first.session.generation;
+    second.session.workingDir = first.session.workingDir;
+    for (const [key, value] of first.receipts) second.receipts.set(key, value);
+    await expect(second.coordinator.execute(REQUEST)).resolves.toMatchObject({ status: 'group_committed' });
+    expect(first.switches + second.switches).toBe(1);
+    expect(first.workers + second.workers).toBe(1);
+    expect(first.commits + second.commits).toBe(1);
+    expect(second.revision).toBe(3);
+  });
+
+  it.each([
+    [{ status: 'conflict', currentRevision: 9 } as const, 'conflict'],
+    [{ status: 'store_unavailable' } as const, 'store_unavailable'],
+  ])('keeps switched session explicit on definite group failure %#', async (commitResult, phase) => {
+    const h = harness({ commitResult });
+    await expect(h.coordinator.execute(REQUEST)).resolves.toMatchObject({ status: phase });
+    expect(h.calls).toContain('converge:explicit:none');
+    await expect(h.store.get(BASE.operationKey)).resolves.toMatchObject({ journal: { phase } });
+  });
+
+  it('rejects a post-commit receipt whose digest or target differs from the frozen operation', async () => {
+    const h = harness();
+    const dependencies = (h.coordinator as any).dependencies;
+    dependencies.afterBoundary = async (boundary: string) => {
+      if (boundary === 'group_committed_before_convergence') {
+        h.receipts.set(BASE.operationKey, receipt({ status: 'committed', resultingRevision: 3 }, {
+          payloadDigest: 'other-operation', targetWorkingDir: '/repo/Y',
+        }));
+      }
+    };
+    await expect(h.coordinator.execute(REQUEST)).resolves.toMatchObject({ status: 'unknown' });
+    await expect(h.store.get(BASE.operationKey)).resolves.toMatchObject({
+      status: 'found', journal: { phase: 'unknown' },
+    });
+    expect(h.calls.some(call => call.startsWith('converge:'))).toBe(false);
+  });
+
+  it('keeps a restored group_committed journal unknown when its authoritative receipt was lost', async () => {
+    const dataDir = dir();
+    const store = new GroupWorkspaceOperationStore(dataDir);
+    await store.prepare(journal());
+    await store.transition(BASE.operationKey, 'session_committed', { sessionGenerationAfter: 5, updatedAt: 2 });
+    const committed = await store.transition(BASE.operationKey, 'group_committed', { groupRevisionAfter: 3, updatedAt: 3 });
+    expect(committed).toMatchObject({ status: 'updated' });
+    if (committed.status !== 'updated') throw new Error('expected committed journal');
+
+    const replay = harness({ dataDir });
+    await expect(replay.coordinator.recover(committed.journal)).resolves.toMatchObject({ status: 'unknown' });
+    expect(replay.calls).not.toContain('converge:group:3');
+  });
+
+  it('keeps group_committed recovery unknown when the exact receipt revision mismatches the journal', async () => {
+    const dataDir = dir();
+    const store = new GroupWorkspaceOperationStore(dataDir);
+    await store.prepare(journal());
+    await store.transition(BASE.operationKey, 'session_committed', { sessionGenerationAfter: 5, updatedAt: 2 });
+    const committed = await store.transition(BASE.operationKey, 'group_committed', { groupRevisionAfter: 3, updatedAt: 3 });
+    expect(committed).toMatchObject({ status: 'updated' });
+    if (committed.status !== 'updated') throw new Error('expected committed journal');
+
+    const replay = harness({ dataDir });
+    replay.receipts.set(BASE.operationKey, receipt({ status: 'committed', resultingRevision: 4 }));
+    await expect(replay.coordinator.recover(committed.journal)).resolves.toMatchObject({ status: 'unknown' });
+    expect(replay.calls).not.toContain('converge:group:4');
+  });
+
+  it.each([
+    ['operation', { operationKey: `${BASE.operationKey}-other` }],
+    ['target', { targetWorkingDir: '/repo/Y' }],
+  ] as const)('keeps group_committed recovery unknown when receipt %s mismatches', async (_field, patch) => {
+    const dataDir = dir();
+    const store = new GroupWorkspaceOperationStore(dataDir);
+    await store.prepare(journal());
+    await store.transition(BASE.operationKey, 'session_committed', { sessionGenerationAfter: 5, updatedAt: 2 });
+    const committed = await store.transition(BASE.operationKey, 'group_committed', { groupRevisionAfter: 3, updatedAt: 3 });
+    expect(committed).toMatchObject({ status: 'updated' });
+    if (committed.status !== 'updated') throw new Error('expected committed journal');
+
+    const replay = harness({ dataDir });
+    replay.receipts.set(BASE.operationKey, receipt({ status: 'committed', resultingRevision: 3 }, patch));
+    await expect(replay.coordinator.recover(committed.journal)).resolves.toMatchObject({ status: 'unknown' });
+    expect(replay.calls.some(call => call.startsWith('converge:'))).toBe(false);
+  });
+
+  it('keeps group_committed recovery unknown when receipt contradicts the committed outcome', async () => {
+    const dataDir = dir();
+    const store = new GroupWorkspaceOperationStore(dataDir);
+    await store.prepare(journal());
+    await store.transition(BASE.operationKey, 'session_committed', { sessionGenerationAfter: 5, updatedAt: 2 });
+    const committed = await store.transition(BASE.operationKey, 'group_committed', { groupRevisionAfter: 3, updatedAt: 3 });
+    expect(committed).toMatchObject({ status: 'updated' });
+    if (committed.status !== 'updated') throw new Error('expected committed journal');
+
+    const replay = harness({ dataDir });
+    replay.receipts.set(BASE.operationKey, receipt({ status: 'conflict', currentRevision: 3 }));
+    await expect(replay.coordinator.recover(committed.journal)).resolves.toMatchObject({ status: 'unknown' });
+    expect(replay.calls.some(call => call.startsWith('converge:'))).toBe(false);
+  });
+
+  it('durably converges an unknown exact proof through journal then provenance, and replays after callback failure', async () => {
+    const dataDir = dir();
+    const first = harness({ dataDir, commitResult: { status: 'unknown' } });
+    await expect(first.coordinator.execute(REQUEST)).resolves.toMatchObject({ status: 'unknown' });
+    const replay = harness({ dataDir });
+    replay.session.generation = 5; replay.session.workingDir = '/repo/X';
+    replay.receipts.set(BASE.operationKey, receipt({ status: 'committed', resultingRevision: 3 }));
+    const originalConverge = (replay.coordinator as any).dependencies.convergeSession;
+    (replay.coordinator as any).dependencies.convergeSession = async () => { throw new Error('provenance callback failed'); };
+    await expect(replay.coordinator.execute(REQUEST)).rejects.toThrow('provenance callback failed');
+    await expect(replay.store.get(BASE.operationKey)).resolves.toMatchObject({ journal: { phase: 'group_committed', groupRevisionAfter: 3 } });
+    (replay.coordinator as any).dependencies.convergeSession = originalConverge;
+    await expect(replay.coordinator.execute(REQUEST)).resolves.toMatchObject({ status: 'group_committed', groupRevision: 3 });
+    expect(replay.commits).toBe(0);
+  });
+
+  it('keeps ambiguous group result unknown, reads back before retry, and blocks irreducible replay', async () => {
+    const dataDir = dir();
+    const first = harness({ dataDir, commitResult: { status: 'unknown' } });
+    await expect(first.coordinator.execute(REQUEST)).resolves.toMatchObject({ status: 'unknown' });
+    const replay = harness({ dataDir, revision: 2 });
+    replay.session.generation = 5; replay.session.workingDir = '/repo/X';
+    await expect(replay.coordinator.execute(REQUEST)).resolves.toMatchObject({ status: 'unknown' });
+    expect(replay.calls.slice(0, 3)).toEqual(['receipt', 'receipt', 'unknown-readback']);
+    expect(replay.switches).toBe(0);
+    expect(replay.commits).toBe(0);
+  });
+
+  it('mutation probe catches repeat-switch recovery', async () => {
+    const dataDir = dir();
+    const first = harness({ dataDir, crashAt: 'session_persisted_before_advance' });
+    await expect(first.coordinator.execute(REQUEST)).rejects.toThrow();
+    const replay = harness({ dataDir });
+    replay.session.generation = first.session.generation; replay.session.workingDir = first.session.workingDir;
+    await replay.coordinator.execute(REQUEST);
+    expect(replay.switches).toBe(0);
+  });
+});

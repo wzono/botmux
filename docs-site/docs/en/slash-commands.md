@@ -8,8 +8,10 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 |------|------|
 | `/repo` | When a repository is pending selection, start with the default workingDir; if a session is in progress, pop up the project selection card |
 | `/repo <N>` | Switch to the Nth project from the last scan |
-| `/repo <path\|project name>` | Directly specify a path or a top-level project name under workingDir |
-| `/cd <path>` | Switch the working directory and restart the CLI process |
+| `/repo <path\|project name>` | Directly specify a path or a top-level project name under workingDir; at an ordinary group's top level, also bind it as the host-local group directory shared by all Bots |
+| `/repo show` | Show session, explicit on-call, automatic default-on-call, group, and Bot-default precedence plus group revision and health |
+| `/repo unbind` | Remove the host-local group binding at an ordinary group's top level while retaining revision, receipts, and workspace managers |
+| `/cd <path>` | Explicitly switch this session's directory and restart the CLI; the session no longer auto-follows later group-directory updates |
 | `/status` | View session info (uptime, terminal address, etc.) |
 | `/lane status` | Inspect your isolated principal lane, including its branch, worktree, dirty state, and unpushed commit count (available when the existing bot-level XPI switch enables principal lanes) |
 | `/lane close` | Safely close your isolated principal lane: refuses while work is running/queued or files are uncommitted, pushes unpublished commits before cleanup, and never auto-merges or deletes the branch |
@@ -53,6 +55,16 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 ![Current-group active topic sessions card](/img/sessions-command-card.png)
 
 See [Session & Topic Model](/en/session-model) for the repository-picker and pinned-directory branches of bare `/t`.
+
+### Shared working directory for ordinary groups
+
+At an ordinary group's top level, `/repo <path|project name|number>` safely switches the current session and then persists the canonical directory as a host-local group binding. Other Bots using the same `SESSION_DATA_DIR`, and new group sessions or `/th` after a daemon restart, consume that binding. The absolute path is never synchronized to another host. Precedence is: explicit session/directive directory > manually configured `oncallChats` override > group binding > automatic `defaultOncall` or Bot default > repository picker. An automatically created `defaultOncall` entry still grants on-call access but does not shadow the group binding; legacy on-call entries without provenance remain explicit for compatibility.
+
+- `/repo show` reports every layer, the resolved source, group revision, health, and managers. `/repo unbind` removes only the top-level group binding; it neither switches the current session nor resets revision, receipts, or managers.
+- Managers are normalized by tenant-scoped `union_id` across local Bots. A non-empty `workspaceManagers` list fully replaces the default Bot-admin union and survives unbind. Missing or unverifiable identity, tenant, or fresh configuration fingerprint fails closed rather than falling back to the receiving Bot's ordinary repo switch.
+- Every top-level `/repo` has a durable receipt keyed by the immutable original Lark message. Cross-Bot delivery, restart recovery, and different delivery attempts replay the same result without another session switch or revision; reusing that original message for different repo intent is rejected.
+- A thread `/repo` stays thread-local. `/repo wt` worktrees and `/repo here` do not change the group binding. If the bound directory is missing, inaccessible, or replaced before launch, consumption fails closed instead of falling back; repair it with a new top-level `/repo` or remove it with `/repo unbind`.
+- Only an ordinary-group local PTY session whose provenance is still `group` safely follows a newer revision before its next business turn: Botmux retires and confirms the old worker first, then starts in the new directory and verifies the ready cwd. Busy/needs-user, remote/adopt, explicit `/cd`, on-call, worktree, and legacy-unknown sessions are never force-switched.
 
 The header directives:
 

@@ -6,7 +6,7 @@
  * Run:  pnpm vitest run test/riff-backend.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -64,6 +64,33 @@ describe('RiffBackend', () => {
   }
 
   const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  it('rejects at the serialized dispatch edge when the host directory identity changes', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'riff-write-contract-'));
+    const moved = `${root}-moved`;
+    const stat = statSync(root, { bigint: true });
+    const be = makeBackend();
+    be.spawn('', [], { cwd: root, expectedWorkingDirIdentity: { dev: String(stat.dev), ino: String(stat.ino) } } as never);
+    let release!: () => void;
+    (be as any).writeChain = new Promise<void>(resolve => { release = resolve; });
+    try {
+      const pending = be.writeBusinessInput('retained prompt');
+      renameSync(root, moved);
+      mkdirSync(root);
+      release();
+      await expect(pending).resolves.toBe('retryable_pre_dispatch_rejection');
+      expect(calls.filter(call => call.url.includes('/api/task-execute'))).toHaveLength(0);
+      rmSync(root, { recursive: true, force: true });
+      renameSync(moved, root);
+      await expect(be.writeBusinessInput('retained prompt')).resolves.toBe('submitted');
+      await flush();
+      expect(calls.filter(call => call.url.includes('/api/task-execute'))).toHaveLength(1);
+    } finally {
+      be.kill();
+      rmSync(root, { recursive: true, force: true });
+      rmSync(moved, { recursive: true, force: true });
+    }
+  });
 
   it('refreshes the host-tools binding on follow-ups instead of reusing creation env', async () => {
     let turn = 0;

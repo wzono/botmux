@@ -767,6 +767,7 @@ import {
   type TurnTerminalCarrier,
 } from './types.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { setSessionWorkingDirMetadata } from './session-cwd.js';
 import { decideAutoRestart } from './restart-policy.js';
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { freezePrincipalLaneTurnBinding, readPrincipalLaneTurnBinding } from './principal-lane-turn.js';
@@ -1063,10 +1064,15 @@ export interface WorkerPoolCallbacks {
     opts?: WorkerSessionReplyOptions,
   ) => Promise<string>;
   getSessionWorkingDir: (ds?: DaemonSession) => string;
+  /** Immediate pre-spawn policy gate. False means no worker process is created. */
+  authorizeWorkingDirLaunch?: (ds: DaemonSession) => boolean;
   /** forkWorker refused a start because the session's working directory is
    *  gone; tell the chat and offer recovery. Fired just before the
    *  {@link MissingWorkingDirError} is thrown, so callers need not reply. */
   onMissingWorkingDir?: (ds: DaemonSession, path: string, ctx: { turnId?: string }) => void;
+  /** Reject a worker generation whose observed launch cwd differs from policy. */
+  confirmWorkerReadyCwd?: (ds: DaemonSession, actualCwd: string | undefined) => boolean;
+  onWorkerReadyCwdMismatch?: (ds: DaemonSession, actualCwd: string | undefined) => void;
   getActiveCount: () => number;
   /** Prepare trigger-user CLI identity before a delayed raw-input turn. */
   prepareRawInputTurn?: (ds: DaemonSession, turnId: string) => void | Promise<void>;
@@ -6604,6 +6610,68 @@ function clearTransferWorkerState(
  * session is already detached, so unlike killWorker() this path must never
  * destroy its orphaned backing resource.
  */
+export async function retireWorkerForReplacement(
+  ds: DaemonSession,
+  opts: { timeoutMs?: number } = {},
+): Promise<boolean> {
+  const w = ds.worker;
+  const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+  if (!backendType || isRemoteBackendType(backendType) || ds.adoptedFrom) return false;
+  if (!w) {
+    // Restore has no ChildProcess handle, but a persistent pane may have survived
+    // the daemon. Positive backing teardown is the old-generation exit proof.
+    return isSuspendableBackendType(backendType) ? destroySuspendBackingVerified(ds) : true;
+  }
+  if (w.killed && (w.exitCode !== null || w.signalCode !== null)) {
+    clearTransferWorkerState(ds, w, 'retireWorkerForReplacement:already_exited');
+    return true;
+  }
+  if (isSuspendableBackendType(backendType) && !destroySuspendBackingVerified(ds)) return false;
+
+  const requestId = randomUUID();
+  trackLifecycleRetirement(ds, w);
+  let acked = false;
+  let exited = w.exitCode !== null || w.signalCode !== null;
+  let finish!: (ok: boolean) => void;
+  const completion = new Promise<boolean>(resolve => { finish = resolve; });
+  const maybeFinish = (): void => { if (acked && exited) finish(true); };
+  const onMessage = (raw: unknown): void => {
+    const msg = raw as Partial<WorkerToDaemon>;
+    if (msg.type !== 'replacement_retired' || msg.requestId !== requestId) return;
+    acked = true;
+    maybeFinish();
+  };
+  const onExit = (): void => { exited = true; maybeFinish(); };
+  w.on('message', onMessage);
+  w.on('exit', onExit);
+  const timeout = setTimeout(() => finish(false), opts.timeoutMs ?? TRANSFER_DETACH_FENCE_MS);
+  timeout.unref?.();
+  void sendWorkerIpc(w, { type: 'retire_for_replacement', requestId }).catch(() => finish(false));
+  let completed = await completion;
+  if (!completed && !exited) {
+    const forcedExit = new Promise<boolean>(resolve => {
+      const forcedTimeout = setTimeout(() => resolve(false), TRANSFER_FORCE_EXIT_MS);
+      forcedTimeout.unref?.();
+      w.once('exit', () => { clearTimeout(forcedTimeout); resolve(true); });
+    });
+    try { w.kill('SIGKILL'); } catch { /* already gone */ }
+    exited = await forcedExit || exited;
+    // A hard-retired local worker is a verified terminal generation even when its
+    // graceful ACK was lost; persistent backing was already positively removed.
+    completed = exited;
+  }
+  clearTimeout(timeout);
+  w.off('message', onMessage);
+  w.off('exit', onExit);
+  if (!completed || !exited || (ds.worker !== w && ds.worker !== null)) {
+    clearLifecycleRetirement(ds, w);
+    return false;
+  }
+  clearTransferWorkerState(ds, w, 'retireWorkerForReplacement');
+  sessionStore.updateSessionPid(ds.session.sessionId, null);
+  return true;
+}
+
 export async function detachWorkerForTransfer(
   ds: DaemonSession,
   opts: { timeoutMs?: number } = {},
@@ -7083,10 +7151,12 @@ export function requestSessionRestart(
       // fresh CLI instead of reattaching the old one and falsely reporting a
       // successful restart.
       destroyLivePaneBeforeRestart(ds);
-      forkWorker(ds, '', {
+      if (forkWorker(ds, '', {
         resume: ds.hasHistory,
         restartAttemptId: attemptId,
-      });
+      }) === false) {
+        throw new Error('worker restart refused before spawn');
+      }
     } catch (error) {
       start.failure = { error };
       // Rethrow: the coordinator settles this fresh attempt as `failed`.
@@ -12298,7 +12368,6 @@ async function forkFromSource(
     childSession.pendingForkSession = true;
     childSession.cliSessionId = lockedCliSessionId;
     childSession.cliId = ds.session.cliId;
-    childSession.workingDir = ds.workingDir ?? ds.session.workingDir;
     childSession.ownerOpenId = opts?.childOwnerOpenId ?? ds.session.ownerOpenId;
     childSession.backendType = ds.session.backendType;
     // Bot identity on the PERSISTED row. Every other createSession caller sets
@@ -12316,7 +12385,7 @@ async function forkFromSource(
     // a missing sandbox stamp on resume can silently disable isolation.
     // Model remains a launch record; current matching-CLI settings still win
     // in resolveSessionLaunchModel. Native pane/conversation IDs are separate.
-    inheritSessionLaunchConfiguration(ds.session, childSession);
+    inheritSessionLaunchConfiguration(ds.session, childSession, ds.workingDir ?? ds.session.workingDir);
     childSession.promptInjection = sessionPromptInjection(ds);
     childSession.nativeSessionTitle = childTitle;
     childSession.nativeSessionTitleUserDefined = true;
@@ -14463,6 +14532,10 @@ export function forkWorker(
   // let the chat offer recovery (rebuild the worktree / switch directories).
   // Only re-attaching a backing session that is still alive goes ahead — that
   // CLI keeps running where it was and is not respawned.
+  if (cb.authorizeWorkingDirLaunch && !cb.authorizeWorkingDirLaunch(ds)) {
+    reportAdmission('rejected');
+    return false;
+  }
   const rawCwd = cb.getSessionWorkingDir(ds);
   const workingDirMissing = !!rawCwd && !existsSync(rawCwd);
   if (workingDirMissing && !opts.reattachLiveBackend) {
@@ -14503,7 +14576,7 @@ export function forkWorker(
   // dir with no repo context) instead of getting its own repo card. Compared via
   // realpath so a symlinked/aliased $HOME is excluded too, not just the literal string.
   if (!ds.session.workingDir && cwd === rawCwd && !resolvesToHome(cwd)) {
-    ds.session.workingDir = cwd;
+    setSessionWorkingDirMetadata(ds.session, { workingDir: cwd, source: 'bot-default' });
     sessionStore.updateSession(ds.session);
   }
 
@@ -14945,6 +15018,9 @@ export function forkWorker(
     chatType: ds.chatType,
     rootMessageId: sessionAnchorId(ds),
     workingDir: cwd,
+    ...(ds.groupWorkspaceLaunchGuard?.identity
+      ? { expectedWorkingDirIdentity: { ...ds.groupWorkspaceLaunchGuard.identity } }
+      : {}),
     cliId: agentCfg.cliId,
     cliRuntime: agentCfg.cliRuntime,
     cliPathOverride: agentCfg.cliPathOverride,
@@ -16245,6 +16321,24 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored ready from stale/transferring worker generation`);
           break;
         }
+        const launchGuard = ds.groupWorkspaceLaunchGuard;
+        const remoteHostProof = msg.hostWorkingDirContract;
+        const readyBackendType = ds.initConfig?.backendType ?? ds.session.backendType;
+        const exactRemoteHostProof = (readyBackendType === 'riff' || readyBackendType === 'mojo')
+          && !!launchGuard?.identity
+          && remoteHostProof?.workingDir === launchGuard.workingDir
+          && remoteHostProof.identity.dev === launchGuard.identity.dev
+          && remoteHostProof.identity.ino === launchGuard.identity.ino;
+        if (launchGuard
+          && !exactRemoteHostProof
+          && (!cb.confirmWorkerReadyCwd || !cb.confirmWorkerReadyCwd(ds, msg.cwd))) {
+          logger.error(`[${t}] Worker ready cwd mismatch: requested=${launchGuard.workingDir} actual=${msg.cwd ?? '(unavailable)'}`);
+          cb.onWorkerReadyCwdMismatch?.(ds, msg.cwd);
+          ds.groupWorkspaceLaunchGuard = undefined;
+          worker.kill('SIGTERM');
+          break;
+        }
+        ds.groupWorkspaceLaunchGuard = undefined;
         startupState.ready = true;
         startupState.onPreReadyExit = undefined;
         ds.workerReady = true;

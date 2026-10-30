@@ -234,6 +234,9 @@ describe('triggerSessionTurn rootMessageId target', () => {
     const ds = activeSessions.get(sessionKey(ROOT, APP));
     expect(ds?.scope).toBe('thread');
     expect(ds?.session.rootMessageId).toBe(ROOT);
+    expect(ds?.session).toMatchObject({ workingDir: '/tmp', workingDirSource: 'bot-default' });
+    expect(ds?.session.groupWorkspaceRevision).toBeUndefined();
+    expect(mockUpdateSession).toHaveBeenCalledWith(ds?.session);
     expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') });
   });
 

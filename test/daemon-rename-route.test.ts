@@ -1343,6 +1343,8 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(ds).toBeDefined();
     expect(ds!.workingDir).toBe(defaultDir);
     expect(ds!.session.workingDir).toBe(defaultDir);
+    expect(ds!.session.workingDirSource).toBe('bot-default');
+    expect(ds!.session.groupWorkspaceRevision).toBeUndefined();
     // Inheriting the dir must NOT turn a non-`/repo` command into a repo picker:
     // these commands fork no CLI of their own.
     expect(ds!.pendingRepo).toBeFalsy();
@@ -2025,7 +2027,10 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     expect(mocks.closeSession).not.toHaveBeenCalled();
     expect(repliedText()).not.toContain('会话已关闭');
-    expect(activeSessions.get(sessionKey(rootId, APP))?.workingDir).toBe('/tmp');
+    const created = activeSessions.get(sessionKey(rootId, APP));
+    expect(created?.workingDir).toBe('/tmp');
+    expect(created?.session).toMatchObject({ workingDir: '/tmp', workingDirSource: 'explicit' });
+    expect(created?.session.groupWorkspaceRevision).toBeUndefined();
   });
 
   it('card-off pinned cwd + `/t /goal ...` seeds the thread before the initial raw fork', async () => {
