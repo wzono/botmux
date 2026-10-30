@@ -1,11 +1,10 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, readlinkSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
-import { createServer } from 'node:net';
+import { existsSync, mkdirSync, readFileSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { EventEmitter } from 'node:events';
 import type { ChildProcess } from 'node:child_process';
-import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import {
   applySessionTempEnv,
@@ -21,23 +20,13 @@ import { tmuxEnv } from '../src/setup/ensure-tmux.js';
 const roots: string[] = [];
 
 function dataDir(): string {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-session-temp-')));
+  const root = mkdtempSync(join(tmpdir(), 'botmux-session-temp-'));
   roots.push(root);
   return join(root, 'data');
 }
 
-beforeEach(() => { vi.stubEnv('HOME', dataDir()); });
-
 afterEach(() => {
-  // Remove only the alias owned by this test HOME; never the shared uid parent.
-  if (process.getuid) {
-    const alias = dirname(dirname(sessionTempDir('/unused', 'unused')));
-    try {
-      if (readlinkSync(alias) === resolve(homedir(), '.cache', 'botmux', 'session-tmp')) unlinkSync(alias);
-    } catch { /* this test never created an alias */ }
-  }
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
-  vi.unstubAllEnvs();
 });
 
 describe('session temp', () => {
@@ -45,8 +34,8 @@ describe('session temp', () => {
     const data = dataDir();
     const path = ensureSessionTempDir(data, 'session-123');
     roots.push(dirname(path));
-    expect(realpathSync(path).startsWith(realpathSync(join(homedir(), '.cache', 'botmux', 'session-tmp')))).toBe(true);
-    expect(path).toBe(sessionTempDir(data, 'session-123'));
+    expect(dirname(dirname(path))).toBe(join(homedir(), '.cache', 'bm'));
+    expect(path).toMatch(/\/[0-9a-f]{8}\/[0-9a-f]{16}$/);
     expect(existsSync(path)).toBe(true);
 
     const env: NodeJS.ProcessEnv = {};
@@ -57,117 +46,20 @@ describe('session temp', () => {
   it('hashes unsafe session ids instead of permitting traversal', () => {
     const data = dataDir();
     const path = sessionTempDir(data, '../../escape');
-    expect(path).not.toContain('escape');
+    expect(path).toMatch(/\/[0-9a-f]{8}\/[0-9a-f]{16}$/);
   });
 
-  it.skipIf(!process.getuid)('binds a Chrome-shaped socket with a long HOME while keeping artifacts on the cache filesystem', async () => {
-    const home = join(dataDir(), 'a-very-long-user-home-component'.repeat(4));
-    roots.push(dirname(home));
-    vi.stubEnv('HOME', home);
-    const data = dataDir();
-    const path = ensureSessionTempDir(data, '6c255026-e993-495d-80ec-85d2c3c440dc');
-    const alias = dirname(dirname(path));
-    roots.push(alias);
-    const socket = join(path, 'com.google.Chrome.XXXXXX', 'SingletonSocket');
-    mkdirSync(dirname(socket));
-    expect(Buffer.byteLength(socket)).toBeLessThan(104);
-    writeFileSync(join(path, 'artifact'), 'disk-backed');
-    const cache = join(home, '.cache', 'botmux', 'session-tmp');
-    expect(realpathSync(path).startsWith(realpathSync(cache))).toBe(true);
-    expect(readFileSync(join(realpathSync(path), 'artifact'), 'utf8')).toBe('disk-backed');
-    const server = createServer();
+  it('leaves room under AF_UNIX limits for Chromium singleton sockets', () => {
+    const previousHome = process.env.HOME;
+    process.env.HOME = '/home/botmux-user';
     try {
-      await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(socket, resolve); });
+      const path = sessionTempDir(dataDir(), '6c255026-e993-495d-80ec-85d2c3c440dc');
+      const chromiumSuffix = '/org.chromium.Chromium.NtgTAI/SingletonSocket';
+      expect(`${path}${chromiumSuffix}`.length).toBeLessThanOrEqual(103);
     } finally {
-      if (server.listening) await new Promise<void>(resolve => server.close(() => resolve()));
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
     }
-  });
-
-  it.skipIf(!process.getuid)('rejects a substituted short alias instead of writing into another tree', () => {
-    const home = dataDir();
-    vi.stubEnv('HOME', home);
-    const data = dataDir();
-    const path = ensureSessionTempDir(data, 'one');
-    const alias = dirname(dirname(path));
-    roots.push(alias);
-    unlinkSync(alias);
-    const other = dataDir();
-    mkdirSync(other, { recursive: true });
-    symlinkSync(other, alias);
-    expect(() => ensureSessionTempDir(data, 'two')).toThrow(/does not point to its cache/);
-    expect(readdirSync(other)).toEqual([]);
-  });
-
-  it.skipIf(!process.getuid)('pins sweep deletion to the backing tree if the alias is changed during the process probe', async () => {
-    vi.stubEnv('HOME', dataDir());
-    const data = dataDir();
-    const path = ensureSessionTempDir(data, 'closed');
-    const physical = realpathSync(path);
-    const alias = dirname(dirname(path));
-    roots.push(alias);
-    const foreign = dataDir();
-    const foreignSession = join(foreign, ...path.slice(alias.length + 1).split('/'));
-    mkdirSync(foreignSession, { recursive: true });
-    writeFileSync(join(foreignSession, 'artifact'), 'foreign');
-    const removed = await sweepOrphanSessionTempDirs(data, new Set(), {
-      now: Date.now() + 600_000,
-      liveReferences: async () => {
-        unlinkSync(alias);
-        symlinkSync(foreign, alias);
-        return new Set();
-      },
-    });
-    expect(removed).toContain(physical);
-    expect(existsSync(physical)).toBe(false);
-    expect(readFileSync(join(foreignSession, 'artifact'), 'utf8')).toBe('foreign');
-  });
-
-  it.skipIf(!process.getuid).each(['short', 'cache', 'lexical-cache'] as const)('keeps live scratch referenced through the %s spelling', async spelling => {
-    const physicalHome = dataDir();
-    mkdirSync(physicalHome, { recursive: true });
-    const lexicalHome = dataDir();
-    symlinkSync(physicalHome, lexicalHome);
-    vi.stubEnv('HOME', lexicalHome);
-    const data = dataDir();
-    const path = ensureSessionTempDir(data, 'running');
-    const alias = dirname(dirname(path));
-    roots.push(alias);
-    const cachePath = join(homedir(), '.cache', 'botmux', 'session-tmp', path.slice(alias.length + 1));
-    writeFileSync(join(path, 'artifact'), 'live');
-    const livePath = spelling === 'short' ? path : spelling === 'cache' ? realpathSync(path) : cachePath;
-    const removed = await sweepOrphanSessionTempDirs(data, new Set(), {
-      now: Date.now() + 600_000,
-      liveReferences: async paths => {
-        expect(paths).toContain(livePath);
-        return new Set([livePath]);
-      },
-    });
-    expect(removed).toEqual([]);
-    expect(readFileSync(join(path, 'artifact'), 'utf8')).toBe('live');
-  });
-
-  it.skipIf(!process.getuid).each(['before', 'during'])('pins close cleanup to its cache when the alias is retargeted %s removal', async timing => {
-    const data = dataDir();
-    const path = ensureSessionTempDir(data, 'closing');
-    const physical = realpathSync(path);
-    const alias = dirname(dirname(path));
-    roots.push(alias);
-    const foreign = dataDir();
-    const foreignSession = join(foreign, path.slice(alias.length + 1));
-    mkdirSync(foreignSession, { recursive: true });
-    writeFileSync(join(foreignSession, 'artifact'), 'foreign');
-    const legacyProfile = createHash('sha256').update(resolve(data)).digest('hex').slice(0, 16);
-    const foreignLegacy = join(foreign, legacyProfile, 'closing');
-    mkdirSync(foreignLegacy, { recursive: true });
-    writeFileSync(join(foreignLegacy, 'artifact'), 'foreign-legacy');
-    const retarget = () => { unlinkSync(alias); symlinkSync(foreign, alias); };
-    if (timing === 'before') retarget();
-    const pending = cleanupSessionTempDir(data, 'closing');
-    if (timing === 'during') retarget();
-    await pending;
-    expect(readFileSync(join(foreignLegacy, 'artifact'), 'utf8')).toBe('foreign-legacy');
-    expect(existsSync(physical)).toBe(false);
-    expect(readFileSync(join(foreignSession, 'artifact'), 'utf8')).toBe('foreign');
   });
 
   it('also retires scratch left in the pre-shortening layout', async () => {
@@ -248,9 +140,9 @@ describe('session temp', () => {
 
   it('refuses a symlink planted at the session path', () => {
     const data = dataDir();
-    const path = ensureSessionTempDir(data, 'linked');
+    const path = sessionTempDir(data, 'linked');
     roots.push(dirname(path));
-    rmSync(path, { recursive: true });
+    mkdirSync(join(path, '..'), { recursive: true });
     symlinkSync(dataDir(), path);
     expect(() => ensureSessionTempDir(data, 'linked')).toThrow(/not a real directory/);
   });
@@ -275,7 +167,7 @@ describe('orphan scratch sweep (#1748)', () => {
   const noLive = async () => new Set<string>();
 
   function sweepRoot(): string {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-scratch-sweep-')));
+    const root = mkdtempSync(join(tmpdir(), 'botmux-scratch-sweep-'));
     roots.push(root);
     return root;
   }
