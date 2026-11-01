@@ -97,7 +97,7 @@ import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
 import { findForbiddenReadWritePaths, findReadOnlyLauncherMountCovers } from '../services/sandbox-path-guard.js';
 import { sandboxBoolValue } from '../adapters/cli/sandbox-mode.js';
-import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
+import { resolveSandboxMode, type SandboxMode } from '../adapters/cli/sandbox-mode.js';
 import { resolveLocalSandboxMode, localSandboxApplies } from '../adapters/backend/sandbox.js';
 import { backendSandboxCompatibilityError } from '../adapters/backend/session-backend-selector.js';
 import * as backendTypeStore from '../services/backend-type-store.js';
@@ -327,7 +327,8 @@ import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.
 import { type CliAvailabilityProbe } from '../setup/cli-availability.js';
 import { agentSaveProbePlan, probeAgentSaveAvailability, AgentSaveProbeError } from '../dashboard/agent-save-probe.js';
 import { resolveBotCodexRpcInput } from '../services/codex-rpc-input-policy.js';
-import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
+import { enrichHistorySenders } from '../dashboard/history-senders.js';
+import { seedSessionHistoryIdentity } from '../dashboard/session-history-identity.js';
 import {
   validateCodexAppManagedSendOrigin,
 } from '../utils/codex-app-dispatch-ledger.js';
@@ -563,7 +564,7 @@ import { recoverFailedTurn, parseFailedTurnRecoveryRequest } from './failed-turn
 import { projectCoreOnlyHostFacts } from './core-only-host-facts.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
-import { isSessionGroup } from '../services/session-groups-store.js';
+import { getSessionGroup, isSessionGroup, sessionGroupBoardMeta, type SessionGroupBoardMeta } from '../services/session-groups-store.js';
 import {
   commitDeviceIsolationActivation,
   DEVICE_ISOLATION_COMMIT_PATH,
@@ -4251,6 +4252,48 @@ function findOwnedSessionRecord(sessionId: string): Session | undefined {
   return findActiveBySessionId(sessionId)?.session ?? sessionStore.getOwnedSession(sessionId);
 }
 
+/**
+ * 每个 GET /api/groups 请求建一个解析器。存储故障是全局性的（同一个未完成的
+ * load() 对每个群都会再抛一次），若逐群重试，N 个会话群会串行各等满一次
+ * busy_timeout——同步 map 里直接卡住事件循环几十秒并刷 N 条 warn。所以两类失败
+ * 各自在本请求内熔断一次：
+ *  - 注册表读取失败：无法分型，该请求内后续群全部降级为普通群（{}）；
+ *  - 会话存储读取失败：仍给注册表摘要（时间/会话入口），只缺会话状态与
+ *    会话侧的最近活跃时间，本请求内不再落库。熔断只管落库那一步：常驻会话
+ *    在内存活跃表里时照常取到状态，不受影响。
+ */
+function makeSessionGroupBoardFields(): (chatId: string) => { sessionGroup?: true; sessionGroupMeta?: SessionGroupBoardMeta } {
+  let registryFailed = false;
+  let sessionLookupFailed = false;
+  return (chatId: string) => {
+    if (registryFailed) return {};
+    let entry: ReturnType<typeof getSessionGroup>;
+    try {
+      // isSessionGroup / getSessionGroup 的 load() 内含 ensureDir→mkdirSync，
+      // dataDir 不可写时同样会抛，必须整段在 try 里。
+      if (!isSessionGroup(chatId)) return {};
+      entry = getSessionGroup(chatId);
+    } catch (err) {
+      registryFailed = true;
+      logger.warn(`[dashboard-ipc] session-group registry unavailable; chats degrade to regular groups for this request: ${err instanceof Error ? err.message : String(err)}`);
+      return {};
+    }
+    if (!entry) return { sessionGroup: true };
+    let session: Session | undefined;
+    // 与 findOwnedSessionRecord 同序：内存活跃表优先（不碰数据库），未命中才落库。
+    if (entry.lastSessionId) session = findActiveBySessionId(entry.lastSessionId)?.session;
+    if (entry.lastSessionId && !session && !sessionLookupFailed) {
+      try {
+        session = sessionStore.getOwnedSession(entry.lastSessionId);
+      } catch (err) {
+        sessionLookupFailed = true;
+        logger.warn(`[dashboard-ipc] session lookup unavailable for session groups; serving registry-only summaries for this request (first error on ${entry.lastSessionId}): ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    return { sessionGroup: true, sessionGroupMeta: sessionGroupBoardMeta(entry, session) };
+  };
+}
+
 /** Four-state async lookup with durable fallback (design A).
  *
  *  In-memory `asyncTriggerResults` lives only on the active DaemonSession and is
@@ -4977,33 +5020,23 @@ ipcRoute('GET', '/api/sessions/:sessionId/history', async (req, res, params) => 
     // Bot sender ids are scoped to the observing app. Reuse the chat-member
     // resolver (cross-ref + observed bot roster) instead of assuming every
     // non-user message came from the bot that owns this dashboard session.
-    const botMembers: ChatBotMember[] = await listChatBotMembers(appId, session.chatId).catch(() => [] as ChatBotMember[]);
-    let botInfos: HistoryBotInfo[] = [];
+    const resolvedBotMembers: ChatBotMember[] = await listChatBotMembers(appId, session.chatId).catch(() => [] as ChatBotMember[]);
+    let botInfosRaw: unknown;
     try {
-      const parsed = JSON.parse(readFileSync(join(config.session.dataDir, 'bots-info.json'), 'utf8'));
-      if (Array.isArray(parsed)) botInfos = parsed;
+      botInfosRaw = JSON.parse(readFileSync(join(config.session.dataDir, 'bots-info.json'), 'utf8'));
     } catch { /* missing/corrupt cache degrades to name/open_id placeholders */ }
     // listChatBotMembers can be temporarily unavailable during startup. Always
     // retain a local self-bot fallback so its own messages still have identity.
+    let self: ReturnType<typeof getBot> | undefined;
     try {
-      const self = getBot(appId);
-      if (self.botOpenId && !botMembers.some(member => member.openId === self.botOpenId)) {
-        const selfName = self.botName || appId;
-        botMembers.push({
-          openId: self.botOpenId,
-          displayName: selfName,
-          name: selfName,
-          larkAppId: appId,
-          source: 'configured',
-          mentionable: true,
-          mentionSource: 'self',
-          hasTeamRole: false,
-        });
-      }
-      if (!botInfos.some(info => info.larkAppId === appId)) {
-        botInfos.push({ larkAppId: appId, botOpenId: self.botOpenId, botName: self.botName, botAvatarUrl: self.botAvatarUrl });
-      }
+      self = getBot(appId);
     } catch { /* session record may outlive a removed bot config */ }
+    const { botMembers, botInfos } = seedSessionHistoryIdentity(
+      appId,
+      self,
+      resolvedBotMembers,
+      botInfosRaw,
+    );
 
     jsonRes(res, 200, {
       ok: true,
@@ -6961,6 +6994,8 @@ ipcRoute('GET', '/api/groups', requireBoundBot(async (_req, res) => {
     // backfill new ones with Date.now()). Lark doesn't expose chat create_time
     // anywhere, so the dashboard sorts by this client-side proxy instead.
     const seenMap = chatFirstSeenStore.markSeenBulk(chats.map(c => c.chatId));
+    // 请求级熔断的会话群摘要解析器（见 makeSessionGroupBoardFields）。
+    const sessionGroupFields = makeSessionGroupBoardFields();
     // Annotate each chat with its oncall binding (if any) so the dashboard
     // matrix can show toggle state without a second round-trip.
     const enriched = chats.map(c => {
@@ -6994,9 +7029,10 @@ ipcRoute('GET', '/api/groups', requireBoundBot(async (_req, res) => {
         streamingCardMasterEnabled,
         streamingCardChatEnabled,
         streamingCardEffectiveEnabled: streamingCardMasterEnabled && streamingCardChatEnabled,
-        // 会话群分型（p2pMode=group 自动创建）：dashboard 群面板据此把它们
-        // 收进独立折叠区，避免淹没需要人工管理的常驻群。
-        ...(isSessionGroup(c.chatId) ? { sessionGroup: true } : {}),
+        // 会话群分型（p2pMode=group 自动创建）：dashboard 群组页据此把它们放进
+        // 独立的「会话群」视图，避免淹没需要人工管理的常驻群；附带的摘要用于
+        // 按最近活跃排序、显示会话状态和跳转当前会话。
+        ...sessionGroupFields(c.chatId),
       };
     });
     jsonRes(res, 200, { chats: enriched });
@@ -8287,25 +8323,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
           allowedChatGroupsCount: (sCfg.allowedChatGroups ?? []).filter(id => !isSessionGroup(id)).length,
           localSandboxApplies: localSandboxApplies(sBackendType, sCfg.mojo),
           sandboxCapable: sSandboxCapable,
-          // resolveLocalSandboxMode throws on a typo'd env: this route must stay
-          // alive. Fall back to the config-only resolver WITHOUT the env leg,
-          // still honouring readIsolation (it implies oncall).
-          effectiveSandboxMode: (() => {
-            try {
-              return resolveLocalSandboxMode({
-                backendType: sBackendType,
-                mojoConfig: sCfg.mojo,
-                configSandbox: sCfg.sandbox,
-                readIsolation: sCfg.readIsolation === true,
-                envValue: process.env.BOTMUX_SANDBOX,
-              });
-            } catch {
-              return resolveSandboxMode({
-                configSandbox: sCfg.sandbox,
-                readIsolation: sCfg.readIsolation === true,
-              });
-            }
-          })(),
+          effectiveSandboxMode: effectiveBotSandboxMode(sCfg),
         };
       } catch {
         return {
@@ -10251,6 +10269,28 @@ botConfigPutRoute<{ enabled?: unknown; larkToolBinding?: unknown }>('/api/bot-la
   respond: value => ({ ok: true, larkToolBinding: value !== false }),
 });
 
+/**
+ * The sandbox mode the worker will spawn this bot's CLI under
+ * (resolveLocalSandboxMode: global BOTMUX_SANDBOX and the legacy readIsolation
+ * flag folded in, remote backends exempt). It throws on a typo'd env and a
+ * route must stay alive: fall back to the config-only resolver WITHOUT the env
+ * leg, still honouring readIsolation (it implies oncall).
+ */
+function effectiveBotSandboxMode(cfg: BotConfig): SandboxMode {
+  const backendType = resolvePairedBackendId(cfg.cliId, cfg.backendType, config.daemon.backendType) ?? 'pty';
+  try {
+    return resolveLocalSandboxMode({
+      backendType,
+      mojoConfig: cfg.mojo,
+      configSandbox: cfg.sandbox,
+      readIsolation: cfg.readIsolation === true,
+      envValue: process.env.BOTMUX_SANDBOX,
+    });
+  } catch {
+    return resolveSandboxMode({ configSandbox: cfg.sandbox, readIsolation: cfg.readIsolation === true });
+  }
+}
+
 // GET /api/bot-trigger-user-auth-status — 当前策略 + 已授权人数 + 两条如实的
 // 边界提示（token 存储保护程度、自带凭证的 MCP server）。
 // 只回人数不回名单：谁授权过是成员关系，dashboard 没有理由把它摊给所有能登录的人。
@@ -10280,11 +10320,10 @@ ipcRoute('GET', '/api/bot-trigger-user-auth-status', requireBoundBot(async (req,
     const policy = cfg.triggerUserAuth ?? null;
     const brand = normalizeBrand(cfg.brand);
     const authorizedCount = listAuthorizedUsers(cfg.larkAppId, brand).length;
-    // Oncall (legacy true) provides the OS-enforced credential boundary that
-    // makes other people's token files unreadable. scratch is NOT counted here:
-    // it is write-integrity COW, not a read/credential boundary, so the agent
-    // can still read shared token stores.
-    const protection = tokenStoreProtection(cfg.sandbox === true || cfg.sandbox === 'oncall');
+    // Same verdict as the worker, on the mode its spawn resolves: only the
+    // allowlist sandbox (oncall, legacy true, readIsolation) makes other
+    // people's token files unreadable; scratch isolates writes only.
+    const protection = tokenStoreProtection(effectiveBotSandboxMode(cfg));
     const mcpAdvisory = credentialBearingMcpAdvisory(scanCredentialBearingMcpServers());
     // Platform-backed source: tell the UI whether this machine is bound so the
     // picker can say what `auto` / `platform` will actually do here.

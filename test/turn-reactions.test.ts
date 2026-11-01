@@ -1297,6 +1297,8 @@ describe('two-phase turn reactions', () => {
 /**
  * Screen status is a runtime hint, not a turn terminal. In particular, the
  * bootstrap working→idle edge of a fresh `/th` worker must not settle reactions.
+ * Behavioral pin: card-off finishTurnReactions requires a working→idle edge.
+ * Argv cold-start (Pi/Gemini/MTR/OpenCode) must seed working before idle.
  */
 describe('turn reaction screen_update behavioral gate', () => {
   function makeFakeWorker() {
