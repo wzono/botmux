@@ -6549,11 +6549,11 @@ const commandDeps: CommandHandlerDeps = {
       || expandHome(requested) !== current.record.directory.workingDir)) return 'proof_mismatch';
     return (await coordinateGroupWorkspaceQuarantineRepair({
       sessionId: ds.session.sessionId, chatId: ds.chatId, actor: authority.actor,
-      authority: { authorize: () => runtime.revalidateAuthority({
+      authority: { authorize: async () => (await runtime.revalidateAuthority({
         chatId: ds.chatId,
         actor: authority.actor,
         authorityFingerprint: authority.configFingerprint,
-      }) },
+      })).status === 'authorized' },
       groupStore: groupWorkspaceStore,
     })).status;
   },
@@ -6573,6 +6573,13 @@ const commandDeps: CommandHandlerDeps = {
         : 'current-policy (legacy/unknown provenance)';
     const groupConsumption = group.status === 'available' && group.record?.directory.kind === 'bound'
       ? await groupWorkspaceStore.probeBoundDirectoryForConsumption(ds.chatId)
+      : undefined;
+    const unresolvedOperations = await groupWorkspaceOperationStore.listUnresolved();
+    const operation = unresolvedOperations.status === 'store_unavailable'
+      ? { status: 'store_unavailable', detail: 'operation journal unavailable' }
+      : unresolvedOperations.journals.find(item => item.chatId === ds.chatId);
+    const quarantinedOperation = operation && 'phase' in operation
+      ? operation
       : undefined;
     const resolution = group.status === 'store_unavailable'
       ? { status: 'store_unavailable', detail: 'group workspace store unavailable' }
@@ -6599,6 +6606,10 @@ const commandDeps: CommandHandlerDeps = {
               health: groupConsumption!.status },
       resolution,
       ...(ds.session.groupWorkspaceQuarantine ? { quarantine: ds.session.groupWorkspaceQuarantine } : {}),
+      ...(quarantinedOperation
+        ? { operation: { status: quarantinedOperation.phase,
+            detail: quarantinedOperation.convergenceFailure ?? quarantinedOperation.legacyPhase } }
+        : operation && 'status' in operation ? { operation } : {}),
       ...(() => {
         try {
           const migration = readWorkspaceMigrationManifest(config.session.dataDir);
@@ -33214,12 +33225,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       groupStore: groupWorkspaceStore,
       now: Date.now,
       authorityFingerprint: frozen.authorityFingerprint,
-      revalidateAuthority: async journal => ({
-        status: await groupWorkspaceRouteRuntime.revalidateAuthority({
-          chatId: journal.chatId,
-          actor: journal.actor,
-          authorityFingerprint: journal.authorityFingerprint ?? '',
-        }) ? 'authorized' : 'unauthorized',
+      revalidateAuthority: journal => groupWorkspaceRouteRuntime.revalidateAuthority({
+        chatId: journal.chatId,
+        actor: journal.actor,
+        authorityFingerprint: journal.authorityFingerprint ?? '',
       }),
       executorLeaseStore: groupWorkspaceExecutorLeaseStore,
       executorOwner: groupWorkspaceExecutorOwner,
@@ -33336,12 +33345,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               groupStore: groupWorkspaceStore,
               now: Date.now,
               authorityFingerprint: route.authorityFingerprint,
-              revalidateAuthority: async journal => ({
-                status: await groupWorkspaceRouteRuntime.revalidateAuthority({
-                  chatId: journal.chatId,
-                  actor: journal.actor,
-                  authorityFingerprint: journal.authorityFingerprint ?? '',
-                }) ? 'authorized' : 'unauthorized',
+              revalidateAuthority: journal => groupWorkspaceRouteRuntime.revalidateAuthority({
+                chatId: journal.chatId,
+                actor: journal.actor,
+                authorityFingerprint: journal.authorityFingerprint ?? '',
               }),
               executorLeaseStore: groupWorkspaceExecutorLeaseStore,
               executorOwner: groupWorkspaceExecutorOwner,
@@ -33371,6 +33378,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                   || activeSessions.get(sessionKey(ds.chatId, cfg.larkAppId)) !== ds) {
                   return { status: 'unknown' };
                 }
+                const targetProof = probePathUsability(input.targetWorkingDir, {
+                  expectedIdentity: input.workspaceIdentity,
+                });
+                if (!targetProof.ok || targetProof.normalizedPath !== input.workspaceIdentity.path
+                  || targetProof.identity.dev !== input.workspaceIdentity.dev
+                  || targetProof.identity.ino !== input.workspaceIdentity.ino) return { status: 'unknown' };
                 const messageId = route.messageId ?? route.originMessageId ?? randomUUID();
                 await handleCommand('/repo', ds.chatId, {
                   messageId, rootId: ds.chatId, chatId: ds.chatId, chatType: 'group',
@@ -33431,12 +33444,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             }, {
               journalStore: groupWorkspaceOperationStore,
               now: Date.now,
-              revalidateAuthority: async journal => ({
-                status: await groupWorkspaceRouteRuntime.revalidateAuthority({
-                  chatId: journal.chatId,
-                  actor: journal.actor,
-                  authorityFingerprint: journal.authorityFingerprint ?? '',
-                }) ? 'authorized' : 'unauthorized',
+              revalidateAuthority: journal => groupWorkspaceRouteRuntime.revalidateAuthority({
+                chatId: journal.chatId,
+                actor: journal.actor,
+                authorityFingerprint: journal.authorityFingerprint ?? '',
               }),
               readReceipt: operationKey => groupWorkspaceStore.readReceipt(operationKey),
               readCurrentRevision: async chatId => {
@@ -33866,12 +33877,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           }, {
             journalStore: groupWorkspaceOperationStore,
             now: Date.now,
-            revalidateAuthority: async frozen => ({
-              status: await groupWorkspaceRouteRuntimes.get(cfg.larkAppId)!.revalidateAuthorityConfiguration({
-                chatId: frozen.chatId,
-                actor: frozen.actor,
-                authorityFingerprint: frozen.authorityFingerprint,
-              }) ? 'authorized' : 'unauthorized',
+            revalidateAuthority: frozen => groupWorkspaceRouteRuntimes.get(cfg.larkAppId)!.revalidateAuthority({
+              chatId: frozen.chatId,
+              actor: frozen.actor,
+              authorityFingerprint: frozen.authorityFingerprint,
             }),
             readReceipt: operationKey => groupWorkspaceStore.readReceipt(operationKey),
             readCurrentRevision: async chatId => {

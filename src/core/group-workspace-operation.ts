@@ -55,13 +55,14 @@ export type GroupWorkspaceOperationResult =
   | { status: 'unauthorized'; journal?: RepoGroupOperationJournal }
   | { status: 'store_unavailable'; journal?: RepoGroupOperationJournal }
   | { status: 'unknown'; journal?: RepoGroupOperationJournal }
+  | { status: 'convergence_quarantined'; journal: RepoGroupOperationJournal; reason: 'session_missing' | 'generation_conflict' }
   | { status: 'observing'; journal: RepoGroupOperationJournal; receipt?: GroupCommitReceipt }
   | { status: 'protocol_conflict'; journal?: RepoGroupOperationJournal };
 
 export interface GroupWorkspaceOperationDependencies {
   journalStore: GroupWorkspaceOperationStore;
   now(): number;
-  revalidateAuthority?(journal: RepoGroupOperationJournal): Promise<{ status: 'authorized' | 'unauthorized' }>;
+  revalidateAuthority?(journal: RepoGroupOperationJournal): Promise<{ status: 'authorized' | 'denied' | 'unauthorized' | 'unavailable' }>;
   acquireExecutor?(operationKey: string): Promise<
     | { status: 'acquired'; lease: OperationExecutorLease }
     | { status: 'observer'; lease: OperationExecutorLease }
@@ -101,7 +102,7 @@ export interface GroupWorkspaceOperationDependencies {
   commitGroup(
     input: RepoGroupOperationJournal,
     fencingToken?: number,
-    revalidateUnderLock?: () => Promise<{ status: 'authorized' | 'unauthorized' }>,
+    revalidateUnderLock?: () => Promise<{ status: 'authorized' | 'denied' | 'unauthorized' | 'unavailable' }>,
   ): Promise<GroupCommitResult>;
   convergeSession(input: {
     sessionId: string;
@@ -263,7 +264,7 @@ export type GroupWorkspaceUnbindResult =
 
 export interface GroupWorkspaceUnbindDependencies {
   journalStore: GroupWorkspaceOperationStore;
-  revalidateAuthority(journal: RepoGroupOperationJournal): Promise<{ status: 'authorized' | 'unauthorized' }>;
+  revalidateAuthority(journal: RepoGroupOperationJournal): Promise<{ status: 'authorized' | 'denied' | 'unauthorized' | 'unavailable' }>;
   readReceipt(operationKey: string): Promise<
     | { status: 'found'; receipt: import('../services/group-workspace-store.js').GroupOperationReceipt }
     | { status: 'missing' | 'store_unavailable' }
@@ -271,7 +272,7 @@ export interface GroupWorkspaceUnbindDependencies {
   readCurrentRevision(chatId: string): Promise<{ status: 'available'; revision: number } | { status: 'store_unavailable' }>;
   mutate(
     input: GroupWorkspaceUnbindMutation,
-    revalidateUnderLock: () => Promise<{ status: 'authorized' | 'unauthorized' }>,
+    revalidateUnderLock: () => Promise<{ status: 'authorized' | 'denied' | 'unauthorized' | 'unavailable' }>,
   ): Promise<GroupWorkspaceMutationResult>;
   executorLeaseStore?: OperationExecutorLeaseStore;
   executorOwner?: string;
@@ -359,7 +360,9 @@ export async function executeGroupWorkspaceUnbind(
   let receipt = receiptLookup.status === 'found' ? receiptLookup.receipt : undefined;
   if (!receipt) {
     if (journal.phase !== 'session_committed') return { status: 'unknown' };
-    if ((await dependencies.revalidateAuthority(journal)).status !== 'authorized') {
+    const authority = await dependencies.revalidateAuthority(journal);
+    if (authority.status === 'unavailable') return { status: 'store_unavailable' };
+    if (authority.status === 'denied' || authority.status === 'unauthorized') {
       const denied = await dependencies.journalStore.transition(operationKey, 'unauthorized', {
         updatedAt: dependencies.now(),
       }, hasFence);
@@ -439,6 +442,10 @@ export class GroupWorkspaceOperationCoordinator {
     const canonicalRequest = { ...request, operationKey: canonicalOperationKey };
     const existing = await this.dependencies.journalStore.getByIntent(request.sourceEventId, request.kind);
     if (existing.status === 'store_unavailable') return { status: 'store_unavailable' };
+    if (existing.status === 'found' && existing.journal.phase === 'convergence_quarantined') {
+      return { status: 'convergence_quarantined', journal: existing.journal,
+        reason: existing.journal.convergenceFailure! };
+    }
     if (existing.status === 'found' && isQuarantinedSetJournal(existing.journal)) {
       return { status: 'protocol_conflict', journal: existing.journal };
     }
@@ -536,9 +543,14 @@ export class GroupWorkspaceOperationCoordinator {
     }
     if (journal.phase === 'conflict') return { status: 'conflict', journal };
     if (journal.phase === 'store_unavailable') return { status: 'store_unavailable', journal };
+    if (journal.phase === 'convergence_quarantined') {
+      return { status: 'convergence_quarantined', journal, reason: journal.convergenceFailure! };
+    }
 
     if (journal.phase === 'prepared') {
-      if (!(await this.hasAuthority(journal))) return this.markUnauthorized(journal, lease);
+      const initialAuthority = await this.authority(journal);
+      if (initialAuthority === 'unavailable') return { status: 'store_unavailable', journal };
+      if (initialAuthority === 'denied') return this.markUnauthorized(journal, lease);
       if (lease && this.dependencies.renewExecutor) {
         lease = await this.dependencies.renewExecutor(journal.operationKey, lease);
         if (!lease) return { status: 'unknown', journal };
@@ -553,7 +565,9 @@ export class GroupWorkspaceOperationCoordinator {
       const expectedAfter = journal.expectedSessionGeneration + 1;
       if (session.generation === journal.expectedSessionGeneration) {
         if (session.workingDir === journal.targetWorkingDir) return this.markUnknown(journal, lease);
-        if (!(await this.hasAuthority(journal))) return this.markUnauthorized(journal, lease);
+        const switchAuthority = await this.authority(journal);
+        if (switchAuthority === 'unavailable') return { status: 'store_unavailable', journal };
+        if (switchAuthority === 'denied') return this.markUnauthorized(journal, lease);
         const switchInput = {
           sessionId: journal.sessionId,
           expectedGeneration: journal.expectedSessionGeneration,
@@ -583,7 +597,9 @@ export class GroupWorkspaceOperationCoordinator {
       journal = advanced.journal;
     }
 
-    if (!(await this.hasAuthority(journal))) return this.markUnauthorized(journal, lease);
+    const commitAuthority = await this.authority(journal);
+    if (commitAuthority === 'unavailable') return { status: 'store_unavailable', journal };
+    if (commitAuthority === 'denied') return this.markUnauthorized(journal, lease);
     if (lease && this.dependencies.renewExecutor) {
       lease = await this.dependencies.renewExecutor(journal.operationKey, lease);
       if (!lease) return { status: 'unknown', journal };
@@ -594,13 +610,13 @@ export class GroupWorkspaceOperationCoordinator {
         journal.operationKey, lease, () => this.dependencies.commitGroup(
           journal,
           lease?.fencingToken,
-          () => this.hasAuthority(journal).then(authorized => ({ status: authorized ? 'authorized' : 'unauthorized' })),
+          () => this.authority(journal).then(status => ({ status })),
         ),
       )
       : { status: 'applied' as const, value: await this.dependencies.commitGroup(
         journal,
         lease?.fencingToken,
-        () => this.hasAuthority(journal).then(authorized => ({ status: authorized ? 'authorized' : 'unauthorized' })),
+        () => this.authority(journal).then(status => ({ status })),
       ) };
     if (fencedCommit.status === 'stale_fence') return { status: 'unknown', journal };
     const groupResult = fencedCommit.value;
@@ -634,7 +650,7 @@ export class GroupWorkspaceOperationCoordinator {
         : { status: 'applied' as const, value: await this.dependencies.convergeSession(convergenceInput) };
       if (sessionConvergence.status === 'stale_fence') return { status: 'observing', journal: completed, receipt: receiptReadback.receipt };
       if (sessionConvergence.value !== undefined && sessionConvergence.value !== 'converged') {
-        return { status: 'unknown', journal: completed };
+        return this.quarantineConvergence(completed, sessionConvergence.value, lease);
       }
       await this.dependencies.afterBoundary?.('receipt_before_response');
       return { status: 'group_committed', journal: completed, groupRevision: groupResult.resultingRevision };
@@ -709,7 +725,7 @@ export class GroupWorkspaceOperationCoordinator {
         if (terminal.status !== 'updated') return { status: 'unknown', journal: completed };
         completed = terminal.journal;
       } else if (convergence !== undefined && convergence !== 'converged') {
-        return { status: 'unknown', journal: completed };
+        return this.quarantineConvergence(completed, convergence, lease);
       }
       return { status: 'group_committed', journal: completed, groupRevision: receipt.resultingRevision };
     }
@@ -739,9 +755,26 @@ export class GroupWorkspaceOperationCoordinator {
       : { status: phase, journal: terminal };
   }
 
-  private async hasAuthority(journal: RepoGroupOperationJournal): Promise<boolean> {
-    return !this.dependencies.revalidateAuthority
-      || (await this.dependencies.revalidateAuthority(journal)).status === 'authorized';
+  private async authority(journal: RepoGroupOperationJournal): Promise<'authorized' | 'denied' | 'unavailable'> {
+    if (!this.dependencies.revalidateAuthority) return 'authorized';
+    const status = (await this.dependencies.revalidateAuthority(journal)).status;
+    return status === 'unauthorized' ? 'denied' : status;
+  }
+
+  private async quarantineConvergence(
+    journal: RepoGroupOperationJournal,
+    reason: 'session_missing' | 'generation_conflict',
+    lease?: OperationExecutorLease,
+  ): Promise<GroupWorkspaceOperationResult> {
+    if (journal.phase === 'convergence_quarantined') {
+      return { status: 'convergence_quarantined', journal, reason: journal.convergenceFailure! };
+    }
+    const advanced = await this.dependencies.journalStore.transition(journal.operationKey, 'convergence_quarantined', {
+      convergenceFailure: reason,
+      updatedAt: this.dependencies.now(),
+    }, lease ? () => this.hasFence(journal.operationKey, lease) : undefined);
+    if (advanced.status !== 'updated') return { status: 'unknown', journal };
+    return { status: 'convergence_quarantined', journal: advanced.journal, reason };
   }
 
   private async hasFence(operationKey: string, lease?: OperationExecutorLease): Promise<boolean> {

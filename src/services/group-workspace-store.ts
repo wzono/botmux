@@ -665,7 +665,7 @@ export class GroupWorkspaceStore {
 
   async mutate(
     input: GroupWorkspaceMutation,
-    revalidateUnderLock?: () => Promise<{ status: 'authorized' | 'unauthorized' }>,
+    revalidateUnderLock?: () => Promise<{ status: 'authorized' | 'denied' | 'unauthorized' | 'unavailable' }>,
   ): Promise<GroupWorkspaceMutationResult> {
     if (!validMutation(input)) return { outcome: 'store_unavailable' };
     const operationKey = groupWorkspaceOperationKey(input.sourceEventId, input.kind);
@@ -698,8 +698,12 @@ export class GroupWorkspaceStore {
           };
         }
 
-        if (revalidateUnderLock && (await revalidateUnderLock()).status !== 'authorized') {
-          return { outcome: 'authorization_revoked' as const };
+        if (revalidateUnderLock) {
+          const authority = await revalidateUnderLock();
+          if (authority.status === 'unavailable') return { outcome: 'store_unavailable' as const };
+          if (authority.status === 'denied' || authority.status === 'unauthorized') {
+            return { outcome: 'authorization_revoked' as const };
+          }
         }
 
         const current = own(registry.records, input.chatId);

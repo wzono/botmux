@@ -22,6 +22,7 @@ export type RepoGroupOperationPhase =
   | 'no_session_complete'
   | 'orphaned'
   | 'migration_blocked_identity_missing'
+  | 'convergence_quarantined'
   | 'unknown';
 
 export type RepoGroupOperationTarget =
@@ -53,6 +54,7 @@ export interface RepoGroupOperationJournal {
   legacyPhase?: Extract<RepoGroupOperationPhase, 'prepared' | 'session_committed' | 'group_committed' | 'unknown'>;
   sessionGenerationAfter?: number;
   groupRevisionAfter?: number;
+  convergenceFailure?: 'session_missing' | 'generation_conflict';
   updatedAt: number;
 }
 
@@ -117,7 +119,7 @@ function isWorkspaceIdentity(value: unknown): value is WorkspaceIdentity {
 }
 
 const PHASES = new Set<RepoGroupOperationPhase>([
-  'prepared', 'session_committed', 'group_committed', 'conflict', 'invalid_dir', 'unauthorized', 'store_unavailable', 'no_session_complete', 'orphaned', 'migration_blocked_identity_missing', 'unknown',
+  'prepared', 'session_committed', 'group_committed', 'conflict', 'invalid_dir', 'unauthorized', 'store_unavailable', 'no_session_complete', 'orphaned', 'migration_blocked_identity_missing', 'convergence_quarantined', 'unknown',
 ]);
 
 function validNonnegativeInteger(value: unknown): value is number {
@@ -167,6 +169,12 @@ function validateJournal(value: unknown, key: string): asserts value is RepoGrou
     || !Number.isFinite(value.updatedAt)
     || (value.sessionGenerationAfter !== undefined && !validNonnegativeInteger(value.sessionGenerationAfter))
     || (value.groupRevisionAfter !== undefined && (!Number.isSafeInteger(value.groupRevisionAfter) || (value.groupRevisionAfter as number) < 1))
+    || (value.convergenceFailure !== undefined && value.convergenceFailure !== 'session_missing'
+      && value.convergenceFailure !== 'generation_conflict')
+    || (value.phase === 'convergence_quarantined'
+      && (value.sessionGenerationAfter === undefined || value.groupRevisionAfter === undefined
+        || value.convergenceFailure === undefined))
+    || (value.phase !== 'convergence_quarantined' && value.convergenceFailure !== undefined)
     || (value.phase === 'prepared' && (value.sessionGenerationAfter !== undefined || value.groupRevisionAfter !== undefined))
     || (value.phase === 'session_committed' && value.sessionGenerationAfter === undefined)
     || (value.phase === 'group_committed' && (value.sessionGenerationAfter === undefined || value.groupRevisionAfter === undefined))
@@ -235,7 +243,7 @@ function mayTransition(from: RepoGroupOperationPhase, to: RepoGroupOperationPhas
     return to === 'group_committed' || to === 'conflict' || to === 'invalid_dir' || to === 'unauthorized'
       || to === 'store_unavailable' || to === 'unknown' || to === 'orphaned';
   }
-  if (from === 'group_committed') return to === 'no_session_complete' || to === 'orphaned';
+  if (from === 'group_committed') return to === 'no_session_complete' || to === 'convergence_quarantined' || to === 'orphaned';
   if (from === 'unknown') return to === 'orphaned';
   return false;
 }
@@ -406,7 +414,7 @@ export class GroupWorkspaceOperationStore {
     operationKey: string,
     phase: RepoGroupOperationPhase,
     patch: Pick<RepoGroupOperationJournal, 'updatedAt'>
-      & Partial<Pick<RepoGroupOperationJournal, 'sessionGenerationAfter' | 'groupRevisionAfter'>>,
+      & Partial<Pick<RepoGroupOperationJournal, 'sessionGenerationAfter' | 'groupRevisionAfter' | 'convergenceFailure'>>,
     assertFence?: () => Promise<boolean>,
   ): Promise<OperationTransitionResult> {
     try {
@@ -480,7 +488,7 @@ export class GroupWorkspaceOperationStore {
         status: 'available' as const,
         journals: Object.values(this.read().operations)
           .filter(item => item.phase === 'prepared' || item.phase === 'session_committed' || item.phase === 'unknown'
-            || item.phase === 'migration_blocked_identity_missing')
+            || item.phase === 'migration_blocked_identity_missing' || item.phase === 'convergence_quarantined')
           .map(item => structuredClone(item)),
       }), { maxWaitMs: this.lockTimeoutMs });
     } catch {

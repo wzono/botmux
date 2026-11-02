@@ -117,9 +117,10 @@ export function createGroupWorkspaceRouteRuntime(options: {
       : { status: 'recognized_denied', reason: 'unauthorized' };
   };
 
+  type Revalidation = { status: 'authorized' | 'denied' | 'unavailable' };
   const revalidateAuthorityConfiguration = async (
     route: Pick<GroupWorkspaceProductionRoute, 'chatId' | 'actor' | 'authorityFingerprint'>,
-  ): Promise<boolean> => {
+  ): Promise<Revalidation> => {
     const registered = options.registeredBots(route.actor.tenantKey);
     const fresh = await loadFreshBotAdminUnionSnapshot({
       registeredBots: registered,
@@ -127,16 +128,25 @@ export function createGroupWorkspaceRouteRuntime(options: {
       now: options.now,
       ttlMs: 1,
     });
-    return !!fresh && fresh.configFingerprint === route.authorityFingerprint
-      && canManageGroupWorkspace({ actor: route.actor, freshSnapshot: fresh });
+    if (!fresh) return { status: 'unavailable' };
+    return fresh.configFingerprint === route.authorityFingerprint
+      && canManageGroupWorkspace({ actor: route.actor, freshSnapshot: fresh })
+      ? { status: 'authorized' }
+      : { status: 'denied' };
   };
 
-  const revalidateAuthority = async (route: Pick<GroupWorkspaceProductionRoute, 'chatId' | 'actor' | 'authorityFingerprint'>): Promise<boolean> => {
-    if (!await revalidateAuthorityConfiguration(route)) return false;
+  const revalidateAuthority = async (
+    route: Pick<GroupWorkspaceProductionRoute, 'chatId' | 'actor' | 'authorityFingerprint'>,
+  ): Promise<Revalidation> => {
+    const configuration = await revalidateAuthorityConfiguration(route);
+    if (configuration.status !== 'authorized') return configuration;
     const workspace = await options.readWorkspace(route.chatId);
-    return workspace.status === 'available' && (!workspace.record?.workspaceManagers?.length
+    if (workspace.status !== 'available') return { status: 'unavailable' };
+    return !workspace.record?.workspaceManagers?.length
       || workspace.record.workspaceManagers.some(manager => manager.tenantKey === route.actor.tenantKey
-        && manager.unionId === route.actor.unionId));
+        && manager.unionId === route.actor.unionId)
+      ? { status: 'authorized' }
+      : { status: 'denied' };
   };
 
   const handleRoute = async (route: GroupWorkspaceProductionRoute): Promise<void> => {

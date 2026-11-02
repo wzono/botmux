@@ -571,6 +571,7 @@ export const messages: Record<string, string> = {
   'cmd.repo.group.conflict': '⚠️ 会话已切换，但群目录版本冲突，群目录未更新。请执行 `/repo show` 查看当前状态后重新操作。',
   'cmd.repo.group.store_unavailable': '⚠️ 会话已切换，但群目录存储不可用，群目录未更新。',
   'cmd.repo.group.unknown': '⚠️ 会话状态已变化，但群目录提交结果未知；为避免覆盖，未自动重试。请执行 `/repo show` 检查。',
+  'cmd.repo.group.convergence_quarantined': '⚠️ 群目录已提交，但会话代次无法安全收敛，操作已隔离且不会重复切换。请执行 `/repo show` 后修复。',
   'cmd.repo.group.protocol_conflict': '⚠️ 同一来源对应了不同请求，协议冲突；本次未执行。',
   'cmd.repo.group.invalid_dir': '⚠️ 目标目录无效、不可访问或目录实体已变化；本次未切换会话，也未写入群目录。',
   'cmd.repo.group.unauthorized': '⚠️ 群目录操作权限已失效；本次未继续切换或写入。',

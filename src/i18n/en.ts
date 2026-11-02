@@ -573,6 +573,7 @@ export const messages: Record<string, string> = {
   'cmd.repo.group.conflict': '⚠️ The session switched, but the group workspace revision conflicted and was not updated. Run `/repo show` and retry.',
   'cmd.repo.group.store_unavailable': '⚠️ The session switched, but group workspace storage is unavailable and was not updated.',
   'cmd.repo.group.unknown': '⚠️ The session changed, but the group workspace result is unknown. It was not retried automatically; run `/repo show` to inspect it.',
+  'cmd.repo.group.convergence_quarantined': '⚠️ The group workspace committed, but the session generation could not converge safely. The operation is quarantined and will not switch again; run `/repo show` and repair it.',
   'cmd.repo.group.protocol_conflict': '⚠️ The same immutable source carried a different request. The conflicting request was rejected.',
   'cmd.repo.group.invalid_dir': '⚠️ The target directory is invalid, inaccessible, or has a different identity. The session and group workspace were not changed.',
   'cmd.repo.group.unauthorized': '⚠️ Group workspace authority was revoked. No further session replacement or group write was performed.',

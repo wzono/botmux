@@ -30,7 +30,7 @@ const request = {
 
 function coordinatorHarness() {
   const dataDir = mkdtempSync(join(tmpdir(), 'botmux-entrypoints-v2-'));
-  let authorized = true;
+  let authority: 'authorized' | 'denied' | 'unavailable' = 'authorized';
   let receipt: GroupCommitReceipt | undefined;
   let switches = 0;
   let commits = 0;
@@ -38,7 +38,7 @@ function coordinatorHarness() {
   const deps: GroupWorkspaceOperationDependencies = {
     journalStore: new GroupWorkspaceOperationStore(dataDir),
     now: () => 10,
-    revalidateAuthority: async () => ({ status: authorized ? 'authorized' : 'unauthorized' }),
+    revalidateAuthority: async () => ({ status: authority }),
     lookupGroupReceipt: async () => receipt ? { status: 'found', receipt } : { status: 'missing' },
     reconcileUnknownGroupReceipt: async () => receipt ? { status: 'found', receipt } : { status: 'missing' },
     readCurrentGroupRevision: async () => ({ status: 'available', revision: 2 }),
@@ -62,8 +62,10 @@ function coordinatorHarness() {
   };
   return {
     coordinator: new GroupWorkspaceOperationCoordinator(deps), afterBoundary,
-    revoke: () => { authorized = false; },
+    revoke: () => { authority = 'denied'; },
+    authorityUnavailable: () => { authority = 'unavailable'; },
     effects: () => ({ switches, commits }),
+    journal: () => deps.journalStore.get(request.operationKey),
     setConvergence: (value: GroupWorkspaceOperationDependencies['convergeSession']) => { deps.convergeSession = value; },
   };
 }
@@ -83,13 +85,31 @@ describe('group workspace Task 7 entrypoints v2', () => {
   });
 
   it.each(['session_missing', 'generation_conflict'] as const)(
-    'does not report success when exact session provenance ends as %s', async convergence => {
+    'durably quarantines a committed receipt when exact session provenance ends as %s', async convergence => {
       const h = coordinatorHarness();
       h.setConvergence(async () => convergence);
-      await expect(h.coordinator.execute(request)).resolves.toMatchObject({ status: 'unknown' });
+      await expect(h.coordinator.execute(request)).resolves.toMatchObject({
+        status: 'convergence_quarantined',
+        reason: convergence,
+        journal: { phase: 'convergence_quarantined', convergenceFailure: convergence },
+      });
+      expect(h.effects()).toEqual({ switches: 1, commits: 1 });
+      await expect(h.coordinator.execute(request)).resolves.toMatchObject({
+        status: 'convergence_quarantined', reason: convergence,
+      });
       expect(h.effects()).toEqual({ switches: 1, commits: 1 });
     },
   );
+
+  it('keeps transient authority unavailability recoverable instead of persisting unauthorized', async () => {
+    const h = coordinatorHarness();
+    h.afterBoundary.mockImplementation(async boundary => {
+      if (boundary === 'prepared_before_switch') h.authorityUnavailable();
+    });
+    await expect(h.coordinator.execute(request)).resolves.toMatchObject({ status: 'store_unavailable' });
+    expect(h.effects()).toEqual({ switches: 0, commits: 0 });
+    expect(await h.journal()).toMatchObject({ status: 'found', journal: { phase: 'prepared' } });
+  });
 
   it.each(['invalid_dir', 'unauthorized'] as const)('renders a localized non-success response for %s', async status => {
     const replies: string[] = [];
@@ -129,10 +149,15 @@ describe('group workspace Task 7 entrypoints v2', () => {
       quarantine: { kind: 'known_group_identity_unprovable', expectedRevision: 7,
         expectedIdentity: { path: '/repo/x', dev: '1', ino: '2' }, detail: 'inode changed' },
       migration: { status: 'blocked', detail: 'migration_blocked_identity_missing' },
+      operation: { status: 'convergence_quarantined', detail: 'generation_conflict' },
+      resolved: { workingDir: '/repo/fallback', source: 'current-policy' },
     }, 'en');
     expect(output).toContain('identity_changed');
     expect(output).toContain('known_group_identity_unprovable');
     expect(output).toContain('revision 7');
     expect(output).toContain('migration_blocked_identity_missing');
+    expect(output).toContain('convergence_quarantined');
+    expect(output).toContain('generation_conflict');
+    expect(output).toContain('resolved: /repo/fallback');
   });
 });
