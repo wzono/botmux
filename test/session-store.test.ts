@@ -187,6 +187,17 @@ beforeEach(() => {
   init('test-app');
 });
 
+it('rejects the real session writer while a migration epoch is active', () => {
+  const session = createSession('chat-fence', 'root-fence', 'fenced');
+  writeFileSync(join(tempDir, 'workspace-migration-manifest.json'), JSON.stringify({
+    manifestVersion: 1, batchId: 'batch', epoch: 1, sourceVersion: 1, targetVersion: 2,
+    phase: 'prepared', writer: { ownerId: 'other-process', leaseExpiresAt: Date.now() + 10_000, fencingToken: 1 },
+    stores: {}, createdAt: Date.now(), updatedAt: Date.now(),
+  }));
+  session.title = 'stale write';
+  expect(() => updateSession(session)).toThrow('workspace migration is active');
+});
+
 afterEach(() => {
   for (const dir of testWorktreeDirs) {
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }

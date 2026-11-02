@@ -27,7 +27,7 @@ describe('workspace migration supervisor fence', () => {
   it('acquires exact-generation quiescence proof, blocks restart, then releases', async () => {
     const dataDir = root(); capable(dataDir);
     const fence = new WorkspaceMigrationSupervisorFence(dataDir, 99);
-    const acquiring = fence.acquire(4, [target], { timeoutMs: 1000, signal: () => {
+    const acquiring = fence.acquire(4, () => [target], { timeoutMs: 1000, alive: () => true, signal: () => {
       const command = readWorkspaceFenceCommand(dataDir, target.larkAppId)!;
       publishWorkspaceFenceAck(dataDir, target.larkAppId, {
         ...command, pid: target.pid, processStart: target.processStart,
@@ -37,14 +37,18 @@ describe('workspace migration supervisor fence', () => {
     const acquired = await acquiring;
     expect(readWorkspaceRestartBlock(dataDir)).toMatchObject({ phase: 'quiesced', epoch: 4, targets: [target] });
     expect(workspaceRestartBlocked(dataDir)).toBe(true);
-    await fence.release(acquired.proofToken);
+    await fence.release(acquired.proofToken, { signal: () => {
+      const command = readWorkspaceFenceCommand(dataDir, target.larkAppId)!;
+      publishWorkspaceFenceAck(dataDir, target.larkAppId, { ...command, pid: target.pid,
+        processStart: target.processStart, sqlite: { open: true, writers: 0, inflight: 0, checkpointed: false }, at: Date.now() });
+    }, alive: () => true });
     expect(workspaceRestartBlocked(dataDir)).toBe(false);
     expect(readWorkspaceFenceCommand(dataDir, target.larkAppId)).toMatchObject({ action: 'release', epoch: 4 });
   });
 
   it('fails closed for legacy, stale generation, stale ACK and timeout while preserving rollback block', async () => {
     const legacyDir = root();
-    await expect(new WorkspaceMigrationSupervisorFence(legacyDir).acquire(1, [target], { timeoutMs: 20 }))
+    await expect(new WorkspaceMigrationSupervisorFence(legacyDir).acquire(1, () => [target], { timeoutMs: 20, alive: () => true }))
       .rejects.toThrow('capability/generation unavailable');
 
     const staleDir = root(); capable(staleDir);
@@ -52,11 +56,11 @@ describe('workspace migration supervisor fence', () => {
       ...target, generation: 6, protocol: WORKSPACE_FENCE_PROTOCOL, schemaVersion: 1,
       sqlite: { open: true, writers: 0, inflight: 0, checkpointed: false }, at: Date.now(),
     });
-    await expect(new WorkspaceMigrationSupervisorFence(staleDir).acquire(1, [target], { timeoutMs: 20 }))
+    await expect(new WorkspaceMigrationSupervisorFence(staleDir).acquire(1, () => [target], { timeoutMs: 20, alive: () => true }))
       .rejects.toThrow('capability/generation unavailable');
 
     const timeoutDir = root(); capable(timeoutDir);
-    await expect(new WorkspaceMigrationSupervisorFence(timeoutDir).acquire(2, [target], { timeoutMs: 40, signal: () => {
+    await expect(new WorkspaceMigrationSupervisorFence(timeoutDir).acquire(2, () => [target], { timeoutMs: 40, alive: () => true, signal: () => {
       const command = readWorkspaceFenceCommand(timeoutDir, target.larkAppId)!;
       publishWorkspaceFenceAck(timeoutDir, target.larkAppId, {
         ...command, generation: 6, pid: target.pid, processStart: target.processStart,
@@ -70,13 +74,17 @@ describe('workspace migration supervisor fence', () => {
   it('rejects release without the durable supervisor proof token', async () => {
     const dataDir = root(); capable(dataDir);
     const fence = new WorkspaceMigrationSupervisorFence(dataDir, 99);
-    const acquired = await fence.acquire(8, [target], { signal: () => {
+    const acquired = await fence.acquire(8, () => [target], { alive: () => true, signal: () => {
       const command = readWorkspaceFenceCommand(dataDir, target.larkAppId)!;
       publishWorkspaceFenceAck(dataDir, target.larkAppId, { ...command, pid: target.pid,
         processStart: target.processStart, sqlite: { open: false, writers: 0, inflight: 0, checkpointed: true }, at: Date.now() });
     } });
     await expect(fence.release('wrong')).rejects.toThrow('invalid supervisor proof token');
     expect(JSON.parse(readFileSync(join(dataDir, 'workspace-fence', 'workspace-restart-block.json'), 'utf8')).phase).toBe('quiesced');
-    await fence.release(acquired.proofToken);
+    await fence.release(acquired.proofToken, { signal: () => {
+      const command = readWorkspaceFenceCommand(dataDir, target.larkAppId)!;
+      publishWorkspaceFenceAck(dataDir, target.larkAppId, { ...command, pid: target.pid,
+        processStart: target.processStart, sqlite: { open: true, writers: 0, inflight: 0, checkpointed: false }, at: Date.now() });
+    }, alive: () => true });
   });
 });

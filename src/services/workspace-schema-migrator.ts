@@ -14,6 +14,7 @@ import { basename, dirname, join, relative } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { fsyncDirectorySyncPortable, fsyncFilesAndDirectorySync, fsyncRegularFileSync } from '../utils/fs-durability.js';
 import { withFileLock } from '../utils/file-lock.js';
+import { workspaceRestartBlocked } from '../core/workspace-migration-supervisor.js';
 import { openDatabaseSyncOrThrow } from './sqlite-compat.js';
 
 export const WORKSPACE_MIGRATION_MANIFEST_FILE = 'workspace-migration-manifest.json';
@@ -299,19 +300,30 @@ function migrateGroupJson(path: string): void {
     }
   }
   for (const receipt of Object.values(value.receipts)) {
-    if (!isObject(receipt) || receipt.kind !== 'set') continue;
+    if (!isObject(receipt) || receipt.kind !== 'set' || receipt.outcome !== 'committed') continue;
     const target = receipt.canonicalTargetWorkingDir;
-    let identity = typeof target === 'string' ? pathIdentity(target) : undefined;
-    if (!identity && receipt.outcome === 'committed' && typeof receipt.chatId === 'string') {
+    // Preserve an already-durable historical identity even when that old path no
+    // longer exists after a later valid rebind. Never replace it with a live probe.
+    if (isObject(receipt.workspaceIdentity)
+      && receipt.workspaceIdentity.path === target
+      && typeof receipt.workspaceIdentity.dev === 'string'
+      && typeof receipt.workspaceIdentity.ino === 'string') continue;
+    let identity: { path: string; dev: string; ino: string } | undefined;
+    if (typeof receipt.chatId === 'string') {
       const current = value.records[receipt.chatId];
       if (isObject(current) && isObject(current.directory) && current.directory.kind === 'bound'
         && current.directory.workingDir === target && current.revision === receipt.resultingRevision
         && isObject(current.workspaceIdentity)) identity = current.workspaceIdentity as { path: string; dev: string; ino: string };
     }
-    if (receipt.outcome === 'committed') {
-      if (!identity) throw new WorkspaceMigrationFenceError('legacy terminal receipt identity is unprovable');
-      receipt.workspaceIdentity = identity;
+    // Only a receipt for the CURRENT published binding may derive proof from the
+    // live path. Historical legacy receipts remain explicit opaque history; they
+    // cannot abort migration of a newer, fully proven current record.
+    if (!identity && typeof target === 'string') {
+      const current = typeof receipt.chatId === 'string' ? value.records[receipt.chatId] : undefined;
+      if (isObject(current) && current.revision === receipt.resultingRevision) identity = pathIdentity(target);
     }
+    if (identity) receipt.workspaceIdentity = identity;
+    else receipt.historicalIdentity = 'legacy_unprovable';
   }
   value.schemaVersion = TARGET_SCHEMA_VERSION;
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
@@ -489,15 +501,18 @@ export class WorkspaceSchemaMigrator {
       const suffix = createHash('sha256').update(relative(this.dataDir, store.path)).digest('hex').slice(0, 12);
       const backupPath = join(root, `${suffix}-${basename(store.path)}.backup`);
       const stagedPath = join(root, `${suffix}-${basename(store.path)}.staged`);
-      const sourceChecksum = checksum(store.path);
       if (store.kind === 'session_sqlite') {
         const db = openDatabaseSyncOrThrow(store.path);
         try {
           const checkpoint = db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as { busy?: number | bigint } | undefined;
           if (Number(checkpoint?.busy ?? 0) !== 0) throw new WorkspaceMigrationFenceError('session WAL is busy');
         } finally { db.close(); }
-        materializeStandaloneSqlite(store.path, backupPath);
-      } else durableCopySync(store.path, backupPath);
+      }
+      // Checksum only after WAL checkpoint: checkpoint mutates the main SQLite
+      // file, so sampling first makes a healthy database look concurrently changed.
+      const sourceChecksum = checksum(store.path);
+      if (store.kind === 'session_sqlite') materializeStandaloneSqlite(store.path, backupPath);
+      else durableCopySync(store.path, backupPath);
       if (checksum(store.path) !== sourceChecksum) {
         throw new WorkspaceMigrationFenceError(`workspace store changed during snapshot: ${key}`);
       }
@@ -646,6 +661,9 @@ export class WorkspaceSchemaMigrator {
     mkdirSync(this.dataDir, { recursive: true });
     return withFileLock(manifestPath(this.dataDir), async () => {
       let manifest = this.prepare();
+      if (this.options.supervisorProofToken && !workspaceRestartBlocked(this.dataDir)) {
+        throw new WorkspaceMigrationFenceError('supervisor restart block was lost');
+      }
       if (manifest.targetVersion > TARGET_SCHEMA_VERSION) throw new WorkspaceMigrationFenceError('future workspace migration version');
       if (manifest.phase === 'complete') {
         if (!workspaceMigrationIngressReady(this.dataDir)) throw new WorkspaceMigrationFenceError('completed workspace epoch failed verification');

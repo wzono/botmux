@@ -10,7 +10,6 @@ import {
 } from './services/group-workspace-store.js';
 import { GroupWorkspaceOperationStore } from './services/group-workspace-operation-store.js';
 import {
-  WorkspaceSchemaMigrator,
   readWorkspaceMigrationManifest,
   workspaceMigrationIngressReady,
 } from './services/workspace-schema-migrator.js';
@@ -31438,14 +31437,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // The host-wide schema epoch is resolved before any optional subsystem,
   // session restore, durable queue driver, IPC release, or IM ingress starts.
   const existingWorkspaceManifest = readWorkspaceMigrationManifest(config.session.dataDir);
-  if (existingWorkspaceManifest && existingWorkspaceManifest.phase !== 'complete') {
-    throw new Error('workspace migration requires the live supervisor quiescence coordinator');
-  }
-  const workspaceMigration = await new WorkspaceSchemaMigrator(config.session.dataDir, {
-    ownerId: `daemon:${process.pid}:${getDaemonBootId()}`,
-  }).migrateOrRecover();
-  if (workspaceMigration.status !== 'complete' || !workspaceMigrationIngressReady(config.session.dataDir)) {
-    throw new Error('workspace migration epoch is not ingress-ready');
+  if (!existingWorkspaceManifest || existingWorkspaceManifest.phase !== 'complete'
+    || !workspaceMigrationIngressReady(config.session.dataDir)) {
+    throw new Error('workspace migration requires a completed supervisor-proven epoch');
   }
   // 会话存储 SQLite 能力硬门：package.json engines 只要求 node>=22（npm 对
   // 不匹配只告警；编译版走 bun:sqlite）。这里经 sqlite-compat 探测，失败

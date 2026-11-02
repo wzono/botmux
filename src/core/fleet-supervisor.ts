@@ -421,31 +421,48 @@ export class FleetSupervisor {
   /** Host migration entrypoint. The supervisor owns the restart-block lease,
    * addresses the exact active daemon generations, and releases only after the
    * coordinator returns a completed durable epoch. */
-  async migrateWorkspaceSchema(options: { timeoutMs?: number } = {}): Promise<{ epoch: number }> {
+  async migrateWorkspaceSchema(options: { timeoutMs?: number } = {}): Promise<
+    { status: 'complete'; epoch: number } | { status: 'owned_elsewhere'; supervisorPid: number }
+  > {
+    const owner = this.claimFleetOwnership(this.opts.processIdentityRuntime ?? fleetProcessIdentityRuntime);
+    if (owner !== undefined) return { status: 'owned_elsewhere', supervisorPid: owner };
     const dataDir = this.opts.daemonEnv.SESSION_DATA_DIR ?? this.opts.cwd;
-    const state = readFleetState(this.opts.statePath);
-    const active: WorkspaceRestartBlockLease['targets'] = (state?.procs ?? [])
-      .filter(proc => proc.status === 'online' && proc.pid > 1 && proc.appId && proc.processStart)
-      .map(proc => ({ larkAppId: proc.appId, pid: proc.pid, processStart: proc.processStart!, generation: proc.generation }));
     const currentEpoch = (() => {
       try { return JSON.parse(readFileSync(join(dataDir, 'workspace-migration-manifest.json'), 'utf8')).epoch as number; }
       catch { return 0; }
     })();
+    const enumerateActive = (): WorkspaceRestartBlockLease['targets'] => {
+      const online = (readFleetState(this.opts.statePath)?.procs ?? [])
+        .filter(proc => proc.status === 'online' && proc.name !== 'botmux-dashboard');
+      if (online.some(proc => proc.pid <= 1 || !proc.appId || !proc.processStart || proc.generation < 1)) {
+        throw new Error('online daemon identity is incomplete');
+      }
+      return online.map(proc => ({ larkAppId: proc.appId, pid: proc.pid,
+        processStart: proc.processStart!, generation: proc.generation }));
+    };
+    const signal = (pid: number) => { try { process.kill(pid, 'SIGUSR2'); } catch { /* timeout fails closed */ } };
     const gate = new WorkspaceMigrationSupervisorFence(dataDir);
-    const proof = await gate.acquire(currentEpoch + 1, active, {
-      timeoutMs: options.timeoutMs,
-      signal: pid => { try { process.kill(pid, 'SIGUSR2'); } catch { /* ACK timeout fails closed */ } },
-    });
-    try {
-      const result = await new WorkspaceSchemaMigrator(dataDir, {
-        ownerId: `supervisor:${process.pid}:${proof.lease.leaseId}`,
-        supervisorProofToken: proof.proofToken,
-      }).migrateOrRecover();
-      if (result.status !== 'complete') throw new Error('workspace migration did not complete');
-      return { epoch: result.epoch };
-    } finally {
-      await gate.release(proof.proofToken);
+    const proof = await gate.acquire(currentEpoch + 1, enumerateActive, { timeoutMs: options.timeoutMs, signal });
+    // Re-read the exact fleet set after every quiescence ACK and before the first
+    // migration publish. The restart block forbids additions; any removal or
+    // identity drift means the proof no longer describes the active fleet.
+    const beforePublish = enumerateActive();
+    if (JSON.stringify(beforePublish) !== JSON.stringify(proof.lease.targets)) {
+      throw new Error('active daemon set changed after quiescence');
     }
+    gate.markMigrating(proof.proofToken);
+    const result = await new WorkspaceSchemaMigrator(dataDir, {
+      ownerId: `supervisor:${process.pid}:${proof.lease.leaseId}`,
+      supervisorProofToken: proof.proofToken,
+    }).migrateOrRecover();
+    if (result.status !== 'complete') throw new Error('workspace migration did not complete');
+    await gate.release(proof.proofToken, { timeoutMs: options.timeoutMs, signal,
+      dead: target => {
+        const identity = (this.opts.processIdentityRuntime ?? fleetProcessIdentityRuntime).readIdentity(target.pid);
+        return identity !== target.processStart;
+      },
+    });
+    return { status: 'complete', epoch: result.epoch };
   }
 
   async drainCommands(commands: readonly FleetCommand[]): Promise<void> {

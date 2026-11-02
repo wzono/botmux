@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { GroupWorkspaceStore } from '../src/services/group-workspace-store.js';
 import { GroupWorkspaceOperationStore } from '../src/services/group-workspace-operation-store.js';
+import { writeBotAdminUnions } from '../src/services/bot-admin-unions-store.js';
 import { assertGroupWorkspaceSessionExecutable, repairKnownGroupWorkspaceSession } from '../src/core/session-cwd.js';
 import type { Session } from '../src/types.js';
 import {
@@ -153,6 +154,23 @@ describe('host-wide workspace schema migration', () => {
     expect(() => assertWorkspaceWriterFence(root)).toThrow('active');
     expect(() => assertWorkspaceWriterFence(root, { epoch: 0, fencingToken: 0 })).toThrow('stale');
     expect(() => assertWorkspaceWriterFence(root, { epoch: 1, fencingToken: 1 })).not.toThrow();
+    if (kind === 'group_json') {
+      await expect(new GroupWorkspaceStore(root).mutate({ kind: 'unbind', chatId: 'chat',
+        sourceEventId: 'group-workspace-text-source-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        expectedRevision: 0, actor: { tenantKey: 'tenant', unionId: 'on_admin' }, authorized: true, now: 1,
+      })).resolves.toMatchObject({ outcome: 'store_unavailable' });
+    } else if (kind === 'operation_json') {
+      const identity = { path: '/repo', dev: '1', ino: '2' };
+      await expect(new GroupWorkspaceOperationStore(root).prepare({ operationKey: 'operation', sourceEventId: 'source',
+        kind: 'set', requestIntentDigest: 'intent', payloadDigest: 'payload', chatId: 'chat', sessionId: 'session',
+        expectedSessionGeneration: 1, expectedGroupRevision: 0, target: { kind: 'workspace', identity },
+        targetWorkingDir: identity.path, targetWorkspaceIdentity: identity,
+        actor: { tenantKey: 'tenant', unionId: 'on_admin' }, phase: 'prepared', updatedAt: 1,
+      })).resolves.toEqual({ status: 'store_unavailable' });
+    } else if (kind === 'admin_snapshot') {
+      expect(() => writeBotAdminUnions(root, 'cli_a', { fingerprint: 'f', admins: ['on_admin'], exact: true, updatedAt: 1 }))
+        .toThrow('workspace migration is active');
+    }
   });
 
   it('exports separate downgrade copies without mutating v2 data, sessions, or manifest', async () => {

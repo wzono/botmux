@@ -27,7 +27,7 @@ import {
   type DatabaseSyncLike,
   type StatementLike,
 } from './sqlite-compat.js';
-import { assertWorkspaceWriterFence } from './workspace-schema-migrator.js';
+import { assertWorkspaceWriterFence, WorkspaceMigrationFenceError } from './workspace-schema-migrator.js';
 import { WORKSPACE_SCHEMA_VERSION, type
   HumanLaneIdentityEvidence,
   HumanLanePrincipal,
@@ -611,6 +611,9 @@ interface OwnSqliteStore {
 }
 type SqliteReadStore = Pick<OwnSqliteStore, 'db'>;
 let ownStore: OwnSqliteStore | undefined;
+let workspaceWriterCount = 0;
+let workspaceInflightCount = 0;
+let workspaceWriteAdmissionBlocked = false;
 
 /** Lock/busy contention is retryable. Swallowing it into loadFailure would let
  *  the daemon start with an empty cache while the durable store is healthy. */
@@ -631,8 +634,11 @@ function runOwnedWriteTransaction<T>(
   operation: () => T,
 ): T {
   assertWorkspaceWriterFence(config.session.dataDir);
+  if (workspaceWriteAdmissionBlocked) throw new WorkspaceMigrationFenceError('session store is quiescing');
+  workspaceInflightCount++;
   if (nonblocking) store.db.exec('PRAGMA busy_timeout = 0;');
   try {
+    workspaceWriterCount++;
     let committed = false;
     store.db.exec('BEGIN IMMEDIATE');
     try {
@@ -651,6 +657,8 @@ function runOwnedWriteTransaction<T>(
     }
     throw error;
   } finally {
+    workspaceWriterCount--;
+    workspaceInflightCount--;
     if (nonblocking) store.db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
   }
 }
@@ -1081,9 +1089,13 @@ export interface WorkspaceSqliteQuiescenceStatus {
  * are synchronous, so reaching this function means no transaction callback is
  * in flight; WAL checkpoint must report no busy writer before close. */
 export function quiesceForWorkspaceMigration(): WorkspaceSqliteQuiescenceStatus {
+  workspaceWriteAdmissionBlocked = true;
+  if (workspaceWriterCount !== 0 || workspaceInflightCount !== 0) {
+    return { open: !!ownStore, writers: workspaceWriterCount, inflight: workspaceInflightCount, checkpointed: false };
+  }
   if (!ownStore) return { open: false, writers: 0, inflight: 0, checkpointed: true };
   const checkpoint = ownStore.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as { busy?: number | bigint } | undefined;
-  if (Number(checkpoint?.busy ?? 0) !== 0) return { open: true, writers: 1, inflight: 1, checkpointed: false };
+  if (Number(checkpoint?.busy ?? 0) !== 0) return { open: true, writers: 0, inflight: 0, checkpointed: false };
   ownStore.db.close();
   ownStore = undefined;
   loaded = false;
@@ -1096,10 +1108,16 @@ export function reopenAfterWorkspaceMigration(): void {
   loaded = false;
   loadFailure = undefined;
   sessions = new Map();
+  workspaceWriteAdmissionBlocked = false;
+  // Force an actual open of the current post-migration SQLite file before the
+  // daemon claims a release ACK. A lazy reopen would acknowledge a file it had
+  // never parsed or attached.
+  if (sqliteBootstrapAllowed) loadForWrite();
 }
 
 export function workspaceSqliteStatus(): WorkspaceSqliteQuiescenceStatus {
-  return { open: !!ownStore, writers: 0, inflight: 0, checkpointed: !ownStore };
+  return { open: !!ownStore, writers: workspaceWriterCount, inflight: workspaceInflightCount,
+    checkpointed: !ownStore && workspaceWriterCount === 0 && workspaceInflightCount === 0 };
 }
 
 export function init(appId: string, opts: {
@@ -2160,6 +2178,25 @@ export function normalizeSessionWorkingDirProvenance<T extends Session>(session:
   } else if (session.groupWorkspaceRevision !== undefined) {
     throw new Error('non-group cwd provenance must not carry a group revision');
   }
+  const repair = session.groupWorkspaceRepairReceipt;
+  if (repair !== undefined) {
+    const prior = repair.priorQuarantine;
+    const validRepair = !session.groupWorkspaceQuarantine
+      && typeof repair.operationId === 'string' && !!repair.operationId.trim()
+      && Number.isSafeInteger(repair.repairedAt) && repair.repairedAt > 0
+      && typeof repair.actor?.tenantKey === 'string' && !!repair.actor.tenantKey
+      && typeof repair.actor?.unionId === 'string' && !!repair.actor.unionId
+      && repair.chatId === session.chatId
+      && Number.isSafeInteger(repair.revision) && repair.revision! >= 1
+      && repair.revision === session.groupWorkspaceRevision
+      && repair.identity?.path === session.workingDir
+      && repair.identity?.path === session.groupWorkspaceIdentity?.path
+      && repair.identity?.dev === session.groupWorkspaceIdentity?.dev
+      && repair.identity?.ino === session.groupWorkspaceIdentity?.ino
+      && prior?.kind === 'known_group_identity_unprovable'
+      && typeof prior.detail === 'string' && !!prior.detail;
+    if (!validRepair) throw new Error('invalid groupWorkspaceRepairReceipt');
+  }
   const follow = session.groupWorkspaceFollow;
   if (follow !== undefined) {
     if (follow.schemaVersion !== WORKSPACE_SCHEMA_VERSION
@@ -2194,6 +2231,9 @@ function parseSessionRow(row: string): Session {
 
 function persistRow(session: Session): void {
   assertWorkspaceWriterFence(config.session.dataDir);
+  if (workspaceWriteAdmissionBlocked) throw new WorkspaceMigrationFenceError('session store is quiescing');
+  workspaceInflightCount++;
+  try {
   normalizeSessionWorkingDirProvenance(session);
   if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
   if (!ownStore) {
@@ -2212,6 +2252,19 @@ function persistRow(session: Session): void {
       // Late whole-row writers may hold a pre-close copy. Retirement cannot
       // be erased by a stale metadata write or by changing workingDir.
       session = { ...session, workspaceRetirement: durable.workspaceRetirement };
+    }
+    // Quarantine repair has one exact-CAS authority writer. A stale Session
+    // object must neither erase its receipt nor resurrect the superseded quarantine.
+    if (durable.groupWorkspaceRepairReceipt) {
+      session = { ...session,
+        groupWorkspaceRepairReceipt: durable.groupWorkspaceRepairReceipt,
+        groupWorkspaceQuarantine: undefined,
+        workspaceSchemaVersion: durable.workspaceSchemaVersion,
+        workingDirSource: durable.workingDirSource,
+        groupWorkspaceRevision: durable.groupWorkspaceRevision,
+        groupWorkspaceIdentity: durable.groupWorkspaceIdentity,
+        groupWorkspaceDirectoryIdentity: durable.groupWorkspaceDirectoryIdentity,
+      };
     }
     // Task continuation has its own compare-and-set writer. Metadata writers
     // holding an old row must neither erase a live task nor resurrect a stop.
@@ -2245,6 +2298,7 @@ function persistRow(session: Session): void {
     ? ownStore.updateExact.run(sessionStatusText(session), json, session.sessionId, existing.row)
     : ownStore.insertNew.run(session.sessionId, sessionStatusText(session), json);
   if (Number(result.changes) !== 1) throw new Error('Session changed concurrently; routing write refused');
+  } finally { workspaceInflightCount--; }
 }
 
 function buildNewSession(
