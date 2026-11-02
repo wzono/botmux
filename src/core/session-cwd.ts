@@ -213,6 +213,34 @@ export function normalizeSessionWorkingDirProvenance<T extends Session>(session:
   return session;
 }
 
+export function assertGroupWorkspaceSessionExecutable(session: Session): void {
+  if (session.groupWorkspaceQuarantine?.kind === 'known_group_identity_unprovable') {
+    throw new Error('known_group_identity_unprovable');
+  }
+}
+
+export function repairKnownGroupWorkspaceSession(input: {
+  session: Session;
+  authorized: boolean;
+  operationId: string;
+  currentRevision: number;
+  currentIdentity: WorkspaceIdentity;
+}): { status: 'repaired'; supersedingEvent: { operationId: string; prior: NonNullable<Session['groupWorkspaceQuarantine']> } }
+  | { status: 'unauthorized' | 'not_quarantined' | 'proof_mismatch' } {
+  const prior = input.session.groupWorkspaceQuarantine;
+  if (!prior) return { status: 'not_quarantined' };
+  if (!input.authorized) return { status: 'unauthorized' };
+  if (input.session.workingDir !== input.currentIdentity.path
+    || input.currentRevision < 0 || !input.operationId.trim()) return { status: 'proof_mismatch' };
+  input.session.workspaceSchemaVersion = WORKSPACE_SCHEMA_VERSION;
+  input.session.workingDirSource = 'group';
+  input.session.groupWorkspaceRevision = input.currentRevision;
+  input.session.groupWorkspaceIdentity = structuredClone(input.currentIdentity);
+  input.session.groupWorkspaceDirectoryIdentity = { dev: input.currentIdentity.dev, ino: input.currentIdentity.ino };
+  delete input.session.groupWorkspaceQuarantine;
+  return { status: 'repaired', supersedingEvent: { operationId: input.operationId, prior: structuredClone(prior) } };
+}
+
 export function setSessionWorkingDirMetadata(session: Session, mutation: SessionWorkingDirMutation): void {
   assertWorkingDirProvenance(mutation);
   session.workingDir = mutation.workingDir;

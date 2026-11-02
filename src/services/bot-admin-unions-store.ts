@@ -16,6 +16,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { assertWorkspaceWriterFence } from './workspace-schema-migrator.js';
 import { isJsonObject, readJsonFileSoft } from '../utils/json-file.js';
 
 export interface BotAdminUnionsSnapshot {
@@ -258,6 +259,7 @@ export async function computeBotAdminUnions(
 }
 
 export function writeBotAdminUnions(dataDir: string, larkAppId: string, snapshot: BotAdminUnionsSnapshot): void {
+  assertWorkspaceWriterFence(dataDir);
   const fp = filePath(dataDir, larkAppId);
   if (!fp) return;
   mkdirSync(dirPath(dataDir), { recursive: true });

@@ -12,6 +12,7 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { fsyncFilesAndDirectorySync } from '../utils/fs-durability.js';
 import { withFileLock } from '../utils/file-lock.js';
 import { WORKSPACE_SCHEMA_VERSION, type WorkspaceIdentity } from '../types.js';
+import { assertWorkspaceWriterFence } from './workspace-schema-migrator.js';
 
 export const GROUP_WORKSPACE_STORE_FILE = 'group-workspaces.json';
 const SCHEMA_VERSION = WORKSPACE_SCHEMA_VERSION;
@@ -490,7 +491,11 @@ export class GroupWorkspaceStore {
   constructor(dataDir: string, options: GroupWorkspaceStoreOptions = {}) {
     this.path = join(dataDir, GROUP_WORKSPACE_STORE_FILE);
     this.lockTimeoutMs = options.lockTimeoutMs;
-    this.writer = options.writer ?? atomicWriteFileSync;
+    const writer = options.writer ?? atomicWriteFileSync;
+    this.writer = ((...args: Parameters<GroupWorkspaceWriter>) => {
+      assertWorkspaceWriterFence(dataDir);
+      return writer(...args);
+    }) as GroupWorkspaceWriter;
     this.durabilityReestablisher = options.durabilityReestablisher
       ?? (filePath => fsyncFilesAndDirectorySync(dirname(filePath), [filePath]));
     this.pathProbe = options.pathProbe ?? probePathUsability;

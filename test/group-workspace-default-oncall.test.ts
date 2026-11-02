@@ -2,6 +2,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { probePathUsability } from '../src/core/path-usability.js';
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
   class FakeClient { constructor(_options: unknown) {} }
@@ -73,9 +74,12 @@ describe('defaultOncall provenance and group workspace precedence', () => {
     });
     expect(source.ok).toBe(true);
     if (!source.ok) throw new Error(source.reason);
+    const identity = probePathUsability(h.groupDir);
+    if (!identity.ok) throw new Error(identity.reason);
     const committed = await groupStore.mutate({
       kind: 'set', chatId: 'oc_group', sourceEventId: source.sourceEventId, originMessageId: 'om_1',
-      requestedWorkingDir: h.groupDir, expectedRevision: 0, actor, authorized: true,
+      requestedWorkingDir: h.groupDir, expectedWorkspaceIdentity: { path: h.groupDir, ...identity.identity },
+      expectedRevision: 0, actor, authorized: true,
       directoryValid: true, now: 1,
     });
     expect(committed.outcome).toBe('committed');

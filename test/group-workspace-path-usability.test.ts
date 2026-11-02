@@ -26,12 +26,13 @@ function source(messageId: string): string {
   return result.sourceEventId;
 }
 
-function setMutation(path: string, messageId = 'om_set') {
+function setMutation(path: string, messageId = 'om_set', expectedWorkspaceIdentity?: { path: string; dev: string; ino: string }) {
   return {
     kind: 'set' as const,
     chatId: CHAT,
     sourceEventId: source(messageId),
     requestedWorkingDir: path,
+    expectedWorkspaceIdentity,
     expectedRevision: 0,
     expectedSessionGeneration: 1,
     actor: ACTOR,
@@ -182,7 +183,7 @@ describe('path usability', () => {
       .mockReturnValueOnce({ ok: false, normalizedPath: target, reason: 'inaccessible' });
     const store = new GroupWorkspaceStore(dataDir, { pathProbe: probe });
 
-    expect(await store.mutate(setMutation(target))).toMatchObject({ outcome: 'committed' });
+    expect(await store.mutate(setMutation(target, 'om_set', { path: target, ...identity }))).toMatchObject({ outcome: 'committed' });
     expect(probe).toHaveBeenCalledTimes(1);
     await expect(store.probeBoundDirectoryForConsumption(CHAT)).resolves.toEqual({
       status: 'unusable',
@@ -200,7 +201,9 @@ describe('path usability', () => {
     mkdirSync(target);
     mkdirSync(replacement);
     const store = new GroupWorkspaceStore(dataDir);
-    expect(await store.mutate(setMutation(target, 'om_replaced'))).toMatchObject({ outcome: 'committed' });
+    const initial = probePathUsability(target);
+    if (!initial.ok) throw new Error(initial.reason);
+    expect(await store.mutate(setMutation(target, 'om_replaced', { path: target, ...initial.identity }))).toMatchObject({ outcome: 'committed' });
 
     rmSync(target, { recursive: true });
     renameSync(replacement, target);
@@ -217,7 +220,7 @@ describe('path usability', () => {
     const store = new GroupWorkspaceStore(dataDir, {
       pathProbe: () => ({ ok: false, normalizedPath: target, reason: 'inaccessible' }),
     });
-    const result = await store.mutate(setMutation(target));
+    const result = await store.mutate(setMutation(target, 'om_set', { path: target, dev: '1', ino: '2' }));
     expect(result).toMatchObject({ outcome: 'invalid_dir' });
     if (!('receipt' in result)) throw new Error('expected terminal receipt');
     expect(result.receipt.resultingRevision).toBeUndefined();

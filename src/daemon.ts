@@ -9,6 +9,7 @@ import {
   groupWorkspaceOperationKey,
 } from './services/group-workspace-store.js';
 import { GroupWorkspaceOperationStore } from './services/group-workspace-operation-store.js';
+import { WorkspaceSchemaMigrator, workspaceMigrationIngressReady } from './services/workspace-schema-migrator.js';
 import { OperationExecutorLeaseStore } from './services/operation-executor-lease-store.js';
 import { probePathUsability, type PathIdentity } from './core/path-usability.js';
 import {
@@ -1259,6 +1260,8 @@ async function restoreSessionsAndScheduleStartupRecovery(opts: {
   recoverGroupWorkspaceOperations?: () => Promise<void>;
 }): Promise<Array<XpiSharedCwdStartupNotice | PrincipalLaneStartupNotice>> {
   const restoredQuarantineNotices = await opts.restoreSessions();
+  // Operation journals own group/session convergence and therefore recover
+  // before follow journals consume the converged session provenance.
   // Reconcile every persisted follow journal while ingress is still fenced. This
   // includes workerless PTY rows and rows restored after the replacement spawn.
   for (const ds of activeSessions.values()) {
@@ -6425,6 +6428,11 @@ async function followGroupWorkspaceBeforeBusinessTurn(
   ds: DaemonSession,
 ): Promise<'continue' | 'stop'> {
   if (ds.scope !== 'chat' || ds.session.workingDirSource !== 'group') return 'continue';
+  if (ds.session.groupWorkspaceQuarantine?.kind === 'known_group_identity_unprovable') {
+    await sessionReply(ds.session.rootMessageId,
+      '群目录身份无法证明，本条消息未投递；请由管理员显式修复群目录绑定。', 'text', ds.larkAppId);
+    return 'stop';
+  }
   const group = await groupWorkspaceStore.read(ds.chatId);
   const followJournal = (ds.session as FollowPersistedSession).groupWorkspaceFollow;
   const resolution = resolveGroupWorkspaceFollowTarget({
@@ -31389,6 +31397,17 @@ async function waitForManagedActivationCommit(index: number, appId: string): Pro
 }
 
 export async function startDaemon(botIndex?: number): Promise<void> {
+  // The host-wide schema epoch is resolved before any optional subsystem,
+  // session restore, durable queue driver, IPC release, or IM ingress starts.
+  const workspaceMigration = await new WorkspaceSchemaMigrator(config.session.dataDir, {
+    ownerId: `daemon:${process.pid}:${getDaemonBootId()}`,
+    legacyFleet: process.env.BOTMUX_WORKSPACE_MIGRATION_FLEET_QUIESCED === '1'
+      ? { quiescedAt: Date.now(), restartBlocked: true }
+      : undefined,
+  }).migrateOrRecover();
+  if (workspaceMigration.status !== 'complete' || !workspaceMigrationIngressReady(config.session.dataDir)) {
+    throw new Error('workspace migration epoch is not ingress-ready');
+  }
   // 会话存储 SQLite 能力硬门：package.json engines 只要求 node>=22（npm 对
   // 不匹配只告警；编译版走 bun:sqlite）。这里经 sqlite-compat 探测，失败
   // 信息可行动，避免拖到首次落盘才炸。

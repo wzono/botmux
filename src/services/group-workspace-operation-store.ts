@@ -6,6 +6,7 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLock } from '../utils/file-lock.js';
 import { WORKSPACE_SCHEMA_VERSION, type WorkspaceIdentity } from '../types.js';
 import { probePathUsability, type PathUsabilityResult } from '../core/path-usability.js';
+import { assertWorkspaceWriterFence } from './workspace-schema-migrator.js';
 
 export const GROUP_WORKSPACE_OPERATION_STORE_FILE = 'group-workspace-operations.json';
 const SCHEMA_VERSION = WORKSPACE_SCHEMA_VERSION;
@@ -248,7 +249,11 @@ export class GroupWorkspaceOperationStore {
   constructor(dataDir: string, options: GroupWorkspaceOperationStoreOptions = {}) {
     this.path = join(dataDir, GROUP_WORKSPACE_OPERATION_STORE_FILE);
     this.lockTimeoutMs = options.lockTimeoutMs;
-    this.writer = options.writer ?? atomicWriteFileSync;
+    const writer = options.writer ?? atomicWriteFileSync;
+    this.writer = ((...args: Parameters<typeof atomicWriteFileSync>) => {
+      assertWorkspaceWriterFence(dataDir);
+      return writer(...args);
+    }) as typeof atomicWriteFileSync;
     this.pathProbe = options.pathProbe ?? probePathUsability;
   }
 

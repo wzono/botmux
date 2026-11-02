@@ -806,6 +806,15 @@ export interface Session {
   /** Directory identity captured from the authoritative group binding. */
   groupWorkspaceDirectoryIdentity?: { dev: string; ino: string };
   groupWorkspaceIdentity?: WorkspaceIdentity;
+  /** A known group-derived cwd that migration could not prove. This is durable
+   * and blocks business/follow fallback until an authorized repair supersedes it. */
+  groupWorkspaceQuarantine?: {
+    kind: 'known_group_identity_unprovable';
+    expectedIdentity?: WorkspaceIdentity;
+    expectedRevision?: number;
+    detail: string;
+    supersededByOperationId?: string;
+  };
   /** Durable replacement journal for a group-following local worker. */
   groupWorkspaceFollow?: {
     schemaVersion?: typeof WORKSPACE_SCHEMA_VERSION;

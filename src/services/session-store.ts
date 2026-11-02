@@ -27,6 +27,7 @@ import {
   type DatabaseSyncLike,
   type StatementLike,
 } from './sqlite-compat.js';
+import { assertWorkspaceWriterFence } from './workspace-schema-migrator.js';
 import { WORKSPACE_SCHEMA_VERSION, type
   HumanLaneIdentityEvidence,
   HumanLanePrincipal,
@@ -2097,9 +2098,9 @@ export function normalizeSessionWorkingDirProvenance<T extends Session>(session:
     if (!Number.isSafeInteger(session.groupWorkspaceRevision) || session.groupWorkspaceRevision! < 0) {
       throw new Error('group cwd provenance requires a safe non-negative revision');
     }
-    if (session.workspaceSchemaVersion !== WORKSPACE_SCHEMA_VERSION
+    if (!session.groupWorkspaceQuarantine && (session.workspaceSchemaVersion !== WORKSPACE_SCHEMA_VERSION
       || !session.groupWorkspaceIdentity
-      || session.groupWorkspaceIdentity.path !== session.workingDir) {
+      || session.groupWorkspaceIdentity.path !== session.workingDir)) {
       throw new Error('group cwd provenance requires workspace identity v2');
     }
   } else if (session.groupWorkspaceRevision !== undefined) {
@@ -2138,6 +2139,7 @@ function parseSessionRow(row: string): Session {
 }
 
 function persistRow(session: Session): void {
+  assertWorkspaceWriterFence(config.session.dataDir);
   normalizeSessionWorkingDirProvenance(session);
   if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
   if (!ownStore) {
