@@ -1225,7 +1225,10 @@ export interface WorkerPoolCallbacks {
 }
 
 let callbacks: WorkerPoolCallbacks | undefined;
-let embeddedWorkspaceDispatcher: WorkerPoolCallbacks['dispatchAdmittedBusinessTurn'] | undefined;
+const embeddedWorkspaceDispatchers: Array<{
+  token: symbol;
+  dispatcher: NonNullable<WorkerPoolCallbacks['dispatchAdmittedBusinessTurn']>;
+}> = [];
 
 /**
  * Initialise worker-pool callbacks. Must be called once before forkWorker().
@@ -1256,13 +1259,12 @@ export function initWorkerPool(cb: WorkerPoolCallbacks): void {
 export function setWorkspaceAdmittedBusinessTurnDispatcher(
   dispatcher: WorkerPoolCallbacks['dispatchAdmittedBusinessTurn'] | undefined,
 ): () => void {
-  const previousEmbedded = embeddedWorkspaceDispatcher;
-  const previousCallback = callbacks?.dispatchAdmittedBusinessTurn;
-  embeddedWorkspaceDispatcher = dispatcher;
-  if (callbacks) callbacks.dispatchAdmittedBusinessTurn = dispatcher;
+  if (!dispatcher) return () => undefined;
+  const entry = { token: Symbol('workspace-admission-dispatcher'), dispatcher };
+  embeddedWorkspaceDispatchers.push(entry);
   return () => {
-    embeddedWorkspaceDispatcher = previousEmbedded;
-    if (callbacks) callbacks.dispatchAdmittedBusinessTurn = previousCallback;
+    const index = embeddedWorkspaceDispatchers.findIndex(candidate => candidate.token === entry.token);
+    if (index >= 0) embeddedWorkspaceDispatchers.splice(index, 1);
   };
 }
 
@@ -13109,7 +13111,8 @@ export async function dispatchWorkspaceAdmittedBusinessTurn(input: {
   trustedCaller?: TrustedCaller;
   markAttempting(): Promise<boolean>;
 }): Promise<boolean> {
-  const dispatcher = callbacks?.dispatchAdmittedBusinessTurn ?? embeddedWorkspaceDispatcher;
+  const dispatcher = callbacks?.dispatchAdmittedBusinessTurn
+    ?? embeddedWorkspaceDispatchers.at(-1)?.dispatcher;
   if (!dispatcher) throw new Error('recovery_workspace_admission_unavailable');
   return dispatcher({
     ds: input.ds,

@@ -6111,6 +6111,22 @@ describe('POST /api/sessions/:sessionId/resume', () => {
   });
 });
 
+describe('embedded workspace admission ownership', () => {
+  it('keeps the newer dispatcher when overlapping servers close out of order', async () => {
+    const calls: string[] = [];
+    const first = await startIpcServer({ port: 0, host: '127.0.0.1',
+      dispatchAdmittedBusinessTurn: async () => { calls.push('first'); return true; } });
+    const second = await startIpcServer({ port: 0, host: '127.0.0.1',
+      dispatchAdmittedBusinessTurn: async () => { calls.push('second'); return true; } });
+    await first.close();
+    const ds = { session: { sessionId: 's' } } as any;
+    await workerPool.dispatchWorkspaceAdmittedBusinessTurn({ ds, turnId: 't', payload: 'x', resume: false,
+      markAttempting: async () => true });
+    expect(calls).toEqual(['second']);
+    await second.close();
+  });
+});
+
 describe('GET /api/events', () => {
   it('replays current active sessions as session.spawned on connect (snapshot-on-connect)', async () => {
     // Guards the descriptor→restore race: a dashboard that subscribes AFTER an
