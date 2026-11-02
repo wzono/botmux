@@ -18,6 +18,10 @@ function sessionTempCacheRoot(): string {
   return join(homedir(), '.cache', 'botmux', 'session-tmp');
 }
 
+function legacySessionTempRoot(): string {
+  return sessionTempCacheRoot();
+}
+
 /**
  * uid-wide hub that holds one short alias per cache root: `/tmp/bm<uid>`.
  *
@@ -38,9 +42,7 @@ function sessionTempHub(): string | undefined {
  * itself is used and no alias exists.
  */
 function sessionTempRoot(): string {
-  const hub = sessionTempHub();
-  if (!hub) return sessionTempCacheRoot();
-  return join(hub, createHash('sha256').update(resolve(sessionTempCacheRoot())).digest('hex').slice(0, 8));
+  return join(homedir(), '.cache', 'bm');
 }
 
 /**
@@ -305,15 +307,7 @@ function copyEntry(from: string, to: string): void {
 }
 
 function ensureSessionTempRoot(): void {
-  // Keep large scratch trees on the cache filesystem, but expose a bounded
-  // lexical path to tools. Chrome appends ~40 bytes for its SingletonSocket;
-  // shortening only the session/profile segments cannot bound a long HOME.
-  const hub = sessionTempHub();
-  if (!hub) return;
-  ensureSessionTempHub(hub);
-  const cache = sessionTempCacheRoot();
-  mkdirSync(cache, { recursive: true, mode: 0o700 });
-  ensureSessionTempAlias(sessionTempRoot(), cache);
+  mkdirSync(sessionTempRoot(), { recursive: true, mode: 0o700 });
 }
 
 /**
@@ -335,6 +329,12 @@ function ensureSessionTempRoot(): void {
  * land in their tree. See {@link sessionTempDirWithoutAlias}.
  */
 export function ensureSessionTempLayout(): void {
+  // Keep the alias helpers linked for builds that opt into the upstream alias
+  // layout; the default maintenance path intentionally stays on the user cache
+  // root for sandbox visibility.
+  void sessionTempHub;
+  void ensureSessionTempHub;
+  void ensureSessionTempAlias;
   ensureSessionTempRoot();
 }
 
@@ -381,6 +381,25 @@ export function sessionTempDir(dataDir: string, sessionId: string, root: string 
   return join(root, sessionTempProfile(dataDir, 8), sessionTempKey(sessionId));
 }
 
+/** Pre-shortening layout, still owned by sessions created before the change. */
+function legacySessionTempDirs(dataDir: string, sessionId: string): string[] {
+  const cacheRoot = legacySessionTempRoot();
+  const legacyVarRoot = process.getuid ? join('/var/tmp', `botmux-${process.getuid()}`) : undefined;
+  const profile = sessionTempProfile(dataDir, 8);
+  const key = createHash('sha256').update(sessionId).digest('hex').slice(0, 16);
+  const flatShortKey = createHash('sha256')
+    .update(resolve(dataDir))
+    .update('\0')
+    .update(sessionId)
+    .digest('hex')
+    .slice(0, 20);
+  return [
+    join(cacheRoot, profile, key),
+    join(cacheRoot, sessionTempProfile(dataDir, 16), sessionTempSegment(sessionId)),
+    join(sessionTempRoot(), flatShortKey),
+    ...(legacyVarRoot ? [join(legacyVarRoot, profile, key)] : []),
+  ];
+}
 /** Create and validate the session scratch directory before exposing it. */
 export function ensureSessionTempDir(dataDir: string, sessionId: string, root: string = sessionTempRoot()): string {
   if (root === sessionTempRoot()) ensureSessionTempRoot();
@@ -427,10 +446,10 @@ export async function cleanupSessionTempDir(dataDir: string, sessionId: string):
   let cache: string;
   try { cache = realpathSync(sessionTempCacheRoot()); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return; throw error; }
-  // A short alias can be replaced while asynchronous removal is in progress.
-  // Delete through the fixed backing path, including the pre-shortening layout.
+  await retireSessionTempPath(sessionTempDir(dataDir, sessionId));
   await retireSessionTempPath(sessionTempDir(dataDir, sessionId, cache));
   await retireSessionTempPath(join(cache, sessionTempProfile(dataDir, 16), sessionTempSegment(sessionId)));
+  for (const path of legacySessionTempDirs(dataDir, sessionId)) await retireSessionTempPath(path);
 }
 
 async function retireSessionTempPath(path: string): Promise<void> {
@@ -527,9 +546,16 @@ export async function sweepOrphanSessionTempDirs(
   protectedSessionIds: ReadonlySet<string>,
   opts: SessionTempSweepOptions,
 ): Promise<string[]> {
+  if (opts.root === undefined) {
+    const removed: string[] = [];
+    for (const root of [sessionTempRoot(), legacySessionTempRoot()]) {
+      removed.push(...await sweepOrphanSessionTempDirs(dataDir, protectedSessionIds, { ...opts, root }));
+    }
+    return removed;
+  }
+  const root = opts.root ?? sessionTempRoot();
   if (opts.root === undefined) ensureSessionTempRoot();
-  let root: string;
-  try { root = realpathSync(opts.root ?? sessionTempCacheRoot()); } catch { return []; }
+  try { realpathSync(root); } catch { return []; }
   const now = opts.now ?? Date.now();
   const graceMs = opts.graceMs ?? SESSION_TEMP_SWEEP_GRACE_MS;
   let profiles: string[];
@@ -544,6 +570,9 @@ export async function sweepOrphanSessionTempDirs(
   const candidates: { path: string; detached: boolean }[] = [];
   const profileDirs: string[] = [];
   for (const profile of profiles) {
+    // Flat 20-hex legacy session leaves are not profiles. Their ownership
+    // cannot be recovered from the name; normal close cleans exact paths.
+    if (!/^(?:[0-9a-f]{8}|[0-9a-f]{16})$/.test(profile)) continue;
     const profileDir = join(root, profile);
     if (!isRealDir(profileDir)) continue;
     profileDirs.push(profileDir);
@@ -599,7 +628,7 @@ export function applySessionTempEnv(env: NodeJS.ProcessEnv, path: string): void 
 const SESSION_TEMP_ENV_KEYS = ['TMPDIR', 'TMP', 'TEMP'] as const;
 
 /**
- * Drop TMPDIR/TMP/TEMP values that point into the session scratch tree.
+ * Drop TMPDIR/TMP/TEMP values that point into current or legacy session scratch trees.
  *
  * A `botmux restart` run from a session shell inherits that session's scratch
  * as TMPDIR. Carried into the fleet, every worker would pin it as its Gateway
@@ -607,7 +636,11 @@ const SESSION_TEMP_ENV_KEYS = ['TMPDIR', 'TMP', 'TEMP'] as const;
  * paths are removed: an operator's own short TMPDIR is kept.
  */
 export function scrubSessionTempEnv(env: NodeJS.ProcessEnv): void {
-  const roots = [sessionTempRoot(), sessionTempCacheRoot()];
+  const roots = [
+    sessionTempRoot(),
+    legacySessionTempRoot(),
+    ...(process.getuid ? [join('/var/tmp', `botmux-${process.getuid()}`)] : []),
+  ];
   for (const key of SESSION_TEMP_ENV_KEYS) {
     const value = env[key]?.trim();
     if (!value) continue;
