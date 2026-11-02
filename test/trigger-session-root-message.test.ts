@@ -124,6 +124,10 @@ vi.mock('../src/core/session-manager.js', () => ({
   ensureSessionWhiteboard: vi.fn(),
   getAvailableBots: (...args: any[]) => mockGetAvailableBots(...args),
   rememberLastCliInput: (...args: any[]) => mockRememberLastCliInput(...args),
+  resolveIngressWorkspace: vi.fn(async (input: any) => ({
+    status: 'resolved', workspace: { path: input.botDefaultWorkingDir ?? '/tmp', dev: '1', ino: '2' },
+    mutation: { workingDir: input.botDefaultWorkingDir ?? '/tmp', source: 'bot-default' },
+  })),
 }));
 
 const mockBotAutoWorktreeEnabled = vi.fn(() => false);

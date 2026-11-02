@@ -11,8 +11,7 @@ import { getBot, effectiveDefaultWorkingDir } from '../bot-registry.js';
 import { getChatMode, getMessageChatId, sendMessage, replyMessage, type ChatMode } from '../im/lark/client.js';
 import { resolveRegularGroupMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import { localeForBot, t } from '../i18n/index.js';
-import { validateWorkingDir } from './working-dir.js';
-import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput } from './session-manager.js';
+import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput, resolveIngressWorkspace } from './session-manager.js';
 import { markSessionActivity } from './session-activity.js';
 import {
   closeSessionForBackgroundCleanup,
@@ -40,8 +39,6 @@ import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.j
 import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
 import { headlessChatId, isHeadlessId, newHeadlessId, saveHeadlessSession, updateHeadlessSession } from '../services/headless-session-store.js';
 import { config } from '../config.js';
-import { GroupWorkspaceStore } from '../services/group-workspace-store.js';
-import { resolveGroupWorkspaceCwd } from './group-workspace-policy.js';
 import { setSessionWorkingDirMetadata, type SessionWorkingDirMutation } from './session-cwd.js';
 
 export interface TriggerSessionDeps {
@@ -236,33 +233,25 @@ export function externalEventOpensOwnTopic(chatMode: ChatMode, regularGroupMode:
   return chatMode === 'topic' || regularGroupMode === 'new-topic';
 }
 
-async function resolveWorkingDir(larkAppId: string, chatId: string): Promise<
+async function resolveTriggerWorkspace(larkAppId: string, chatId: string): Promise<
   { ok: true; mutation: SessionWorkingDirMutation; fromBotDefault: boolean }
   | { ok: false; error: string }
 > {
   const bot = getBot(larkAppId);
   const oncall = oncallStore.getOncallStatus(larkAppId, chatId);
-  const group = await new GroupWorkspaceStore(config.session.dataDir).read(chatId);
-  const workspace = resolveGroupWorkspaceCwd({
-    oncall,
-    groupWorkingDir: group.status === 'available' && group.record?.directory.kind === 'bound'
-      ? group.record.directory.workingDir
-      : undefined,
-    groupWorkspaceRevision: group.status === 'available' ? group.record?.revision : undefined,
+  const botDefaultWorkingDir = effectiveDefaultWorkingDir(bot.config) ?? bot.config.workingDir ?? '~';
+  const resolution = await resolveIngressWorkspace({
+    larkAppId, chatId, chatType: 'group', dataDir: config.session.dataDir,
+    oncall, botDefaultWorkingDir,
   });
-  const botDefault = effectiveDefaultWorkingDir(bot.config);
-  const candidate = workspace?.workingDir || botDefault || bot.config.workingDir || '~';
-  const v = validateWorkingDir(candidate, localeForBot(larkAppId));
-  if (!v.ok) return { ok: false, error: v.error };
-  const groupIdentity = group.status === 'available' ? group.record?.workspaceIdentity : undefined;
-  if (workspace?.source === 'group' && !groupIdentity) {
-    return { ok: false, error: 'group workspace identity unavailable' };
+  if (resolution.status !== 'resolved') {
+    return { ok: false, error: `workspace_${resolution.status}: ${'detail' in resolution ? resolution.detail : ''}` };
   }
-  const mutation: SessionWorkingDirMutation = workspace?.source === 'group'
-    ? { workingDir: v.resolvedPath, source: 'group', groupWorkspaceRevision: workspace.groupWorkspaceRevision!,
-        groupWorkspaceIdentity: groupIdentity! }
-    : { workingDir: v.resolvedPath, source: workspace?.source ?? (botDefault ? 'bot-default' : 'legacy-unknown') };
-  return { ok: true, mutation, fromBotDefault: !workspace && !!botDefault };
+  return {
+    ok: true,
+    mutation: resolution.mutation,
+    fromBotDefault: resolution.mutation.source === 'bot-default',
+  };
 }
 
 function activeBySessionId(activeSessions: Map<string, DaemonSession>, sessionId: string): DaemonSession | undefined {
@@ -1736,7 +1725,7 @@ async function triggerSessionTurnAdmitted(
 
   if (ds) return deliverToExisting(ds);
 
-  const wd = await resolveWorkingDir(larkAppId, chatId);
+  const wd = await resolveTriggerWorkspace(larkAppId, chatId);
   if (!wd.ok) {
     return { ok: false, errorCode: 'trigger_failed', error: wd.error };
   }

@@ -2468,6 +2468,13 @@ export interface GroupWorkspaceTextRouteDeps {
  * Authorization seam before the receiving Bot's generic command gate. Production
  * wiring may resolve stable identity/snapshot here while the later saga owns all writes.
  */
+export function normalizeGroupWorkspaceRouteText(message: any): string {
+  return stripLeadingMentions(
+    (extractMessageTextForRouting(message) ?? '').trim(),
+    message?.mentions ?? [],
+  ).trim();
+}
+
 export async function tryDispatchGroupWorkspaceTextRoute(
   input: GroupWorkspaceTextRouteInput,
   deps: GroupWorkspaceTextRouteDeps,
@@ -2832,6 +2839,9 @@ export interface RoutingContext {
   commandTrigger?: CommandTriggerMatch;
   /** This turn was triggered by a configured group message listener. */
   messageListener?: MessageListenerMatch;
+  /** Listener transport provenance only; both variants retain the ordinary
+   * message adapter and never acquire an independent workspace resolver. */
+  messageListenerOrigin?: 'realtime' | 'polled';
   /** Daemon-minted turn created after a requester accepted a Completion
    * Proposal. It has no native inbound Lark message, so consumers must not
    * emit message reactions, quote its synthetic turn id, or run unrelated
@@ -2901,6 +2911,7 @@ function listenerRoutingContext(input: {
   messageId: string;
   chatType: 'group' | 'p2p';
   larkAppId: string;
+  origin: 'realtime' | 'polled';
 }): PendingForwardTopicPayload {
   const replyInChat = input.match.replyMode === 'chat';
   return {
@@ -2914,6 +2925,7 @@ function listenerRoutingContext(input: {
       anchor: replyInChat ? input.chatId : input.messageId,
       regularGroupTopLevel: replyInChat,
       messageListener: input.match,
+      messageListenerOrigin: input.origin,
     },
     ownsSession: false,
   };
@@ -3548,6 +3560,7 @@ async function dispatchPolledMessageListenerMatch(input: {
     messageId: input.messageId,
     chatType: 'group',
     larkAppId: input.larkAppId,
+    origin: 'polled',
   }));
 }
 
@@ -5265,6 +5278,7 @@ export function createLarkEventDispatcherRuntime(
             messageId,
             chatType,
             larkAppId,
+            origin: 'realtime',
           });
           if (primary) {
             preparePrimaryRoutingContext(listenerPayload.ctx, primary);
@@ -5879,7 +5893,7 @@ export function createLarkEventDispatcherRuntime(
       // absent dedicated handler leaves the existing route byte-for-byte intact.
       if (handlers.resolveGroupWorkspaceRouteAuthority && handlers.handleGroupWorkspaceRoute) {
         const routeResult = await tryDispatchGroupWorkspaceTextRoute({
-          text: extractMessageTextForRouting(message) ?? '',
+          text: normalizeGroupWorkspaceRouteText(message),
           chatId,
           chatType,
           scope: ordinaryGroupTopLevel ? 'chat' : routing.scope,

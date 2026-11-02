@@ -4,8 +4,8 @@
 
 - **提交基线**：实现范围为 `09940cecc5ce403f694900b335d39dbd2aeffa61..HEAD`（R2 历史 blocker 修复起点 `2affe4c87a259f2115356ad1c102439853a762f2`）；本矩阵只陈述该范围内代码和测试已经证明的结果。
 - **目标**：同一宿主机内按 `chatId` 共享群工作目录；所有已迁移的离散业务 turn 在实际派发前证明冻结目录身份、群修订、worker generation 与派发许可；群目录管理操作使用可信 tenant/真人身份、提交前复验、持久 journal/receipt 与启动恢复。
-- **本轮范围**：Tasks 1–5 的基础契约，以及为关闭基础实现 blocker 实际触达的普通消息冷启动、`/queue`、principal lane、XPI、初始 session 派发、异步 Ask、文本/卡片 `/repo`、operation/follow 启动恢复。
-- **本轮非目标 / 未声称完成**：计划 Tasks 7+ 的全量 caller 迁移与产品 E2E；Dashboard create/start/resume、scheduler、failed-turn、terminal bytes 等逐入口行为矩阵；宿主机级 migration manifest/整批 rollback；Riff/Mojo provider 级 effective-repository proof；Task 11 全量 suite 与用户文档。下表中的 `unknown/leftover` 是未完成审查项，不是通过。
+- **本轮范围**：Tasks 1–8 已提交/本次实现的基础契约、Task 7 authority/saga 收敛，以及 ordinary/trigger/listener/Dashboard/scheduler/failed-turn ingress 适配证据。
+- **本轮非目标 / 未声称完成**：Task 9 durable queue/principal/XPI/terminal/continuation 扩展、Task 10 remote provider proof、Task 11 全量 suite 与用户文档；宿主机级 migration manifest/整批 rollback。下表中的 `unknown/leftover` 是未完成审查项，不是通过。
 - **评审结论边界**：这是供独立实现复核的 submitter evidence，不是 GO、merge 或部署批准。当前实现**未部署、未重启 daemon、未 push**。
 - **结果审查预算**：下一轮仅做有针对性的 R2（复核下列已修基础 blocker 及直接触达边界）；随后由原始需求决策 owner 在 R3 给终态 GO/NO-GO，不开启 R4，也不由提交者自行扩大或改写验收目标。
 
@@ -46,7 +46,14 @@
 
 结果：**27 test files passed；1703 tests passed、3 skipped（1706 total）**。该数字只是 implementation-touched focused suites，不是 `bun run test`，也不证明 Tasks 7–11 或全仓 suite。
 
-### 2.2 基础实现提交锚点
+### 2.2 Task 7 / Task 8 增量证据
+
+- Task 7 terminal approved HEAD：`8933f67ec9f2d08b85a051efe360c90690e3cb86`；authority/saga 修复提交 `03fee3bf6`、`e545eb0d9`、`8933f67ec`，客观覆盖 repair ownership、fresh snapshot 与提交期租约。
+- Task 8 新增 `group-workspace-ingress-adapters`：**31/31**，参数化覆盖 ordinary new/existing、realtime/polled listener、trigger new/existing、Dashboard create/start/board/resume、scheduler tick/manual、failed-turn retry/fresh；断言 resolve→follow→identity proof→lease/attempting/delivery 顺序、三类失败零业务副作用、leading `@Bot /repo` 与 Dashboard provenance。
+- Task 8 focused run：**13 files / 1070 tests passed**（ingress adapter、trigger、Dashboard managed spawn、scheduler 三组、turn admission/resolver/daemon/follow、ordinary failure notice、event dispatcher）。
+- `bun run build`：PASS；`git diff --check`：提交前复验。
+
+### 2.3 基础实现提交锚点
 
 | contract | first implementation | blocker-closing commits | focused evidence |
 |---|---|---|---|
@@ -72,9 +79,9 @@
 | P1-08 | fixed | snapshot/fingerprint 在授权及提交边界 fresh 比对 | `7a4c6eba3`, `3237ad1cf`; `group-workspace-authority-v2`, `group-workspace-e2e` |
 | P1-09 | fixed | `recognized_denied` 消费 text/card 路由，不落 legacy | `89ac489c3`; `route-authorization`, `daemon-wiring` zero-fallback cases |
 | P1-10 | fixed | 同 intent loser 采用 frozen winner；共享 lease epoch/fencing token 决定执行权 | `ce08af3b9`, `133d1028d`, `35797d8f1`; `operation-v2` 含 two-OS-process/expiry-steal/late effect |
-| P1-11 | fixed（trigger resolver fault contract） | store/identity failure为 discriminated failure，不折成 absent/default | `9bbca3f0a`, `6851ae860`; `resolver-contract`, `daemon-resolution`; trigger 全入口 E2E 留给 Task 8 |
-| P1-12 | fixed（当前 trigger/central boundary） | migrated dispatch 经 typed permit；remote/其它 later callers 仍逐项审查 | `64b247fe6`, `a4d468559`; `turn-admission`, `admitted-turn-dispatch`; Task 8 全量 caller 为 leftover |
-| P1-13 | deferred | Dashboard create/start/resume 尚无共享 resolver + admission 的参数化真实 IPC 证明 | 仅 `dashboard-ipc` touched regression 通过；`src/core/session-manager.ts` 未在实现范围修改；Task 8 leftover |
+| P1-11 | fixed（Task 8 host adapters） | trigger 与 Dashboard create 共用 async resolver；store/path/identity failure 原样 fail closed，不折成 absent/default | `group-workspace-ingress-adapters`、`trigger-session-root-message`、`resolver-contract`、`daemon-resolution` |
+| P1-12 | fixed（Task 8 ingress set） | ordinary/listener/trigger/Dashboard/scheduler/failed-turn 参数矩阵证明 permit 前 follow/identity、业务副作用顺序；Task 9 durable 扩展仍独立保留 | `group-workspace-ingress-adapters` 31 cases；focused 13 files/1070 pass |
+| P1-13 | fixed（Dashboard resolver/provenance） | Dashboard create/start/board/resume 使用同一 resolver contract；list/detail row 显示 source/revision/identity provenance | `group-workspace-ingress-adapters` Dashboard rows；`dashboard-managed-spawn` regression |
 | P1-14 | fixed（基础 identity chain） | `{path,dev,ino}` 贯穿；未终态 v1 set journal 在 execute/recover/advance/store mutate 全边界保持 `migration_blocked_identity_missing` quarantine，缺冻结 identity 不 resolve、switch、CAS 或建 receipt；终态历史保持迁移 | `dana-r2-closure-regressions` 三种真实 store replacement/recover/replay 零副作用；`group-workspace-operation-v2`, `group-workspace-store` |
 | P1-15 | unknown / fail-closed | host contract 可校验；remote-runner 无 provider proof 时拒绝。Riff primary repo、Mojo isolation/cloud provider identity 尚未证明 | `ef0e7f86e`; `admitted-worker-workspace-identity`; Task 10/provider proof leftover |
 | P1-16 | fixed（已迁移 drivers） | principal/XPI 在 permit 后 acquire/attempting；结构护栏禁止直调 send/fork | `64b247fe6`, `a4d468559`; `admitted-turn-driver-structure`, `admitted-turn-dispatch`; scheduler/failed-turn/terminal 仍见矩阵 leftover |
@@ -99,11 +106,11 @@
 | acceptance item | affected behavior | required caller/callee nodes | original issue IDs | revised contract | verification evidence/result |
 |---|---|---|---|---|---|
 | AC-01 | Bot A set 后 Bot B new chat 与 `/th` 消费 X | ordinary handler → admitted initial dispatch → resolver → blank fork/ready/business submit；`/th` → shared resolver | P1-12,P1-14,AR-01 | two-phase typed permit + frozen identity | `group-workspace-e2e` “Bot B and /th”；`daemon-resolution`; `admitted-turn-dispatch`；**基础路径通过** |
-| AC-01 | external trigger new/existing | trigger adapter → shared resolver → admitted dispatch | P1-11,P1-12 | errors fail closed；business input requires permit | `resolver-contract`/`turn-admission` 证明 callee contract；**Task 8 参数化真实 trigger caller 仍 leftover，不计完整通过** |
-| AC-01 | Dashboard create/start/resume | Dashboard IPC/session manager → shared resolver/admission | P1-13 | 与 ordinary 相同 async resolver/admission | **unknown/leftover**：`dashboard-ipc` regression 通过但未证明这些 caller 已迁移 |
+| AC-01 | external trigger new/existing | trigger adapter → shared resolver → admitted dispatch | P1-11,P1-12 | errors fail closed；business input requires permit | `group-workspace-ingress-adapters` trigger new/existing + `trigger-session-root-message`；通过 |
+| AC-01 | Dashboard create/start/resume | Dashboard IPC/session manager → shared resolver/admission | P1-13 | 与 ordinary 相同 async resolver/admission | `group-workspace-ingress-adapters` create/start/board/resume + Dashboard provenance；通过 |
 | AC-01 | restart 后仍消费 X | startup barrier → operation/follow/permit recovery → per-bot ingress open | P1-05,AR-01 | recovery before ingress | `turn-permit-startup-order`, `operation-v2`, `session-follow`; `bca401860`,`43e44bfd7`,`2b69ea5f4`；**基础恢复通过** |
 | AC-02 | thread `/repo` 隔离；wt/here 不写 group | route classifier → thread command path / group route runtime | P1-09 | 只有 ordinary-group set/unbind 进入 group saga | `group-workspace-route-authorization` accepts-only case；focused route/card suites 通过 |
-| AC-03 | explicit/oncall/group/default precedence | resolver → selected source/provenance | P1-11,P1-13 | explicit > oncall-explicit > group > auto/default > picker；fault 不 fallback | `resolver-contract`, `daemon-resolution`, `group-workspace-e2e`；**resolver contract 通过，Dashboard caller 仍 leftover** |
+| AC-03 | explicit/oncall/group/default precedence | resolver → selected source/provenance | P1-11,P1-13 | explicit > oncall-explicit > group > auto/default > picker；fault 不 fallback | `resolver-contract`, `daemon-resolution`, `group-workspace-ingress-adapters` real store/provenance；通过 |
 | AC-04 | 跨 app 真人、per-app tenant | event/card → authority → admin union snapshot | P1-02,P1-03,P1-08 | verified app tenant + tenant-scoped union + fresh fingerprint | `authority-v2`, `route-authorization`, `daemon-wiring`; `7a4c6eba3`,`f0d029f4f`,`3237ad1cf`；通过 |
 | AC-04 | prepared 后 revoke 与 recognized denial | operation coordinator → revalidate before switch/CAS/under lock；route runtime consumes denial | P1-04,P1-09 | no stale authorization/no legacy fallthrough | `group-workspace-operation` revoke cases；`route-authorization` visible denial/zero fallback；通过 |
 | AC-05 | historical replay/frozen target/identity | operation store prepare/adopt → coordinator → receipt | P1-07,P1-14 | source intent freezes target/revision/generation/identity；replay does not reread mutable target | `group-workspace-operation` frozen/replay/readback cases；通过 |
@@ -115,7 +122,7 @@
 | AC-09 | ordinary existing/new local PTY | ordinary driver → admitted dispatch → follow/consume → permit → submit | P1-06,P1-12,AR-01 | proof before business side effect | `admitted-turn-dispatch`; `session-follow` claude/codex；`group-workspace-e2e` retire/spawn/deliver；通过 |
 | AC-09 | `/queue` | command handler → submitQueuedMessage → central admitted driver | P1-17 | accepted only through valid permit/receipt | `admitted-turn-driver-structure`; permit failure/retry tests；通过 |
 | AC-09 | principal lane / XPI | durable driver → admitted dispatch → acquire/attempting → submit | P1-16 | lease/attempting after permit | `admitted-turn-driver-structure` production guard + `admitted-turn-dispatch` ordering；**当前 drivers 通过，Task 9 完整 durable fault matrix leftover** |
-| AC-09 | scheduler / listener / failed-turn | caller → ordinary/admitTurnUnderMutation → submit | P1-16 | same permit boundary; stronger mutation gate must not nest | listener classification/callee contract exists；**scheduler、failed-turn 参数化真实 caller 为 unknown/leftover** |
+| AC-09 | scheduler / listener / failed-turn | caller → ordinary/mutation-owned recovery → submit | P1-16 | same permit boundary；listener retains ordinary origin；mutation path does not nest shared gate | `group-workspace-ingress-adapters` realtime/polled、tick/manual、retry/fresh 参数行；scheduler/event/failed-turn regressions；Task 8 通过 |
 | AC-09 | Ask exact-turn reply | Ask answer → control permit → worker submission → exact ACK receipt | AR-02 | resume original wait only；frozen workspace/generation/authority；single durable receipt | `turn-admission`, `admitted-turn-dispatch`, `turn-permit-startup-order`, structure guard；通过（Ask）；approval production caller 仍待 Task 9 核对 |
 | AC-09 | Riff/Mojo output and effective context | worker ready/backend submit → authoritative effective-context proof；output listener independent | P1-01,P1-15 | host contract可验证；无 provider identity则 fail closed | `ef0e7f86e`; `daemon-resolution` host ready；`admitted-worker-workspace-identity` remote fail-closed；**provider-level Riff/Mojo proof unknown/leftover** |
 | AC-10 | path/store/inode failure no fallback | resolver → consume at commit/spawn/ready/backend submit | P1-11,P1-14,P1-15 | discriminated fault; exact `{path,dev,ino}` | `resolver-contract` all consume points/inode replacement；`daemon-resolution` corrupt/locked；`e2e` inaccessible；通过（host path） |
@@ -125,8 +132,8 @@
 | AC-11 | group/operation local v1→v2 | store locked migration → identity-bearing v2 | P1-05,P1-14 | retryable locked migration; future schema fail closed | `schema-v2`, `operation-v2`; `6de89f7ca`,`bf9812b0d`,`efda0ff3a`; **局部 store 通过** |
 | AC-11 | host-wide migration batch/rollback/version compatibility | migration manifest → all JSON/SQLite/admin stores → epoch barrier | AR-04,AR-05 | one fenced epoch, per-store publish points, resume/rollback/export | **deferred/leftover Task 6**；仓库无 `workspace-schema-migrator.ts`/manifest 全矩阵，不能记 pass |
 | AC-12 | command/repo card/thread/worktree/oncall regression | routers/handlers/card runtime | P1-02,P1-09 | recognized group route consumes denial；其它 route 保持旧语义 | touched focused suites 27 files/1703 pass，含 card/event/rename/dashboard regressions；**未运行 command oracle/full suite，不作全回归声明** |
-| AC-12 | every business submit caller | production drivers → `dispatchAdmittedBusinessTurn` → typed callee | P1-12,P1-16,P1-17,AR-01 | callee requires permit and durable dispatch receipt | structure guard覆盖 `/queue`、principal、XPI、initial session；普通/Ask有行为测试；**Tasks 8–9 其余 caller inventory leftover** |
-| AC-12 | every worker creation caller | caller → `forkWorkerBlank` | AR-01 | only blank permit can zero-payload fork | worker-pool typed API + cold-start tests；**Dashboard/scheduler/resume 等 later caller 尚未逐项证明** |
+| AC-12 | every business submit caller | production drivers → `dispatchAdmittedBusinessTurn` → typed callee | P1-12,P1-16,P1-17,AR-01 | callee requires permit and durable dispatch receipt | Task 8 ingress matrix + 既有 structure guard覆盖 ordinary/listener/trigger/Dashboard/scheduler/recovery；**Task 9 durable/terminal/continuation inventory 仍 leftover** |
+| AC-12 | every worker creation caller | caller → `forkWorkerBlank` | AR-01 | only blank permit can zero-payload fork | Task 8 ingress ordering matrix与 Dashboard/scheduler/trigger regressions通过；Task 9 后续 creation callers 仍独立审查 |
 | AC-12 | unknown external provider cwd | remote-runner/Riff/Mojo provider | P1-15 | proof unavailable → reject, never infer from host path | remote-runner/Riff no-host-proof negative test通过；provider proof仍 **unknown**，所以 group turn只能 fail closed |
 
 ## 5. 独立 reviewer 应重点复核的边界

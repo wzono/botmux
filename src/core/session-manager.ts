@@ -8,7 +8,7 @@ import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection
  * Handles working directory resolution, attachment downloads, prompt building,
  * session restoration, and scheduled task execution.
  */
-import { existsSync, statSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { normalizeImageAttachment, imageSequenceHint } from './attachment-image-format.js';
 import { randomUUID } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
@@ -83,7 +83,11 @@ import {
   larkTransportEnabled,
 } from './types.js';
 import type { DaemonSession, GroupJoinContext } from './types.js';
-import { setSessionWorkingDirMetadata } from './session-cwd.js';
+import { setSessionWorkingDirMetadata, type SessionWorkingDirMutation } from './session-cwd.js';
+import { GroupWorkspaceStore } from '../services/group-workspace-store.js';
+import { resolveGroupWorkspaceCwd } from './group-workspace-policy.js';
+import { probePathUsability } from './path-usability.js';
+import type { WorkspaceIdentity } from './turn-admission.js';
 import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime } from './pending-repo-journal.js';
 import { announceSessionRow, clearAgentAttention, markSessionActivity, stampHumanActivity, announcePendingRepoSession } from './session-activity.js';
 import { applyFollowActive, followActiveOpenedFreshTopic, recordFollowActiveFreshTopic } from './schedule-follow-active.js';
@@ -130,6 +134,89 @@ export { getAttachmentsDir } from './attachment-path.js';
 type RefreshCliVersion = (
   botConfig: Pick<BotConfig, 'cliId' | 'cliRuntime' | 'cliPathOverride'>,
 ) => boolean;
+
+export type WorkspaceIngressOrigin =
+  | 'ordinary_new' | 'ordinary_existing'
+  | 'listener_realtime' | 'listener_polled'
+  | 'trigger_new' | 'trigger_existing'
+  | 'dashboard_create' | 'dashboard_start' | 'dashboard_board' | 'dashboard_resume'
+  | 'scheduler_tick' | 'scheduler_manual'
+  | 'failed_turn_retry' | 'failed_turn_fresh';
+
+export type IngressWorkspaceResolution =
+  | { status: 'resolved'; workspace: WorkspaceIdentity; mutation: SessionWorkingDirMutation; groupRevision?: number }
+  | { status: 'unbound' }
+  | { status: 'store_unavailable' | 'invalid_dir' | 'inaccessible' | 'identity_changed'; detail: string };
+
+/** Shared host resolver for every business ingress. Resolver faults are terminal:
+ * no caller may reinterpret an unreadable/invalid group binding as absence. */
+export async function resolveIngressWorkspace(input: {
+  larkAppId: string;
+  chatId: string;
+  chatType: 'group' | 'p2p';
+  dataDir: string;
+  explicitWorkingDir?: string;
+  oncall?: { workingDir: string; provenance?: 'oncall-explicit' | 'oncall-default-auto' };
+  botDefaultWorkingDir?: string;
+}): Promise<IngressWorkspaceResolution> {
+  const group = input.chatType === 'group'
+    ? await new GroupWorkspaceStore(input.dataDir).probeBoundDirectoryForConsumption(input.chatId)
+    : { status: 'available' as const, record: undefined };
+  const groupLayer = group.status === 'usable'
+    ? { status: 'usable' as const, workingDir: group.usability.normalizedPath,
+        revision: group.record.revision, directoryIdentity: group.record.directoryIdentity ?? group.usability.identity }
+    : group.status === 'unusable'
+      ? { status: group.usability.reason === 'inaccessible' ? 'inaccessible' as const : 'invalid' as const,
+          workingDir: group.record.directory.kind === 'bound' ? group.record.directory.workingDir : group.usability.normalizedPath,
+          revision: group.record.revision }
+      : group.status === 'store_unavailable'
+        ? { status: 'store-unavailable' as const }
+        : { status: 'unbound' as const };
+  const resolution = resolveGroupWorkspaceCwd({
+    explicitWorkingDir: input.explicitWorkingDir,
+    oncall: input.oncall,
+    group: groupLayer,
+    botDefaultWorkingDir: input.botDefaultWorkingDir,
+  });
+  if (resolution.status === 'store-unavailable') return { status: 'store_unavailable', detail: 'group workspace store unavailable' };
+  if (resolution.status === 'invalid' || resolution.status === 'inaccessible') {
+    return { status: resolution.status === 'invalid' ? 'invalid_dir' : 'inaccessible', detail: resolution.workingDir };
+  }
+  if (resolution.status === 'picker') return { status: 'unbound' };
+  if (resolution.status !== 'selected') return { status: 'store_unavailable', detail: 'unexpected workspace resolution' };
+  const proof = probePathUsability(resolution.workingDir,
+    resolution.source === 'group' && resolution.groupWorkspaceDirectoryIdentity
+      ? { expectedIdentity: resolution.groupWorkspaceDirectoryIdentity } : undefined);
+  if (!proof.ok) return { status: proof.reason === 'inaccessible' ? 'inaccessible' : 'invalid_dir', detail: resolution.workingDir };
+  const workspace = { path: proof.normalizedPath, ...proof.identity };
+  const mutation: SessionWorkingDirMutation = resolution.source === 'group'
+    ? { workingDir: workspace.path, source: 'group', groupWorkspaceRevision: resolution.groupWorkspaceRevision!,
+        groupWorkspaceIdentity: workspace }
+    : { workingDir: workspace.path, source: resolution.source };
+  return { status: 'resolved', workspace, mutation,
+    ...(resolution.groupWorkspaceRevision === undefined ? {} : { groupRevision: resolution.groupWorkspaceRevision }) };
+}
+
+/** Behavior-level adapter contract shared by real ingress owners. It centralizes
+ * the invariant ordering while callers retain their existing delivery mechanics. */
+export async function runWorkspaceIngressAdapter(input: {
+  origin: WorkspaceIngressOrigin;
+  resolve(): Promise<Omit<IngressWorkspaceResolution & { status: 'resolved' }, 'mutation'> | Exclude<IngressWorkspaceResolution, { status: 'resolved' }>>;
+  follow(resolution: { workspace: WorkspaceIdentity; groupRevision?: number }): Promise<boolean>;
+  prove(resolution: { workspace: WorkspaceIdentity; groupRevision?: number }): Promise<boolean>;
+  acquire(): Promise<boolean>;
+  markAttempting(): Promise<boolean>;
+  deliver(): Promise<boolean>;
+}): Promise<{ status: 'delivered' } | { status: 'rejected'; reason: string }> {
+  const resolution = await input.resolve();
+  if (resolution.status !== 'resolved') return { status: 'rejected', reason: resolution.status };
+  if (!await input.follow(resolution)) return { status: 'rejected', reason: 'follow_failed' };
+  if (!await input.prove(resolution)) return { status: 'rejected', reason: 'identity_changed' };
+  if (!await input.acquire()) return { status: 'rejected', reason: 'lease_refused' };
+  if (!await input.markAttempting()) return { status: 'rejected', reason: 'attempting_refused' };
+  if (!await input.deliver()) return { status: 'rejected', reason: 'delivery_refused' };
+  return { status: 'delivered' };
+}
 
 function sessionCreatedAtMs(session: { createdAt?: string }): number {
   return session.createdAt ? (Date.parse(session.createdAt) || Date.now()) : Date.now();
@@ -5331,21 +5418,13 @@ export async function deliverOwnerBatchTurn(
  *  模式下的 defaultOncall 目录；校验是真目录）。都没有 → undefined，表示「不钉目录」，交给
  *  forkOrShowRepoCard 弹 /repo 卡片让用户在群里选。与普通新话题的 resolvePinnedWorkingDir
  *  同口径（少了 sibling 继承那层，新群无 sibling 可继承）。*/
-function resolveDashboardSpawnWorkingDir(larkAppId: string, chatId: string):
-  | { workingDir: string; source: 'oncall-explicit' | 'oncall-default-auto' | 'bot-default' }
-  | undefined {
-  const oncall = findOncallChat(larkAppId, chatId);
-  if (oncall?.workingDir) return {
-    workingDir: oncall.workingDir,
-    source: oncall.provenance === 'oncall-default-auto' ? 'oncall-default-auto' : 'oncall-explicit',
-  };
-  const raw = effectiveDefaultWorkingDir(getBot(larkAppId).config);
-  if (!raw) return undefined;
-  const resolved = expandHome(raw);
-  try {
-    if (statSync(resolved).isDirectory()) return { workingDir: resolved, source: 'bot-default' };
-  } catch { /* not a dir → 当作没配 */ }
-  return undefined;
+async function resolveDashboardWorkspace(larkAppId: string, chatId: string): Promise<IngressWorkspaceResolution> {
+  const bot = getBot(larkAppId);
+  return resolveIngressWorkspace({
+    larkAppId, chatId, chatType: 'group', dataDir: config.session.dataDir,
+    oncall: findOncallChat(larkAppId, chatId),
+    botDefaultWorkingDir: effectiveDefaultWorkingDir(bot.config),
+  });
 }
 
 /** forkOrShowRepoCard 的缺目录分支：首轮按选仓流程落盘，发缺目录形态的选仓卡（没有「直接开启
@@ -5668,9 +5747,16 @@ export async function spawnDashboardSession(
       session.kanbanColumn = 'backlog';
     }
 
-    const workingDirResolution = resolveDashboardSpawnWorkingDir(larkAppId, chatId);
-    const workingDir = workingDirResolution?.workingDir;
-    if (workingDirResolution) setSessionWorkingDirMetadata(session, workingDirResolution);
+    const workingDirResolution = await resolveDashboardWorkspace(larkAppId, chatId);
+    if (workingDirResolution.status !== 'resolved' && workingDirResolution.status !== 'unbound') {
+      sessionStore.closeSession(session.sessionId);
+      return { error: `workspace_${workingDirResolution.status}` };
+    }
+    const workingDir = workingDirResolution.status === 'resolved'
+      ? workingDirResolution.workspace.path : undefined;
+    if (workingDirResolution.status === 'resolved') {
+      setSessionWorkingDirMetadata(session, workingDirResolution.mutation);
+    }
     sessionStore.updateSession(session);
     messageQueue.ensureQueue(anchor);
 
