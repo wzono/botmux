@@ -15,7 +15,7 @@ export function buildAskFormElements(ask: PendingAsk, locale: Locale, result?: A
     return head + (en ? '… (full answer returned to caller)' : '…（完整答案已返回调用方）');
   };
   const deadline = ask.deadlineAt === null
-    ? (en ? 'No deadline' : '无截止时间')
+    ? (en ? 'Waiting for your response' : '等待你回答')
     : new Date(ask.deadlineAt).toLocaleString(en ? 'en-US' : 'zh-CN');
   const elements: Array<Record<string, any>> = [{ tag: 'markdown', content:
     `${en ? 'Deadline' : '等待截止'}：${deadline}\n`

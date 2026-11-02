@@ -235,6 +235,7 @@ export function isTruncatedMatch(recordedNorm: string, markContentNorm?: string)
 export interface BridgeTurnStartEvidence {
   fullContentMatch: boolean;
   sourceJsonlPath?: string;
+  nativeTurnId?: string;
 }
 
 export class BridgeTurnQueue {
@@ -943,7 +944,13 @@ export class BridgeTurnQueue {
       }
     }
     if (consumedNext && next) {
-      this.onLarkTurnStarted?.(next, { fullContentMatch, ...(sourceJsonlPath ? { sourceJsonlPath } : {}) });
+      this.onLarkTurnStarted?.(next, {
+        fullContentMatch,
+        ...(sourceJsonlPath ? { sourceJsonlPath } : {}),
+        ...(typeof (ev as { promptId?: unknown }).promptId === 'string'
+          ? { nativeTurnId: (ev as { promptId: string }).promptId }
+          : {}),
+      });
     }
     if (!consumedNext) {
       // The user event neither fingerprint-matched nor proved a truncation of a

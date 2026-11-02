@@ -109,6 +109,7 @@ export interface AskPendingResult {
   requestId: string;
   askId: string;
   messageId: string;
+  originWorkerGeneration?: number;
   pending: true;
 }
 
@@ -153,6 +154,9 @@ export interface CreateAskInput {
    *  'explicit' = `botmux ask buttons`, etc.). Namespaces the identity so an
    *  explicit ask can never re-claim a hook ask's card. Defaults to 'hook'. */
   originKind?: string;
+  /** Frozen worker generation that issued this Ask. Host acknowledgements must
+   * carry the same value so a later generation cannot consume its receipt. */
+  originWorkerGeneration?: number;
   /** DAEMON-COMPUTED authoritative persistence gate (codex P1-4): does the
    *  authenticated issuing session's FROZEN backend survive a daemon restart
    *  (tmux/herdr/zellij/zmx = yes; pty = no)? The broker persists + resumes ONLY

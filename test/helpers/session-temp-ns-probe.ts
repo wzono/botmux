@@ -80,7 +80,7 @@ export function runWithPrivateTmp(
     'private-tmp', script,
   ], {
     encoding: 'utf8',
-    env: { ...process.env, ...opts.env },
+    env: { ...process.env, BOTMUX_SESSION_TEMP_ALIAS: '1', ...opts.env },
     timeout: opts.timeoutMs ?? 120_000,
     maxBuffer: 16 * 1024 * 1024,
   });

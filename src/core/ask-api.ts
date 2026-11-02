@@ -33,6 +33,7 @@ export interface AskApiBody {
   /** 显式 `botmux ask --mention <open_id>` 要 @ 的人类成员。daemon 会在发卡前
    *  剔除 bot open_id（卡片 at bot 触发 100290）。 */
   mentionedOpenId?: string;
+  originWorkerGeneration?: number;
   acknowledge?: boolean;
   asyncUserInput?: CodexAsyncUserInput;
   /** Optional narrowing only; never grants talk/approval authority. */
@@ -66,6 +67,7 @@ export type AskApiBodyError =
   | 'bad_requestId'
   | 'bad_originKind'
   | 'bad_mentionedOpenId'
+  | 'bad_originWorkerGeneration'
   | 'bad_acknowledge'
   | 'bad_asyncUserInput';
 
@@ -141,6 +143,10 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
   }
 
   if (r.acknowledge !== undefined && typeof r.acknowledge !== 'boolean') return { error: 'bad_acknowledge' };
+  if (r.originWorkerGeneration !== undefined && (typeof r.originWorkerGeneration !== 'number'
+    || !Number.isSafeInteger(r.originWorkerGeneration) || r.originWorkerGeneration < 1)) {
+    return { error: 'bad_originWorkerGeneration' };
+  }
 
   if (r.asyncFailure !== undefined && (originKind !== CODEX_ASYNC_ASK_ORIGIN
     || (r.asyncFailure !== 'limit' && r.asyncFailure !== 'invalid_questions'))) return { error: 'bad_asyncUserInput' };
@@ -193,6 +199,8 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     ...(requestId !== undefined ? { requestId } : {}),
     ...(originKind !== undefined ? { originKind } : {}),
     ...(mentionedOpenId !== undefined ? { mentionedOpenId } : {}),
+    ...(r.originWorkerGeneration !== undefined
+      ? { originWorkerGeneration: r.originWorkerGeneration as number } : {}),
     ...(r.acknowledge !== undefined ? { acknowledge: r.acknowledge as boolean } : {}),
     ...(asyncUserInput ? { asyncUserInput } : {}),
     ...(r.asyncFailure ? { asyncFailure: r.asyncFailure as 'limit' | 'invalid_questions' } : {}),

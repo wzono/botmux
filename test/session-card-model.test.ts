@@ -58,6 +58,21 @@ describe('session-card-model · composeEntries / statusToDot', () => {
       label: 'sessions.status.stalled',
     });
   });
+
+  it('surfaces capacity waiting in list and detail DTOs without replacing process status', () => {
+    const row = makeRow({
+      status: 'working',
+      capacityFeedback: { state: 'waiting', position: 3, observedAtMs: FIXED_NOW - 1_000, ageMs: 1_000 },
+    });
+    const [entry] = composeEntries([row], FIXED_NOW);
+    const detail = composeDetail(row, FIXED_NOW);
+
+    expect(entry.status).toBe('working');
+    expect(entry.capacityFeedback).toEqual(row.capacityFeedback);
+    expect(entry.secondary).toContain('capacity waiting #3');
+    expect(detail.status).toBe('working');
+    expect(detail.capacityFeedback).toEqual(row.capacityFeedback);
+  });
 });
 
 describe('session-card-model · sortByStatus', () => {
