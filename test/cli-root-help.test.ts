@@ -30,6 +30,8 @@ describe('botmux root help workflow surface', () => {
 
       expect(stdout).toContain('workflow save [last|runId] [名称]');
       expect(stdout).toContain('goal run <goal> [--run-id <id>]');
+      expect(stdout).toContain('ask buttons [--multi] [--into <om_root>]');
+      expect(stdout).toContain('--into 经当前会话鉴权后回复到同群指定话题');
       expect(stdout).toContain('actor current --json');
       expect(stdout).toContain('auth request [--scope "<scope1 scope2,...>"] [--json]');
       expect(stdout).toContain('auth wait --request-id <id> [--json]');
