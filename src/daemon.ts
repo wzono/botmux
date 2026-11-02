@@ -31401,9 +31401,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // session restore, durable queue driver, IPC release, or IM ingress starts.
   const workspaceMigration = await new WorkspaceSchemaMigrator(config.session.dataDir, {
     ownerId: `daemon:${process.pid}:${getDaemonBootId()}`,
-    legacyFleet: process.env.BOTMUX_WORKSPACE_MIGRATION_FLEET_QUIESCED === '1'
-      ? { quiescedAt: Date.now(), restartBlocked: true }
-      : undefined,
   }).migrateOrRecover();
   if (workspaceMigration.status !== 'complete' || !workspaceMigrationIngressReady(config.session.dataDir)) {
     throw new Error('workspace migration epoch is not ingress-ready');

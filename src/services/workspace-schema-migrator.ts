@@ -7,10 +7,12 @@ import {
   readdirSync,
   renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { basename, dirname, join, relative } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { fsyncDirectorySyncPortable, fsyncFilesAndDirectorySync, fsyncRegularFileSync } from '../utils/fs-durability.js';
 import { withFileLock } from '../utils/file-lock.js';
 import { openDatabaseSyncOrThrow } from './sqlite-compat.js';
 
@@ -37,6 +39,7 @@ export interface WorkspaceMigrationStoreEntry {
   backupPath: string;
   stagedPath: string;
   sourceChecksum: string;
+  backupChecksum?: string;
   targetChecksum?: string;
   publishPoint: 'pending' | 'published';
 }
@@ -77,6 +80,51 @@ function manifestPath(dataDir: string): string {
 
 function checksum(path: string): string {
   return createHash('sha256').update(readFileSync(path)).digest('hex');
+}
+
+function durableCopySync(source: string, target: string): void {
+  mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+  copyFileSync(source, target);
+  fsyncFilesAndDirectorySync(dirname(target), [target]);
+}
+
+function durablePublishCopySync(source: string, target: string, batchId: string): void {
+  const temp = `${target}.workspace-migration-${batchId}`;
+  try {
+    copyFileSync(source, temp);
+    fsyncRegularFileSync(temp);
+    renameSync(temp, target);
+    fsyncDirectorySyncPortable(dirname(target));
+  } catch (error) {
+    try { unlinkSync(temp); } catch { /* best effort */ }
+    throw error;
+  }
+}
+
+function materializeStandaloneSqlite(source: string, target: string): void {
+  try { unlinkSync(target); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  const db = openDatabaseSyncOrThrow(source, { readOnly: true });
+  try {
+    const escaped = target.replaceAll("'", "''");
+    db.exec(`VACUUM INTO '${escaped}'`);
+  } finally {
+    db.close();
+  }
+  fsyncFilesAndDirectorySync(dirname(target), [target]);
+  const verify = openDatabaseSyncOrThrow(target, { readOnly: true });
+  try {
+    const integrity = verify.prepare('PRAGMA integrity_check').get() as Record<string, unknown> | undefined;
+    if (!integrity || !Object.values(integrity).includes('ok')) {
+      throw new WorkspaceMigrationFenceError('staged SQLite integrity check failed');
+    }
+  } finally {
+    verify.close();
+  }
+  if (existsSync(`${target}-wal`) || existsSync(`${target}-shm`)) {
+    throw new WorkspaceMigrationFenceError('staged SQLite retained WAL dependency');
+  }
 }
 
 function storeKey(kind: WorkspaceMigrationStoreKind, path: string, dataDir: string): string {
@@ -183,23 +231,77 @@ function pathIdentity(path: string): { path: string; dev: string; ino: string } 
   }
 }
 
+function sameActor(left: unknown, right: unknown): boolean {
+  return isObject(left) && isObject(right)
+    && left.tenantKey === right.tenantKey && left.unionId === right.unionId;
+}
+
+function migrationSourceEventId(chatId: string, revision: number): string {
+  return `group-workspace-text-source-v1:sha256:${createHash('sha256')
+    .update(JSON.stringify(['workspace-schema-migration-v1', chatId, revision])).digest('hex')}`;
+}
+
+function migrationOperationKey(sourceEventId: string, kind: 'set' | 'unbind'): string {
+  return `group-workspace-operation-v1:sha256:${createHash('sha256')
+    .update(JSON.stringify([1, sourceEventId, kind])).digest('hex')}`;
+}
+
+function migrationPayloadDigest(chatId: string, kind: 'set' | 'unbind', target?: string): string {
+  return `group-workspace-payload-v1:sha256:${createHash('sha256')
+    .update(JSON.stringify([1, chatId, kind, kind === 'set' ? target : 'tombstone'])).digest('hex')}`;
+}
+
 function migrateGroupJson(path: string): void {
   const value = readJson(path);
   if (!isObject(value) || !Number.isSafeInteger(value.schemaVersion)) throw new Error('malformed group workspace store');
   if ((value.schemaVersion as number) > TARGET_SCHEMA_VERSION) throw new WorkspaceMigrationFenceError('future group workspace schema');
   if (value.schemaVersion === TARGET_SCHEMA_VERSION) return;
   if (value.schemaVersion !== 1 || !isObject(value.records) || !isObject(value.receipts)) throw new Error('malformed v1 group workspace store');
-  for (const record of Object.values(value.records)) {
+  for (const [chatId, record] of Object.entries(value.records)) {
     if (!isObject(record) || !isObject(record.directory)) throw new Error('malformed group workspace record');
-    if (record.directory.kind !== 'bound') continue;
-    const identity = typeof record.directory.workingDir === 'string' ? pathIdentity(record.directory.workingDir) : undefined;
-    if (!identity) throw new WorkspaceMigrationFenceError('legacy bound workspace identity is unprovable');
-    if (isObject(record.directoryIdentity)
-      && (record.directoryIdentity.dev !== identity.dev || record.directoryIdentity.ino !== identity.ino)) {
-      throw new WorkspaceMigrationFenceError('legacy bound workspace identity changed');
+    let identity: { path: string; dev: string; ino: string } | undefined;
+    if (record.directory.kind === 'bound') {
+      identity = typeof record.directory.workingDir === 'string' ? pathIdentity(record.directory.workingDir) : undefined;
+      if (!identity) throw new WorkspaceMigrationFenceError('legacy bound workspace identity is unprovable');
+      if (isObject(record.directoryIdentity)
+        && (record.directoryIdentity.dev !== identity.dev || record.directoryIdentity.ino !== identity.ino)) {
+        throw new WorkspaceMigrationFenceError('legacy bound workspace identity changed');
+      }
+      record.workspaceIdentity = identity;
+      record.directoryIdentity = { dev: identity.dev, ino: identity.ino };
     }
-    record.workspaceIdentity = identity;
-    record.directoryIdentity = { dev: identity.dev, ino: identity.ino };
+    const directory = record.directory as Record<string, unknown>;
+    const revision = Number(record.revision);
+    const exact = Object.values(value.receipts).find(receipt => isObject(receipt)
+      && receipt.outcome === 'committed' && receipt.chatId === chatId
+      && receipt.resultingRevision === revision
+      && JSON.stringify(receipt.resultingDirectory) === JSON.stringify(directory)
+      && receipt.completedAt === record.updatedAt && sameActor(receipt.actor, record.updatedBy)
+      && (directory.kind !== 'bound'
+        || (receipt.canonicalTargetWorkingDir === directory.workingDir
+          && isObject(receipt.workspaceIdentity)
+          && receipt.workspaceIdentity.path === identity?.path
+          && receipt.workspaceIdentity.dev === identity?.dev
+          && receipt.workspaceIdentity.ino === identity?.ino)));
+    if (!exact && revision === 1 && isObject(record.updatedBy)) {
+      const kind = directory.kind === 'bound' ? 'set' : 'unbind';
+      const sourceEventId = migrationSourceEventId(chatId, revision);
+      const operationKey = migrationOperationKey(sourceEventId, kind);
+      value.receipts[operationKey] = {
+        operationKey, sourceEventId, kind,
+        payloadDigest: migrationPayloadDigest(chatId, kind,
+          typeof directory.workingDir === 'string' ? directory.workingDir : undefined),
+        chatId, outcome: 'committed', resultingRevision: 1,
+        resultingDirectory: structuredClone(directory), actor: structuredClone(record.updatedBy),
+        completedAt: record.updatedAt, expectedRevision: 0,
+        ...(kind === 'set' ? { canonicalTargetWorkingDir: directory.workingDir,
+          workspaceIdentity: structuredClone(identity) } : {}),
+      };
+    } else if (!exact) {
+      throw new WorkspaceMigrationFenceError(
+        `legacy group revision history is unprovable: ${chatId}:${revision}`,
+      );
+    }
   }
   for (const receipt of Object.values(value.receipts)) {
     if (!isObject(receipt) || receipt.kind !== 'set') continue;
@@ -325,8 +427,6 @@ export interface WorkspaceSchemaMigratorOptions {
   now?: () => number;
   leaseMs?: number;
   requiredStores?: WorkspaceMigrationStoreKind[];
-  /** Required when a deployed binary predates the fence protocol. */
-  legacyFleet?: 'fence-aware' | { quiescedAt: number; restartBlocked: boolean };
   transform?: (kind: WorkspaceMigrationStoreKind, source: string, staged: string) => Promise<void> | void;
   crashProbe?: (point: string, manifest: Readonly<WorkspaceMigrationManifest>) => void;
 }
@@ -351,35 +451,12 @@ export class WorkspaceSchemaMigrator {
   }
 
   private prepare(): WorkspaceMigrationManifest {
-    const legacyFleet = this.options.legacyFleet;
-    if (legacyFleet !== undefined && legacyFleet !== 'fence-aware'
-      && (!legacyFleet.restartBlocked || !Number.isFinite(legacyFleet.quiescedAt))) {
-      throw new WorkspaceMigrationFenceError('legacy fleet must be quiesced with restart blocked');
-    }
     const prior = readWorkspaceMigrationManifest(this.dataDir);
     if (prior) return prior;
     const now = this.now();
     const batchId = randomUUID();
     const root = join(this.dataDir, 'workspace-migrations', batchId);
     mkdirSync(root, { recursive: true, mode: 0o700 });
-    const stores: Record<string, WorkspaceMigrationStoreEntry> = Object.create(null);
-    for (const store of this.selectedStores()) {
-      if (store.kind === 'session_sqlite') {
-        const db = openDatabaseSyncOrThrow(store.path);
-        try {
-          const checkpoint = db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as { busy?: number | bigint } | undefined;
-          if (Number(checkpoint?.busy ?? 0) !== 0) throw new WorkspaceMigrationFenceError('session WAL is busy');
-        } finally { db.close(); }
-      }
-      const suffix = createHash('sha256').update(relative(this.dataDir, store.path)).digest('hex').slice(0, 12);
-      const backupPath = join(root, `${suffix}-${basename(store.path)}.backup`);
-      const stagedPath = join(root, `${suffix}-${basename(store.path)}.staged`);
-      copyFileSync(store.path, backupPath);
-      stores[storeKey(store.kind, store.path, this.dataDir)] = {
-        kind: store.kind, sourcePath: store.path, backupPath, stagedPath,
-        sourceChecksum: checksum(store.path), publishPoint: 'pending',
-      };
-    }
     const manifest: WorkspaceMigrationManifest = {
       manifestVersion: MANIFEST_VERSION,
       batchId,
@@ -388,14 +465,32 @@ export class WorkspaceSchemaMigrator {
       targetVersion: TARGET_SCHEMA_VERSION,
       phase: 'prepared',
       writer: { ownerId: this.options.ownerId, leaseExpiresAt: now + this.leaseMs, fencingToken: 1 },
-      stores,
+      stores: Object.create(null) as Record<string, WorkspaceMigrationStoreEntry>,
       createdAt: now,
       updatedAt: now,
-      ...(legacyFleet && legacyFleet !== 'fence-aware'
-        ? { fleetQuiescence: { provenAt: legacyFleet.quiescedAt, restartBlocked: true } }
-        : {}),
     };
+    // Publish the enforceable host fence before discovery, checkpoint, checksum,
+    // or copying. Every current/future production writer consults this manifest.
     writeManifest(this.dataDir, manifest);
+    this.probe('fence:published', manifest);
+    for (const store of this.selectedStores()) {
+      const suffix = createHash('sha256').update(relative(this.dataDir, store.path)).digest('hex').slice(0, 12);
+      const backupPath = join(root, `${suffix}-${basename(store.path)}.backup`);
+      const stagedPath = join(root, `${suffix}-${basename(store.path)}.staged`);
+      if (store.kind === 'session_sqlite') {
+        const db = openDatabaseSyncOrThrow(store.path);
+        try {
+          const checkpoint = db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as { busy?: number | bigint } | undefined;
+          if (Number(checkpoint?.busy ?? 0) !== 0) throw new WorkspaceMigrationFenceError('session WAL is busy');
+        } finally { db.close(); }
+        materializeStandaloneSqlite(store.path, backupPath);
+      } else durableCopySync(store.path, backupPath);
+      manifest.stores[storeKey(store.kind, store.path, this.dataDir)] = {
+        kind: store.kind, sourcePath: store.path, backupPath, stagedPath,
+        sourceChecksum: checksum(store.path), backupChecksum: checksum(backupPath), publishPoint: 'pending',
+      };
+      writeManifest(this.dataDir, manifest);
+    }
     this.probe('phase:prepared', manifest);
     return manifest;
   }
@@ -430,11 +525,20 @@ export class WorkspaceSchemaMigrator {
       if (checksum(store.sourcePath) !== store.sourceChecksum) {
         throw new WorkspaceMigrationFenceError(`workspace store changed after fence: ${key}`);
       }
-      copyFileSync(store.backupPath, store.stagedPath);
+      if (store.kind === 'session_sqlite') materializeStandaloneSqlite(store.backupPath, store.stagedPath);
+      else durableCopySync(store.backupPath, store.stagedPath);
       if (store.kind === 'group_json') migrateGroupJson(store.stagedPath);
       else if (store.kind === 'operation_json') migrateOperationJson(store.stagedPath);
       else if (store.kind === 'session_sqlite') migrateSessionSqlite(store.stagedPath, groupRecordsFromStagedStores(manifest.stores));
       await this.options.transform?.(store.kind, store.backupPath, store.stagedPath);
+      fsyncFilesAndDirectorySync(dirname(store.stagedPath), [store.stagedPath]);
+      if (store.kind === 'session_sqlite') {
+        const verify = openDatabaseSyncOrThrow(store.stagedPath, { readOnly: true });
+        try { verify.prepare('SELECT COUNT(*) AS count FROM sessions').get(); } finally { verify.close(); }
+        if (existsSync(`${store.stagedPath}-wal`) || existsSync(`${store.stagedPath}-shm`)) {
+          throw new WorkspaceMigrationFenceError(`staged SQLite has WAL dependency: ${key}`);
+        }
+      }
       this.probe(`stage:${key}`, manifest);
     }
     manifest.phase = 'per_store_staged';
@@ -444,7 +548,7 @@ export class WorkspaceSchemaMigrator {
 
   private verify(manifest: WorkspaceMigrationManifest): void {
     for (const [key, store] of Object.entries(manifest.stores)) {
-      if (!existsSync(store.backupPath) || checksum(store.backupPath) !== store.sourceChecksum) {
+      if (!existsSync(store.backupPath) || checksum(store.backupPath) !== (store.backupChecksum ?? store.sourceChecksum)) {
         throw new WorkspaceMigrationFenceError(`workspace backup checksum mismatch: ${key}`);
       }
       if (!existsSync(store.stagedPath)) throw new WorkspaceMigrationFenceError(`workspace stage missing: ${key}`);
@@ -463,12 +567,18 @@ export class WorkspaceSchemaMigrator {
         }
         continue;
       }
-      if (checksum(store.sourcePath) !== store.sourceChecksum) {
+      const liveChecksum = checksum(store.sourcePath);
+      if (liveChecksum === store.targetChecksum) {
+        store.publishPoint = 'published';
+        writeManifest(this.dataDir, manifest);
+        this.probe(`publish-recovered:${key}`, manifest);
+        continue;
+      }
+      if (liveChecksum !== store.sourceChecksum) {
         throw new WorkspaceMigrationFenceError(`newer fenced data would be overwritten: ${key}`);
       }
-      const publishTemp = `${store.sourcePath}.workspace-migration-${manifest.batchId}`;
-      copyFileSync(store.stagedPath, publishTemp);
-      renameSync(publishTemp, store.sourcePath);
+      durablePublishCopySync(store.stagedPath, store.sourcePath, manifest.batchId);
+      this.probe(`publish-renamed:${key}`, manifest);
       store.publishPoint = 'published';
       writeManifest(this.dataDir, manifest);
       this.probe(`publish:${key}`, manifest);
@@ -491,8 +601,21 @@ export class WorkspaceSchemaMigrator {
 
   private rollbackBeforePublish(manifest: WorkspaceMigrationManifest): void {
     if (Object.values(manifest.stores).some(store => store.publishPoint === 'published')) return;
+    if (manifest.phase === 'per_store_verified') {
+      const checksums = Object.values(manifest.stores).map(store => ({
+        store,
+        live: existsSync(store.sourcePath) ? checksum(store.sourcePath) : undefined,
+      }));
+      const hasPublishedTarget = checksums.some(({ store, live }) =>
+        store.targetChecksum !== undefined && store.targetChecksum !== store.sourceChecksum
+        && live === store.targetChecksum);
+      const hasThirdChecksum = checksums.some(({ store, live }) =>
+        live !== store.sourceChecksum && live !== store.targetChecksum);
+      if (hasThirdChecksum) throw new WorkspaceMigrationFenceError('workspace store changed while fenced');
+      if (hasPublishedTarget) return;
+    }
     for (const [key, store] of Object.entries(manifest.stores)) {
-      if (checksum(store.backupPath) !== store.sourceChecksum) {
+      if (checksum(store.backupPath) !== (store.backupChecksum ?? store.sourceChecksum)) {
         throw new WorkspaceMigrationFenceError('workspace rollback backup checksum mismatch');
       }
       if (checksum(store.sourcePath) !== store.sourceChecksum) {

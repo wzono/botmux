@@ -3,6 +3,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
+import { GroupWorkspaceStore } from '../src/services/group-workspace-store.js';
+import { GroupWorkspaceOperationStore } from '../src/services/group-workspace-operation-store.js';
 import { assertGroupWorkspaceSessionExecutable, repairKnownGroupWorkspaceSession } from '../src/core/session-cwd.js';
 import type { Session } from '../src/types.js';
 import {
@@ -64,6 +66,11 @@ describe('host-wide workspace schema migration', () => {
     const group = JSON.parse(readFileSync(join(root, 'group-workspaces.json'), 'utf8'));
     expect(group.schemaVersion).toBe(2);
     expect(group.records.chat.workspaceIdentity).toMatchObject({ path: repo });
+    expect(Object.values(group.receipts)).toHaveLength(1);
+    await expect(new GroupWorkspaceStore(root).read('chat')).resolves.toMatchObject({
+      status: 'available', record: { revision: 1, directory: { kind: 'bound', workingDir: repo } },
+    });
+    await expect(new GroupWorkspaceOperationStore(root).listUnresolved()).resolves.toMatchObject({ status: 'available' });
     const migrated = openDatabaseSyncOrThrow(dbPath, { readOnly: true });
     const rows = migrated.prepare('SELECT session_id,row FROM sessions ORDER BY session_id').all() as Array<{ session_id: string; row: string }>;
     migrated.close();
@@ -75,7 +82,7 @@ describe('host-wide workspace schema migration', () => {
 
   it('rolls back before the first publish and resumes instead of rolling back after a publish point', async () => {
     const root = dataDir();
-    writeFileSync(join(root, 'group-workspaces.json'), JSON.stringify({ schemaVersion: 2, records: {}, receipts: {} }));
+    writeFileSync(join(root, 'group-workspaces.json'), JSON.stringify({ schemaVersion: 1, records: {}, receipts: {} }));
     writeFileSync(join(root, 'group-workspace-operations.json'), JSON.stringify({ schemaVersion: 2, operations: {}, sourceIndex: {} }));
     const before = readFileSync(join(root, 'group-workspaces.json'), 'utf8');
     await new WorkspaceSchemaMigrator(root, { ownerId: 'a' }).migrateOrRecover({ stopAfter: 'per_store_verified' });
@@ -88,11 +95,11 @@ describe('host-wide workspace schema migration', () => {
 
     let crashed = false;
     const crash = new WorkspaceSchemaMigrator(root, { ownerId: 'a', crashProbe(point) {
-      if (!crashed && point.startsWith('publish:')) { crashed = true; throw new Error('crash'); }
+      if (!crashed && point.startsWith('publish-renamed:')) { crashed = true; throw new Error('crash'); }
     } });
     await expect(crash.migrateOrRecover()).rejects.toThrow('crash');
     expect(readWorkspaceMigrationManifest(root)!.phase).toBe('per_store_verified');
-    expect(Object.values(readWorkspaceMigrationManifest(root)!.stores).some(store => store.publishPoint === 'published')).toBe(true);
+    expect(Object.values(readWorkspaceMigrationManifest(root)!.stores).some(store => store.publishPoint === 'pending')).toBe(true);
     await expect(new WorkspaceSchemaMigrator(root, { ownerId: 'a' }).migrateOrRecover()).resolves.toMatchObject({ status: 'complete' });
   });
 
