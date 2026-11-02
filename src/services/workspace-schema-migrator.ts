@@ -277,12 +277,7 @@ function migrateGroupJson(path: string): void {
       && receipt.resultingRevision === revision
       && JSON.stringify(receipt.resultingDirectory) === JSON.stringify(directory)
       && receipt.completedAt === record.updatedAt && sameActor(receipt.actor, record.updatedBy)
-      && (directory.kind !== 'bound'
-        || (receipt.canonicalTargetWorkingDir === directory.workingDir
-          && isObject(receipt.workspaceIdentity)
-          && receipt.workspaceIdentity.path === identity?.path
-          && receipt.workspaceIdentity.dev === identity?.dev
-          && receipt.workspaceIdentity.ino === identity?.ino)));
+      && (directory.kind !== 'bound' || receipt.canonicalTargetWorkingDir === directory.workingDir));
     if (!exact && revision === 1 && isObject(record.updatedBy)) {
       const kind = directory.kind === 'bound' ? 'set' : 'unbind';
       const sourceEventId = migrationSourceEventId(chatId, revision);
@@ -485,6 +480,7 @@ export class WorkspaceSchemaMigrator {
       const suffix = createHash('sha256').update(relative(this.dataDir, store.path)).digest('hex').slice(0, 12);
       const backupPath = join(root, `${suffix}-${basename(store.path)}.backup`);
       const stagedPath = join(root, `${suffix}-${basename(store.path)}.staged`);
+      const sourceChecksum = checksum(store.path);
       if (store.kind === 'session_sqlite') {
         const db = openDatabaseSyncOrThrow(store.path);
         try {
@@ -493,9 +489,12 @@ export class WorkspaceSchemaMigrator {
         } finally { db.close(); }
         materializeStandaloneSqlite(store.path, backupPath);
       } else durableCopySync(store.path, backupPath);
+      if (checksum(store.path) !== sourceChecksum) {
+        throw new WorkspaceMigrationFenceError(`workspace store changed during snapshot: ${key}`);
+      }
       manifest.stores[key] = {
         kind: store.kind, sourcePath: store.path, backupPath, stagedPath,
-        sourceChecksum: checksum(store.path), backupChecksum: checksum(backupPath), publishPoint: 'pending',
+        sourceChecksum, backupChecksum: checksum(backupPath), publishPoint: 'pending',
       };
       writeManifest(this.dataDir, manifest);
     }
