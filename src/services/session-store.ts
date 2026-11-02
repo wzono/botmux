@@ -2995,6 +2995,46 @@ export function updateGroupWorkspaceFollowSession(
   return true;
 }
 
+/** Durable quarantine repair with exact old-row CAS. Authority, record revision,
+ * and path identity are re-probed by the production coordinator before entry. */
+export function repairGroupWorkspaceQuarantineExact(input: {
+  sessionId: string;
+  operationId: string;
+  repairedAt: number;
+  actor: { tenantKey: string; unionId: string };
+  chatId: string;
+  revision: number;
+  identity: import('../types.js').WorkspaceIdentity;
+}): { status: 'repaired'; session: Session } | { status: 'not_quarantined' | 'proof_mismatch' | 'conflict' } {
+  loadForWrite();
+  const store = ownStore;
+  if (!store) throw new SessionStoreUnavailableError(new Error('owned session store is not attached'));
+  return runOwnedWriteTransaction(store, false, () => {
+    const hit = store.selectRow.get(input.sessionId) as { row: string } | undefined;
+    if (!hit) return { status: 'conflict' as const };
+    const durable = parseSessionRow(hit.row);
+    const prior = durable.groupWorkspaceQuarantine;
+    if (!prior) return { status: 'not_quarantined' as const };
+    if (durable.chatId !== input.chatId || durable.workingDir !== input.identity.path
+      || input.revision < 1 || !input.operationId.trim()) return { status: 'proof_mismatch' as const };
+    durable.workspaceSchemaVersion = WORKSPACE_SCHEMA_VERSION;
+    durable.workingDirSource = 'group';
+    durable.groupWorkspaceRevision = input.revision;
+    durable.groupWorkspaceIdentity = structuredClone(input.identity);
+    durable.groupWorkspaceDirectoryIdentity = { dev: input.identity.dev, ino: input.identity.ino };
+    durable.groupWorkspaceRepairReceipt = {
+      operationId: input.operationId, repairedAt: input.repairedAt, actor: structuredClone(input.actor),
+      chatId: input.chatId, revision: input.revision, identity: structuredClone(input.identity),
+      priorQuarantine: structuredClone(prior),
+    };
+    delete durable.groupWorkspaceQuarantine;
+    const updated = store.updateExact.run(sessionStatusText(durable), JSON.stringify(durable), input.sessionId, hit.row);
+    if (Number(updated.changes) !== 1) return { status: 'conflict' as const };
+    sessions.set(input.sessionId, durable);
+    return { status: 'repaired' as const, session: structuredClone(durable) };
+  });
+}
+
 /** Exact task authority mutation; ordinary metadata updates cannot write it. */
 export function updateDeploymentContinuation(
   session: Session,

@@ -815,6 +815,16 @@ export interface Session {
     detail: string;
     supersededByOperationId?: string;
   };
+  /** Durable proof that an authorized repair superseded a migration quarantine. */
+  groupWorkspaceRepairReceipt?: {
+    operationId: string;
+    repairedAt: number;
+    actor: { tenantKey: string; unionId: string };
+    chatId: string;
+    revision: number;
+    identity: WorkspaceIdentity;
+    priorQuarantine: NonNullable<Session['groupWorkspaceQuarantine']>;
+  };
   /** Durable replacement journal for a group-following local worker. */
   groupWorkspaceFollow?: {
     schemaVersion?: typeof WORKSPACE_SCHEMA_VERSION;
