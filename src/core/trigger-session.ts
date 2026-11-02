@@ -20,6 +20,7 @@ import {
   getDaemonBootId,
   hasQueuedActivationAdmissionGate,
   sendWorkerInput,
+  dispatchWorkspaceAdmittedBusinessTurn,
   setActiveSessionIfActive,
   withActiveSessionKeyLock,
 } from './worker-pool.js';
@@ -1467,6 +1468,19 @@ async function triggerSessionTurnAdmitted(
       }
     };
 
+    const dispatchAdmittedTrigger = (payload: string | CliTurnPayload, options: {
+      dispatchAttempt?: number; atMostOnce?: true; codexAppSteerable?: true;
+    } = {}) => dispatchWorkspaceAdmittedBusinessTurn({
+      ds: target,
+      turnId: triggerId,
+      payload,
+      resume: target.hasHistory,
+      markAttempting: async () => true,
+      ...(options.dispatchAttempt === undefined ? {} : { dispatchAttempt: options.dispatchAttempt }),
+      ...(options.codexAppSteerable ? { codexAppSteerable: true as const } : {}),
+      ...(options.atMostOnce ? { atMostOnce: true as const } : {}),
+    });
+
     if (workerIsLive) {
       if (req.options?.waitForFinalOutput) {
         return waitForSessionFinalOutput(
@@ -1585,9 +1599,9 @@ async function triggerSessionTurnAdmitted(
       const dispatchAttempt = prepareStableDispatch(target, false);
       armFinalOutputSuppression(target, dispatchAttempt);
       armLoudFinalSuppression(target);
-      const accepted = sendWorkerInput(target, content, triggerId, {
+      const accepted = await dispatchAdmittedTrigger(content, {
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-        ...(internal?.atMostOnce ? { atMostOnce: true } : {}),
+        ...(internal?.atMostOnce ? { atMostOnce: true as const } : {}),
         ...(steerRequested ? { codexAppSteerable: true as const } : {}),
       });
       if (!accepted) {
@@ -1709,12 +1723,11 @@ async function triggerSessionTurnAdmitted(
     const dispatchAttempt = prepareStableDispatch(target, true);
     armFinalOutputSuppression(target, dispatchAttempt);
     armLoudFinalSuppression(target);
-    forkWorker(target, withSteer(content), {
-      resume: target.hasHistory,
-      turnId: triggerId,
-      ...(internal?.atMostOnce ? { atMostOnce: true } : {}),
+    const admitted = await dispatchAdmittedTrigger(withSteer(content), {
+      ...(internal?.atMostOnce ? { atMostOnce: true as const } : {}),
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     });
+    if (!admitted) return { ok: false, triggerId, errorCode: 'trigger_failed', error: 'workspace admission rejected' };
     return {
       ok: true,
       triggerId,

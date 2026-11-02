@@ -58,6 +58,24 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/core/worker-pool.js')>();
   return {
   forkWorker: (...args: any[]) => mockForkWorker(...args),
+  dispatchWorkspaceAdmittedBusinessTurn: vi.fn(async (input: any) => {
+    if (!await input.markAttempting()) return false;
+    const opts = input;
+    if (input.ds.worker && !input.ds.worker.killed) {
+      if (actual.hasQueuedActivationAdmissionGate(input.ds)) {
+        return mockQueuedTailAdmission(input.ds, input.payload, input.turnId, {
+          ...(opts.dispatchAttempt === undefined ? {} : { dispatchAttempt: opts.dispatchAttempt }),
+        });
+      }
+      input.ds.worker.send({ type: 'message', content: typeof input.payload === 'string' ? input.payload : input.payload.content,
+        ...(typeof input.payload === 'object' && input.payload.codexAppInput ? { codexAppInput: input.payload.codexAppInput } : {}),
+        turnId: input.turnId, ...(opts.dispatchAttempt === undefined ? {} : { dispatchAttempt: opts.dispatchAttempt }) });
+      return true;
+    }
+    mockForkWorker(input.ds, input.payload, { resume: input.resume, turnId: input.turnId,
+      ...(opts.dispatchAttempt === undefined ? {} : { dispatchAttempt: opts.dispatchAttempt }) });
+    return true;
+  }),
   sendWorkerInput: (ds: any, payload: any, turnId?: string, opts: any = {}) => {
     if (!ds.worker || ds.worker.killed) return false;
     if (actual.hasQueuedActivationAdmissionGate(ds)) return mockQueuedTailAdmission(ds, payload, turnId, opts);

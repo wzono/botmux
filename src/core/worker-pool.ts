@@ -1089,7 +1089,7 @@ export interface WorkerPoolCallbacks {
     ds: DaemonSession;
     turnId: string;
     payload: string | CliTurnPayload;
-    options: { resume: boolean; atMostOnce?: true; trustedCaller?: TrustedCaller };
+    options: { resume: boolean; dispatchAttempt?: number; atMostOnce?: true; codexAppSteerable?: true; trustedCaller?: TrustedCaller };
     markAttempting?: () => Promise<boolean>;
   }) => Promise<boolean>;
   /** Connector-owned live card for a handoff whose exact input has started. */
@@ -13088,6 +13088,9 @@ export async function dispatchWorkspaceAdmittedBusinessTurn(input: {
   turnId: string;
   payload: string | CliTurnPayload;
   resume: boolean;
+  dispatchAttempt?: number;
+  codexAppSteerable?: true;
+  atMostOnce?: true;
   trustedCaller?: TrustedCaller;
   markAttempting(): Promise<boolean>;
 }): Promise<boolean> {
@@ -13098,7 +13101,10 @@ export async function dispatchWorkspaceAdmittedBusinessTurn(input: {
     ds: input.ds,
     turnId: input.turnId,
     payload: input.payload,
-    options: { resume: input.resume, atMostOnce: true,
+    options: { resume: input.resume,
+      ...(input.dispatchAttempt === undefined ? {} : { dispatchAttempt: input.dispatchAttempt }),
+      ...(input.codexAppSteerable ? { codexAppSteerable: true as const } : {}),
+      ...(input.atMostOnce ? { atMostOnce: true as const } : {}),
       ...(input.trustedCaller ? { trustedCaller: input.trustedCaller } : {}) },
     markAttempting: input.markAttempting,
   });
