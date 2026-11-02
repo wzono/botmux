@@ -2839,9 +2839,6 @@ export interface RoutingContext {
   commandTrigger?: CommandTriggerMatch;
   /** This turn was triggered by a configured group message listener. */
   messageListener?: MessageListenerMatch;
-  /** Listener transport provenance only; both variants retain the ordinary
-   * message adapter and never acquire an independent workspace resolver. */
-  messageListenerOrigin?: 'realtime' | 'polled';
   /** Daemon-minted turn created after a requester accepted a Completion
    * Proposal. It has no native inbound Lark message, so consumers must not
    * emit message reactions, quote its synthetic turn id, or run unrelated
@@ -2911,7 +2908,6 @@ function listenerRoutingContext(input: {
   messageId: string;
   chatType: 'group' | 'p2p';
   larkAppId: string;
-  origin: 'realtime' | 'polled';
 }): PendingForwardTopicPayload {
   const replyInChat = input.match.replyMode === 'chat';
   return {
@@ -2925,7 +2921,6 @@ function listenerRoutingContext(input: {
       anchor: replyInChat ? input.chatId : input.messageId,
       regularGroupTopLevel: replyInChat,
       messageListener: input.match,
-      messageListenerOrigin: input.origin,
     },
     ownsSession: false,
   };
@@ -3560,7 +3555,6 @@ async function dispatchPolledMessageListenerMatch(input: {
     messageId: input.messageId,
     chatType: 'group',
     larkAppId: input.larkAppId,
-    origin: 'polled',
   }));
 }
 
@@ -5278,7 +5272,6 @@ export function createLarkEventDispatcherRuntime(
             messageId,
             chatType,
             larkAppId,
-            origin: 'realtime',
           });
           if (primary) {
             preparePrimaryRoutingContext(listenerPayload.ctx, primary);

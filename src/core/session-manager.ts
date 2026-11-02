@@ -21,7 +21,7 @@ import { scheduledWorkingDirSwapReason, updateRuntimeTaskState } from './schedul
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart, dispatchWorkspaceAdmittedBusinessTurn } from './worker-pool.js';
+import { forkWorker, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart, dispatchWorkspaceAdmittedBusinessTurn } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
@@ -5220,6 +5220,14 @@ export async function deliverOwnerBatchTurn(
     }
     return bannerId;
   };
+  const boardWorkspace = await resolveIngressWorkspace({
+    larkAppId, chatId, chatType, dataDir: config.session.dataDir,
+    oncall: findOncallChat(larkAppId, chatId),
+    botDefaultWorkingDir: effectiveDefaultWorkingDir(bot.config),
+  });
+  if (boardWorkspace.status !== 'resolved' && boardWorkspace.status !== 'unbound') {
+    throw new Error(`decision board workspace_${boardWorkspace.status}`);
+  }
   if (independentByMode) await postBanner();
   // 横幅发送失败时回落 chat 锚点（与定时任务 chat 级触发同形）。
   const opensIndependentTopic = independentByMode && !!bannerId;
@@ -5286,21 +5294,12 @@ export async function deliverOwnerBatchTurn(
           trustedCaller,
         });
         rememberLastCliInput(existing, input.prompt, payload);
-        if (existing.worker && !existing.worker.killed) {
-          try {
-            if (sendWorkerInput(existing, payload, turnId, trustedCaller ? { trustedCaller } : {})) {
-              logger.info(`[decision-board] Batch turn ${turnId} injected into steward session ${existing.session.sessionId}`);
-              return { sessionId: existing.session.sessionId };
-            }
-          } catch (err: any) {
-            logger.warn(`[decision-board] Live injection threw (${err.message}); cold-resuming steward session`);
-          }
-        }
-        if (activeSessions.get(key) !== existing || existing.session.status !== 'active') {
-          throw new Error(`steward session ${existing.session.sessionId} is no longer active`);
-        }
-        forkWorker(existing, payload, { resume: existing.hasHistory, turnId });
-        logger.info(`[decision-board] Batch turn ${turnId} cold-resumed steward session ${existing.session.sessionId}`);
+        const accepted = await dispatchWorkspaceAdmittedBusinessTurn({
+          ds: existing, turnId, payload, resume: existing.hasHistory,
+          ...(trustedCaller ? { trustedCaller } : {}), markAttempting: async () => true,
+        });
+        if (!accepted) throw new Error(`steward session ${existing.session.sessionId} workspace admission rejected`);
+        logger.info(`[decision-board] Batch turn ${turnId} admitted in steward session ${existing.session.sessionId}`);
         return { sessionId: existing.session.sessionId };
       }
       if (isDisposableCommandScratch(existing)) {
@@ -5322,6 +5321,7 @@ export async function deliverOwnerBatchTurn(
       stampHumanActivity(session, now);
     }
     session.lastMessageAt = new Date(now).toISOString();
+    if (boardWorkspace.status === 'resolved') setSessionWorkingDirMetadata(session, boardWorkspace.mutation);
     sessionStore.updateSession(session);
     messageQueue.ensureQueue(anchor);
     const ds: DaemonSession = {
@@ -5337,7 +5337,7 @@ export async function deliverOwnerBatchTurn(
       cliVersion: getCurrentCliVersion(),
       lastMessageAt: now,
       hasHistory: false,
-      workingDir: effectiveDefaultWorkingDir(bot.config),
+      workingDir: boardWorkspace.status === 'resolved' ? boardWorkspace.workspace.path : undefined,
       initialStartPending: true,
       pendingPrompt: input.prompt,
     };
@@ -5372,12 +5372,11 @@ export async function deliverOwnerBatchTurn(
         + (winner ? ` to ${winner.session.sessionId}` : ''));
     }
     rememberLastCliInput(ds, input.prompt, prompt);
-    try {
-      forkWorker(ds, prompt, turnId);
-    } catch (err) {
-      await releaseStartRefusedForMissingDir(ds, err);
-      throw err;
-    }
+    const admitted = await dispatchWorkspaceAdmittedBusinessTurn({
+      ds, turnId, payload: prompt, resume: false,
+      ...(trustedCaller ? { trustedCaller } : {}), markAttempting: async () => true,
+    });
+    if (!admitted) throw new Error(`decision board batch ${turnId} workspace admission rejected`);
     ds.initialStartPending = false;
     ds.pendingPrompt = undefined;
     logger.info(`[decision-board] Batch turn ${turnId} spawned steward session ${session.sessionId} (anchor ${anchor})`);
