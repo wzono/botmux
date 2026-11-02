@@ -48,6 +48,7 @@ export function createGroupWorkspaceRouteRuntime(options: {
   registeredBots: (tenantKey: string) => readonly BotAdminIdentityConfig[];
   resolveAllowedUser: ResolveBotAllowedUser;
   resolveActorUnion: (openId: string) => Promise<string | undefined>;
+  observeVerifiedTenant?: (larkAppId: string, tenantKey: string) => void;
   readWorkspace: (chatId: string) => Promise<WorkspaceAclRead>;
   canSwitchSession: (session: DaemonSession, actor: GroupWorkspaceSessionActor) => boolean;
   dispatchRepo: (
@@ -74,9 +75,14 @@ export function createGroupWorkspaceRouteRuntime(options: {
       || !envelopeUnionId?.startsWith('on_')) return { status: 'recognized_denied', reason: 'identity_unavailable' };
     const verifiedUnionId = await options.resolveActorUnion(actorOpenId);
     if (verifiedUnionId !== envelopeUnionId) return { status: 'recognized_denied', reason: 'identity_unavailable' };
+    options.observeVerifiedTenant?.(options.larkAppId, tenantKey);
 
+    const registeredBots = options.registeredBots(tenantKey);
+    if (!registeredBots.some(bot => bot.larkAppId === options.larkAppId && bot.tenantKey === tenantKey)) {
+      return { status: 'recognized_denied', reason: 'identity_unavailable' };
+    }
     snapshot = await loadFreshBotAdminUnionSnapshot({
-      registeredBots: options.registeredBots(tenantKey),
+      registeredBots,
       snapshot,
       resolveAllowedUser: options.resolveAllowedUser,
       now: options.now,
@@ -98,7 +104,7 @@ export function createGroupWorkspaceRouteRuntime(options: {
       unionId: verifiedUnionId,
       humanProvenance: true,
     };
-    return {
+    const authority: GroupWorkspaceRouteAuthorityResult = {
       status: 'authorized',
       actor: { tenantKey, unionId: verifiedUnionId },
       configFingerprint: snapshot.configFingerprint,
@@ -106,6 +112,9 @@ export function createGroupWorkspaceRouteRuntime(options: {
       workspaceManagers: workspace.record?.workspaceManagers,
       canSwitchSession: !!exactSession && options.canSwitchSession(exactSession, sessionActor),
     };
+    return canManageGroupWorkspace(authority)
+      ? authority
+      : { status: 'recognized_denied', reason: 'unauthorized' };
   };
 
   const revalidateAuthorityConfiguration = async (

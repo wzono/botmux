@@ -16,7 +16,29 @@ const journal: any = { operationKey: groupWorkspaceOperationKey(sourceEventId, '
 const dir = () => mkdtempSync(join(tmpdir(), 'operation-v2-'));
 
 describe('same-source winner and executor lease', () => {
-  it('durably migrates a schema-v1 locked journal without losing phase or intent', async () => {
+  it.each(['prepared', 'session_committed', 'group_committed', 'unknown'] as const)(
+    'quarantines unresolved schema-v1 set journal in %s without probing a replacement path', async phase => {
+      const dataDir = dir();
+      const path = join(dataDir, 'group-workspace-operations.json');
+      const legacy = { ...journal, target: undefined, targetWorkspaceIdentity: undefined, phase,
+        ...(phase === 'session_committed' ? { sessionGenerationAfter: 2 } : {}),
+        ...(phase === 'group_committed' ? { sessionGenerationAfter: 2, groupRevisionAfter: 1 } : {}),
+      };
+      writeFileSync(path, JSON.stringify({ schemaVersion: 1, operations: { [journal.operationKey]: legacy } }));
+      let probes = 0;
+      const store = new GroupWorkspaceOperationStore(dataDir, { pathProbe: () => { probes += 1; throw new Error('must not probe'); } });
+      await expect(store.get(journal.operationKey)).resolves.toMatchObject({ status: 'found', journal: {
+        phase: 'migration_blocked_identity_missing', legacyPhase: phase,
+      } });
+      expect(probes).toBe(0);
+      await expect(store.listRecoverable()).resolves.toEqual({ status: 'available', journals: [] });
+      await expect(store.listUnresolved()).resolves.toMatchObject({ status: 'available', journals: [
+        { operationKey: journal.operationKey, phase: 'migration_blocked_identity_missing' },
+      ] });
+    },
+  );
+
+  it('durably migrates a schema-v1 failed terminal journal without losing phase or intent', async () => {
     const dataDir = dir();
     const path = join(dataDir, 'group-workspace-operations.json');
     const legacy = {
@@ -24,7 +46,7 @@ describe('same-source winner and executor lease', () => {
       chatId: journal.chatId, sessionId: journal.sessionId,
       expectedSessionGeneration: journal.expectedSessionGeneration, expectedGroupRevision: journal.expectedGroupRevision,
       targetWorkingDir: journal.targetWorkingDir, actor: journal.actor,
-      phase: 'session_committed', sessionGenerationAfter: 2, updatedAt: 2,
+      phase: 'conflict', sessionGenerationAfter: 2, updatedAt: 2,
     };
     writeFileSync(path, JSON.stringify({ schemaVersion: 1, operations: { [journal.operationKey]: legacy } }));
     const store = new GroupWorkspaceOperationStore(dataDir, { pathProbe: target => ({
@@ -32,7 +54,7 @@ describe('same-source winner and executor lease', () => {
     }) });
     await expect(store.get(journal.operationKey)).resolves.toMatchObject({
       status: 'found', journal: {
-        phase: 'session_committed', sessionGenerationAfter: 2, requestIntentDigest: journal.payloadDigest,
+        phase: 'conflict', sessionGenerationAfter: 2, requestIntentDigest: journal.payloadDigest,
         target: { kind: 'workspace', identity }, targetWorkspaceIdentity: identity,
       },
     });
@@ -47,7 +69,7 @@ describe('same-source winner and executor lease', () => {
       chatId: journal.chatId, sessionId: journal.sessionId,
       expectedSessionGeneration: journal.expectedSessionGeneration, expectedGroupRevision: journal.expectedGroupRevision,
       targetWorkingDir: journal.targetWorkingDir, actor: journal.actor,
-      phase: 'session_committed', sessionGenerationAfter: 2, updatedAt: 2,
+      phase: 'conflict', sessionGenerationAfter: 2, updatedAt: 2,
     };
     const original = JSON.stringify({ schemaVersion: 1, operations: { [journal.operationKey]: legacy } });
     writeFileSync(path, original);
@@ -61,7 +83,7 @@ describe('same-source winner and executor lease', () => {
       pathProbe: target => ({ ok: true, normalizedPath: target, identity }),
     });
     await expect(retried.get(journal.operationKey)).resolves.toMatchObject({
-      status: 'found', journal: { phase: 'session_committed', target: { kind: 'workspace', identity } },
+      status: 'found', journal: { phase: 'conflict', target: { kind: 'workspace', identity } },
     });
     expect(JSON.parse(readFileSync(path, 'utf8'))).toMatchObject({ schemaVersion: 2 });
   });

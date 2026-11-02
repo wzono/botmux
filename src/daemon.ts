@@ -548,8 +548,9 @@ import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.j
 import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, runGroupWorkspaceRepoEntrypoint } from './core/command-handler.js';
 import { resolveGroupWorkspaceRepoSelection } from './core/repo-selection.js';
 import { resolveGroupWorkspaceCwd } from './core/group-workspace-policy.js';
-import { applySessionWorkingDir, resolveGroupWorkspaceFollowTarget, runGroupWorkspaceSessionFollow, setSessionWorkingDirMetadata, type SessionWorkingDirMutation } from './core/session-cwd.js';
+import { applySessionWorkingDir, proveGroupWorkspaceSessionReplacement, resolveGroupWorkspaceFollowTarget, runGroupWorkspaceSessionFollow, setSessionWorkingDirMetadata, type SessionWorkingDirMutation } from './core/session-cwd.js';
 import { createGroupWorkspaceRouteRuntime } from './core/group-workspace-route-runtime.js';
+import { DurableVerifiedAppTenantRegistry } from './core/workspace-authority.js';
 import { classifySlash, isCommandDecision, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
 import { deriveSessionPhase } from './core/session-phase.js';
 import { noteObservedCliVersion } from './core/cli-version-history.js';
@@ -7371,6 +7372,7 @@ const cardClickTurns = createCardClickTurnBinder({
 });
 setCardClickTurnPoster((larkAppId, body) => cardClickTurns.post(larkAppId, body));
 
+const verifiedAppTenantRegistry = new DurableVerifiedAppTenantRegistry(config.session.dataDir);
 const groupWorkspaceStore = new GroupWorkspaceStore(config.session.dataDir);
 const groupWorkspaceOperationStore = new GroupWorkspaceOperationStore(config.session.dataDir);
 const groupWorkspaceExecutorLeaseStore = new OperationExecutorLeaseStore(config.session.dataDir);
@@ -33196,24 +33198,33 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       larkAppId: cfg.larkAppId,
       activeSessions,
       sessionKey,
-      registeredBots: tenantKey => getAllBots()
-        .filter(candidate => !candidate.config.apiOnly)
-        .map((candidate): BotAdminIdentityConfig => ({
-          larkAppId: candidate.config.larkAppId,
-          tenantKey,
-          brand: candidate.config.brand,
-          resolvedAllowedUsers: candidate.config.allowedUsers ?? candidate.resolvedAllowedUsers,
-        })),
+      registeredBots: tenantKey => verifiedAppTenantRegistry.registeredBots(
+        loadBotConfigsCached()
+          .filter(candidate => !candidate.apiOnly)
+          .map(candidate => ({
+            larkAppId: candidate.larkAppId,
+            brand: candidate.brand,
+            resolvedAllowedUsers: candidate.allowedUsers ?? [],
+          })),
+        tenantKey,
+      ) as BotAdminIdentityConfig[],
       resolveAllowedUser: async (candidate, allowedUser) => {
-        const state = getBot(candidate.larkAppId);
-        const openId = state.rawAllowedUserResolution.get(allowedUser)
+        const configured = loadBotConfigsCached().find(bot => bot.larkAppId === candidate.larkAppId)?.allowedUsers;
+        const published = readBotAdminUnions(config.session.dataDir, candidate.larkAppId, configured);
+        if (!published?.exact) return undefined;
+        if (allowedUser.startsWith('on_') && published.admins.has(allowedUser)) {
+          return { tenantKey: candidate.tenantKey, unionId: allowedUser };
+        }
+        const liveState = candidate.larkAppId === cfg.larkAppId ? getBot(candidate.larkAppId) : undefined;
+        const openId = liveState?.rawAllowedUserResolution.get(allowedUser)
           ?? (allowedUser.startsWith('ou_') ? allowedUser : undefined);
         if (!openId) return undefined;
         const resolved = await resolveUserUnionId(candidate.larkAppId, openId);
-        return resolved.unionId?.startsWith('on_')
+        return resolved.unionId?.startsWith('on_') && published.admins.has(resolved.unionId)
           ? { tenantKey: candidate.tenantKey, unionId: resolved.unionId }
           : undefined;
       },
+      observeVerifiedTenant: (larkAppId, tenantKey) => verifiedAppTenantRegistry.observeSignedCallback(larkAppId, tenantKey),
       resolveActorUnion: async openId => {
         const resolved = await resolveUnionIdFromOpenIdStrict(cfg.larkAppId, openId);
         return resolved.status === 'resolved' && resolved.unionId.startsWith('on_')
@@ -33281,7 +33292,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                   : { status: 'store_unavailable' };
               },
               switchSession: async input => {
-                const before = ds.workerGeneration ?? 0;
+                const before = ds.workerGeneration ?? ds.session.workerGeneration ?? 0;
+                const previousSessionId = ds.session.sessionId;
+                const ownerOpenId = ds.session.ownerOpenId;
                 if (before !== input.expectedGeneration
                   || activeSessions.get(sessionKey(ds.chatId, cfg.larkAppId)) !== ds) {
                   return { status: 'unknown' };
@@ -33298,12 +33311,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                   sessionReply: async () => '',
                 }, cfg.larkAppId);
                 const current = activeSessions.get(sessionKey(ds.chatId, cfg.larkAppId));
-                if (!current || current === ds || getSessionWorkingDir(current) !== input.targetWorkingDir) {
-                  return { status: 'unknown' };
-                }
-                const generation = current.workerGeneration ?? before + 1;
-                current.workerGeneration = generation;
-                return { status: 'committed', generation };
+                const proof = probePathUsability(input.targetWorkingDir);
+                if (!proof.ok) return { status: 'unknown' };
+                return proveGroupWorkspaceSessionReplacement({
+                  current,
+                  larkAppId: cfg.larkAppId,
+                  chatId: ds.chatId,
+                  previousSessionId,
+                  previousGeneration: before,
+                  ownerOpenId,
+                  targetWorkingDir: input.targetWorkingDir,
+                  workspaceIdentity: input.workspaceIdentity,
+                  observedWorkspaceIdentity: { path: proof.normalizedPath, ...proof.identity },
+                });
               },
               convergeSession: async input => {
                 const current = activeSessions.get(sessionKey(ds.chatId, cfg.larkAppId));
@@ -33323,9 +33343,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               authorityFingerprint: route.authorityFingerprint,
               ownerLarkAppId: cfg.larkAppId,
             });
-            return result.status === 'group_committed'
-              ? { status: 'group_committed', groupRevision: result.groupRevision }
-              : { status: result.status };
+            if (result.status === 'group_committed') {
+              return { status: 'group_committed', groupRevision: result.groupRevision };
+            }
+            return { status: result.status === 'observing' ? 'unknown' : result.status };
           },
           executeUnbind: async request => {
             return executeGroupWorkspaceUnbind({

@@ -55,6 +55,7 @@ export type GroupWorkspaceOperationResult =
   | { status: 'unauthorized'; journal?: RepoGroupOperationJournal }
   | { status: 'store_unavailable'; journal?: RepoGroupOperationJournal }
   | { status: 'unknown'; journal?: RepoGroupOperationJournal }
+  | { status: 'observing'; journal: RepoGroupOperationJournal; receipt?: GroupCommitReceipt }
   | { status: 'protocol_conflict'; journal?: RepoGroupOperationJournal };
 
 export interface GroupWorkspaceOperationDependencies {
@@ -433,7 +434,11 @@ export class GroupWorkspaceOperationCoordinator {
         || receiptLookup.receipt.targetWorkingDir !== existing.journal.targetWorkingDir) {
         return { status: 'protocol_conflict', journal: existing.status === 'found' ? existing.journal : undefined };
       }
-      return this.convergeReceipt(existing.journal, receiptLookup.receipt);
+      const executor = await this.dependencies.acquireExecutor?.(existing.journal.operationKey);
+      if (executor?.status === 'observer') {
+        return { status: 'observing', journal: existing.journal, receipt: receiptLookup.receipt };
+      }
+      return this.convergeReceipt(existing.journal, receiptLookup.receipt, executor?.lease);
     }
     if (existing.status === 'found' && !sameIntent(existing.journal, canonicalRequest)) {
       return { status: 'protocol_conflict', journal: existing.journal };
@@ -475,8 +480,8 @@ export class GroupWorkspaceOperationCoordinator {
     if (executor?.status === 'observer') {
       const observed = await this.dependencies.lookupGroupReceipt(journal.operationKey);
       return observed.status === 'found'
-        ? this.convergeReceipt(journal, observed.receipt)
-        : { status: 'unknown', journal };
+        ? { status: 'observing', journal, receipt: observed.receipt }
+        : { status: 'observing', journal };
     }
     return this.advance(journal, executor?.lease);
   }
@@ -486,8 +491,8 @@ export class GroupWorkspaceOperationCoordinator {
     if (executor?.status === 'observer') {
       const observed = await this.dependencies.lookupGroupReceipt(journal.operationKey);
       return observed.status === 'found'
-        ? this.convergeReceipt(journal, observed.receipt)
-        : { status: 'unknown', journal };
+        ? { status: 'observing', journal, receipt: observed.receipt }
+        : { status: 'observing', journal };
     }
     return this.advance(journal, executor?.lease);
   }
@@ -498,16 +503,16 @@ export class GroupWorkspaceOperationCoordinator {
   ): Promise<GroupWorkspaceOperationResult> {
     const receiptLookup = await this.dependencies.lookupGroupReceipt(journal.operationKey);
     if (receiptLookup.status === 'store_unavailable') return { status: 'unknown', journal };
-    if (receiptLookup.status === 'found') return this.convergeReceipt(journal, receiptLookup.receipt);
+    if (receiptLookup.status === 'found') return this.convergeReceipt(journal, receiptLookup.receipt, lease);
     if (journal.phase === 'unknown') {
       const readback = await this.dependencies.reconcileUnknownGroupReceipt(journal);
       if (readback.status === 'missing') return { status: 'unknown', journal };
       if (readback.status === 'store_unavailable') return { status: 'store_unavailable', journal };
-      return this.convergeReceipt(journal, readback.receipt);
+      return this.convergeReceipt(journal, readback.receipt, lease);
     }
     if (journal.phase === 'group_committed') {
       const readback = await this.dependencies.reconcileUnknownGroupReceipt(journal);
-      if (readback.status === 'found') return this.convergeReceipt(journal, readback.receipt);
+      if (readback.status === 'found') return this.convergeReceipt(journal, readback.receipt, lease);
       return { status: readback.status === 'store_unavailable' ? 'store_unavailable' : 'unknown', journal };
     }
     if (journal.phase === 'conflict') return { status: 'conflict', journal };
@@ -593,26 +598,38 @@ export class GroupWorkspaceOperationCoordinator {
       }, lease ? () => this.hasFence(journal.operationKey, lease) : undefined);
       if (advanced.status !== 'updated') return this.markUnknown(journal);
       const completed = advanced.journal;
-      await this.dependencies.convergeSession({
+      const convergenceInput = {
         sessionId: completed.sessionId,
         expectedGeneration: completed.sessionGenerationAfter!,
-        source: 'group',
+        source: 'group' as const,
         groupRevision: groupResult.resultingRevision,
         workspaceIdentity: completed.targetWorkspaceIdentity,
-      });
+      };
+      const sessionConvergence = lease && this.dependencies.runFencedEffect
+        ? await this.dependencies.runFencedEffect(journal.operationKey, lease,
+          () => this.dependencies.convergeSession(convergenceInput))
+        : { status: 'applied' as const, value: await this.dependencies.convergeSession(convergenceInput) };
+      if (sessionConvergence.status === 'stale_fence') return { status: 'observing', journal: completed, receipt: receiptReadback.receipt };
       await this.dependencies.afterBoundary?.('receipt_before_response');
       return { status: 'group_committed', journal: completed, groupRevision: groupResult.resultingRevision };
     }
 
-    await this.dependencies.convergeSession({
-      sessionId: journal.sessionId,
-      expectedGeneration: journal.sessionGenerationAfter!,
-      source: 'explicit',
-    });
+    const explicitConvergence = lease && this.dependencies.runFencedEffect
+      ? await this.dependencies.runFencedEffect(journal.operationKey, lease, () => this.dependencies.convergeSession({
+        sessionId: journal.sessionId,
+        expectedGeneration: journal.sessionGenerationAfter!,
+        source: 'explicit',
+      }))
+      : { status: 'applied' as const, value: await this.dependencies.convergeSession({
+        sessionId: journal.sessionId,
+        expectedGeneration: journal.sessionGenerationAfter!,
+        source: 'explicit',
+      }) };
+    if (explicitConvergence.status === 'stale_fence') return { status: 'observing', journal };
     const phase = groupResult.status;
     const advanced = await this.dependencies.journalStore.transition(journal.operationKey, phase, {
       updatedAt: this.dependencies.now(),
-    });
+    }, lease ? () => this.hasFence(journal.operationKey, lease) : undefined);
     const terminal = advanced.status === 'updated' ? advanced.journal : journal;
     return phase === 'conflict'
       ? { status: phase, journal: terminal, currentRevision: groupResult.currentRevision }
@@ -622,8 +639,11 @@ export class GroupWorkspaceOperationCoordinator {
   private async convergeReceipt(
     journal: RepoGroupOperationJournal | undefined,
     receipt: GroupCommitReceipt,
+    lease?: OperationExecutorLease,
   ): Promise<GroupWorkspaceOperationResult> {
     if (!journal) return { status: 'store_unavailable' };
+    if (this.dependencies.acquireExecutor && !lease) return { status: 'observing', journal, receipt };
+    if (lease && !(await this.hasFence(journal.operationKey, lease))) return { status: 'observing', journal, receipt };
     if (!receiptMatchesJournal(receipt, journal)) {
       return { status: 'unknown', journal };
     }
@@ -636,38 +656,53 @@ export class GroupWorkspaceOperationCoordinator {
       if (journal.phase === 'session_committed' || journal.phase === 'unknown') {
         const patch = { groupRevisionAfter: receipt.resultingRevision, updatedAt: this.dependencies.now() };
         const advanced = journal.phase === 'unknown'
-          ? await this.dependencies.journalStore.convergeReceipt(journal.operationKey, 'group_committed', patch)
-          : await this.dependencies.journalStore.transition(journal.operationKey, 'group_committed', patch);
+          ? await this.dependencies.journalStore.convergeReceipt(journal.operationKey, 'group_committed', patch,
+            lease ? () => this.hasFence(journal.operationKey, lease) : undefined)
+          : await this.dependencies.journalStore.transition(journal.operationKey, 'group_committed', patch,
+            lease ? () => this.hasFence(journal.operationKey, lease) : undefined);
         if (advanced.status !== 'updated') return { status: 'unknown', journal };
         completed = advanced.journal;
       }
-      const convergence = await this.dependencies.convergeSession({
+      const convergenceInput = {
         sessionId: completed.sessionId,
         expectedGeneration: completed.sessionGenerationAfter ?? completed.expectedSessionGeneration + 1,
-        source: 'group',
+        source: 'group' as const,
         groupRevision: receipt.resultingRevision,
         workspaceIdentity: completed.targetWorkspaceIdentity,
-      });
+      };
+      const fencedConvergence = lease && this.dependencies.runFencedEffect
+        ? await this.dependencies.runFencedEffect(journal.operationKey, lease,
+          () => this.dependencies.convergeSession(convergenceInput))
+        : { status: 'applied' as const, value: await this.dependencies.convergeSession(convergenceInput) };
+      if (fencedConvergence.status === 'stale_fence') return { status: 'observing', journal, receipt };
+      const convergence = fencedConvergence.value;
       if (convergence === 'session_missing' && completed.phase === 'group_committed') {
         const terminal = await this.dependencies.journalStore.transition(completed.operationKey, 'no_session_complete', {
           updatedAt: this.dependencies.now(),
-        });
+        }, lease ? () => this.hasFence(journal.operationKey, lease) : undefined);
         if (terminal.status !== 'updated') return { status: 'unknown', journal: completed };
         completed = terminal.journal;
       }
       return { status: 'group_committed', journal: completed, groupRevision: receipt.resultingRevision };
     }
-    await this.dependencies.convergeSession({
+    const explicitInput = {
       sessionId: journal.sessionId,
       expectedGeneration: journal.sessionGenerationAfter ?? journal.expectedSessionGeneration + 1,
-      source: 'explicit',
-    });
+      source: 'explicit' as const,
+    };
+    const explicitConvergence = lease && this.dependencies.runFencedEffect
+      ? await this.dependencies.runFencedEffect(journal.operationKey, lease,
+        () => this.dependencies.convergeSession(explicitInput))
+      : { status: 'applied' as const, value: await this.dependencies.convergeSession(explicitInput) };
+    if (explicitConvergence.status === 'stale_fence') return { status: 'observing', journal, receipt };
     const phase = receipt.status;
     let terminal = journal;
     if (journal.phase === 'session_committed' || journal.phase === 'unknown') {
       const advanced = journal.phase === 'unknown'
-        ? await this.dependencies.journalStore.convergeReceipt(journal.operationKey, phase, { updatedAt: this.dependencies.now() })
-        : await this.dependencies.journalStore.transition(journal.operationKey, phase, { updatedAt: this.dependencies.now() });
+        ? await this.dependencies.journalStore.convergeReceipt(journal.operationKey, phase, { updatedAt: this.dependencies.now() },
+          lease ? () => this.hasFence(journal.operationKey, lease) : undefined)
+        : await this.dependencies.journalStore.transition(journal.operationKey, phase, { updatedAt: this.dependencies.now() },
+          lease ? () => this.hasFence(journal.operationKey, lease) : undefined);
       if (advanced.status !== 'updated') return { status: 'unknown', journal };
       terminal = advanced.journal;
     }

@@ -3,6 +3,7 @@ import type { DaemonSession } from '../src/core/types.js';
 import { createGroupWorkspaceRouteRuntime } from '../src/core/group-workspace-route-runtime.js';
 import { tryDispatchGroupWorkspaceTextRoute } from '../src/im/lark/event-dispatcher.js';
 import { tryDispatchGroupWorkspaceCardRoute } from '../src/im/lark/card-handler.js';
+import { VerifiedAppTenantRegistry } from '../src/core/workspace-authority.js';
 
 const APP = 'cli_b';
 const CHAT = 'oc_group';
@@ -144,6 +145,38 @@ describe('production group-workspace route dependency assembly', () => {
     });
     expect(authority?.canSwitchSession).toBe(false);
     expect(dispatchRepo).not.toHaveBeenCalled();
+  });
+
+  it('excludes a foreign-tenant bot from the production admin union', async () => {
+    const tenants = new VerifiedAppTenantRegistry();
+    tenants.observeSignedCallback('app-a', 'tenant-a', 1);
+    tenants.observeSignedCallback('app-b', 'tenant-b', 1);
+    const registeredBots = tenants.registeredBots([
+      { larkAppId: 'app-a', resolvedAllowedUsers: ['ou_owner_a'] },
+      { larkAppId: 'app-b', resolvedAllowedUsers: ['ou_owner_b'] },
+    ], 'tenant-a');
+    const runtime = createGroupWorkspaceRouteRuntime({
+      larkAppId: 'app-a', activeSessions: new Map(), sessionKey: (chatId, appId) => `${appId}:${chatId}`,
+      registeredBots: () => registeredBots,
+      resolveAllowedUser: vi.fn(async bot => bot.larkAppId === 'app-b'
+        ? { tenantKey: bot.tenantKey, unionId: 'on_foreign' }
+        : { tenantKey: bot.tenantKey, unionId: 'on_owner' }),
+      resolveActorUnion: vi.fn(async () => 'on_foreign'),
+      readWorkspace: vi.fn(async () => ({ status: 'available' as const })),
+      canSwitchSession: () => true, dispatchRepo: vi.fn(), reply: vi.fn(),
+    });
+
+    const fallback = vi.fn(() => true);
+    await expect(tryDispatchGroupWorkspaceTextRoute({ text: '/repo /repos/x', chatId: CHAT,
+      chatType: 'group', scope: 'chat', regularGroupTopLevel: true, senderOpenId: 'ou_foreign_view_a',
+      senderUnionId: 'on_foreign', tenantKey: 'tenant-a', humanProvenance: true }, {
+      resolveAuthority: runtime.resolveAuthority, handleRoute: runtime.handleRoute,
+      canRunGenericCommand: fallback, replyDenied: vi.fn(),
+    })).resolves.toBe('recognized_denied');
+    expect(fallback).not.toHaveBeenCalled();
+    expect(registeredBots).toEqual([
+      expect.objectContaining({ larkAppId: 'app-a', tenantKey: 'tenant-a' }),
+    ]);
   });
 
   it('rejects an envelope union that the receiving app cannot verify', async () => {

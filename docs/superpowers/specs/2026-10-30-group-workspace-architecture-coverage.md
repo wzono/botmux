@@ -64,24 +64,24 @@
 |---|---|---|---|
 | P1-01 | fixed（host output ownership） | Riff/Mojo 的 host cwd guard 不再拥有/切断 output listener；provider effective-context 仍见 P1-15 | `ef0e7f86e`; `group-workspace-daemon-resolution` 的 riff/mojo host-contract ready cases；provider proof 未覆盖 |
 | P1-02 | fixed | 卡片 tenant 来自可信 callback app→tenant 映射，不读 synthetic `data.tenant_key` | `f0d029f4f`, `3237ad1cf`; `group-workspace-authority-v2`, `daemon-wiring`, `card-handler-repo-select` |
-| P1-03 | fixed | 各 app 保留 verified tenant，禁止请求 tenant 重标其它 Bot | `7a4c6eba3`; `group-workspace-authority-v2` two-tenant case |
+| P1-03 | fixed | 生产 registry 只纳入与请求 tenant 一致的逐 app signed-callback tenant；跨 tenant Bot 排除且 recognized denial 不落 legacy | `group-workspace-daemon-wiring` production two-tenant denial；`workspace-authority` registry |
 | P1-04 | fixed | switch 前、group mutation 前及锁内 fresh authority 复验 | `e58ff8f91`, `3d4ce1f7d`, `3237ad1cf`; `group-workspace-operation` revoke cases |
 | P1-05 | fixed（基础 operation/follow recovery） | startup 枚举 recoverable 与 committed-pending convergence，并在 ingress 前恢复 | `6de89f7ca`, `bca401860`, `43e44bfd7`, `2b69ea5f4`; `operation-v2`, `operation`, `turn-permit-startup-order` |
 | P1-06 | fixed | follow journal revision CAS，persist-first 后才发布 live state | `6f278d2d1`, `362211ac5`; `group-workspace-session-follow` persistence/overlap/recovery cases |
-| P1-07 | fixed | 用 durable session/generation/provenance proof，不再依赖对象不等 | `ce08af3b9`, `2b69ea5f4`; `group-workspace-operation` in-place/replay/convergence cases |
+| P1-07 | fixed | 实际 `/repo` 原地复用 DaemonSession 后，以 durable sessionId/owner/generation/cwd/WorkspaceIdentity 判成功，不依赖对象不等 | `group-workspace-operation` in-place replacement proof；生产 saga wrapper |
 | P1-08 | fixed | snapshot/fingerprint 在授权及提交边界 fresh 比对 | `7a4c6eba3`, `3237ad1cf`; `group-workspace-authority-v2`, `group-workspace-e2e` |
 | P1-09 | fixed | `recognized_denied` 消费 text/card 路由，不落 legacy | `89ac489c3`; `route-authorization`, `daemon-wiring` zero-fallback cases |
 | P1-10 | fixed | 同 intent loser 采用 frozen winner；共享 lease epoch/fencing token 决定执行权 | `ce08af3b9`, `133d1028d`, `35797d8f1`; `operation-v2` 含 two-OS-process/expiry-steal/late effect |
 | P1-11 | fixed（trigger resolver fault contract） | store/identity failure为 discriminated failure，不折成 absent/default | `9bbca3f0a`, `6851ae860`; `resolver-contract`, `daemon-resolution`; trigger 全入口 E2E 留给 Task 8 |
 | P1-12 | fixed（当前 trigger/central boundary） | migrated dispatch 经 typed permit；remote/其它 later callers 仍逐项审查 | `64b247fe6`, `a4d468559`; `turn-admission`, `admitted-turn-dispatch`; Task 8 全量 caller 为 leftover |
 | P1-13 | deferred | Dashboard create/start/resume 尚无共享 resolver + admission 的参数化真实 IPC 证明 | 仅 `dashboard-ipc` touched regression 通过；`src/core/session-manager.ts` 未在实现范围修改；Task 8 leftover |
-| P1-14 | fixed（基础 identity chain） | `{path,dev,ino}` 贯穿 record/journal/session/follow/spawn/ready/CAS，并在消费点复验 | `6f278d2d1`, `7878443b2`, `81ef84184`, `bf9812b0d`; `schema-v2`, `resolver-contract`, `admitted-worker-workspace-identity` |
+| P1-14 | fixed（基础 identity chain） | `{path,dev,ino}` 贯穿；未终态 v1 set journal 不 probe 当前 path，持久化 `migration_blocked_identity_missing` quarantine 且不进入 recovery；终态历史保持迁移 | `group-workspace-operation-v2` replacement-path/no-probe/quarantine + terminal migration；`schema-v2`, `resolver-contract` |
 | P1-15 | unknown / fail-closed | host contract 可校验；remote-runner 无 provider proof 时拒绝。Riff primary repo、Mojo isolation/cloud provider identity 尚未证明 | `ef0e7f86e`; `admitted-worker-workspace-identity`; Task 10/provider proof leftover |
 | P1-16 | fixed（已迁移 drivers） | principal/XPI 在 permit 后 acquire/attempting；结构护栏禁止直调 send/fork | `64b247fe6`, `a4d468559`; `admitted-turn-driver-structure`, `admitted-turn-dispatch`; scheduler/failed-turn/terminal 仍见矩阵 leftover |
 | P1-17 | fixed | `/queue` 通过中央 admitted driver；拒绝/异常不留下已接收终态，派发 receipt 可恢复 | `64b247fe6`, `0b23e7d20`; `admitted-turn-driver-structure`, `admitted-turn-dispatch`, `turn-admission` |
 | AR-01 | fixed | durable blank bootstrap → zero-payload fork → exact ready proof → durable business permit → ACK receipt；过期/失败须证明孤儿 generation 已退役才可重发 | `27707e61b`, `1bfa3ae3d`, `f4024d6a0`, `dcd64f119`, `3d0252289`; `turn-admission`, `admitted-turn-dispatch` |
 | AR-02 | fixed（Ask path） | exact original turn/wait/generation/frozen identity/authority 的 control permit；worker ACK 后终态；拒绝、迟到 ACK、restart/ambiguous 有持久语义 | `1bfa3ae3d`, `582ba46e2`, `451a72cff`, `247f417bd`; `turn-admission`, `admitted-turn-dispatch`, `turn-permit-startup-order` |
-| AR-03 | fixed（operation effects） | shared-store owner/lease epoch/fencing token；observer 不执行；过期 steal 后旧 token 的 write/effect 被拒绝 | `133d1028d`, `35797d8f1`, `2b69ea5f4`; `operation-v2` real two-process case |
+| AR-03 | fixed（operation effects） | observer 只返回 observing/receipt，不推进 journal 或 SQLite provenance；current executor 的 receipt convergence 与 journal 写均校验 lease fence | `group-workspace-operation` observer zero-mutation；`operation-v2` real two-process expiry/late-old-owner fence |
 | AR-04 | deferred | 当前只实现 touched store 的 durable v1→v2 migration/retry；**未实现**冻结设计要求的 host-wide manifest、全 store epoch/publish points、整批 rollback/export | `6de89f7ca`, `bf9812b0d`, `efda0ff3a` 仅为局部证据；Task 6 host-wide coordinator leftover |
 | AR-05 | deferred | legacy 与已知 group source 已隔离，不会静默当普通 legacy 执行；但完整持久 `known_group_identity_unprovable` quarantine + authorized repair/superseding receipt 尚无端到端证明 | `85cf4cfa9`; `schema-v2`, `provenance`; Task 6 repair matrix leftover |
 | foundation R1-F1 | fixed | permit dispatch 的“提交成功”必须由下游 worker exact ACK/receipt 决定，不能以 IPC write 返回代替 | `8153a31ca`, `7f6b74c5a`, `451a72cff`; `turn-admission`, `admitted-turn-dispatch` |

@@ -226,6 +226,34 @@ export function setSessionWorkingDirMetadata(session: Session, mutation: Session
   session.riffRepoDirs = undefined;
 }
 
+export function proveGroupWorkspaceSessionReplacement(input: {
+  current: DaemonSession | undefined;
+  larkAppId: string;
+  chatId: string;
+  previousSessionId: string;
+  previousGeneration: number;
+  ownerOpenId?: string;
+  targetWorkingDir: string;
+  workspaceIdentity: WorkspaceIdentity;
+  observedWorkspaceIdentity?: WorkspaceIdentity;
+}): { status: 'committed'; generation: number } | { status: 'unknown' } {
+  const current = input.current;
+  const generation = current?.workerGeneration ?? current?.session.workerGeneration ?? 0;
+  const identity = current?.session.groupWorkspaceIdentity ?? input.observedWorkspaceIdentity;
+  if (!current
+    || current.larkAppId !== input.larkAppId
+    || current.chatId !== input.chatId
+    || current.session.sessionId === input.previousSessionId
+    || current.session.ownerOpenId !== input.ownerOpenId
+    || generation !== input.previousGeneration + 1
+    || current.session.workingDir !== input.targetWorkingDir
+    || !identity
+    || identity.path !== input.workspaceIdentity.path
+    || identity.dev !== input.workspaceIdentity.dev
+    || identity.ino !== input.workspaceIdentity.ino) return { status: 'unknown' };
+  return { status: 'committed', generation };
+}
+
 /** Persist cwd and provenance as one session-row mutation, then publish the in-memory/dashboard state. */
 export function applySessionWorkingDir(ds: DaemonSession, mutation: SessionWorkingDirMutation): void {
   assertWorkingDirProvenance(mutation);

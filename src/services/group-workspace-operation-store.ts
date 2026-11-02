@@ -20,10 +20,12 @@ export type RepoGroupOperationPhase =
   | 'store_unavailable'
   | 'no_session_complete'
   | 'orphaned'
+  | 'migration_blocked_identity_missing'
   | 'unknown';
 
 export type RepoGroupOperationTarget =
   | { kind: 'workspace'; identity: WorkspaceIdentity }
+  | { kind: 'legacy_identity_missing'; path: string }
   | { kind: 'absent' };
 
 export interface RepoGroupOperationJournal {
@@ -47,6 +49,7 @@ export interface RepoGroupOperationJournal {
   /** Frozen authorization configuration fingerprint; required by production operations. */
   authorityFingerprint?: string;
   phase: RepoGroupOperationPhase;
+  legacyPhase?: Extract<RepoGroupOperationPhase, 'prepared' | 'session_committed' | 'group_committed' | 'unknown'>;
   sessionGenerationAfter?: number;
   groupRevisionAfter?: number;
   updatedAt: number;
@@ -113,7 +116,7 @@ function isWorkspaceIdentity(value: unknown): value is WorkspaceIdentity {
 }
 
 const PHASES = new Set<RepoGroupOperationPhase>([
-  'prepared', 'session_committed', 'group_committed', 'conflict', 'invalid_dir', 'unauthorized', 'store_unavailable', 'no_session_complete', 'orphaned', 'unknown',
+  'prepared', 'session_committed', 'group_committed', 'conflict', 'invalid_dir', 'unauthorized', 'store_unavailable', 'no_session_complete', 'orphaned', 'migration_blocked_identity_missing', 'unknown',
 ]);
 
 function validNonnegativeInteger(value: unknown): value is number {
@@ -132,14 +135,20 @@ function validateJournal(value: unknown, key: string): asserts value is RepoGrou
     || typeof value.sessionId !== 'string' || !value.sessionId
     || !validNonnegativeInteger(value.expectedSessionGeneration)
     || !validNonnegativeInteger(value.expectedGroupRevision)
-    || (value.kind === 'set' && (!isObject(value.target) || value.target.kind !== 'workspace'
-      || !isWorkspaceIdentity(value.target.identity)
-      || typeof value.targetWorkingDir !== 'string' || !isAbsolute(value.targetWorkingDir)
-      || !isWorkspaceIdentity(value.targetWorkspaceIdentity)
-      || value.targetWorkspaceIdentity.path !== value.targetWorkingDir
-      || value.target.identity.path !== value.targetWorkingDir
-      || value.target.identity.dev !== value.targetWorkspaceIdentity.dev
-      || value.target.identity.ino !== value.targetWorkspaceIdentity.ino))
+    || (value.kind === 'set' && value.phase !== 'migration_blocked_identity_missing'
+      && (!isObject(value.target) || value.target.kind !== 'workspace'
+        || !isWorkspaceIdentity(value.target.identity)
+        || typeof value.targetWorkingDir !== 'string' || !isAbsolute(value.targetWorkingDir)
+        || !isWorkspaceIdentity(value.targetWorkspaceIdentity)
+        || value.targetWorkspaceIdentity.path !== value.targetWorkingDir
+        || value.target.identity.path !== value.targetWorkingDir
+        || value.target.identity.dev !== value.targetWorkspaceIdentity.dev
+        || value.target.identity.ino !== value.targetWorkspaceIdentity.ino))
+    || (value.kind === 'set' && value.phase === 'migration_blocked_identity_missing'
+      && (!isObject(value.target) || value.target.kind !== 'legacy_identity_missing'
+        || value.target.path !== value.targetWorkingDir
+        || typeof value.targetWorkingDir !== 'string' || !isAbsolute(value.targetWorkingDir)
+        || value.targetWorkspaceIdentity !== undefined))
     || (value.kind === 'unbind' && (!isObject(value.target) || value.target.kind !== 'absent'
       || value.targetWorkingDir !== undefined || value.targetWorkspaceIdentity !== undefined))
     || !isActor(value.actor)
@@ -150,6 +159,10 @@ function validateJournal(value: unknown, key: string): asserts value is RepoGrou
       && (typeof value.originMessageId !== 'string' || !value.originMessageId
         || value.originMessageId.trim() !== value.originMessageId))
     || !PHASES.has(value.phase as RepoGroupOperationPhase)
+    || (value.legacyPhase !== undefined
+      && value.legacyPhase !== 'prepared' && value.legacyPhase !== 'session_committed'
+      && value.legacyPhase !== 'group_committed' && value.legacyPhase !== 'unknown')
+    || (value.phase === 'migration_blocked_identity_missing' && value.legacyPhase === undefined)
     || !Number.isFinite(value.updatedAt)
     || (value.sessionGenerationAfter !== undefined && !validNonnegativeInteger(value.sessionGenerationAfter))
     || (value.groupRevisionAfter !== undefined && (!Number.isSafeInteger(value.groupRevisionAfter) || (value.groupRevisionAfter as number) < 1))
@@ -252,6 +265,28 @@ export class GroupWorkspaceOperationStore {
       if (kind === 'unbind') {
         target = { kind: 'absent' };
       } else if (kind === 'set' && typeof targetWorkingDir === 'string' && isAbsolute(targetWorkingDir)) {
+        const legacyPhase = candidate.phase;
+        if (legacyPhase !== 'conflict' && legacyPhase !== 'invalid_dir'
+          && legacyPhase !== 'unauthorized' && legacyPhase !== 'store_unavailable'
+          && legacyPhase !== 'no_session_complete' && legacyPhase !== 'orphaned') {
+          const migrated = {
+            ...candidate,
+            requestIntentDigest: typeof candidate.requestIntentDigest === 'string'
+              ? candidate.requestIntentDigest
+              : candidate.payloadDigest,
+            target: { kind: 'legacy_identity_missing', path: targetWorkingDir },
+            targetWorkingDir,
+            targetWorkspaceIdentity: undefined,
+            phase: 'migration_blocked_identity_missing',
+            legacyPhase,
+          } as unknown as RepoGroupOperationJournal;
+          validateJournal(migrated, key);
+          const indexKey = sourceIndexKey(migrated.sourceEventId, migrated.kind);
+          if (registry.sourceIndex[indexKey]) throw new Error(`duplicate group workspace operation source: ${indexKey}`);
+          registry.operations[key] = migrated;
+          registry.sourceIndex[indexKey] = key;
+          continue;
+        }
         const probed = this.pathProbe(targetWorkingDir);
         if (!probed.ok) throw new Error(`legacy group workspace operation target identity unprovable: ${key}`);
         migratedTargetWorkingDir = probed.normalizedPath;
@@ -395,10 +430,12 @@ export class GroupWorkspaceOperationStore {
     phase: Extract<RepoGroupOperationPhase, 'group_committed' | 'conflict' | 'invalid_dir' | 'unauthorized' | 'store_unavailable'>,
     patch: Pick<RepoGroupOperationJournal, 'updatedAt'>
       & Partial<Pick<RepoGroupOperationJournal, 'groupRevisionAfter'>>,
+    assertFence?: () => Promise<boolean>,
   ): Promise<OperationTransitionResult> {
     try {
       mkdirSync(dirname(this.path), { recursive: true });
       return await withFileLock(this.path, async () => {
+        if (assertFence && !(await assertFence())) return { status: 'store_unavailable' as const };
         const registry = this.read();
         const existing = registry.operations[operationKey];
         if (!existing) return { status: 'missing' as const };
@@ -437,7 +474,8 @@ export class GroupWorkspaceOperationStore {
       return await withFileLock(this.path, async () => ({
         status: 'available' as const,
         journals: Object.values(this.read().operations)
-          .filter(item => item.phase === 'prepared' || item.phase === 'session_committed' || item.phase === 'unknown')
+          .filter(item => item.phase === 'prepared' || item.phase === 'session_committed' || item.phase === 'unknown'
+            || item.phase === 'migration_blocked_identity_missing')
           .map(item => structuredClone(item)),
       }), { maxWaitMs: this.lockTimeoutMs });
     } catch {

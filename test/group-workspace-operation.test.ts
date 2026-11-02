@@ -22,8 +22,19 @@ import {
   type GroupWorkspaceOperationDependencies,
 } from '../src/core/group-workspace-operation.js';
 import { OperationExecutorLeaseStore } from '../src/services/operation-executor-lease-store.js';
+import { proveGroupWorkspaceSessionReplacement } from '../src/core/session-cwd.js';
 
 const ACTOR: TenantHumanId = { tenantKey: 'tenant-a', unionId: 'on_user' };
+
+it('proves an in-place DaemonSession replacement from durable identity and generation', () => {
+  const ds = { larkAppId: 'app-a', chatId: 'oc_group', workerGeneration: 5,
+    session: { sessionId: 'new-session', workingDir: '/new', ownerOpenId: 'ou_owner',
+      groupWorkspaceIdentity: { path: '/new', dev: '1', ino: '2' } }, workingDir: '/new' } as any;
+  expect(proveGroupWorkspaceSessionReplacement({ current: ds,
+    larkAppId: 'app-a', chatId: 'oc_group', previousSessionId: 'old-session', previousGeneration: 4,
+    ownerOpenId: 'ou_owner', targetWorkingDir: '/new', workspaceIdentity: { path: '/new', dev: '1', ino: '2' },
+  })).toEqual({ status: 'committed', generation: 5 });
+});
 const SOURCE_EVENT_ID = 'group-workspace-text-source-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const BASE = {
   operationKey: groupWorkspaceOperationKey(SOURCE_EVENT_ID, 'set'), sourceEventId: SOURCE_EVENT_ID, kind: 'set' as const,
@@ -424,6 +435,25 @@ describe('executeGroupWorkspaceUnbind', () => {
 });
 
 describe('GroupWorkspaceOperationCoordinator', () => {
+  it('lets an observer read a committed receipt without advancing journal or session provenance', async () => {
+    const dataDir = dir();
+    const owner = harness({ dataDir, crashAt: 'group_committed_before_convergence' });
+    await expect(owner.coordinator.execute(REQUEST)).rejects.toThrow('crash:group_committed_before_convergence');
+    const observer = harness({ dataDir });
+    for (const [key, value] of owner.receipts) observer.receipts.set(key, value);
+    const dependencies = (observer.coordinator as any).dependencies;
+    dependencies.acquireExecutor = async () => ({ status: 'observer' });
+    let convergences = 0;
+    dependencies.convergeSession = async () => { convergences += 1; };
+    const before = await observer.store.get(BASE.operationKey);
+
+    await expect(observer.coordinator.recover((before as any).journal)).resolves.toMatchObject({
+      status: 'observing', receipt: { status: 'committed' },
+    });
+    expect(convergences).toBe(0);
+    await expect(observer.store.get(BASE.operationKey)).resolves.toEqual(before);
+  });
+
   it('rejects unbind at the session-to-group coordinator seam', async () => {
     const h = harness();
     await expect(h.coordinator.execute({ ...REQUEST, kind: 'unbind' } as any)).resolves.toMatchObject({ status: 'protocol_conflict' });
