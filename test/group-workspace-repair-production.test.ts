@@ -32,19 +32,38 @@ function seed(sessionId: string, repo: string): void {
 describe('production group workspace quarantine repair coordinator', () => {
   beforeEach(() => { dataDir = mkdtempSync(join(tmpdir(), 'workspace-repair-production-')); });
 
-  it('releases successful repair authority so subsequent admin publication can acquire', async () => {
-    let release!: () => void;
-    const held = new Promise<void>(resolve => { release = resolve; });
-    let acquired!: () => void;
-    const ready = new Promise<void>(resolve => { acquired = resolve; });
-    const lease = withBotAdminIdentityPublication(dataDir, async () => { acquired(); await held; });
-    await ready;
-    await expect(consumeGroupWorkspaceRepairAuthority(async () => ({
-      status: 'authorized', releasePublicationLease: async () => { release(); await lease; },
-    }))).resolves.toBe(true);
-    await expect(withBotAdminIdentityPublication(dataDir, async () => 'published', { maxWaitMs: 100 }))
-      .resolves.toBe('published');
-  });
+  it.each(['success', 'failure'] as const)(
+    'holds repair authority through read/proof/CAS and releases after %s', async outcome => {
+      const repo = join(dataDir, 'repo'); mkdirSync(repo); seed('session', repo);
+      const stat = await import('node:fs').then(fs => fs.statSync(repo, { bigint: true }));
+      const identity = { path: repo, dev: stat.dev.toString(), ino: stat.ino.toString() };
+      let release!: () => void;
+      const held = new Promise<void>(resolve => { release = resolve; });
+      let acquired!: () => void;
+      const ready = new Promise<void>(resolve => { acquired = resolve; });
+      const lease = withBotAdminIdentityPublication(dataDir, async () => { acquired(); await held; });
+      await ready;
+      let publicationAcquired = false;
+      let publication: Promise<string> | undefined;
+      const repair = coordinateGroupWorkspaceQuarantineRepair({ sessionId: 'session', chatId: 'chat',
+        actor: { tenantKey: 'tenant', unionId: 'on_admin' }, authority: { authorize: () =>
+          consumeGroupWorkspaceRepairAuthority(async () => ({ status: 'authorized',
+            releasePublicationLease: async () => { release(); await lease; } })) },
+        groupStore: { read: async () => {
+          publication = withBotAdminIdentityPublication(dataDir, async () => { publicationAcquired = true; return 'published'; });
+          await new Promise(resolve => setTimeout(resolve, 30));
+          expect(publicationAcquired).toBe(false);
+          if (outcome === 'failure') throw new Error('repair read failed');
+          return { status: 'available' as const, record: { chatId: 'chat', revision: 2,
+            directory: { kind: 'bound' as const, workingDir: repo }, workspaceIdentity: identity,
+            updatedAt: 1, updatedBy: { tenantKey: 'tenant', unionId: 'on_admin' } } };
+        } }, operationId: 'repair-op', now: () => 10 });
+      if (outcome === 'failure') await expect(repair).rejects.toThrow('repair read failed');
+      else await expect(repair).resolves.toEqual({ status: 'repaired', operationId: 'repair-op' });
+      await expect(publication).resolves.toBe('published');
+      expect(publicationAcquired).toBe(true);
+    },
+  );
 
   it('revalidates fresh authority/current record/path identity and commits one exact durable CAS receipt', async () => {
     const repo = join(dataDir, 'repo'); mkdirSync(repo); seed('session', repo);

@@ -53,13 +53,12 @@ function resolvedAdminSnapshotFingerprint(snapshot: FreshBotAdminUnionSnapshot):
 
 export async function consumeGroupWorkspaceRepairAuthority(
   revalidate: () => Promise<{ status: string; releasePublicationLease?: () => Promise<void> }>,
-): Promise<boolean> {
+): Promise<{ authorized: boolean; release?: () => Promise<void> }> {
   const authority = await revalidate();
-  try {
-    return authority.status === 'authorized';
-  } finally {
-    await authority.releasePublicationLease?.();
-  }
+  return {
+    authorized: authority.status === 'authorized',
+    ...(authority.releasePublicationLease ? { release: authority.releasePublicationLease } : {}),
+  };
 }
 
 export function createGroupWorkspaceRouteRuntime(options: {
