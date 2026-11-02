@@ -70,7 +70,8 @@ describe('group workspace /repo entrypoints', () => {
             writes += 1;
             const result = await groupStore.mutate({
               kind: 'set', chatId: journal.chatId, sourceEventId: journal.sourceEventId,
-              requestedWorkingDir: journal.targetWorkingDir, expectedRevision: journal.expectedGroupRevision,
+              requestedWorkingDir: journal.targetWorkingDir, expectedWorkspaceIdentity: journal.targetWorkspaceIdentity,
+              expectedRevision: journal.expectedGroupRevision,
               expectedSessionGeneration: journal.expectedSessionGeneration,
               actor: journal.actor, authorized: true, directoryValid: true, now: 10,
             });

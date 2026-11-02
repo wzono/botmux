@@ -2,14 +2,14 @@
 
 ## 1. 冻结审查口径
 
-- **提交基线**：实现范围为 `09940cecc5ce403f694900b335d39dbd2aeffa61..2b69ea5f422f3a348529a26124a32ee1e13edd4b`；本矩阵只陈述该范围内代码和测试已经证明的结果。
+- **提交基线**：实现范围为 `09940cecc5ce403f694900b335d39dbd2aeffa61..HEAD`（R2 历史 blocker 修复起点 `2affe4c87a259f2115356ad1c102439853a762f2`）；本矩阵只陈述该范围内代码和测试已经证明的结果。
 - **目标**：同一宿主机内按 `chatId` 共享群工作目录；所有已迁移的离散业务 turn 在实际派发前证明冻结目录身份、群修订、worker generation 与派发许可；群目录管理操作使用可信 tenant/真人身份、提交前复验、持久 journal/receipt 与启动恢复。
 - **本轮范围**：Tasks 1–5 的基础契约，以及为关闭基础实现 blocker 实际触达的普通消息冷启动、`/queue`、principal lane、XPI、初始 session 派发、异步 Ask、文本/卡片 `/repo`、operation/follow 启动恢复。
 - **本轮非目标 / 未声称完成**：计划 Tasks 7+ 的全量 caller 迁移与产品 E2E；Dashboard create/start/resume、scheduler、failed-turn、terminal bytes 等逐入口行为矩阵；宿主机级 migration manifest/整批 rollback；Riff/Mojo provider 级 effective-repository proof；Task 11 全量 suite 与用户文档。下表中的 `unknown/leftover` 是未完成审查项，不是通过。
 - **评审结论边界**：这是供独立实现复核的 submitter evidence，不是 GO、merge 或部署批准。当前实现**未部署、未重启 daemon、未 push**。
 - **结果审查预算**：下一轮仅做有针对性的 R2（复核下列已修基础 blocker 及直接触达边界）；随后由原始需求决策 owner 在 R3 给终态 GO/NO-GO，不开启 R4，也不由提交者自行扩大或改写验收目标。
 
-## 2. 可复现证据（HEAD `2b69ea5f4`）
+## 2. 可复现证据（R2 closure HEAD）
 
 ### 2.1 本轮实际执行
 
@@ -75,13 +75,13 @@
 | P1-11 | fixed（trigger resolver fault contract） | store/identity failure为 discriminated failure，不折成 absent/default | `9bbca3f0a`, `6851ae860`; `resolver-contract`, `daemon-resolution`; trigger 全入口 E2E 留给 Task 8 |
 | P1-12 | fixed（当前 trigger/central boundary） | migrated dispatch 经 typed permit；remote/其它 later callers 仍逐项审查 | `64b247fe6`, `a4d468559`; `turn-admission`, `admitted-turn-dispatch`; Task 8 全量 caller 为 leftover |
 | P1-13 | deferred | Dashboard create/start/resume 尚无共享 resolver + admission 的参数化真实 IPC 证明 | 仅 `dashboard-ipc` touched regression 通过；`src/core/session-manager.ts` 未在实现范围修改；Task 8 leftover |
-| P1-14 | fixed（基础 identity chain） | `{path,dev,ino}` 贯穿；未终态 v1 set journal 不 probe 当前 path，持久化 `migration_blocked_identity_missing` quarantine 且不进入 recovery；终态历史保持迁移 | `group-workspace-operation-v2` replacement-path/no-probe/quarantine + terminal migration；`schema-v2`, `resolver-contract` |
+| P1-14 | fixed（基础 identity chain） | `{path,dev,ino}` 贯穿；未终态 v1 set journal 在 execute/recover/advance/store mutate 全边界保持 `migration_blocked_identity_missing` quarantine，缺冻结 identity 不 resolve、switch、CAS 或建 receipt；终态历史保持迁移 | `dana-r2-closure-regressions` 三种真实 store replacement/recover/replay 零副作用；`group-workspace-operation-v2`, `group-workspace-store` |
 | P1-15 | unknown / fail-closed | host contract 可校验；remote-runner 无 provider proof 时拒绝。Riff primary repo、Mojo isolation/cloud provider identity 尚未证明 | `ef0e7f86e`; `admitted-worker-workspace-identity`; Task 10/provider proof leftover |
 | P1-16 | fixed（已迁移 drivers） | principal/XPI 在 permit 后 acquire/attempting；结构护栏禁止直调 send/fork | `64b247fe6`, `a4d468559`; `admitted-turn-driver-structure`, `admitted-turn-dispatch`; scheduler/failed-turn/terminal 仍见矩阵 leftover |
 | P1-17 | fixed | `/queue` 通过中央 admitted driver；拒绝/异常不留下已接收终态，派发 receipt 可恢复 | `64b247fe6`, `0b23e7d20`; `admitted-turn-driver-structure`, `admitted-turn-dispatch`, `turn-admission` |
 | AR-01 | fixed | durable blank bootstrap → zero-payload fork → exact ready proof → durable business permit → ACK receipt；过期/失败须证明孤儿 generation 已退役才可重发 | `27707e61b`, `1bfa3ae3d`, `f4024d6a0`, `dcd64f119`, `3d0252289`; `turn-admission`, `admitted-turn-dispatch` |
 | AR-02 | fixed（Ask path） | exact original turn/wait/generation/frozen identity/authority 的 control permit；worker ACK 后终态；拒绝、迟到 ACK、restart/ambiguous 有持久语义 | `1bfa3ae3d`, `582ba46e2`, `451a72cff`, `247f417bd`; `turn-admission`, `admitted-turn-dispatch`, `turn-permit-startup-order` |
-| AR-03 | fixed（operation effects） | observer 只返回 observing/receipt，不推进 journal 或 SQLite provenance；current executor 的 receipt convergence 与 journal 写均校验 lease fence | `group-workspace-operation` observer zero-mutation；`operation-v2` real two-process expiry/late-old-owner fence |
+| AR-03 | fixed（operation effects） | observer 只返回 observing/receipt；markUnauthorized 的 SQLite provenance effect 与 transition、markUnknown transition 都要求当前 lease/fence，租约被 steal 后不写 session/journal | `dana-r2-closure-regressions` fake-clock unauthorized/unknown takeover 两例；`group-workspace-operation` observer zero-mutation；`operation-v2` real two-process expiry/late-old-owner fence |
 | AR-04 | deferred | 当前只实现 touched store 的 durable v1→v2 migration/retry；**未实现**冻结设计要求的 host-wide manifest、全 store epoch/publish points、整批 rollback/export | `6de89f7ca`, `bf9812b0d`, `efda0ff3a` 仅为局部证据；Task 6 host-wide coordinator leftover |
 | AR-05 | deferred | legacy 与已知 group source 已隔离，不会静默当普通 legacy 执行；但完整持久 `known_group_identity_unprovable` quarantine + authorized repair/superseding receipt 尚无端到端证明 | `85cf4cfa9`; `schema-v2`, `provenance`; Task 6 repair matrix leftover |
 | foundation R1-F1 | fixed | permit dispatch 的“提交成功”必须由下游 worker exact ACK/receipt 决定，不能以 IPC write 返回代替 | `8153a31ca`, `7f6b74c5a`, `451a72cff`; `turn-admission`, `admitted-turn-dispatch` |

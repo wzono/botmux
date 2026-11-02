@@ -70,6 +70,7 @@ describe('workspace schema v2', () => {
   it('writes bound record and committed receipt identities as strings', async () => {
     const dataDir = dir(); const store = new GroupWorkspaceStore(dataDir, { pathProbe: () => ({ ok: true, normalizedPath: identity.path, identity }) });
     await store.mutate({ kind: 'set', chatId: 'chat', sourceEventId: source.sourceEventId, requestedWorkingDir: identity.path,
+      expectedWorkspaceIdentity: identity,
       expectedRevision: 0, expectedSessionGeneration: 1, actor, authorized: true, directoryValid: true, now: 1 });
     const raw = JSON.parse(readFileSync(join(dataDir, 'group-workspaces.json'), 'utf8'));
     expect(raw.schemaVersion).toBe(WORKSPACE_SCHEMA_VERSION);

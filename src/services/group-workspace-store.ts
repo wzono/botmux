@@ -470,6 +470,8 @@ function validMutation(input: unknown): input is GroupWorkspaceMutation {
     || !input.requestedWorkingDir
     || (input.directoryValid && !isAbsolute(input.requestedWorkingDir))
     || (input.directoryValid && !isAbsolute(canonicalWorkingDir(input.requestedWorkingDir)))
+    || !isWorkspaceIdentity(input.expectedWorkspaceIdentity)
+    || input.expectedWorkspaceIdentity.path !== canonicalWorkingDir(input.requestedWorkingDir)
     || (input.expectedSessionGeneration !== undefined
       && (!Number.isSafeInteger(input.expectedSessionGeneration)
         || (input.expectedSessionGeneration as number) < 0))) {
@@ -702,15 +704,17 @@ export class GroupWorkspaceStore {
 
         if (!actorAllowed(input, current)) outcome = 'unauthorized';
         else if (input.kind === 'set') {
-          if (!input.directoryValid || !isAbsolute(input.requestedWorkingDir)) {
+          const expectedIdentity = input.expectedWorkspaceIdentity;
+          if (!expectedIdentity || !input.directoryValid || !isAbsolute(input.requestedWorkingDir)) {
             outcome = 'invalid_dir';
           } else {
-            const usability = this.pathProbe(input.requestedWorkingDir);
+            const usability = this.pathProbe(input.requestedWorkingDir, {
+              expectedIdentity,
+            });
             if (!usability.ok) outcome = 'invalid_dir';
-            else if (input.expectedWorkspaceIdentity
-              && (usability.normalizedPath !== input.expectedWorkspaceIdentity.path
-                || usability.identity.dev !== input.expectedWorkspaceIdentity.dev
-                || usability.identity.ino !== input.expectedWorkspaceIdentity.ino)) {
+            else if (usability.normalizedPath !== expectedIdentity.path
+              || usability.identity.dev !== expectedIdentity.dev
+              || usability.identity.ino !== expectedIdentity.ino) {
               outcome = 'invalid_dir';
             } else {
               validatedIdentity = usability.identity;

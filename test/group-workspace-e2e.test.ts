@@ -138,7 +138,8 @@ function durableHarness(input: {
       calls.push('unknown-readback');
       const result = await groupStore.reconcileExactOperation({
         kind: 'set', chatId: journal.chatId, sourceEventId: journal.sourceEventId,
-        requestedWorkingDir: journal.targetWorkingDir, expectedRevision: journal.expectedGroupRevision,
+        requestedWorkingDir: journal.targetWorkingDir, expectedWorkspaceIdentity: journal.targetWorkspaceIdentity,
+        expectedRevision: journal.expectedGroupRevision,
         expectedSessionGeneration: journal.expectedSessionGeneration, actor: journal.actor,
         authorized: true, directoryValid: true, now: journal.updatedAt,
       });
@@ -183,7 +184,8 @@ function durableHarness(input: {
       calls.push('group-commit');
       const result = await groupStore.mutate({
         kind: 'set', chatId: journal.chatId, sourceEventId: journal.sourceEventId,
-        requestedWorkingDir: journal.targetWorkingDir, expectedRevision: journal.expectedGroupRevision,
+        requestedWorkingDir: journal.targetWorkingDir, expectedWorkspaceIdentity: journal.targetWorkspaceIdentity,
+        expectedRevision: journal.expectedGroupRevision,
         expectedSessionGeneration: journal.expectedSessionGeneration, actor: journal.actor,
         authorized: true, directoryValid: true, now: journal.updatedAt,
       });
@@ -289,7 +291,9 @@ describe('cross-Bot shared dataDir and restart', () => {
     })).toBeUndefined();
 
     const store = new GroupWorkspaceStore(dataDir);
+    const proof = probePathUsability(workspace); if (!proof.ok) throw new Error(proof.reason);
     await store.mutate({ kind: 'set', chatId: CHAT, sourceEventId: textSource('om_profile'), requestedWorkingDir: workspace,
+      expectedWorkspaceIdentity: { path: proof.normalizedPath, ...proof.identity },
       expectedRevision: 0, expectedSessionGeneration: 0, actor: ACTOR, authorized: true, directoryValid: true, now: 1 });
     const before = readFileSync(join(dataDir, 'group-workspaces.json'), 'utf8');
     writeFileSync(join(dataDir, 'bots.json'), JSON.stringify([{ larkAppId: 'app-b', profile: 'rewritten' }]));
@@ -308,6 +312,7 @@ describe('cross-Bot shared dataDir and restart', () => {
       ? { ok: true, normalizedPath: resolve(path), identity: { dev: '1', ino: '2' } }
       : { ok: false, normalizedPath: resolve(path), reason: 'inaccessible' } });
     await store.mutate({ kind: 'set', chatId: CHAT, sourceEventId: textSource('om_access'), requestedWorkingDir: workspace,
+      expectedWorkspaceIdentity: { path: workspace, dev: '1', ino: '2' },
       expectedRevision: 0, actor: ACTOR, authorized: true, directoryValid: true, now: 1 });
     accessible = false;
     expect(await store.probeBoundDirectoryForConsumption(CHAT)).toMatchObject({
@@ -360,7 +365,9 @@ describe('durable replay details', () => {
     const y = makeDir(root, 'Y');
     const path = join(dataDir, 'group-workspaces.json');
     const store = new GroupWorkspaceStore(dataDir);
+    const xProof = probePathUsability(x); if (!xProof.ok) throw new Error(xProof.reason);
     const seed = await store.mutate({ kind: 'set', chatId: CHAT, sourceEventId: textSource('om_set_x'), requestedWorkingDir: x,
+      expectedWorkspaceIdentity: { path: xProof.normalizedPath, ...xProof.identity },
       expectedRevision: 0, actor: ACTOR, authorized: true, directoryValid: true, now: 1 });
     expect(seed.outcome).toBe('committed');
     const registry = JSON.parse(readFileSync(path, 'utf8'));
@@ -378,11 +385,15 @@ describe('durable replay details', () => {
       now: () => 2,
     });
     expect(await store.read(CHAT)).toMatchObject({ record: { revision: 2, directory: { kind: 'unbound' }, workspaceManagers: [ACTOR] } });
+    const yProof = probePathUsability(y); if (!yProof.ok) throw new Error(yProof.reason);
     expect((await store.mutate({ kind: 'set', chatId: CHAT, sourceEventId: textSource('om_other'), requestedWorkingDir: y,
+      expectedWorkspaceIdentity: { path: yProof.normalizedPath, ...yProof.identity },
       expectedRevision: 2, actor: OTHER, authorized: true, directoryValid: true, now: 3 })).outcome).toBe('unauthorized');
     expect((await store.mutate({ kind: 'set', chatId: CHAT, sourceEventId: textSource('om_set_y'), requestedWorkingDir: y,
+      expectedWorkspaceIdentity: { path: yProof.normalizedPath, ...yProof.identity },
       expectedRevision: 2, actor: ACTOR, authorized: true, directoryValid: true, now: 4 })).outcome).toBe('committed');
     expect((await store.mutate({ kind: 'set', chatId: CHAT, sourceEventId: textSource('om_old_cas'), requestedWorkingDir: x,
+      expectedWorkspaceIdentity: { path: xProof.normalizedPath, ...xProof.identity },
       expectedRevision: 1, actor: ACTOR, authorized: true, directoryValid: true, now: 5 })).outcome).toBe('conflict');
     expect(await store.read(CHAT)).toMatchObject({ record: { revision: 3, directory: { workingDir: y }, workspaceManagers: [ACTOR] } });
   });

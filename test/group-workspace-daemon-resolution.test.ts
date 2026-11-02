@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
@@ -96,7 +96,9 @@ describe('group workspace resolution', () => {
     const store = new groupStore.GroupWorkspaceStore(process.env.SESSION_DATA_DIR!);
     const source = groupStore.canonicalTextSourceEventId({ tenantKey: 't', chatId: CHAT, messageId: 'om_set' });
     if (!source.ok) throw new Error(source.reason);
+    const stat = statSync(workspace, { bigint: true });
     await store.mutate({ kind: 'set', chatId: CHAT, sourceEventId: source.sourceEventId, requestedWorkingDir: workspace,
+      expectedWorkspaceIdentity: { path: workspace, dev: String(stat.dev), ino: String(stat.ino) },
       expectedRevision: 0, actor: { tenantKey: 't', unionId: 'on_admin' }, authorized: true, directoryValid: true, now: 1 });
 
     const result = await daemon.__testOnly_resolvePinnedWorkingDir({ scope: 'thread', anchor: CHAT, chatId: CHAT, chatType: 'group', larkAppId: 'bot-b' });

@@ -57,6 +57,7 @@ function setInput(options: {
     chatId: CHAT,
     sourceEventId: options.sourceEventId,
     requestedWorkingDir: options.workingDir,
+    expectedWorkspaceIdentity: { path: resolve(options.workingDir), dev: '1', ino: '2' },
     expectedRevision: options.expectedRevision,
     expectedSessionGeneration: options.expectedSessionGeneration ?? 1,
     actor: options.actor ?? U,

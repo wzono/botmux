@@ -202,6 +202,7 @@ export function createGroupWorkspaceSetCoordinator(options: {
     readSession: options.readSession,
     switchSession: options.switchSession,
     commitGroup: async (journal, _fencingToken, revalidateUnderLock) => {
+      if (isQuarantinedSetJournal(journal)) return { status: 'unknown' };
       const result = await options.groupStore.mutate({
         kind: 'set', chatId: journal.chatId, sourceEventId: journal.sourceEventId,
         ...(options.originMessageId ? { originMessageId: options.originMessageId } : {}),
@@ -243,9 +244,17 @@ function receiptMatchesJournal(receipt: GroupCommitReceipt, journal: RepoGroupOp
     && receipt.chatId === journal.chatId
     && receipt.targetWorkingDir === journal.targetWorkingDir
     && targetIdentity !== undefined
+    && receipt.workspaceIdentity !== undefined
     && receipt.workspaceIdentity.path === targetIdentity.path
     && receipt.workspaceIdentity.dev === targetIdentity.dev
     && receipt.workspaceIdentity.ino === targetIdentity.ino;
+}
+
+function isQuarantinedSetJournal(journal: RepoGroupOperationJournal): boolean {
+  return journal.kind === 'set'
+    && (journal.phase === 'migration_blocked_identity_missing'
+      || journal.target.kind === 'legacy_identity_missing'
+      || journal.targetWorkspaceIdentity === undefined);
 }
 
 export type GroupWorkspaceUnbindResult =
@@ -381,7 +390,12 @@ export async function executeGroupWorkspaceUnbind(
     }
     if (result.outcome === 'protocol_conflict') return { status: 'protocol_conflict' };
     if (result.outcome === 'unknown') {
-      await dependencies.journalStore.transition(operationKey, 'unknown', { updatedAt: dependencies.now() });
+      await dependencies.journalStore.transition(
+        operationKey,
+        'unknown',
+        { updatedAt: dependencies.now() },
+        hasFence,
+      );
       return { status: 'unknown' };
     }
     if (result.outcome === 'store_unavailable') return { status: 'store_unavailable' };
@@ -402,7 +416,7 @@ export async function executeGroupWorkspaceUnbind(
   const converged = journal.phase === phase
     ? { status: 'updated' as const, journal }
     : journal.phase === 'unknown'
-      ? await dependencies.journalStore.convergeReceipt(operationKey, phase, patch)
+      ? await dependencies.journalStore.convergeReceipt(operationKey, phase, patch, hasFence)
       : await dependencies.journalStore.transition(operationKey, phase, patch, hasFence);
   if (converged.status !== 'updated') return { status: 'unknown' };
   await dependencies.afterBoundary?.('convergence_before_persisted_readback');
@@ -425,6 +439,9 @@ export class GroupWorkspaceOperationCoordinator {
     const canonicalRequest = { ...request, operationKey: canonicalOperationKey };
     const existing = await this.dependencies.journalStore.getByIntent(request.sourceEventId, request.kind);
     if (existing.status === 'store_unavailable') return { status: 'store_unavailable' };
+    if (existing.status === 'found' && isQuarantinedSetJournal(existing.journal)) {
+      return { status: 'protocol_conflict', journal: existing.journal };
+    }
     const receiptLookup = await this.dependencies.lookupGroupReceipt(canonicalOperationKey);
     if (receiptLookup.status === 'store_unavailable') return { status: 'unknown' };
     if (receiptLookup.status === 'found') {
@@ -487,6 +504,7 @@ export class GroupWorkspaceOperationCoordinator {
   }
 
   async recover(journal: RepoGroupOperationJournal): Promise<GroupWorkspaceOperationResult> {
+    if (isQuarantinedSetJournal(journal)) return { status: 'protocol_conflict', journal };
     const executor = await this.dependencies.acquireExecutor?.(journal.operationKey);
     if (executor?.status === 'observer') {
       const observed = await this.dependencies.lookupGroupReceipt(journal.operationKey);
@@ -501,6 +519,7 @@ export class GroupWorkspaceOperationCoordinator {
     journal: RepoGroupOperationJournal,
     lease?: OperationExecutorLease,
   ): Promise<GroupWorkspaceOperationResult> {
+    if (isQuarantinedSetJournal(journal)) return { status: 'protocol_conflict', journal };
     const receiptLookup = await this.dependencies.lookupGroupReceipt(journal.operationKey);
     if (receiptLookup.status === 'store_unavailable') return { status: 'unknown', journal };
     if (receiptLookup.status === 'found') return this.convergeReceipt(journal, receiptLookup.receipt, lease);
@@ -527,10 +546,10 @@ export class GroupWorkspaceOperationCoordinator {
       if (!(await this.hasFence(journal.operationKey, lease))) return { status: 'unknown', journal };
       await this.dependencies.afterBoundary?.('prepared_before_switch');
       const session = await this.dependencies.readSession(journal.sessionId);
-      if (session.status === 'store_unavailable') return this.markUnknown(journal);
+      if (session.status === 'store_unavailable') return this.markUnknown(journal, lease);
       const expectedAfter = journal.expectedSessionGeneration + 1;
       if (session.generation === journal.expectedSessionGeneration) {
-        if (session.workingDir === journal.targetWorkingDir) return this.markUnknown(journal);
+        if (session.workingDir === journal.targetWorkingDir) return this.markUnknown(journal, lease);
         const switchInput = {
           sessionId: journal.sessionId,
           expectedGeneration: journal.expectedSessionGeneration,
@@ -543,14 +562,14 @@ export class GroupWorkspaceOperationCoordinator {
           : { status: 'applied' as const, value: await this.dependencies.switchSession(switchInput) };
         if (fencedSwitch.status === 'stale_fence') return { status: 'unknown', journal };
         const switched = fencedSwitch.value;
-        if (switched.status === 'unknown') return this.markUnknown(journal);
+        if (switched.status === 'unknown') return this.markUnknown(journal, lease);
         if (switched.status === 'store_unavailable') return { status: 'store_unavailable', journal };
         journal = { ...journal, sessionGenerationAfter: switched.generation };
         await this.dependencies.afterBoundary?.('session_persisted_before_advance');
       } else if (session.generation === expectedAfter && session.workingDir === journal.targetWorkingDir) {
         journal = { ...journal, sessionGenerationAfter: session.generation };
       } else {
-        return this.markUnknown(journal);
+        return this.markUnknown(journal, lease);
       }
       const advanced = await this.dependencies.journalStore.transition(journal.operationKey, 'session_committed', {
         sessionGenerationAfter: journal.sessionGenerationAfter,
@@ -582,7 +601,7 @@ export class GroupWorkspaceOperationCoordinator {
     if (fencedCommit.status === 'stale_fence') return { status: 'unknown', journal };
     const groupResult = fencedCommit.value;
     if (groupResult.status === 'unauthorized') return this.markUnauthorized(journal, lease);
-    if (groupResult.status === 'unknown') return this.markUnknown(journal);
+    if (groupResult.status === 'unknown') return this.markUnknown(journal, lease);
     await this.dependencies.afterBoundary?.('group_committed_before_convergence');
     if (groupResult.status === 'committed') {
       const receiptReadback = await this.dependencies.lookupGroupReceipt(journal.operationKey);
@@ -590,13 +609,13 @@ export class GroupWorkspaceOperationCoordinator {
         || !receiptMatchesJournal(receiptReadback.receipt, journal)
         || receiptReadback.receipt.status !== 'committed'
         || receiptReadback.receipt.resultingRevision !== groupResult.resultingRevision) {
-        return this.markUnknown(journal);
+        return this.markUnknown(journal, lease);
       }
       const advanced = await this.dependencies.journalStore.transition(journal.operationKey, 'group_committed', {
         groupRevisionAfter: groupResult.resultingRevision,
         updatedAt: this.dependencies.now(),
       }, lease ? () => this.hasFence(journal.operationKey, lease) : undefined);
-      if (advanced.status !== 'updated') return this.markUnknown(journal);
+      if (advanced.status !== 'updated') return this.markUnknown(journal, lease);
       const completed = advanced.journal;
       const convergenceInput = {
         sessionId: completed.sessionId,
@@ -726,11 +745,16 @@ export class GroupWorkspaceOperationCoordinator {
     lease?: OperationExecutorLease,
   ): Promise<GroupWorkspaceOperationResult> {
     if (journal.phase === 'session_committed') {
-      await this.dependencies.convergeSession({
+      const input = {
         sessionId: journal.sessionId,
         expectedGeneration: journal.sessionGenerationAfter!,
-        source: 'explicit',
-      });
+        source: 'explicit' as const,
+      };
+      const convergence = lease && this.dependencies.runFencedEffect
+        ? await this.dependencies.runFencedEffect(journal.operationKey, lease,
+          () => this.dependencies.convergeSession(input))
+        : { status: 'applied' as const, value: await this.dependencies.convergeSession(input) };
+      if (convergence.status === 'stale_fence') return { status: 'observing', journal };
     }
     const advanced = await this.dependencies.journalStore.transition(
       journal.operationKey,
@@ -738,16 +762,22 @@ export class GroupWorkspaceOperationCoordinator {
       { updatedAt: this.dependencies.now() },
       lease ? () => this.hasFence(journal.operationKey, lease) : undefined,
     );
-    return { status: 'unauthorized', journal: advanced.status === 'updated' ? advanced.journal : journal };
+    return advanced.status === 'updated'
+      ? { status: 'unauthorized', journal: advanced.journal }
+      : lease ? { status: 'observing', journal } : { status: 'unauthorized', journal };
   }
 
-  private async markUnknown(journal: RepoGroupOperationJournal): Promise<GroupWorkspaceOperationResult> {
+  private async markUnknown(
+    journal: RepoGroupOperationJournal,
+    lease?: OperationExecutorLease,
+  ): Promise<GroupWorkspaceOperationResult> {
     if (journal.phase !== 'unknown') {
       const advanced = await this.dependencies.journalStore.transition(journal.operationKey, 'unknown', {
         sessionGenerationAfter: journal.sessionGenerationAfter,
         updatedAt: this.dependencies.now(),
-      });
+      }, lease ? () => this.hasFence(journal.operationKey, lease) : undefined);
       if (advanced.status === 'updated') journal = advanced.journal;
+      else if (lease) return { status: 'observing', journal };
     }
     return { status: 'unknown', journal };
   }
