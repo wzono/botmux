@@ -10,6 +10,8 @@ vi.mock('../src/utils/logger.js', () => ({ logger: { info: vi.fn(), warn: vi.fn(
 const sessionStore = await import('../src/services/session-store.js');
 const { coordinateGroupWorkspaceQuarantineRepair } = await import('../src/services/group-workspace-repair.js');
 const { openDatabaseSyncOrThrow } = await import('../src/services/sqlite-compat.js');
+const { consumeGroupWorkspaceRepairAuthority } = await import('../src/core/group-workspace-route-runtime.js');
+const { withBotAdminIdentityPublication } = await import('../src/services/bot-admin-unions-store.js');
 
 function seed(sessionId: string, repo: string): void {
   sessionStore.init('cli_repair');
@@ -29,6 +31,20 @@ function seed(sessionId: string, repo: string): void {
 
 describe('production group workspace quarantine repair coordinator', () => {
   beforeEach(() => { dataDir = mkdtempSync(join(tmpdir(), 'workspace-repair-production-')); });
+
+  it('releases successful repair authority so subsequent admin publication can acquire', async () => {
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let acquired!: () => void;
+    const ready = new Promise<void>(resolve => { acquired = resolve; });
+    const lease = withBotAdminIdentityPublication(dataDir, async () => { acquired(); await held; });
+    await ready;
+    await expect(consumeGroupWorkspaceRepairAuthority(async () => ({
+      status: 'authorized', releasePublicationLease: async () => { release(); await lease; },
+    }))).resolves.toBe(true);
+    await expect(withBotAdminIdentityPublication(dataDir, async () => 'published', { maxWaitMs: 100 }))
+      .resolves.toBe('published');
+  });
 
   it('revalidates fresh authority/current record/path identity and commits one exact durable CAS receipt', async () => {
     const repo = join(dataDir, 'repo'); mkdirSync(repo); seed('session', repo);

@@ -51,6 +51,17 @@ function resolvedAdminSnapshotFingerprint(snapshot: FreshBotAdminUnionSnapshot):
   return createHash('sha256').update(JSON.stringify([snapshot.configFingerprint, admins])).digest('hex');
 }
 
+export async function consumeGroupWorkspaceRepairAuthority(
+  revalidate: () => Promise<{ status: string; releasePublicationLease?: () => Promise<void> }>,
+): Promise<boolean> {
+  const authority = await revalidate();
+  try {
+    return authority.status === 'authorized';
+  } finally {
+    await authority.releasePublicationLease?.();
+  }
+}
+
 export function createGroupWorkspaceRouteRuntime(options: {
   larkAppId: string;
   dataDir?: string;

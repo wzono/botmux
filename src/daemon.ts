@@ -566,7 +566,7 @@ import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, h
 import { resolveGroupWorkspaceRepoSelection } from './core/repo-selection.js';
 import { resolveGroupWorkspaceCwd } from './core/group-workspace-policy.js';
 import { applySessionWorkingDir, proveGroupWorkspaceSessionReplacement, resolveGroupWorkspaceFollowTarget, runGroupWorkspaceSessionFollow, setSessionWorkingDirMetadata, type SessionWorkingDirMutation } from './core/session-cwd.js';
-import { createGroupWorkspaceRouteRuntime } from './core/group-workspace-route-runtime.js';
+import { consumeGroupWorkspaceRepairAuthority, createGroupWorkspaceRouteRuntime } from './core/group-workspace-route-runtime.js';
 import { DurableVerifiedAppTenantRegistry } from './core/workspace-authority.js';
 import { classifySlash, isCommandDecision, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
 import { deriveSessionPhase } from './core/session-phase.js';
@@ -6553,11 +6553,11 @@ const commandDeps: CommandHandlerDeps = {
       || expandHome(requested) !== current.record.directory.workingDir)) return 'proof_mismatch';
     return (await coordinateGroupWorkspaceQuarantineRepair({
       sessionId: ds.session.sessionId, chatId: ds.chatId, actor: authority.actor,
-      authority: { authorize: async () => (await runtime.revalidateAuthority({
+      authority: { authorize: () => consumeGroupWorkspaceRepairAuthority(() => runtime.revalidateAuthority({
         chatId: ds.chatId,
         actor: authority.actor,
         authorityFingerprint: authority.configFingerprint,
-      })).status === 'authorized' },
+      })) },
       groupStore: groupWorkspaceStore,
     })).status;
   },
