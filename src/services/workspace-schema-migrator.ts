@@ -160,9 +160,11 @@ export function readWorkspaceMigrationManifest(dataDir: string): WorkspaceMigrat
 
 /** Every workspace-schema writer calls this immediately before its durable write. */
 export function assertWorkspaceWriterFence(dataDir: string, fence?: WorkspaceWriterFence): void {
+  const restartBlocked = workspaceRestartBlocked(dataDir);
   const manifest = readWorkspaceMigrationManifest(dataDir);
   if (!manifest) {
     if (fence) throw new WorkspaceMigrationFenceError('workspace migration fence does not exist');
+    if (restartBlocked) throw new WorkspaceMigrationFenceError('workspace supervisor restart block is active');
     return;
   }
   if (manifest.targetVersion > TARGET_SCHEMA_VERSION) {
