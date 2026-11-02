@@ -196,6 +196,7 @@ describe('敏感动作清单', () => {
   // 逐项钉死：漏登记 = 该动作绕过 canOperate、任何人都能点。新增 / 删除必须同步改这里。
   const EXPECTED = [
     'cleanup_session_worktree', 'close', 'compact_session', 'disconnect', 'export_text', 'get_write_link', 'open_local_cli', 'open_local_terminal',
+    'purge_images_continue',
     'quote_confirm', 'refresh_screenshot', 'reply_card_menu', 'reply_model_pick',
     'repo_manual_submit', 'repo_rebuild_worktree', 'repo_worktree_submit', 'restart', 'resume',
     'retry_last_task', 'retry_turn', 'set_reasoning_effort', 'skip_repo', 'stop_turn', 'takeover', 'term_action',
@@ -203,7 +204,7 @@ describe('敏感动作清单', () => {
     'worktree_toggle_mode',
   ];
 
-  it('清单逐项一致（含工作目录恢复卡的重建 worktree）', () => {
+  it('清单逐项一致（含 purge_images_continue、回复卡菜单与工作目录恢复卡的重建 worktree）', () => {
     expect([...SENSITIVE_CARD_ACTIONS.keys()].sort()).toEqual(EXPECTED);
   });
 
