@@ -152,6 +152,36 @@ vi.mock('../src/services/session-store.js', async () => {
   };
 });
 
+vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/admitted-turn-dispatch.js');
+  const workerPool = await vi.importActual<any>('../src/core/worker-pool.js');
+  return {
+    ...actual,
+    // Narrow route-fixture seam: these tests exercise daemon routing with
+    // synthetic sessions that intentionally have no filesystem identity/ready
+    // handshake. Terminate the central-admission adapter at the worker boundary;
+    // permit semantics have their own real-store suites.
+    dispatchAdmittedBusinessTurn: vi.fn(async (input: any) => {
+      if (input.ds.worker) {
+        return workerPool.sendWorkerInput(input.ds, input.payload, input.turnId, input.options);
+      }
+      const options = { ...input.options, turnId: input.turnId };
+      const accepted = mocks.forkWorker(input.ds, input.payload, options, options);
+      if (accepted && input.ds.session.queuedActivationTail?.length) {
+        const tail = input.ds.session.queuedActivationTail[0];
+        workerPool.sendWorkerInput(input.ds, tail.cliInput, tail.turnId, input.options);
+        input.ds.worker?.send?.({
+          type: 'message',
+          ...tail.cliInput,
+          turnId: tail.turnId,
+          queuedActivationToken: tail.token ?? 'fixture-queued-activation',
+        });
+      }
+      return accepted;
+    }),
+  };
+});
+
 vi.mock('../src/core/worker-pool.js', async () => {
   const actual = await vi.importActual<any>('../src/core/worker-pool.js');
   return {
@@ -731,6 +761,7 @@ function resetRouteTestState(): void {
   rmSync(botsConfigPath(), { force: true });
   rmSync(botsInfoPath(), { force: true });
   rmSync(botUnionIdsPath(), { force: true });
+  rmSync(join(mocks.dataDir, 'turn-permits.json'), { force: true });
   const bot = registerBot({
     larkAppId: APP,
     larkAppSecret: 's',
@@ -788,6 +819,7 @@ describe('/rename production routing — must not pre-create a session (review P
     rmSync(botsConfigPath(), { force: true });
     rmSync(botsInfoPath(), { force: true });
     rmSync(botUnionIdsPath(), { force: true });
+    rmSync(join(mocks.dataDir, 'turn-permits.json'), { force: true });
     const bot = registerBot({
       larkAppId: APP,
       larkAppSecret: 's',

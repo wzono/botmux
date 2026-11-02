@@ -6384,7 +6384,7 @@ const centralTurnWorkerBoundary = {
     forkWorkerBlank(ds, permit, { resume: options.resume,
       ...(options.dispatchAttempt === undefined ? {} : { dispatchAttempt: options.dispatchAttempt }),
       ...(options.trustedCaller ? { trustedCaller: options.trustedCaller } : {}),
-      ...(options.atMostOnce ? { atMostOnce: true as const } : {}) }),
+      ...(options.atMostOnce ? { atMostOnce: true as const } : {}) }, centralTurnPermitStore),
   submit: (ds: DaemonSession, payload: string | CliTurnPayload,
     permit: import('./core/turn-admission.js').BusinessSubmitPermit, digest: string,
     options: import('./core/admitted-turn-dispatch.js').BusinessTurnSubmitOptions) =>
@@ -6395,7 +6395,7 @@ const centralTurnWorkerBoundary = {
       ...(options.codexAppSteerable ? { codexAppSteerable: true as const } : {}),
       ...(options.atMostOnce ? { atMostOnce: true as const } : {}),
       ...(options.trustedCaller ? { trustedCaller: options.trustedCaller } : {}),
-    }),
+    }, centralTurnPermitStore),
 };
 
 type FollowPersistedSession = Session;
@@ -9706,16 +9706,6 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
           sessionBackendType: askSession.session.backendType,
           promptInjection: sessionPromptInjection(askSession), turnId,
         });
-        if (documentDelivery && asyncDocumentTarget) {
-          // The originating turn can finish and consume its comment route while
-          // this card is pending. The answer's new turn must retain that route,
-          // never inherit a later comment's recipient or reaction cleanup.
-          (askSession.session.docCommentTargets ??= {})[turnId] = {
-            fileToken: asyncDocumentTarget.fileToken, fileType: asyncDocumentTarget.fileType,
-            commentId: asyncDocumentTarget.commentId, replyToOpenId: documentDelivery.openId,
-            replyToName: asyncDocumentTarget.replyToName, turnId,
-          };
-        }
         // Keep accepted-input durability and the answer's own reply identity.
         // A correlated ordinary human answer may enter its original active
         // native turn; completed/different targets retain the serial fallback.
@@ -9775,9 +9765,25 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
           // The original turn remains the authorization authority, while the
           // control delivery gets its own worker dedupe key. Reusing turnId here
           // lets an ordinary-turn receipt suppress the later async answer.
-          resume: async permit => sendWorkerInput(askSession, input, permit.controlDispatchId, { atMostOnce: true,
-            controlDispatchId: permit.controlDispatchId, controlReplyDigest: replyDigest,
-            trustedCaller, ...(steerable ? { codexAppSteerable: true as const } : {}) }),
+          resume: async permit => {
+            if (documentDelivery && asyncDocumentTarget) {
+              // The control dispatch gets its own worker dedupe key. Preserve the
+              // originating document route under that exact key before IPC so a
+              // synchronous worker ACK/final output can resolve it immediately.
+              (askSession.session.docCommentTargets ??= {})[permit.controlDispatchId] = {
+                fileToken: asyncDocumentTarget.fileToken, fileType: asyncDocumentTarget.fileType,
+                commentId: asyncDocumentTarget.commentId, replyToOpenId: documentDelivery.openId,
+                replyToName: asyncDocumentTarget.replyToName, turnId: permit.controlDispatchId,
+              };
+            }
+            const accepted = sendWorkerInput(askSession, input, permit.controlDispatchId, { atMostOnce: true,
+              controlDispatchId: permit.controlDispatchId, controlReplyDigest: replyDigest,
+              trustedCaller, ...(steerable ? { codexAppSteerable: true as const } : {}) });
+            if (!accepted && documentDelivery && asyncDocumentTarget) {
+              delete askSession.session.docCommentTargets?.[permit.controlDispatchId];
+            }
+            return accepted;
+          },
           abort: async permit => {
             await centralTurnPermitStore.abortControlReplyDispatch(permit, replyDigest);
           },
@@ -33718,13 +33724,42 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       const recoverable = await groupWorkspaceOperationStore.listRecoverable();
       if (recoverable.status !== 'available') throw new Error('group workspace operation store unavailable');
       for (const journal of recoverable.journals) {
-        const session = findActiveBySessionId(journal.sessionId)
-          ?? activeSessions.get(journal.sessionId)
-          ?? activeSessions.get(sessionKey(journal.chatId, cfg.larkAppId));
-        if (!session || session.larkAppId !== cfg.larkAppId) continue;
-        const coordinator = groupWorkspaceRecoveryCoordinators.get(cfg.larkAppId);
-        if (!coordinator) throw new Error(`group workspace recovery coordinator unavailable: ${cfg.larkAppId}`);
-        const result = await coordinator(journal).recover(journal);
+        let result: { status: string };
+        if (journal.kind === 'unbind') {
+          result = await executeGroupWorkspaceUnbind({
+            sourceEventId: journal.sourceEventId,
+            chatId: journal.chatId,
+            actor: journal.actor,
+            authorityFingerprint: journal.authorityFingerprint ?? '',
+          }, {
+            journalStore: groupWorkspaceOperationStore,
+            now: Date.now,
+            revalidateAuthority: async frozen => ({
+              status: await groupWorkspaceRouteRuntime.revalidateAuthority({
+                chatId: frozen.chatId,
+                actor: frozen.actor,
+                authorityFingerprint: frozen.authorityFingerprint ?? '',
+              }) ? 'authorized' : 'unauthorized',
+            }),
+            readReceipt: operationKey => groupWorkspaceStore.readReceipt(operationKey),
+            readCurrentRevision: async chatId => {
+              const current = await groupWorkspaceStore.read(chatId);
+              return current.status === 'available'
+                ? { status: 'available', revision: current.record?.revision ?? 0 }
+                : current;
+            },
+            mutate: (input, revalidateUnderLock) => groupWorkspaceStore.mutate(input, revalidateUnderLock),
+          });
+        } else {
+          const session = findActiveBySessionId(journal.sessionId)
+            ?? activeSessions.get(journal.sessionId);
+          if (!session || session.larkAppId !== cfg.larkAppId) {
+            throw new Error(`group workspace set recovery session unavailable: ${journal.operationKey}:${journal.sessionId}`);
+          }
+          const coordinator = groupWorkspaceRecoveryCoordinators.get(cfg.larkAppId);
+          if (!coordinator) throw new Error(`group workspace recovery coordinator unavailable: ${cfg.larkAppId}`);
+          result = await coordinator(journal).recover(journal);
+        }
         if (result.status !== 'group_committed' && result.status !== 'conflict'
           && result.status !== 'unauthorized') {
           throw new Error(`group workspace operation recovery unresolved: ${journal.operationKey}:${result.status}`);
