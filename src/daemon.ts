@@ -33735,7 +33735,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             journalStore: groupWorkspaceOperationStore,
             now: Date.now,
             revalidateAuthority: async frozen => ({
-              status: await groupWorkspaceRouteRuntime.revalidateAuthority({
+              status: await groupWorkspaceRouteRuntimes.get(cfg.larkAppId)!.revalidateAuthority({
                 chatId: frozen.chatId,
                 actor: frozen.actor,
                 authorityFingerprint: frozen.authorityFingerprint ?? '',
