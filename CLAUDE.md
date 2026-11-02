@@ -170,6 +170,20 @@ daemon 两条入口（`handleNewTopicAdmitted` / `handleThreadReplyAdmitted`）�
 - UI 类改动（飞书卡片 / dashboard / web 终端）附**截图示意**，让 reviewer 不用跑代码就能看到效果
 - **不写飞书群内真人名字，也不写机器人协作花名/内部 review 编排**：commit message 与 PR 标题/描述进的是**公开 git 历史**，读者不需要知道群里谁参与、谁审的。① 不出现群成员真名——验证描述用中性客观表述（如「矮视口下成员/机器人行都能滚动可见」，而不是「某某/某某两行成员」）；② 不出现 `@Codex`、`Codex 复审`、`双审`、`首审`、`双审收敛` 这类多 bot 协作花名，验证只陈述**做了什么验证、结果如何**的客观事实，不写「谁审的」。（`Co-authored-by` git 署名 trailer 属正常署名规范，不在此列。）
 
+## Agent skills
+
+### Issue tracker
+
+Issues and specs use local Markdown under `.scratch/<feature-slug>/`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the default five-role vocabulary, including `ready-for-agent`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Use the single-context domain-doc layout. See `docs/agents/domain.md`.
+
 ## Git 提交 & 发版规范
 
 - commit message 格式：`type(scope): 中文描述`。`type`（feat/fix/docs/chore 等）和 `scope`（模块名）保留英文，冒号后的描述用中文；同样**不带飞书真人名字与机器人协作花名**（见上「PR 规范」）

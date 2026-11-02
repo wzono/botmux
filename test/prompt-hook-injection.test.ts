@@ -415,8 +415,9 @@ describe('buildNewTopicCliInput — hook 注入模式（opening）', () => {
     expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
   });
 
-  it('无 whiteboard/sender/mentions（envelope 为空）：回退 inline，保留外壳', () => {
-    // envelope 为空时不写 sidecar，回退 inline——外壳保留给会话发现/标题提取用。
+  it('无 whiteboard/sender/mentions 时：全局回复规则进入 sidecar，PTY 保留用户正文前缀', () => {
+    // 全局回复规则本身是稳定的 Botmux-owned envelope；即使没有其它 envelope，
+    // hook 模式仍写 sidecar，让 PTY 文本从用户正文开始，避免提交指纹共享规则前缀。
     const result = buildNewTopicCliInput(
       '帮我修个 bug', SESSION_ID, 'claude-code', undefined,
       undefined, undefined, undefined, undefined,
@@ -425,8 +426,8 @@ describe('buildNewTopicCliInput — hook 注入模式（opening）', () => {
       undefined,
       openingOpts({ whiteboardId: undefined }),
     );
-    expect(result.content).toContain('<user_message>');
-    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+    expect(result.content).toBe('帮我修个 bug');
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toContain('<botmux_response_style>');
   });
 
   it('skill catalog 追加到 prompt 尾部后：全量指纹 miss，prefix 兜底仍能 claim', () => {
