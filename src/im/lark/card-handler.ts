@@ -339,7 +339,7 @@ export async function tryDispatchGroupWorkspaceCardRoute(
   const authority = await deps.resolveAuthority(input);
   if (!authorizeGroupWorkspaceRoute(authority)) {
     if (authority?.status === 'recognized_denied') {
-      return { status: 'recognized_denied', toast: '无法验证群目录操作权限；本次未切换会话，也未写入群目录。' };
+      return { status: 'recognized_denied', toast: t(`cmd.repo.group.denied_${authority.reason}`, undefined, 'zh') };
     }
     deps.canRunGenericCardAction();
     return { status: 'not_authorized' };
@@ -347,7 +347,7 @@ export async function tryDispatchGroupWorkspaceCardRoute(
   if (intent.kind === 'set' && !authority.canSwitchSession) {
     return {
       status: 'switch_denied',
-      toast: '你有群目录管理权限，但没有接收机器人的会话切换权限；本次未切换会话，也未写入群目录。',
+      toast: t('cmd.repo.group.switch_denied', undefined, 'zh'),
     };
   }
   await deps.handleRoute({

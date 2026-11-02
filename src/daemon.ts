@@ -6571,6 +6571,16 @@ const commandDeps: CommandHandlerDeps = {
       : persistedWorkingDir && resolvedWorkingDir === expandHome(persistedWorkingDir)
         ? 'session-persisted'
         : 'current-policy (legacy/unknown provenance)';
+    const groupConsumption = group.status === 'available' && group.record?.directory.kind === 'bound'
+      ? await groupWorkspaceStore.probeBoundDirectoryForConsumption(ds.chatId)
+      : undefined;
+    const resolution = group.status === 'store_unavailable'
+      ? { status: 'store_unavailable', detail: 'group workspace store unavailable' }
+      : ds.session.groupWorkspaceQuarantine
+        ? { status: 'identity_changed', detail: ds.session.groupWorkspaceQuarantine.detail }
+        : groupConsumption && groupConsumption.status !== 'available'
+          ? { status: groupConsumption.status, detail: `group binding is ${groupConsumption.status}` }
+          : { status: 'resolved', detail: resolvedSource };
     return {
       session: { workingDir: persistedWorkingDir ?? resolvedWorkingDir,
         source: persistedWorkingDir ? 'session-persisted (legacy/unknown provenance)' : 'not-persisted' },
@@ -6586,7 +6596,17 @@ const commandDeps: CommandHandlerDeps = {
             : { state: 'bound', workingDir: group.record.directory.workingDir, revision: group.record.revision,
               source: 'group', updatedAt: group.record.updatedAt,
               managers: group.record.workspaceManagers?.map(manager => `${manager.tenantKey}/${manager.unionId}`),
-              health: (await groupWorkspaceStore.probeBoundDirectoryForConsumption(ds.chatId)).status },
+              health: groupConsumption!.status },
+      resolution,
+      ...(ds.session.groupWorkspaceQuarantine ? { quarantine: ds.session.groupWorkspaceQuarantine } : {}),
+      ...(() => {
+        try {
+          const migration = readWorkspaceMigrationManifest(config.session.dataDir);
+          return migration ? { migration: { status: migration.phase, detail: `epoch ${migration.epoch}` } } : {};
+        } catch (error) {
+          return { migration: { status: 'unavailable', detail: error instanceof Error ? error.message : String(error) } };
+        }
+      })(),
       ...(botDefault ? { botDefault: { workingDir: botDefault, source: 'bot-default-config' } } : {}),
       resolved: { workingDir: resolvedWorkingDir, source: resolvedSource },
     };
@@ -33195,7 +33215,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       now: Date.now,
       authorityFingerprint: frozen.authorityFingerprint,
       revalidateAuthority: async journal => ({
-        status: await groupWorkspaceRouteRuntime.revalidateAuthorityConfiguration({
+        status: await groupWorkspaceRouteRuntime.revalidateAuthority({
           chatId: journal.chatId,
           actor: journal.actor,
           authorityFingerprint: journal.authorityFingerprint ?? '',
@@ -33237,7 +33257,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         const current = findGroupOperationSession(input.sessionId, frozen.chatId);
         if (!current) return 'session_missing';
         if ((current.workerGeneration ?? current.session.workerGeneration ?? 0) !== input.expectedGeneration) {
-          throw new Error('session provenance convergence lost generation ownership');
+          return 'generation_conflict';
         }
         applySessionWorkingDir(current, input.source === 'group'
           ? { workingDir: getSessionWorkingDir(current), source: 'group', groupWorkspaceRevision: input.groupRevision!,
@@ -33317,7 +33337,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               now: Date.now,
               authorityFingerprint: route.authorityFingerprint,
               revalidateAuthority: async journal => ({
-                status: await groupWorkspaceRouteRuntime.revalidateAuthorityConfiguration({
+                status: await groupWorkspaceRouteRuntime.revalidateAuthority({
                   chatId: journal.chatId,
                   actor: journal.actor,
                   authorityFingerprint: journal.authorityFingerprint ?? '',
@@ -33379,13 +33399,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               },
               convergeSession: async input => {
                 const current = activeSessions.get(sessionKey(ds.chatId, cfg.larkAppId));
-                if (!current || (current.workerGeneration ?? 0) !== input.expectedGeneration) {
-                  throw new Error('session provenance convergence lost generation ownership');
+                if (!current) return 'session_missing';
+                if ((current.workerGeneration ?? current.session.workerGeneration ?? 0) !== input.expectedGeneration) {
+                  return 'generation_conflict';
                 }
                 applySessionWorkingDir(current, input.source === 'group'
                   ? { workingDir: getSessionWorkingDir(current), source: 'group', groupWorkspaceRevision: input.groupRevision!,
                       groupWorkspaceIdentity: input.workspaceIdentity! }
                   : { workingDir: getSessionWorkingDir(current), source: 'explicit' });
+                return 'converged';
               },
             });
             const result = await coordinator.execute({
@@ -33410,7 +33432,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               journalStore: groupWorkspaceOperationStore,
               now: Date.now,
               revalidateAuthority: async journal => ({
-                status: await groupWorkspaceRouteRuntime.revalidateAuthorityConfiguration({
+                status: await groupWorkspaceRouteRuntime.revalidateAuthority({
                   chatId: journal.chatId,
                   actor: journal.actor,
                   authorityFingerprint: journal.authorityFingerprint ?? '',

@@ -677,6 +677,14 @@ export interface GroupWorkspaceRepoShowState {
   session?: GroupWorkspaceRepoShowLayer;
   explicitOncall?: GroupWorkspaceRepoShowLayer;
   defaultOncall?: GroupWorkspaceRepoShowLayer;
+  resolution?: { status: string; detail?: string };
+  quarantine?: {
+    kind: string;
+    expectedRevision?: number;
+    expectedIdentity?: { path: string; dev: string; ino: string };
+    detail?: string;
+  };
+  migration?: { status: string; detail?: string };
   group: {
     state: 'bound' | 'unbound' | 'missing' | 'unavailable';
     workingDir?: string;
@@ -696,11 +704,15 @@ export function formatGroupWorkspaceRepoShow(state: GroupWorkspaceRepoShowState,
     `${name}: ${value?.workingDir ?? none} (${value?.source ?? none}${value?.revision !== undefined ? `; revision ${value.revision}` : ''})`;
   const groupDirectory = state.group.state === 'bound' ? state.group.workingDir ?? none : state.group.state;
   const managers = state.group.managers?.length ? state.group.managers.join(', ') : none;
+  const identity = state.quarantine?.expectedIdentity;
   return [
     layer('session', state.session),
     layer('explicit oncall', state.explicitOncall),
     layer('default oncall', state.defaultOncall),
     `group: ${groupDirectory} (${state.group.source ?? none}; revision ${state.group.revision ?? none}; updated ${state.group.updatedAt ?? none}; managers ${managers}; health ${state.group.health})`,
+    `resolution: ${state.resolution?.status ?? none}${state.resolution?.detail ? ` (${state.resolution.detail})` : ''}`,
+    `quarantine: ${state.quarantine?.kind ?? none}${state.quarantine?.expectedRevision !== undefined ? `; revision ${state.quarantine.expectedRevision}` : ''}${identity ? `; identity ${identity.path} dev=${identity.dev} ino=${identity.ino}` : ''}${state.quarantine?.detail ? `; ${state.quarantine.detail}` : ''}`,
+    `migration: ${state.migration?.status ?? none}${state.migration?.detail ? ` (${state.migration.detail})` : ''}`,
     layer('default', state.botDefault),
     layer('resolved', state.resolved),
   ].join('\n');

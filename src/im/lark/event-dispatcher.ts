@@ -2479,14 +2479,14 @@ export async function tryDispatchGroupWorkspaceTextRoute(
   const authority = await deps.resolveAuthority(input);
   if (!authorizeGroupWorkspaceRoute(authority)) {
     if (authority?.status === 'recognized_denied') {
-      await deps.replyDenied('无法验证群目录操作权限；本次未切换会话，也未写入群目录。');
+      await deps.replyDenied(t(`cmd.repo.group.denied_${authority.reason}`, undefined, 'zh'));
       return 'recognized_denied';
     }
     deps.canRunGenericCommand();
     return 'not_authorized';
   }
   if (intent.kind === 'set' && !authority.canSwitchSession) {
-    await deps.replyDenied('你有群目录管理权限，但没有接收机器人的会话切换权限；本次未切换会话，也未写入群目录。');
+    await deps.replyDenied(t('cmd.repo.group.switch_denied', undefined, 'zh'));
     return 'switch_denied';
   }
   await deps.handleRoute({

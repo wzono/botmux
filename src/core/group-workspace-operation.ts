@@ -109,7 +109,7 @@ export interface GroupWorkspaceOperationDependencies {
     source: 'explicit' | 'group';
     groupRevision?: number;
     workspaceIdentity?: WorkspaceIdentity;
-  }): Promise<void | 'converged' | 'session_missing'>;
+  }): Promise<void | 'converged' | 'session_missing' | 'generation_conflict'>;
   fencingToken?(): number | undefined;
   afterBoundary?(boundary:
     | 'prepared_before_switch'
@@ -545,11 +545,15 @@ export class GroupWorkspaceOperationCoordinator {
       }
       if (!(await this.hasFence(journal.operationKey, lease))) return { status: 'unknown', journal };
       await this.dependencies.afterBoundary?.('prepared_before_switch');
+      // The boundary hook models time spent between prepare and the externally
+      // visible replacement effect. Authority may be revoked while that work is
+      // pending, so the proof used above cannot authorize the switch itself.
       const session = await this.dependencies.readSession(journal.sessionId);
       if (session.status === 'store_unavailable') return this.markUnknown(journal, lease);
       const expectedAfter = journal.expectedSessionGeneration + 1;
       if (session.generation === journal.expectedSessionGeneration) {
         if (session.workingDir === journal.targetWorkingDir) return this.markUnknown(journal, lease);
+        if (!(await this.hasAuthority(journal))) return this.markUnauthorized(journal, lease);
         const switchInput = {
           sessionId: journal.sessionId,
           expectedGeneration: journal.expectedSessionGeneration,
@@ -629,6 +633,9 @@ export class GroupWorkspaceOperationCoordinator {
           () => this.dependencies.convergeSession(convergenceInput))
         : { status: 'applied' as const, value: await this.dependencies.convergeSession(convergenceInput) };
       if (sessionConvergence.status === 'stale_fence') return { status: 'observing', journal: completed, receipt: receiptReadback.receipt };
+      if (sessionConvergence.value !== undefined && sessionConvergence.value !== 'converged') {
+        return { status: 'unknown', journal: completed };
+      }
       await this.dependencies.afterBoundary?.('receipt_before_response');
       return { status: 'group_committed', journal: completed, groupRevision: groupResult.resultingRevision };
     }
@@ -701,6 +708,8 @@ export class GroupWorkspaceOperationCoordinator {
         }, lease ? () => this.hasFence(journal.operationKey, lease) : undefined);
         if (terminal.status !== 'updated') return { status: 'unknown', journal: completed };
         completed = terminal.journal;
+      } else if (convergence !== undefined && convergence !== 'converged') {
+        return { status: 'unknown', journal: completed };
       }
       return { status: 'group_committed', journal: completed, groupRevision: receipt.resultingRevision };
     }

@@ -465,10 +465,10 @@ describe('GroupWorkspaceOperationCoordinator', () => {
     const dependencies = (h.coordinator as any).dependencies;
     let checks = 0;
     dependencies.revalidateAuthority = async () => ({
-      status: ++checks === 1 ? 'authorized' : 'unauthorized',
+      status: ++checks < 3 ? 'authorized' : 'unauthorized',
     });
     await expect(h.coordinator.execute(REQUEST)).resolves.toMatchObject({ status: 'unauthorized' });
-    expect(checks).toBe(2);
+    expect(checks).toBe(3);
     expect(h.switches).toBe(1);
     expect(h.commits).toBe(0);
     expect(h.calls).toContain('converge:explicit:none');
