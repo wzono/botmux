@@ -956,7 +956,7 @@ describe('renderCursorSenderNote', () => {
   });
 
   it('returns empty for every non-cursor CLI', () => {
-    for (const cli of ['claude-code', 'codex', 'gemini', 'opencode', 'coco', 'aiden'] as const) {
+    for (const cli of ['claude-code', 'codex', 'kimi', 'opencode', 'coco', 'aiden'] as const) {
       expect(renderCursorSenderNote(cli, true)).toBe('');
     }
   });
@@ -985,7 +985,7 @@ describe('renderBufferedSenderBlock', () => {
   });
 
   it('renders the bare <sender> tag (no note) for non-cursor CLIs', () => {
-    for (const cli of ['claude-code', 'codex', 'gemini', 'opencode', 'coco', 'aiden'] as const) {
+    for (const cli of ['claude-code', 'codex', 'kimi', 'opencode', 'coco', 'aiden'] as const) {
       const out = renderBufferedSenderBlock(SENDER, cli);
       expect(out).toContain('open_id="ou_bob"');
       expect(out).not.toContain('<sender_note>');

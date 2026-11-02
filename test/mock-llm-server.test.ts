@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import {
   MockLlmServer,
   extractMarker,
@@ -289,58 +289,69 @@ describe('MockLlmServer', () => {
       expect(text).toContain('ACK-e2e-cli-1793300000000');
     });
 
-    it('speaks Gemini: a run_shell_command call, then text after the functionResponse', async () => {
-      const tools = [{ functionDeclarations: [{ name: 'run_shell_command', parametersJsonSchema: { type: 'object', required: ['command'], properties: { command: { type: 'string' } } } }] }];
-      const first = await post('/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse', {
+    it('speaks the Gemini API for Antigravity: a run_command call, then text after the functionResponse', async () => {
+      // Antigravity's run_command as agy 1.4.12 declares it: the command field
+      // is `CommandLine`, and `toolSummary` / `WaitMsBeforeAsync` are required.
+      const tools = [{ functionDeclarations: [{
+        name: 'run_command',
+        parametersJsonSchema: {
+          type: 'object',
+          required: ['CommandLine', 'toolSummary', 'WaitMsBeforeAsync'],
+          properties: { CommandLine: { type: 'string' }, IsDaemon: { type: 'boolean' }, WaitMsBeforeAsync: { type: 'integer' }, toolSummary: { type: 'string' } },
+        },
+      }] }];
+      const first = await post('/v1beta/models/gemini-3.1-pro-preview:streamGenerateContent?alt=sse', {
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
         tools,
       });
       const call = JSON.parse(first.replace(/^data: /, '').trim()).candidates[0].content.parts[0].functionCall;
-      expect(call.name).toBe('run_shell_command');
-      // The reply command carries an env-snapshot fragment (live diagnostic)
-      // followed by the real `botmux send`.
-      expect(call.args.command).toMatch(/^printf '%s %s %s\\n' "\$\(date \+%s\)" "[\s\S]*" >> \.e2e-gemini-shell-env\.log; /);
-      expect(call.args.command).toContain("GITHUB_SHA={${GITHUB_SHA+x}:${GITHUB_SHA-}}");
-      expect(call.args.command).toContain("botmux send --mention-back 'ACK-e2e-cli-1793300000000'");
+      expect(call.name).toBe('run_command');
+      expect(call.args.CommandLine).toBe("botmux send --mention-back 'ACK-e2e-cli-1793300000000'");
+      expect(call.args).not.toHaveProperty('command');
+      expect(call.args.toolSummary).toBeTypeOf('string');
+      expect(call.args.WaitMsBeforeAsync).toBeTypeOf('number');
+      expect(call.args).not.toHaveProperty('IsDaemon');
 
-      const second = await post('/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse', {
+      const second = await post('/v1beta/models/gemini-3.1-pro-preview:streamGenerateContent?alt=sse', {
         contents: [
           { role: 'user', parts: [{ text: prompt }] },
           { role: 'model', parts: [{ functionCall: call }] },
-          { role: 'user', parts: [{ functionResponse: { name: 'run_shell_command', response: { output: 'sent' } } }] },
+          { role: 'user', parts: [{ functionResponse: { name: 'run_command', response: { output: 'sent' } } }] },
         ],
         tools,
       });
       expect(JSON.parse(second.replace(/^data: /, '').trim()).candidates[0].content.parts[0].text).toBeTypeOf('string');
-
-      const routed = await fetch(`${baseUrl}/v1beta/models/flash:generateContent`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'route' }] }], generationConfig: { responseJsonSchema: {} } }),
-      }).then((r) => r.json() as Promise<any>);
-      expect(JSON.parse(routed.candidates[0].content.parts[0].text)).toHaveProperty('complexity_score');
     });
 
-    it('warns only after a marker asks the router >2 times without a main-model call', async () => {
-      const warnings: string[] = [];
-      const spy = vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
-        warnings.push(args.join(' '));
+    it('answers a Gemini API request that declares no tools (Antigravity title call) with text', async () => {
+      const text = await post('/v1beta/models/gemini-3.1-flash-lite-preview:streamGenerateContent?alt=sse', {
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
       });
-      const postRouter = () =>
-        post('/v1beta/models/flash:generateContent', {
-          contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          generationConfig: { responseJsonSchema: {} },
-        });
-      try {
-        await postRouter();
-        await postRouter();
-        expect(warnings.filter((w) => w.includes('gemini router'))).toHaveLength(0);
-        await postRouter();
-        const hits = warnings.filter((w) => w.includes('gemini router') && w.includes('hit 3 times'));
-        expect(hits).toHaveLength(1);
-      } finally {
-        spy.mockRestore();
-      }
+      const part = JSON.parse(text.replace(/^data: /, '').trim()).candidates[0].content.parts[0];
+      expect(part).not.toHaveProperty('functionCall');
+      expect(part.text).toBeTypeOf('string');
+    });
+
+    it('answers a Gemini API tools group holding only a built-in (googleSearch) with text', async () => {
+      // A non-empty `tools` array that declares no callable function must not
+      // fall through to a fabricated run_command the request never offered.
+      const text = await post('/v1beta/models/gemini-3.1-pro-preview:streamGenerateContent?alt=sse', {
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        tools: [{ googleSearch: {} }],
+      });
+      const part = JSON.parse(text.replace(/^data: /, '').trim()).candidates[0].content.parts[0];
+      expect(part).not.toHaveProperty('functionCall');
+      expect(part.text).toBeTypeOf('string');
+    });
+
+    it('answers a Gemini API request whose functions hold no shell with text', async () => {
+      const text = await post('/v1beta/models/gemini-3.1-pro-preview:streamGenerateContent?alt=sse', {
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        tools: [{ functionDeclarations: [{ name: 'session_title', parametersJsonSchema: { type: 'object' } }] }],
+      });
+      const part = JSON.parse(text.replace(/^data: /, '').trim()).candidates[0].content.parts[0];
+      expect(part).not.toHaveProperty('functionCall');
+      expect(part.text).toBeTypeOf('string');
     });
   });
 
