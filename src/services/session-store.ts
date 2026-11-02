@@ -609,6 +609,7 @@ function runOwnedWriteTransaction<T>(
   nonblocking: boolean,
   operation: () => T,
 ): T {
+  assertWorkspaceWriterFence(config.session.dataDir);
   if (nonblocking) store.db.exec('PRAGMA busy_timeout = 0;');
   try {
     let committed = false;

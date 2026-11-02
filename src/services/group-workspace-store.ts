@@ -678,7 +678,8 @@ export class GroupWorkspaceStore {
         // Replay is intentionally decided before reading the current record/revision.
         const existing = own(registry.receipts, operationKey);
         if (existing) {
-          if (existing.payloadDigest !== payloadDigest || existing.chatId !== input.chatId) {
+          if (existing.payloadDigest !== payloadDigest || existing.chatId !== input.chatId
+            || !sameActor(existing.actor, input.actor)) {
             return { outcome: 'protocol_conflict' as const, existingReceipt: structuredClone(existing) };
           }
           try {
