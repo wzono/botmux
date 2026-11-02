@@ -389,6 +389,8 @@ botmux plugin service start my-plugin
 
 Botmux 不会在安装、更新或卸载时隐式停止正在运行的 Service。
 
+`botmux plugin repair [id|--all] [--dry-run]` 仅支持 Linux 主机。它用于显式修复旧安装的贡献物化与 Service 身份状态；其他平台会保持 fail closed，不开放 Dashboard Service Bridge。
+
 卸载：
 
 ```bash

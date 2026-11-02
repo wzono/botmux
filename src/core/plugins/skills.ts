@@ -9,8 +9,10 @@ export interface PluginSkillResolution {
   diagnostics: string[];
 }
 
-export function resolvePluginSkillPackages(pluginIds: readonly string[]): PluginSkillResolution {
-  const registry = readPluginRegistry();
+export function resolvePluginSkillPackages(
+  pluginIds: readonly string[],
+  registry = readPluginRegistry(),
+): PluginSkillResolution {
   const skills: SkillPackage[] = [];
   const diagnostics: string[] = [];
 
