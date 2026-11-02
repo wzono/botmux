@@ -15,11 +15,9 @@ import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, 
 import { markSessionActivity } from './session-activity.js';
 import {
   closeSessionForBackgroundCleanup,
-  forkWorker,
   getCurrentCliVersion,
   getDaemonBootId,
   hasQueuedActivationAdmissionGate,
-  sendWorkerInput,
   dispatchWorkspaceAdmittedBusinessTurn,
   setActiveSessionIfActive,
   withActiveSessionKeyLock,
@@ -1496,14 +1494,16 @@ async function triggerSessionTurnAdmitted(
             message: 'delivered to existing session and completed',
           }),
           () => {
-            const dispatchAttempt = prepareStableDispatch(target, false);
-            armFinalOutputSuppression(target, dispatchAttempt);
-            const accepted = sendWorkerInput(target, content, triggerId, {
-              ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-              ...(steerRequested ? { codexAppSteerable: true as const } : {}),
-            });
-            if (!accepted) throw new Error('worker refused trigger input before acceptance');
-            recordAcceptedInput();
+            void (async () => {
+              const dispatchAttempt = prepareStableDispatch(target, false);
+              armFinalOutputSuppression(target, dispatchAttempt);
+              const accepted = await dispatchAdmittedTrigger(content, {
+                ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+                ...(steerRequested ? { codexAppSteerable: true as const } : {}),
+              });
+              if (!accepted) throw new Error('worker refused trigger input before acceptance');
+              recordAcceptedInput();
+            })().catch(error => target.pendingWaitPromises?.get(triggerId)?.reject?.(error instanceof Error ? error : new Error(String(error))));
           },
         );
       }
@@ -1539,13 +1539,9 @@ async function triggerSessionTurnAdmitted(
           beginAsyncTrigger(target, triggerId);
           const dispatchAttempt = prepareStableDispatch(target, false);
           armFinalOutputSuppression(target, dispatchAttempt);
-          accepted = sendWorkerInput(target, content, triggerId, {
+          accepted = await dispatchAdmittedTrigger(content, {
             ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-            // At-most-once: a keyed follow-up delivered to a LIVE worker must be
-            // tagged so a CLI crash never replays it onto the auto-restarted CLI
-            // after the daemon has already terminalized it (dispatch_unknown). The
-            // dormant-fork branch rides atMostOnce on the fork init instead.
-            ...(turnLease ? { atMostOnce: true } : {}),
+            ...(turnLease ? { atMostOnce: true as const } : {}),
             ...(steerRequested ? { codexAppSteerable: true as const } : {}),
           });
         } catch (err) {
@@ -1645,13 +1641,14 @@ async function triggerSessionTurnAdmitted(
           message: 'delivered to existing session and completed',
         }),
         () => {
-          const dispatchAttempt = prepareStableDispatch(target, true);
-          armFinalOutputSuppression(target, dispatchAttempt);
-          forkWorker(target, withSteer(content), {
-            resume: target.hasHistory,
-            turnId: triggerId,
-            ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-          });
+          void (async () => {
+            const dispatchAttempt = prepareStableDispatch(target, true);
+            armFinalOutputSuppression(target, dispatchAttempt);
+            if (!await dispatchAdmittedTrigger(withSteer(content), {
+              ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+              ...(steerRequested ? { codexAppSteerable: true as const } : {}),
+            })) throw new Error('workspace admission rejected');
+          })().catch(error => target.pendingWaitPromises?.get(triggerId)?.reject?.(error instanceof Error ? error : new Error(String(error))));
         },
       );
     }
@@ -1686,12 +1683,11 @@ async function triggerSessionTurnAdmitted(
         beginAsyncTrigger(target, triggerId);
         const dispatchAttempt = prepareStableDispatch(target, true);
         armFinalOutputSuppression(target, dispatchAttempt);
-        forkWorker(target, withSteer(content), {
-          resume: target.hasHistory,
-          turnId: triggerId,
+        if (!await dispatchAdmittedTrigger(withSteer(content), {
           ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-          ...(atMostOnce ? { atMostOnce: true } : {}),
-        });
+          ...(atMostOnce ? { atMostOnce: true as const } : {}),
+          ...(steerRequested ? { codexAppSteerable: true as const } : {}),
+        })) throw new Error('workspace admission rejected');
         recordHeadlessTurn(target);
       } catch (err) {
         // A throw AFTER the attempting barrier (begin/prepare/fork). Terminalize
@@ -2079,6 +2075,20 @@ async function triggerSessionTurnAdmitted(
     }
   }
 
+  const dispatchNewAdmitted = (options: {
+    dispatchAttempt?: number; atMostOnce?: true; codexAppSteerable?: true;
+    markAttempting?: () => Promise<boolean>;
+  } = {}) => dispatchWorkspaceAdmittedBusinessTurn({
+    ds: newDs,
+    turnId: triggerId,
+    payload: promptInput,
+    resume: false,
+    markAttempting: options.markAttempting ?? (async () => true),
+    ...(options.dispatchAttempt === undefined ? {} : { dispatchAttempt: options.dispatchAttempt }),
+    ...(options.atMostOnce ? { atMostOnce: true as const } : {}),
+    ...(options.codexAppSteerable ? { codexAppSteerable: true as const } : {}),
+  });
+
   // CAS the lease reserved→attempting immediately before dispatch (commit-unknown
   // barrier). Throws → caller rolls back (releases the reserved lease).
   const markAttemptingBeforeDispatch = (): void => {
@@ -2103,12 +2113,14 @@ async function triggerSessionTurnAdmitted(
         message: 'queued new session turn and completed',
       }),
       () => {
-        const dispatchAttempt = prepareStableDispatch(newDs, true);
-        armFinalOutputSuppression(newDs, dispatchAttempt);
-        forkWorker(newDs, promptInput, dispatchAttempt === undefined
-          ? triggerId
-          : { turnId: triggerId, dispatchAttempt });
-        releaseInitialReservation();
+        void (async () => {
+          const dispatchAttempt = prepareStableDispatch(newDs, true);
+          armFinalOutputSuppression(newDs, dispatchAttempt);
+          if (!await dispatchNewAdmitted({ ...(dispatchAttempt === undefined ? {} : { dispatchAttempt }) })) {
+            throw new Error('workspace admission rejected');
+          }
+          releaseInitialReservation();
+        })().catch(error => newDs.pendingWaitPromises?.get(triggerId)?.reject?.(error instanceof Error ? error : new Error(String(error))));
       },
     );
   }
@@ -2216,10 +2228,10 @@ async function triggerSessionTurnAdmitted(
       // object form so `atMostOnce` rides the init message even when there's no
       // dispatchAttempt (keyed turns have none).
       const atMostOnce = !!(idempotencyKey && idempotencyLease);
-      const forkArg = (dispatchAttempt === undefined && !atMostOnce)
-        ? triggerId
-        : { turnId: triggerId, ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}), ...(atMostOnce ? { atMostOnce: true } : {}) };
-      forkWorker(newDs, promptInput, forkArg);
+      if (!await dispatchNewAdmitted({
+        ...(dispatchAttempt === undefined ? {} : { dispatchAttempt }),
+        ...(atMostOnce ? { atMostOnce: true as const } : {}),
+      })) throw new Error('workspace admission rejected');
       releaseInitialReservation();
     } catch (err) {
       // The ONLY thing that lets us honestly report a terminal `failed` is a
@@ -2270,19 +2282,23 @@ async function triggerSessionTurnAdmitted(
   if (stableTurnId) {
     const dispatchAttempt = prepareStableDispatch(newDs, true);
     armFinalOutputSuppression(newDs, dispatchAttempt);
-    forkWorker(newDs, promptInput, dispatchAttempt === undefined
-      ? triggerId
-      : { turnId: triggerId, dispatchAttempt });
+    if (!await dispatchNewAdmitted({ ...(dispatchAttempt === undefined ? {} : { dispatchAttempt }) })) {
+      return { ok: false, triggerId, errorCode: 'trigger_failed', error: 'workspace admission rejected' };
+    }
     releaseInitialReservation();
   }
   else if (loudTurnId) {
     prepareTriggerPresentation(newDs, true);
     armLoudFinalSuppression(newDs);
-    forkWorker(newDs, promptInput, loudTurnId);
+    if (!await dispatchNewAdmitted()) {
+      return { ok: false, triggerId, errorCode: 'trigger_failed', error: 'workspace admission rejected' };
+    }
     releaseInitialReservation();
   }
   else {
-    forkWorker(newDs, promptInput);
+    if (!await dispatchNewAdmitted()) {
+      return { ok: false, triggerId, errorCode: 'trigger_failed', error: 'workspace admission rejected' };
+    }
     releaseInitialReservation();
   }
 
