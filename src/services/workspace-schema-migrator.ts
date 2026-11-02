@@ -473,7 +473,15 @@ export class WorkspaceSchemaMigrator {
     // or copying. Every current/future production writer consults this manifest.
     writeManifest(this.dataDir, manifest);
     this.probe('fence:published', manifest);
+    return manifest;
+  }
+
+  private populateStores(manifest: WorkspaceMigrationManifest): void {
+    if (manifest.phase !== 'prepared') return;
+    const root = join(this.dataDir, 'workspace-migrations', manifest.batchId);
     for (const store of this.selectedStores()) {
+      const key = storeKey(store.kind, store.path, this.dataDir);
+      if (manifest.stores[key]) continue;
       const suffix = createHash('sha256').update(relative(this.dataDir, store.path)).digest('hex').slice(0, 12);
       const backupPath = join(root, `${suffix}-${basename(store.path)}.backup`);
       const stagedPath = join(root, `${suffix}-${basename(store.path)}.staged`);
@@ -485,14 +493,13 @@ export class WorkspaceSchemaMigrator {
         } finally { db.close(); }
         materializeStandaloneSqlite(store.path, backupPath);
       } else durableCopySync(store.path, backupPath);
-      manifest.stores[storeKey(store.kind, store.path, this.dataDir)] = {
+      manifest.stores[key] = {
         kind: store.kind, sourcePath: store.path, backupPath, stagedPath,
         sourceChecksum: checksum(store.path), backupChecksum: checksum(backupPath), publishPoint: 'pending',
       };
       writeManifest(this.dataDir, manifest);
     }
     this.probe('phase:prepared', manifest);
-    return manifest;
   }
 
   private assertOwner(manifest: WorkspaceMigrationManifest): void {
@@ -638,6 +645,7 @@ export class WorkspaceSchemaMigrator {
           fence: { epoch: manifest.epoch, fencingToken: manifest.writer.fencingToken } };
       }
       this.assertOwner(manifest);
+      this.populateStores(manifest);
       this.rollbackBeforePublish(manifest);
       if (options.stopAfter === manifest.phase) return { status: 'incomplete', phase: manifest.phase, epoch: manifest.epoch };
       if (manifest.phase === 'prepared') await this.stage(manifest);

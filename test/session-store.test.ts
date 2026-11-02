@@ -2333,7 +2333,7 @@ describe('init()', () => {
 
     expect(getSession('broken')?.scope).toBe('chat');
     expect(getSession('healthy')?.title).toBe('Healthy thread');
-    expect(listSessions()).toHaveLength(4);
+    expect(listSessions()).toHaveLength(3);
   });
 
   it('repairs the corruption signature through the shared deserialization helper', () => {
@@ -2661,6 +2661,9 @@ describe('closeSession()', () => {
     const session = createSession('chat1', 'root1', 'Provenance reload');
     Object.assign(session, {
       workingDir: '/repo/group', workingDirSource: 'group', groupWorkspaceRevision: 4,
+      workspaceSchemaVersion: 2,
+      groupWorkspaceIdentity: { path: '/repo/group', dev: '1', ino: '2' },
+      groupWorkspaceDirectoryIdentity: { dev: '1', ino: '2' },
     });
     updateSession(session);
     Object.assign(session, {

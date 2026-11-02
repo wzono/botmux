@@ -506,7 +506,28 @@ function openDbForOwnStore(path: string): SqliteDatabaseLike {
   ensurePrincipalLaneWorktreeCommonDirColumns(db);
   ensureMessageProvenanceTrustFenceIdentityColumns(db);
   db.exec(OCCUPANCY_SCHEMA_SQL);
-  return db;
+  const rawPrepare = db.prepare.bind(db);
+  const rawExec = db.exec.bind(db);
+  return {
+    exec(sql: string): void {
+      if (/^\s*(?:BEGIN|INSERT|UPDATE|DELETE|REPLACE|CREATE|ALTER|DROP|VACUUM|REINDEX)\b/i.test(sql)) {
+        assertWorkspaceWriterFence(config.session.dataDir);
+      }
+      rawExec(sql);
+    },
+    prepare(sql: string): SqliteStatementLike {
+      const statement = rawPrepare(sql);
+      return {
+        get: (...params) => statement.get(...params),
+        all: (...params) => statement.all(...params),
+        run: (...params) => {
+          assertWorkspaceWriterFence(config.session.dataDir);
+          return statement.run(...params);
+        },
+      };
+    },
+    close: () => db.close(),
+  };
 }
 
 /** `0d6ab50d1` could create this sidecar before the common-dir proof columns
