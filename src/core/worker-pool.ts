@@ -1251,6 +1251,14 @@ export function initWorkerPool(cb: WorkerPoolCallbacks): void {
   }));
 }
 
+/** Embedded IPC/test seam; production normally supplies this in initWorkerPool. */
+export function setWorkspaceAdmittedBusinessTurnDispatcher(
+  dispatcher: WorkerPoolCallbacks['dispatchAdmittedBusinessTurn'] | undefined,
+): void {
+  if (!callbacks) return;
+  callbacks.dispatchAdmittedBusinessTurn = dispatcher;
+}
+
 function requireCallbacks(): WorkerPoolCallbacks {
   if (!callbacks) throw new Error('WorkerPool not initialised — call initWorkerPool() first');
   return callbacks;

@@ -220,7 +220,7 @@ import {
   updateTaskWithOptionalPrecondition,
   type SchedulePreconditionMutation,
 } from './schedule-precondition-config.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, requestSessionRestart, isSessionRestartInFlight, getDaemonReplyCardUsageSnapshot, getDaemonReplyCardRenderSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, requestSessionRestart, isSessionRestartInFlight, getDaemonReplyCardUsageSnapshot, getDaemonReplyCardRenderSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached, setWorkspaceAdmittedBusinessTurnDispatcher } from './worker-pool.js';
 import {
   awaitReadonlyTaskContinuationUser,
   cancelReadonlyTaskContinuationExplicit,
@@ -10880,6 +10880,9 @@ ipcRoute('GET', '/api/events', (_req, res) => {
 export function startIpcServer(opts: {
   port: number;
   host: string;
+  /** Test/embedded seam for the daemon-owned typed admission callback. Production
+   * already installs it through initWorkerPool before this server starts. */
+  dispatchAdmittedBusinessTurn?: import('./worker-pool.js').WorkerPoolCallbacks['dispatchAdmittedBusinessTurn'];
   /** Enable the production trusted-host boundary. The verifier reloads the
    * tiny secret file for each request so concurrent fleet bootstrap or a
    * deliberate secret repair cannot strand a daemon on a stale cached key.
@@ -10900,6 +10903,9 @@ export function startIpcServer(opts: {
    * the trusted-host HMAC — this does NOT disable auth wholesale (codex P1). */
   coreOnlyPublicRoutes?: boolean;
 }): Promise<IpcServerHandle> {
+  if (opts.dispatchAdmittedBusinessTurn) {
+    setWorkspaceAdmittedBusinessTurnDispatcher(opts.dispatchAdmittedBusinessTurn);
+  }
   let boundPort = opts.port;
   const server: Server = createServer(async (req, res) => {
     try {
