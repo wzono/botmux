@@ -41,7 +41,8 @@ export class TurnPermitStore {
       const e = r.entries[permit.permitId];
       if (!e || r.turns[key] !== permit.permitId || !this.matches(e.blank, permit)
         || (e.state !== 'issued' && e.state !== 'spawning' && e.state !== 'spawn_failed'
-          && e.state !== 'ready_timeout' && e.state !== 'cancelled' && e.state !== 'orphan_unproven')
+          && e.state !== 'ready_timeout' && e.state !== 'expired'
+          && e.state !== 'cancelled' && e.state !== 'orphan_unproven')
         || proof.observedGeneration > permit.reservedGeneration) return { status: 'rejected' as const };
       if (proof.phase === 'forked_unproven' && !proof.orphanRetired) {
         e.state = 'orphan_unproven';

@@ -112,6 +112,28 @@ describe('durable turn permits', () => {
     })).status).toBe('rejected');
   });
 
+  it('reissues an expired bootstrap only after exact-generation orphan retirement and remains single-winner', async () => {
+    let now = 100;
+    const store = new TurnPermitStore(mkdtempSync(join(tmpdir(), 'turn-permit-')), { now: () => now });
+    const first = await store.issueBlank({ ...base, reservedGeneration: 4, expiresAt: 101 });
+    expect((await store.beginSpawn(first)).status).toBe('acquired');
+    now = 102;
+    expect((await store.beginSpawn(first)).status).toBe('expired');
+    expect(await store.issueBlank({ ...base, reservedGeneration: 5, expiresAt: 200 })).toEqual(first);
+    expect((await store.abortBootstrap(first, {
+      phase: 'forked_unproven', observedGeneration: 4, orphanRetired: false,
+    })).status).toBe('orphan_unproven');
+    expect((await store.abortBootstrap(first, {
+      phase: 'forked_unproven', observedGeneration: 4, orphanRetired: true,
+    })).status).toBe('aborted');
+    const [winner, duplicate] = await Promise.all([
+      store.issueBlank({ ...base, reservedGeneration: 5, expiresAt: 200 }),
+      store.issueBlank({ ...base, reservedGeneration: 6, expiresAt: 200 }),
+    ]);
+    expect(duplicate).toEqual(winner);
+    expect(winner.permitId).not.toBe(first.permitId);
+  });
+
   it('requires orphan-generation retirement before reissuing a forked unproven bootstrap', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'turn-permit-'));
     const store = new TurnPermitStore(dataDir, { now: () => 100 });
