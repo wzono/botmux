@@ -39,6 +39,34 @@ describe('workspace schema v2', () => {
     } });
     expect(JSON.parse(readFileSync(path, 'utf8')).schemaVersion).toBe(2);
   });
+  it('migrates each historical receipt from its own canonical target identity', async () => {
+    const dataDir = dir(); const path = join(dataDir, 'group-workspaces.json');
+    const sourceA = canonicalTextSourceEventId({ tenantKey: actor.tenantKey, chatId: 'chat', messageId: 'a' });
+    const sourceB = canonicalTextSourceEventId({ tenantKey: actor.tenantKey, chatId: 'chat', messageId: 'b' });
+    if (!sourceA.ok || !sourceB.ok) throw new Error('source');
+    const makeReceipt = (sourceEventId: string, target: string, expectedRevision: number, completedAt: number) => ({
+      operationKey: groupWorkspaceOperationKey(sourceEventId, 'set'), sourceEventId, kind: 'set',
+      payloadDigest: canonicalGroupOperationPayloadDigest({ kind: 'set', chatId: 'chat', sourceEventId,
+        requestedWorkingDir: target, expectedRevision, actor, authorized: true, directoryValid: true, now: completedAt }),
+      chatId: 'chat', outcome: 'committed', resultingRevision: expectedRevision + 1,
+      resultingDirectory: { kind: 'bound', workingDir: target }, actor, completedAt,
+      expectedRevision, canonicalTargetWorkingDir: target,
+    });
+    const receiptA = makeReceipt(sourceA.sourceEventId, '/repo/A', 0, 1);
+    const receiptB = makeReceipt(sourceB.sourceEventId, '/repo/B', 1, 2);
+    writeFileSync(path, JSON.stringify({ schemaVersion: 1, records: { chat: {
+      chatId: 'chat', revision: 2, directory: { kind: 'bound', workingDir: '/repo/B' },
+      directoryIdentity: { dev: '2', ino: '20' }, updatedAt: 2, updatedBy: actor,
+    } }, receipts: { [receiptA.operationKey]: receiptA, [receiptB.operationKey]: receiptB } }));
+    const store = new GroupWorkspaceStore(dataDir, { pathProbe: target => ({
+      ok: true, normalizedPath: target, identity: target === '/repo/A' ? { dev: '1', ino: '10' } : { dev: '2', ino: '20' },
+    }) });
+    expect((await store.read('chat')).status).toBe('available');
+    const migrated = JSON.parse(readFileSync(path, 'utf8'));
+    expect(migrated.receipts[receiptA.operationKey].workspaceIdentity).toEqual({ path: '/repo/A', dev: '1', ino: '10' });
+    expect(migrated.receipts[receiptB.operationKey].workspaceIdentity).toEqual({ path: '/repo/B', dev: '2', ino: '20' });
+  });
+
   it('writes bound record and committed receipt identities as strings', async () => {
     const dataDir = dir(); const store = new GroupWorkspaceStore(dataDir, { pathProbe: () => ({ ok: true, normalizedPath: identity.path, identity }) });
     await store.mutate({ kind: 'set', chatId: 'chat', sourceEventId: source.sourceEventId, requestedWorkingDir: identity.path,

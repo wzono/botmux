@@ -506,11 +506,14 @@ export class GroupWorkspaceStore {
         record.workspaceIdentity = { path: record.directory.workingDir, ...proof.identity };
       }
       for (const receipt of Object.values(receipts)) {
-        if (receipt.kind === 'set' && receipt.outcome === 'committed') {
-          const identity = records[receipt.chatId]?.workspaceIdentity;
-          if (!identity) throw new Error('legacy receipt identity unavailable');
-          receipt.workspaceIdentity = structuredClone(identity);
+        if (receipt.kind !== 'set') continue;
+        const target = receipt.canonicalTargetWorkingDir;
+        if (!target) throw new Error('legacy receipt target unavailable');
+        const proof = this.pathProbe(target);
+        if (!proof.ok || proof.normalizedPath !== target) {
+          throw new Error('legacy receipt identity unavailable');
         }
+        receipt.workspaceIdentity = { path: target, ...proof.identity };
       }
       const migrated = { schemaVersion: SCHEMA_VERSION, records, receipts } as GroupWorkspaceRegistry;
       for (const [key, value] of Object.entries(records)) validateRecord(value, key);
