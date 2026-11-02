@@ -16303,8 +16303,11 @@ function setupWorkerHandlers(
           sessionId: ds.session.sessionId,
           turnId: msg.turnId,
           workerGeneration,
-        }).then(result => {
-          if (result.status === 'delivered') activeBusinessPermitStores.delete(permitAckKey);
+        }).then(() => {
+          // The exact generation ACK has been handed to the originating store.
+          // Keep no process-lifetime reference after any durable verdict; a
+          // later duplicate can safely fall back to the production store.
+          activeBusinessPermitStores.delete(permitAckKey);
         }).catch(err => logger.warn(
           `[${t}] durable business ACK failed: ${err instanceof Error ? err.message : String(err)}`,
         ));
