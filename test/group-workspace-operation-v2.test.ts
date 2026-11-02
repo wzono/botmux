@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -16,6 +16,76 @@ const journal: any = { operationKey: groupWorkspaceOperationKey(sourceEventId, '
 const dir = () => mkdtempSync(join(tmpdir(), 'operation-v2-'));
 
 describe('same-source winner and executor lease', () => {
+  it('durably migrates a schema-v1 locked journal without losing phase or intent', async () => {
+    const dataDir = dir();
+    const path = join(dataDir, 'group-workspace-operations.json');
+    const legacy = {
+      operationKey: journal.operationKey, sourceEventId, kind: 'set', payloadDigest: journal.payloadDigest,
+      chatId: journal.chatId, sessionId: journal.sessionId,
+      expectedSessionGeneration: journal.expectedSessionGeneration, expectedGroupRevision: journal.expectedGroupRevision,
+      targetWorkingDir: journal.targetWorkingDir, actor: journal.actor,
+      phase: 'session_committed', sessionGenerationAfter: 2, updatedAt: 2,
+    };
+    writeFileSync(path, JSON.stringify({ schemaVersion: 1, operations: { [journal.operationKey]: legacy } }));
+    const store = new GroupWorkspaceOperationStore(dataDir, { pathProbe: target => ({
+      ok: true, normalizedPath: target, identity,
+    }) });
+    await expect(store.get(journal.operationKey)).resolves.toMatchObject({
+      status: 'found', journal: {
+        phase: 'session_committed', sessionGenerationAfter: 2, requestIntentDigest: journal.payloadDigest,
+        target: { kind: 'workspace', identity }, targetWorkspaceIdentity: identity,
+      },
+    });
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toMatchObject({ schemaVersion: 2 });
+  });
+
+  it('retries a failed durable v1 migration without damaging the locked source', async () => {
+    const dataDir = dir();
+    const path = join(dataDir, 'group-workspace-operations.json');
+    const legacy = {
+      operationKey: journal.operationKey, sourceEventId, kind: 'set', payloadDigest: journal.payloadDigest,
+      chatId: journal.chatId, sessionId: journal.sessionId,
+      expectedSessionGeneration: journal.expectedSessionGeneration, expectedGroupRevision: journal.expectedGroupRevision,
+      targetWorkingDir: journal.targetWorkingDir, actor: journal.actor,
+      phase: 'session_committed', sessionGenerationAfter: 2, updatedAt: 2,
+    };
+    const original = JSON.stringify({ schemaVersion: 1, operations: { [journal.operationKey]: legacy } });
+    writeFileSync(path, original);
+    const failed = new GroupWorkspaceOperationStore(dataDir, {
+      pathProbe: target => ({ ok: true, normalizedPath: target, identity }),
+      writer: () => { throw new Error('crash before rename'); },
+    });
+    await expect(failed.get(journal.operationKey)).resolves.toEqual({ status: 'store_unavailable' });
+    expect(readFileSync(path, 'utf8')).toBe(original);
+    const retried = new GroupWorkspaceOperationStore(dataDir, {
+      pathProbe: target => ({ ok: true, normalizedPath: target, identity }),
+    });
+    await expect(retried.get(journal.operationKey)).resolves.toMatchObject({
+      status: 'found', journal: { phase: 'session_committed', target: { kind: 'workspace', identity } },
+    });
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toMatchObject({ schemaVersion: 2 });
+  });
+
+  it('migrates a v1 unbind target to explicit absence without probing a path', async () => {
+    const dataDir = dir();
+    const path = join(dataDir, 'group-workspace-operations.json');
+    const operationKey = groupWorkspaceOperationKey(sourceEventId, 'unbind');
+    writeFileSync(path, JSON.stringify({ schemaVersion: 1, operations: { [operationKey]: {
+      ...journal, operationKey, kind: 'unbind', sessionId: 'group-workspace-unbind',
+      expectedSessionGeneration: 0, targetWorkingDir: '/', target: undefined,
+      targetWorkspaceIdentity: undefined,
+    } } }));
+    const store = new GroupWorkspaceOperationStore(dataDir, {
+      pathProbe: () => { throw new Error('unbind must not probe'); },
+    });
+    await expect(store.get(operationKey)).resolves.toMatchObject({
+      status: 'found', journal: { kind: 'unbind', target: { kind: 'absent' } },
+    });
+    const migrated = JSON.parse(readFileSync(path, 'utf8')).operations[operationKey];
+    expect(migrated).not.toHaveProperty('targetWorkingDir');
+    expect(migrated).not.toHaveProperty('targetWorkspaceIdentity');
+  });
+
   it('adopts the frozen same-intent winner', async () => {
     const store = new GroupWorkspaceOperationStore(dir());
     expect((await store.prepareOrAdopt(journal)).status).toBe('created');

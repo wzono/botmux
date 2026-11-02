@@ -5,6 +5,7 @@ import { groupWorkspaceOperationKey, type GroupOperationKind } from './group-wor
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLock } from '../utils/file-lock.js';
 import { WORKSPACE_SCHEMA_VERSION, type WorkspaceIdentity } from '../types.js';
+import { probePathUsability, type PathUsabilityResult } from '../core/path-usability.js';
 
 export const GROUP_WORKSPACE_OPERATION_STORE_FILE = 'group-workspace-operations.json';
 const SCHEMA_VERSION = WORKSPACE_SCHEMA_VERSION;
@@ -74,6 +75,7 @@ export type OperationTransitionResult =
 export interface GroupWorkspaceOperationStoreOptions {
   lockTimeoutMs?: number;
   writer?: typeof atomicWriteFileSync;
+  pathProbe?: (path: string) => PathUsabilityResult;
 }
 
 function emptyRegistry(): OperationRegistry {
@@ -148,7 +150,10 @@ function validateJournal(value: unknown, key: string): asserts value is RepoGrou
   }
 }
 
-function readRegistry(path: string): OperationRegistry {
+function readRegistry(
+  path: string,
+  migrateV1?: (legacy: Record<string, unknown>) => OperationRegistry,
+): OperationRegistry {
   let raw: string;
   try {
     raw = readFileSync(path, 'utf8');
@@ -157,6 +162,7 @@ function readRegistry(path: string): OperationRegistry {
     throw error;
   }
   const value: unknown = JSON.parse(raw);
+  if (isObject(value) && value.schemaVersion === 1 && migrateV1) return migrateV1(value);
   if (!isObject(value) || value.schemaVersion !== SCHEMA_VERSION
     || !isObject(value.operations)
     || (value.sourceIndex !== undefined && !isObject(value.sourceIndex))) {
@@ -208,18 +214,69 @@ export class GroupWorkspaceOperationStore {
   private readonly path: string;
   private readonly lockTimeoutMs: number | undefined;
   private readonly writer: typeof atomicWriteFileSync;
+  private readonly pathProbe: (path: string) => PathUsabilityResult;
 
   constructor(dataDir: string, options: GroupWorkspaceOperationStoreOptions = {}) {
     this.path = join(dataDir, GROUP_WORKSPACE_OPERATION_STORE_FILE);
     this.lockTimeoutMs = options.lockTimeoutMs;
     this.writer = options.writer ?? atomicWriteFileSync;
+    this.pathProbe = options.pathProbe ?? probePathUsability;
+  }
+
+  private migrateV1(value: Record<string, unknown>): OperationRegistry {
+    if (!isObject(value.operations)) throw new Error('invalid group workspace operation store schema');
+    const registry = emptyRegistry();
+    for (const [key, candidate] of Object.entries(value.operations)) {
+      if (!isObject(candidate)) throw new Error(`invalid legacy group workspace operation journal: ${key}`);
+      const kind = candidate.kind;
+      const targetWorkingDir = candidate.targetWorkingDir;
+      let target: RepoGroupOperationTarget;
+      let migratedTargetWorkingDir: string | undefined;
+      let targetWorkspaceIdentity: WorkspaceIdentity | undefined;
+      if (kind === 'unbind') {
+        target = { kind: 'absent' };
+      } else if (kind === 'set' && typeof targetWorkingDir === 'string' && isAbsolute(targetWorkingDir)) {
+        const probed = this.pathProbe(targetWorkingDir);
+        if (!probed.ok) throw new Error(`legacy group workspace operation target identity unprovable: ${key}`);
+        migratedTargetWorkingDir = probed.normalizedPath;
+        targetWorkspaceIdentity = { path: probed.normalizedPath, ...probed.identity };
+        target = { kind: 'workspace', identity: targetWorkspaceIdentity };
+      } else {
+        throw new Error(`invalid legacy group workspace operation target: ${key}`);
+      }
+      const migrated: RepoGroupOperationJournal = {
+        ...candidate,
+        requestIntentDigest: typeof candidate.requestIntentDigest === 'string'
+          ? candidate.requestIntentDigest
+          : candidate.payloadDigest,
+        target,
+        ...(kind === 'set' ? {
+          targetWorkingDir: migratedTargetWorkingDir,
+          targetWorkspaceIdentity,
+        } : {
+          targetWorkingDir: undefined,
+          targetWorkspaceIdentity: undefined,
+        }),
+      } as RepoGroupOperationJournal;
+      validateJournal(migrated, key);
+      const indexKey = sourceIndexKey(migrated.sourceEventId, migrated.kind);
+      if (registry.sourceIndex[indexKey]) throw new Error(`duplicate group workspace operation source: ${indexKey}`);
+      registry.operations[key] = migrated;
+      registry.sourceIndex[indexKey] = key;
+    }
+    this.write(registry);
+    return registry;
+  }
+
+  private read(): OperationRegistry {
+    return readRegistry(this.path, value => this.migrateV1(value));
   }
 
   async get(operationKey: string): Promise<OperationReadResult> {
     try {
       mkdirSync(dirname(this.path), { recursive: true });
       return await withFileLock(this.path, async () => {
-        const journal = readRegistry(this.path).operations[operationKey];
+        const journal = this.read().operations[operationKey];
         return journal
           ? { status: 'found' as const, journal: structuredClone(journal) }
           : { status: 'missing' as const };
@@ -233,7 +290,7 @@ export class GroupWorkspaceOperationStore {
     try {
       mkdirSync(dirname(this.path), { recursive: true });
       return await withFileLock(this.path, async () => {
-        const registry = readRegistry(this.path);
+        const registry = this.read();
         const operationKey = registry.sourceIndex[sourceIndexKey(sourceEventId, kind)];
         const journal = operationKey ? registry.operations[operationKey] : undefined;
         return journal
@@ -251,7 +308,7 @@ export class GroupWorkspaceOperationStore {
       if (journal.phase !== 'prepared') return { status: 'store_unavailable' };
       mkdirSync(dirname(this.path), { recursive: true });
       return await withFileLock(this.path, async () => {
-        const registry = readRegistry(this.path);
+        const registry = this.read();
         const existing = registry.operations[journal.operationKey];
         if (existing) {
           return sameFrozenIntent(existing, journal)
@@ -297,7 +354,7 @@ export class GroupWorkspaceOperationStore {
       mkdirSync(dirname(this.path), { recursive: true });
       return await withFileLock(this.path, async () => {
         if (assertFence && !(await assertFence())) return { status: 'store_unavailable' as const };
-        const registry = readRegistry(this.path);
+        const registry = this.read();
         const existing = registry.operations[operationKey];
         if (!existing) return { status: 'missing' as const };
         if (!mayTransition(existing.phase, phase)) {
@@ -323,7 +380,7 @@ export class GroupWorkspaceOperationStore {
     try {
       mkdirSync(dirname(this.path), { recursive: true });
       return await withFileLock(this.path, async () => {
-        const registry = readRegistry(this.path);
+        const registry = this.read();
         const existing = registry.operations[operationKey];
         if (!existing) return { status: 'missing' as const };
         if (existing.phase !== 'unknown') {
@@ -345,7 +402,7 @@ export class GroupWorkspaceOperationStore {
       mkdirSync(dirname(this.path), { recursive: true });
       return await withFileLock(this.path, async () => ({
         status: 'available' as const,
-        journals: Object.values(readRegistry(this.path).operations)
+        journals: Object.values(this.read().operations)
           .filter(item => item.phase === 'prepared' || item.phase === 'session_committed'
             || item.phase === 'unknown' || item.phase === 'group_committed')
           .map(item => structuredClone(item)),
@@ -360,7 +417,7 @@ export class GroupWorkspaceOperationStore {
       mkdirSync(dirname(this.path), { recursive: true });
       return await withFileLock(this.path, async () => ({
         status: 'available' as const,
-        journals: Object.values(readRegistry(this.path).operations)
+        journals: Object.values(this.read().operations)
           .filter(item => item.phase === 'prepared' || item.phase === 'session_committed' || item.phase === 'unknown')
           .map(item => structuredClone(item)),
       }), { maxWaitMs: this.lockTimeoutMs });
