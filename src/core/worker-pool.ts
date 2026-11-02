@@ -1225,6 +1225,7 @@ export interface WorkerPoolCallbacks {
 }
 
 let callbacks: WorkerPoolCallbacks | undefined;
+let embeddedWorkspaceDispatcher: WorkerPoolCallbacks['dispatchAdmittedBusinessTurn'] | undefined;
 
 /**
  * Initialise worker-pool callbacks. Must be called once before forkWorker().
@@ -1255,8 +1256,8 @@ export function initWorkerPool(cb: WorkerPoolCallbacks): void {
 export function setWorkspaceAdmittedBusinessTurnDispatcher(
   dispatcher: WorkerPoolCallbacks['dispatchAdmittedBusinessTurn'] | undefined,
 ): void {
-  if (!callbacks) return;
-  callbacks.dispatchAdmittedBusinessTurn = dispatcher;
+  embeddedWorkspaceDispatcher = dispatcher;
+  if (callbacks) callbacks.dispatchAdmittedBusinessTurn = dispatcher;
 }
 
 function requireCallbacks(): WorkerPoolCallbacks {
@@ -13102,10 +13103,9 @@ export async function dispatchWorkspaceAdmittedBusinessTurn(input: {
   trustedCaller?: TrustedCaller;
   markAttempting(): Promise<boolean>;
 }): Promise<boolean> {
-  if (!callbacks?.dispatchAdmittedBusinessTurn) {
-    throw new Error('recovery_workspace_admission_unavailable');
-  }
-  return callbacks.dispatchAdmittedBusinessTurn({
+  const dispatcher = callbacks?.dispatchAdmittedBusinessTurn ?? embeddedWorkspaceDispatcher;
+  if (!dispatcher) throw new Error('recovery_workspace_admission_unavailable');
+  return dispatcher({
     ds: input.ds,
     turnId: input.turnId,
     payload: input.payload,
