@@ -86,12 +86,51 @@ describe('same-source winner and executor lease', () => {
     expect(migrated).not.toHaveProperty('targetWorkspaceIdentity');
   });
 
+  it('migrates a v1 unbind with absent origin and authority without inventing empty identities', async () => {
+    const dataDir = dir();
+    const path = join(dataDir, 'group-workspace-operations.json');
+    const operationKey = groupWorkspaceOperationKey(sourceEventId, 'unbind');
+    const legacy = { ...journal, operationKey, kind: 'unbind', sessionId: 'group-workspace-unbind',
+      expectedSessionGeneration: 0, targetWorkingDir: '/', target: undefined,
+      targetWorkspaceIdentity: undefined, authorityFingerprint: undefined, originMessageId: undefined };
+    writeFileSync(path, JSON.stringify({ schemaVersion: 1, operations: { [operationKey]: legacy } }));
+    const store = new GroupWorkspaceOperationStore(dataDir, {
+      pathProbe: () => { throw new Error('unbind must not probe'); },
+    });
+    const migrated = await store.get(operationKey);
+    expect(migrated).toMatchObject({ status: 'found', journal: { kind: 'unbind', target: { kind: 'absent' } } });
+    if (migrated.status !== 'found') throw new Error('migration failed');
+    expect(migrated.journal).not.toHaveProperty('originMessageId');
+    expect(migrated.journal).not.toHaveProperty('authorityFingerprint');
+  });
+
   it('adopts the frozen same-intent winner', async () => {
     const store = new GroupWorkspaceOperationStore(dir());
     expect((await store.prepareOrAdopt(journal)).status).toBe('created');
     const adopted = await store.prepareOrAdopt({ ...journal, expectedSessionGeneration: 99, targetWorkingDir: '/other', targetWorkspaceIdentity: { ...identity, path: '/other' } });
     expect(adopted).toMatchObject({ status: 'adopted', journal: { targetWorkingDir: '/repo/x', expectedSessionGeneration: 1 } });
   });
+  it('persists recovery ownership and rejects cross-Bot adoption', async () => {
+    const store = new GroupWorkspaceOperationStore(dir());
+    await expect(store.prepareOrAdopt({ ...journal, ownerLarkAppId: 'app-a' }))
+      .resolves.toMatchObject({ status: 'created', journal: { ownerLarkAppId: 'app-a' } });
+    await expect(store.prepareOrAdopt({ ...journal, ownerLarkAppId: 'app-b' }))
+      .resolves.toMatchObject({ status: 'protocol_conflict', journal: { ownerLarkAppId: 'app-a' } });
+  });
+
+  it('terminalizes an unknown missing-session operation only through a fenced orphan transition', async () => {
+    const dataDir = dir();
+    const store = new GroupWorkspaceOperationStore(dataDir);
+    await store.prepare(journal);
+    await store.transition(journal.operationKey, 'unknown', { updatedAt: 2 });
+    const leases = new OperationExecutorLeaseStore(dataDir, { now: () => 10 });
+    const owner = await leases.acquire(journal.operationKey, 'daemon-a', 100);
+    if (owner.status !== 'acquired') throw new Error('lease');
+    await expect(store.transition(journal.operationKey, 'orphaned', { updatedAt: 3 }, async () =>
+      (await leases.assertCurrent(journal.operationKey, owner.lease)).status === 'current'))
+      .resolves.toMatchObject({ status: 'updated', journal: { phase: 'orphaned' } });
+  });
+
   it('lists terminal group commits that still require session convergence at startup', async () => {
     const store = new GroupWorkspaceOperationStore(dir());
     await store.prepare(journal);

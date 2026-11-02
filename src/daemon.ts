@@ -6365,7 +6365,14 @@ async function submitQueuedMessage(
     ds, turnId: message.messageId, payload: input,
     options: { resume: ds.hasHistory, notifyRejection: false, trustedCaller },
     boundary: centralTurnWorkerBoundary, permitStore: centralTurnPermitStore,
-    retireUnproven: current => retireWorkerForReplacement(current),
+    retireUnproven: async (current, reservedGeneration) => {
+      const generation = current.workerGeneration ?? current.session.workerGeneration ?? 0;
+      if (generation !== reservedGeneration) return undefined;
+      const workerPid = current.worker?.pid ?? current.session.pid ?? null;
+      return await retireWorkerForReplacement(current)
+        ? { retiredGeneration: generation, workerPid }
+        : undefined;
+    },
   })) { rollbackReplyContext(); return false; }
   ds.session.lastCallerOpenId = message.senderId;
   beginNewTurn(ds, text, message.messageId);
@@ -21287,7 +21294,14 @@ async function driveNextPrincipalLaneTurn(ds: DaemonSession): Promise<boolean> {
       },
       boundary: centralTurnWorkerBoundary,
       permitStore: centralTurnPermitStore,
-      retireUnproven: current => retireWorkerForReplacement(current),
+      retireUnproven: async (current, reservedGeneration) => {
+      const generation = current.workerGeneration ?? current.session.workerGeneration ?? 0;
+      if (generation !== reservedGeneration) return undefined;
+      const workerPid = current.worker?.pid ?? current.session.pid ?? null;
+      return await retireWorkerForReplacement(current)
+        ? { retiredGeneration: generation, workerPid }
+        : undefined;
+    },
       resource: {
         markAttempting: async permit => {
           ensurePrincipalLaneInboundTurnBinding(ds, head.turnId, permit.workerGeneration);
@@ -22079,7 +22093,14 @@ async function driveNextXpiSharedCwdTurn(
       },
       boundary: centralTurnWorkerBoundary,
       permitStore: centralTurnPermitStore,
-      retireUnproven: current => retireWorkerForReplacement(current),
+      retireUnproven: async (current, reservedGeneration) => {
+      const generation = current.workerGeneration ?? current.session.workerGeneration ?? 0;
+      if (generation !== reservedGeneration) return undefined;
+      const workerPid = current.worker?.pid ?? current.session.pid ?? null;
+      return await retireWorkerForReplacement(current)
+        ? { retiredGeneration: generation, workerPid }
+        : undefined;
+    },
       resource: {
         acquire: async permit => {
           admission = claimExactXpiSharedCwdAdmission({
@@ -22160,7 +22181,14 @@ async function dispatchReservedInitialSession(
     },
     boundary: centralTurnWorkerBoundary,
     permitStore: centralTurnPermitStore,
-    retireUnproven: current => retireWorkerForReplacement(current),
+    retireUnproven: async (current, reservedGeneration) => {
+      const generation = current.workerGeneration ?? current.session.workerGeneration ?? 0;
+      if (generation !== reservedGeneration) return undefined;
+      const workerPid = current.worker?.pid ?? current.session.pid ?? null;
+      return await retireWorkerForReplacement(current)
+        ? { retiredGeneration: generation, workerPid }
+        : undefined;
+    },
   });
   if (!accepted) return false;
   rememberLastCliInput(ds, userPrompt, input);
@@ -33113,7 +33141,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       now: Date.now,
       authorityFingerprint: frozen.authorityFingerprint,
       revalidateAuthority: async journal => ({
-        status: await groupWorkspaceRouteRuntime.revalidateAuthority({
+        status: await groupWorkspaceRouteRuntime.revalidateAuthorityConfiguration({
           chatId: journal.chatId,
           actor: journal.actor,
           authorityFingerprint: journal.authorityFingerprint ?? '',
@@ -33153,13 +33181,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       },
       convergeSession: async input => {
         const current = findGroupOperationSession(input.sessionId, frozen.chatId);
-        if (!current || (current.workerGeneration ?? current.session.workerGeneration ?? 0) !== input.expectedGeneration) {
+        if (!current) return 'session_missing';
+        if ((current.workerGeneration ?? current.session.workerGeneration ?? 0) !== input.expectedGeneration) {
           throw new Error('session provenance convergence lost generation ownership');
         }
         applySessionWorkingDir(current, input.source === 'group'
           ? { workingDir: getSessionWorkingDir(current), source: 'group', groupWorkspaceRevision: input.groupRevision!,
               groupWorkspaceIdentity: input.workspaceIdentity! }
           : { workingDir: getSessionWorkingDir(current), source: 'explicit' });
+        return 'converged';
       },
     });
     groupWorkspaceRouteRuntime = createGroupWorkspaceRouteRuntime({
@@ -33224,7 +33254,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               now: Date.now,
               authorityFingerprint: route.authorityFingerprint,
               revalidateAuthority: async journal => ({
-                status: await groupWorkspaceRouteRuntime.revalidateAuthority({
+                status: await groupWorkspaceRouteRuntime.revalidateAuthorityConfiguration({
                   chatId: journal.chatId,
                   actor: journal.actor,
                   authorityFingerprint: journal.authorityFingerprint ?? '',
@@ -33291,6 +33321,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               sourceEventId: request.sourceEventId, kind: 'set', requestIntentDigest,
               chatId: request.chatId, sessionId: sessionKey(request.chatId, cfg.larkAppId), actor: request.actor,
               authorityFingerprint: route.authorityFingerprint,
+              ownerLarkAppId: cfg.larkAppId,
             });
             return result.status === 'group_committed'
               ? { status: 'group_committed', groupRevision: result.groupRevision }
@@ -33300,12 +33331,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             return executeGroupWorkspaceUnbind({
               sourceEventId: request.sourceEventId, chatId: request.chatId, actor: request.actor,
               authorityFingerprint: route.authorityFingerprint,
+              ownerLarkAppId: cfg.larkAppId,
               ...(route.originMessageId ? { originMessageId: route.originMessageId } : {}),
             }, {
               journalStore: groupWorkspaceOperationStore,
               now: Date.now,
               revalidateAuthority: async journal => ({
-                status: await groupWorkspaceRouteRuntime.revalidateAuthority({
+                status: await groupWorkspaceRouteRuntime.revalidateAuthorityConfiguration({
                   chatId: journal.chatId,
                   actor: journal.actor,
                   authorityFingerprint: journal.authorityFingerprint ?? '',
@@ -33319,6 +33351,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                   : current;
               },
               mutate: (input, revalidateUnderLock) => groupWorkspaceStore.mutate(input, revalidateUnderLock),
+            executorLeaseStore: groupWorkspaceExecutorLeaseStore,
+            executorOwner: groupWorkspaceExecutorOwner,
             });
           },
         });
@@ -33725,20 +33759,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (recoverable.status !== 'available') throw new Error('group workspace operation store unavailable');
       for (const journal of recoverable.journals) {
         let result: { status: string };
+        if (journal.ownerLarkAppId !== undefined && journal.ownerLarkAppId !== cfg.larkAppId) continue;
         if (journal.kind === 'unbind') {
           result = await executeGroupWorkspaceUnbind({
             sourceEventId: journal.sourceEventId,
             chatId: journal.chatId,
             actor: journal.actor,
-            authorityFingerprint: journal.authorityFingerprint ?? '',
+            authorityFingerprint: journal.authorityFingerprint,
+            ...(journal.ownerLarkAppId !== undefined ? { ownerLarkAppId: journal.ownerLarkAppId } : {}),
+            ...(journal.originMessageId !== undefined ? { originMessageId: journal.originMessageId } : {}),
           }, {
             journalStore: groupWorkspaceOperationStore,
             now: Date.now,
             revalidateAuthority: async frozen => ({
-              status: await groupWorkspaceRouteRuntimes.get(cfg.larkAppId)!.revalidateAuthority({
+              status: await groupWorkspaceRouteRuntimes.get(cfg.larkAppId)!.revalidateAuthorityConfiguration({
                 chatId: frozen.chatId,
                 actor: frozen.actor,
-                authorityFingerprint: frozen.authorityFingerprint ?? '',
+                authorityFingerprint: frozen.authorityFingerprint,
               }) ? 'authorized' : 'unauthorized',
             }),
             readReceipt: operationKey => groupWorkspaceStore.readReceipt(operationKey),
@@ -33749,12 +33786,50 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                 : current;
             },
             mutate: (input, revalidateUnderLock) => groupWorkspaceStore.mutate(input, revalidateUnderLock),
+            executorLeaseStore: groupWorkspaceExecutorLeaseStore,
+            executorOwner: groupWorkspaceExecutorOwner,
           });
         } else {
           const session = findActiveBySessionId(journal.sessionId)
             ?? activeSessions.get(journal.sessionId);
-          if (!session || session.larkAppId !== cfg.larkAppId) {
-            throw new Error(`group workspace set recovery session unavailable: ${journal.operationKey}:${journal.sessionId}`);
+          if ((!session || session.larkAppId !== cfg.larkAppId)
+            && journal.phase !== 'group_committed' && journal.phase !== 'unknown') {
+            const executor = await groupWorkspaceExecutorLeaseStore.acquire(
+              journal.operationKey, groupWorkspaceExecutorOwner, 30_000,
+            );
+            if (executor.status === 'observer') continue;
+            const refreshed = await groupWorkspaceOperationStore.get(journal.operationKey);
+            if (refreshed.status !== 'found' || refreshed.journal.phase !== journal.phase) continue;
+            const quarantined = await groupWorkspaceOperationStore.transition(journal.operationKey, 'orphaned', {
+              updatedAt: Date.now(),
+            }, async () => (await groupWorkspaceExecutorLeaseStore.assertCurrent(
+              journal.operationKey, executor.lease,
+            )).status === 'current');
+            if (quarantined.status !== 'updated') {
+              throw new Error(`group workspace set recovery quarantine failed: ${journal.operationKey}:${journal.sessionId}`);
+            }
+            logger.error(`[group-workspace] quarantined unsafe precommit recovery ${journal.operationKey}; repair requires a matching durable session`);
+            continue;
+          }
+          if ((!session || session.larkAppId !== cfg.larkAppId) && journal.phase === 'unknown') {
+            const receipt = await groupWorkspaceStore.readReceipt(journal.operationKey);
+            if (receipt.status === 'missing') {
+              const executor = await groupWorkspaceExecutorLeaseStore.acquire(
+                journal.operationKey, groupWorkspaceExecutorOwner, 30_000,
+              );
+              if (executor.status === 'observer') continue;
+              const refreshed = await groupWorkspaceOperationStore.get(journal.operationKey);
+              const exactReceipt = await groupWorkspaceStore.readReceipt(journal.operationKey);
+              if (refreshed.status !== 'found' || refreshed.journal.phase !== 'unknown'
+                || exactReceipt.status !== 'missing') continue;
+              const orphaned = await groupWorkspaceOperationStore.transition(journal.operationKey, 'orphaned', {
+                updatedAt: Date.now(),
+              }, async () => (await groupWorkspaceExecutorLeaseStore.assertCurrent(
+                journal.operationKey, executor.lease,
+              )).status === 'current');
+              if (orphaned.status !== 'updated') throw new Error(`group workspace orphan terminalization failed: ${journal.operationKey}`);
+              continue;
+            }
           }
           const coordinator = groupWorkspaceRecoveryCoordinators.get(cfg.larkAppId);
           if (!coordinator) throw new Error(`group workspace recovery coordinator unavailable: ${cfg.larkAppId}`);

@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { runGroupWorkspaceRepoEntrypoint } from '../src/core/command-handler.js';
+import { probePathUsability } from '../src/core/path-usability.js';
 import type { DaemonSession } from '../src/core/types.js';
 import {
   GroupWorkspaceOperationCoordinator,
@@ -86,6 +87,7 @@ function receiptToCommit(receipt: GroupOperationReceipt): GroupCommitReceipt | u
     payloadDigest: receipt.payloadDigest,
     chatId: receipt.chatId,
     targetWorkingDir: receipt.canonicalTargetWorkingDir,
+    workspaceIdentity: receipt.workspaceIdentity!,
   };
   if (receipt.outcome === 'committed') return { ...base, status: 'committed', resultingRevision: receipt.resultingRevision! };
   if (receipt.outcome === 'conflict') return { ...base, status: 'conflict', currentRevision: receipt.expectedRevision };
@@ -155,7 +157,12 @@ function durableHarness(input: {
     resolveCanonicalTarget: async request => {
       calls.push('target');
       const target = input.targetBySelection.get(request.requestIntentDigest);
-      return target ? { status: 'resolved', workingDir: target, workspaceIdentity: { path: target, dev: '1', ino: '2' } } : { status: 'store_unavailable' };
+      if (!target) return { status: 'store_unavailable' };
+      const proof = probePathUsability(target);
+      return proof.ok
+        ? { status: 'resolved', workingDir: proof.normalizedPath,
+            workspaceIdentity: { path: proof.normalizedPath, ...proof.identity } }
+        : { status: 'store_unavailable' };
     },
     readSession: async () => {
       calls.push('session');

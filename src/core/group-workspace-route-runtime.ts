@@ -34,7 +34,7 @@ export type GroupWorkspaceProductionRoute = GroupWorkspaceRouteIntent & {
   source: 'text' | 'card';
   chatId: string;
   actor: TenantHumanId;
-  authorityFingerprint: string;
+  authorityFingerprint?: string;
   actorOpenId?: string;
   messageId?: string;
   originMessageId?: string;
@@ -108,7 +108,9 @@ export function createGroupWorkspaceRouteRuntime(options: {
     };
   };
 
-  const revalidateAuthority = async (route: Pick<GroupWorkspaceProductionRoute, 'chatId' | 'actor' | 'authorityFingerprint'>): Promise<boolean> => {
+  const revalidateAuthorityConfiguration = async (
+    route: Pick<GroupWorkspaceProductionRoute, 'chatId' | 'actor' | 'authorityFingerprint'>,
+  ): Promise<boolean> => {
     const registered = options.registeredBots(route.actor.tenantKey);
     const fresh = await loadFreshBotAdminUnionSnapshot({
       registeredBots: registered,
@@ -116,13 +118,16 @@ export function createGroupWorkspaceRouteRuntime(options: {
       now: options.now,
       ttlMs: 1,
     });
-    if (!fresh || fresh.configFingerprint !== route.authorityFingerprint) return false;
+    return !!fresh && fresh.configFingerprint === route.authorityFingerprint
+      && canManageGroupWorkspace({ actor: route.actor, freshSnapshot: fresh });
+  };
+
+  const revalidateAuthority = async (route: Pick<GroupWorkspaceProductionRoute, 'chatId' | 'actor' | 'authorityFingerprint'>): Promise<boolean> => {
+    if (!await revalidateAuthorityConfiguration(route)) return false;
     const workspace = await options.readWorkspace(route.chatId);
-    return workspace.status === 'available' && canManageGroupWorkspace({
-      actor: route.actor,
-      freshSnapshot: fresh,
-      workspaceManagers: workspace.record?.workspaceManagers,
-    });
+    return workspace.status === 'available' && (!workspace.record?.workspaceManagers?.length
+      || workspace.record.workspaceManagers.some(manager => manager.tenantKey === route.actor.tenantKey
+        && manager.unionId === route.actor.unionId));
   };
 
   const handleRoute = async (route: GroupWorkspaceProductionRoute): Promise<void> => {
@@ -157,5 +162,5 @@ export function createGroupWorkspaceRouteRuntime(options: {
     });
   };
 
-  return { resolveAuthority, revalidateAuthority, handleRoute };
+  return { resolveAuthority, revalidateAuthority, revalidateAuthorityConfiguration, handleRoute };
 }

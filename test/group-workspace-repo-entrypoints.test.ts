@@ -53,8 +53,8 @@ describe('group workspace /repo entrypoints', () => {
             if (found.status !== 'found') return found;
             return { status: 'found' as const, receipt: {
               operationKey: key, payloadDigest: found.receipt.payloadDigest, chatId: found.receipt.chatId,
-              targetWorkingDir: found.receipt.canonicalTargetWorkingDir!, status: 'committed' as const,
-              resultingRevision: found.receipt.resultingRevision!,
+              targetWorkingDir: found.receipt.canonicalTargetWorkingDir!, workspaceIdentity: found.receipt.workspaceIdentity!,
+              status: 'committed' as const, resultingRevision: found.receipt.resultingRevision!,
             } satisfies GroupCommitReceipt };
           },
           reconcileUnknownGroupReceipt: async () => ({ status: 'missing' as const }),
@@ -71,6 +71,7 @@ describe('group workspace /repo entrypoints', () => {
             const result = await groupStore.mutate({
               kind: 'set', chatId: journal.chatId, sourceEventId: journal.sourceEventId,
               requestedWorkingDir: journal.targetWorkingDir, expectedRevision: journal.expectedGroupRevision,
+              expectedSessionGeneration: journal.expectedSessionGeneration,
               actor: journal.actor, authorized: true, directoryValid: true, now: 10,
             });
             return result.outcome === 'committed'

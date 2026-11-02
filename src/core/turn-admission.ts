@@ -44,7 +44,7 @@ export type AdmittedBusinessTurnDependencies = {
   }): Promise<BusinessSubmitPermit | undefined>;
   reserveWorkerGeneration(): number;
   issueBlank(input: BlankBootstrapPermitInput): Promise<BlankBootstrapPermit>;
-  forkBlank(permit: BlankBootstrapPermit): Promise<boolean>;
+  forkBlank(permit: BlankBootstrapPermit): Promise<'started' | 'deferred' | 'rejected'>;
   awaitBlankReady(permit: BlankBootstrapPermit): Promise<{
     actualGeneration: number; cwd: WorkspaceIdentity; backend: WorkspaceIdentity;
   } | undefined>;
@@ -83,7 +83,8 @@ export async function dispatchAdmittedBusinessTurn(input: {
       ...(frozen.groupRevision === undefined ? {} : { groupRevision: frozen.groupRevision }),
       expiresAt: Date.now() + (input.permitTtlMs ?? 60_000),
     });
-    if (!await deps.forkBlank(blank)) {
+    const fork = await deps.forkBlank(blank);
+    if (fork === 'rejected') {
       await deps.abortBlank?.(blank, 'pre_fork');
       return false;
     }

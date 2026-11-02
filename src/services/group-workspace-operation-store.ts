@@ -18,6 +18,8 @@ export type RepoGroupOperationPhase =
   | 'invalid_dir'
   | 'unauthorized'
   | 'store_unavailable'
+  | 'no_session_complete'
+  | 'orphaned'
   | 'unknown';
 
 export type RepoGroupOperationTarget =
@@ -38,6 +40,10 @@ export interface RepoGroupOperationJournal {
   targetWorkingDir?: string;
   targetWorkspaceIdentity?: WorkspaceIdentity;
   actor: TenantHumanId;
+  /** Daemon identity that owns recovery. Absent only on deterministic v1 migration. */
+  ownerLarkAppId?: string;
+  /** Frozen card origin. Absence is semantically distinct from an empty id. */
+  originMessageId?: string;
   /** Frozen authorization configuration fingerprint; required by production operations. */
   authorityFingerprint?: string;
   phase: RepoGroupOperationPhase;
@@ -107,7 +113,7 @@ function isWorkspaceIdentity(value: unknown): value is WorkspaceIdentity {
 }
 
 const PHASES = new Set<RepoGroupOperationPhase>([
-  'prepared', 'session_committed', 'group_committed', 'conflict', 'invalid_dir', 'unauthorized', 'store_unavailable', 'unknown',
+  'prepared', 'session_committed', 'group_committed', 'conflict', 'invalid_dir', 'unauthorized', 'store_unavailable', 'no_session_complete', 'orphaned', 'unknown',
 ]);
 
 function validNonnegativeInteger(value: unknown): value is number {
@@ -137,6 +143,12 @@ function validateJournal(value: unknown, key: string): asserts value is RepoGrou
     || (value.kind === 'unbind' && (!isObject(value.target) || value.target.kind !== 'absent'
       || value.targetWorkingDir !== undefined || value.targetWorkspaceIdentity !== undefined))
     || !isActor(value.actor)
+    || (value.ownerLarkAppId !== undefined
+      && (typeof value.ownerLarkAppId !== 'string' || !value.ownerLarkAppId
+        || value.ownerLarkAppId.trim() !== value.ownerLarkAppId))
+    || (value.originMessageId !== undefined
+      && (typeof value.originMessageId !== 'string' || !value.originMessageId
+        || value.originMessageId.trim() !== value.originMessageId))
     || !PHASES.has(value.phase as RepoGroupOperationPhase)
     || !Number.isFinite(value.updatedAt)
     || (value.sessionGenerationAfter !== undefined && !validNonnegativeInteger(value.sessionGenerationAfter))
@@ -198,15 +210,19 @@ function sameFrozenIntent(left: RepoGroupOperationJournal, right: RepoGroupOpera
     && left.sessionId === right.sessionId
     && left.actor.tenantKey === right.actor.tenantKey
     && left.actor.unionId === right.actor.unionId
+    && left.ownerLarkAppId === right.ownerLarkAppId
+    && left.originMessageId === right.originMessageId
     && left.authorityFingerprint === right.authorityFingerprint;
 }
 
 function mayTransition(from: RepoGroupOperationPhase, to: RepoGroupOperationPhase): boolean {
-  if (from === 'prepared') return to === 'session_committed' || to === 'unauthorized' || to === 'unknown';
+  if (from === 'prepared') return to === 'session_committed' || to === 'unauthorized' || to === 'unknown' || to === 'orphaned';
   if (from === 'session_committed') {
     return to === 'group_committed' || to === 'conflict' || to === 'invalid_dir' || to === 'unauthorized'
-      || to === 'store_unavailable' || to === 'unknown';
+      || to === 'store_unavailable' || to === 'unknown' || to === 'orphaned';
   }
+  if (from === 'group_committed') return to === 'no_session_complete' || to === 'orphaned';
+  if (from === 'unknown') return to === 'orphaned';
   return false;
 }
 
@@ -250,6 +266,9 @@ export class GroupWorkspaceOperationStore {
           ? candidate.requestIntentDigest
           : candidate.payloadDigest,
         target,
+        ...(typeof candidate.originMessageId === 'string'
+          ? { originMessageId: candidate.originMessageId }
+          : {}),
         ...(kind === 'set' ? {
           targetWorkingDir: migratedTargetWorkingDir,
           targetWorkspaceIdentity,

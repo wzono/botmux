@@ -35,6 +35,7 @@ export class TurnPermitStore {
   async failBootstrap(permit: BlankBootstrapPermit, failure: Exclude<Failure, 'identity_mismatch' | 'backend_mismatch' | 'generation_mismatch' | 'expired' | 'orphan_unproven'>) { return this.locked(r => { const e = r.entries[permit.permitId]; if (!e || !this.matches(e.blank, permit)) return { status: 'rejected' as const }; if (e.state === 'issued' || e.state === 'spawning') e.state = failure; return { status: e.state }; }); }
   async abortBootstrap(permit: BlankBootstrapPermit, proof: {
     phase: 'pre_fork' | 'forked_unproven'; observedGeneration: number; orphanRetired: boolean;
+    retiredGeneration?: number; retiredWorkerPid?: number | null;
   }): Promise<{ status: 'aborted' | 'orphan_unproven' | 'rejected' }> {
     return this.locked(r => {
       const key = turnKey(permit);
@@ -44,7 +45,8 @@ export class TurnPermitStore {
           && e.state !== 'ready_timeout' && e.state !== 'expired'
           && e.state !== 'cancelled' && e.state !== 'orphan_unproven')
         || proof.observedGeneration > permit.reservedGeneration) return { status: 'rejected' as const };
-      if (proof.phase === 'forked_unproven' && !proof.orphanRetired) {
+      if (proof.phase === 'forked_unproven'
+        && (!proof.orphanRetired || proof.retiredGeneration !== permit.reservedGeneration)) {
         e.state = 'orphan_unproven';
         return { status: 'orphan_unproven' as const };
       }

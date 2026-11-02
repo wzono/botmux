@@ -46,6 +46,7 @@ export interface GroupWorkspaceOperationRequest {
   sessionId: string;
   actor: TenantHumanId;
   authorityFingerprint?: string;
+  ownerLarkAppId?: string;
 }
 
 export type GroupWorkspaceOperationResult =
@@ -107,7 +108,7 @@ export interface GroupWorkspaceOperationDependencies {
     source: 'explicit' | 'group';
     groupRevision?: number;
     workspaceIdentity?: WorkspaceIdentity;
-  }): Promise<void>;
+  }): Promise<void | 'converged' | 'session_missing'>;
   fencingToken?(): number | undefined;
   afterBoundary?(boundary:
     | 'prepared_before_switch'
@@ -180,7 +181,8 @@ export function createGroupWorkspaceSetCoordinator(options: {
     reconcileUnknownGroupReceipt: async journal => {
       const result = await options.groupStore.reconcileExactOperation({
         kind: 'set', chatId: journal.chatId, sourceEventId: journal.sourceEventId,
-        requestedWorkingDir: journal.targetWorkingDir!, expectedRevision: journal.expectedGroupRevision,
+        requestedWorkingDir: journal.targetWorkingDir!, expectedWorkspaceIdentity: journal.targetWorkspaceIdentity,
+        expectedRevision: journal.expectedGroupRevision,
         expectedSessionGeneration: journal.expectedSessionGeneration, actor: journal.actor,
         authorized: true, directoryValid: true, now: journal.updatedAt,
       });
@@ -202,7 +204,8 @@ export function createGroupWorkspaceSetCoordinator(options: {
       const result = await options.groupStore.mutate({
         kind: 'set', chatId: journal.chatId, sourceEventId: journal.sourceEventId,
         ...(options.originMessageId ? { originMessageId: options.originMessageId } : {}),
-        requestedWorkingDir: journal.targetWorkingDir!, expectedRevision: journal.expectedGroupRevision,
+        requestedWorkingDir: journal.targetWorkingDir!, expectedWorkspaceIdentity: journal.targetWorkspaceIdentity,
+        expectedRevision: journal.expectedGroupRevision,
         expectedSessionGeneration: journal.expectedSessionGeneration, actor: journal.actor,
         authorized: true, directoryValid: true, now: options.now(),
       }, revalidateUnderLock);
@@ -226,7 +229,8 @@ function sameIntent(journal: RepoGroupOperationJournal, request: GroupWorkspaceO
     && journal.chatId === request.chatId
     && journal.actor.tenantKey === request.actor.tenantKey
     && journal.actor.unionId === request.actor.unionId
-    && journal.authorityFingerprint === request.authorityFingerprint;
+    && journal.authorityFingerprint === request.authorityFingerprint
+    && journal.ownerLarkAppId === request.ownerLarkAppId;
 }
 
 function receiptMatchesJournal(receipt: GroupCommitReceipt, journal: RepoGroupOperationJournal): boolean {
@@ -259,6 +263,9 @@ export interface GroupWorkspaceUnbindDependencies {
     input: GroupWorkspaceUnbindMutation,
     revalidateUnderLock: () => Promise<{ status: 'authorized' | 'unauthorized' }>,
   ): Promise<GroupWorkspaceMutationResult>;
+  executorLeaseStore?: OperationExecutorLeaseStore;
+  executorOwner?: string;
+  executorLeaseTtlMs?: number;
   now(): number;
   afterBoundary?(boundary: 'commit_before_readback' | 'readback_before_convergence' | 'convergence_before_persisted_readback'): Promise<void>;
 }
@@ -274,18 +281,21 @@ export function isPreparedNoSessionUnbindJournal(journal: RepoGroupOperationJour
 }
 
 export async function executeGroupWorkspaceUnbind(
-  request: { sourceEventId: string; chatId: string; actor: TenantHumanId; authorityFingerprint: string; originMessageId?: string },
+  request: { sourceEventId: string; chatId: string; actor: TenantHumanId; authorityFingerprint?: string; originMessageId?: string; ownerLarkAppId?: string },
   dependencies: GroupWorkspaceUnbindDependencies,
 ): Promise<GroupWorkspaceUnbindResult> {
   const operationKey = groupWorkspaceOperationKey(request.sourceEventId, 'unbind');
-  const intent = { kind: 'unbind' as const, chatId: request.chatId, sourceEventId: request.sourceEventId,
-    ...(request.originMessageId ? { originMessageId: request.originMessageId } : {}), actor: request.actor };
   const prior = await dependencies.journalStore.getByIntent(request.sourceEventId, 'unbind');
   if (prior.status === 'store_unavailable') return { status: 'store_unavailable' };
   let journal = prior.status === 'found' ? prior.journal : undefined;
   if (journal && (journal.chatId !== request.chatId || journal.actor.tenantKey !== request.actor.tenantKey
     || journal.actor.unionId !== request.actor.unionId
-    || journal.authorityFingerprint !== request.authorityFingerprint)) return { status: 'protocol_conflict' };
+    || journal.authorityFingerprint !== request.authorityFingerprint
+    || journal.originMessageId !== request.originMessageId
+    || journal.ownerLarkAppId !== request.ownerLarkAppId)) return { status: 'protocol_conflict' };
+  const frozenOriginMessageId = journal?.originMessageId ?? request.originMessageId;
+  const intent = { kind: 'unbind' as const, chatId: request.chatId, sourceEventId: request.sourceEventId,
+    ...(frozenOriginMessageId !== undefined ? { originMessageId: frozenOriginMessageId } : {}), actor: request.actor };
   if (!journal) {
     const current = await dependencies.readCurrentRevision(request.chatId);
     if (current.status === 'store_unavailable') return { status: 'store_unavailable' };
@@ -298,16 +308,39 @@ export async function executeGroupWorkspaceUnbind(
         ...intent, expectedRevision: current.revision, authorized: true, now: 0,
       }), chatId: request.chatId, sessionId: GROUP_WORKSPACE_UNBIND_NO_SESSION_ID, expectedSessionGeneration: 0,
       expectedGroupRevision: current.revision, target: { kind: 'absent' }, actor: request.actor,
+      ...(request.originMessageId !== undefined ? { originMessageId: request.originMessageId } : {}),
+      ...(request.ownerLarkAppId !== undefined ? { ownerLarkAppId: request.ownerLarkAppId } : {}),
       authorityFingerprint: request.authorityFingerprint, phase: 'prepared', updatedAt: dependencies.now(),
     });
     if (prepared.status === 'store_unavailable') return { status: 'store_unavailable' };
     if (prepared.status === 'protocol_conflict') return { status: 'protocol_conflict' };
     journal = prepared.journal;
   }
+  let lease: OperationExecutorLease | undefined;
+  if (dependencies.executorLeaseStore && dependencies.executorOwner) {
+    const acquired = await dependencies.executorLeaseStore.acquire(
+      operationKey, dependencies.executorOwner, dependencies.executorLeaseTtlMs ?? 30_000,
+    );
+    if (acquired.status === 'observer') {
+      const observed = await dependencies.readReceipt(operationKey);
+      if (observed.status !== 'found') return { status: 'unknown' };
+      const mutation = {
+        ...intent, expectedRevision: journal.expectedGroupRevision, authorized: true,
+        now: observed.receipt.completedAt,
+      };
+      if (!groupWorkspaceReceiptMatchesMutation(observed.receipt, mutation)) return { status: 'unknown' };
+      return observed.receipt.outcome === 'committed'
+        ? { status: 'group_committed', groupRevision: observed.receipt.resultingRevision! }
+        : { status: observed.receipt.outcome };
+    }
+    lease = acquired.lease;
+  }
+  const hasFence = async (): Promise<boolean> => !lease || !dependencies.executorLeaseStore
+    || (await dependencies.executorLeaseStore.assertCurrent(operationKey, lease)).status === 'current';
   if (isPreparedNoSessionUnbindJournal(journal)) {
     const advanced = await dependencies.journalStore.transition(operationKey, 'session_committed', {
       sessionGenerationAfter: 0, updatedAt: dependencies.now(),
-    });
+    }, hasFence);
     if (advanced.status !== 'updated') return { status: 'unknown' };
     journal = advanced.journal;
   }
@@ -319,15 +352,30 @@ export async function executeGroupWorkspaceUnbind(
     if ((await dependencies.revalidateAuthority(journal)).status !== 'authorized') {
       const denied = await dependencies.journalStore.transition(operationKey, 'unauthorized', {
         updatedAt: dependencies.now(),
-      });
+      }, hasFence);
       return denied.status === 'updated' ? { status: 'unauthorized' } : { status: 'unknown' };
     }
     const mutation = { ...intent, expectedRevision: journal.expectedGroupRevision, authorized: true, now: dependencies.now() };
-    const result = await dependencies.mutate(mutation, () => dependencies.revalidateAuthority(journal));
+    if (lease && dependencies.executorLeaseStore) {
+      const renewed = await dependencies.executorLeaseStore.renew(
+        operationKey, lease, dependencies.executorLeaseTtlMs ?? 30_000,
+      );
+      if (renewed.status !== 'renewed') return { status: 'unknown' };
+      lease = renewed.lease;
+    }
+    const fenced = lease && dependencies.executorLeaseStore
+      ? await dependencies.executorLeaseStore.runFencedEffect(
+        operationKey, lease, () => dependencies.mutate(mutation, () => dependencies.revalidateAuthority(journal)),
+      )
+      : { status: 'applied' as const, value: await dependencies.mutate(
+        mutation, () => dependencies.revalidateAuthority(journal),
+      ) };
+    if (fenced.status === 'stale_fence') return { status: 'unknown' };
+    const result = fenced.value;
     if (result.outcome === 'authorization_revoked') {
       const denied = await dependencies.journalStore.transition(operationKey, 'unauthorized', {
         updatedAt: dependencies.now(),
-      });
+      }, hasFence);
       return denied.status === 'updated' ? { status: 'unauthorized' } : { status: 'unknown' };
     }
     if (result.outcome === 'protocol_conflict') return { status: 'protocol_conflict' };
@@ -354,7 +402,7 @@ export async function executeGroupWorkspaceUnbind(
     ? { status: 'updated' as const, journal }
     : journal.phase === 'unknown'
       ? await dependencies.journalStore.convergeReceipt(operationKey, phase, patch)
-      : await dependencies.journalStore.transition(operationKey, phase, patch);
+      : await dependencies.journalStore.transition(operationKey, phase, patch, hasFence);
   if (converged.status !== 'updated') return { status: 'unknown' };
   await dependencies.afterBoundary?.('convergence_before_persisted_readback');
   const persisted = await dependencies.journalStore.get(operationKey);
@@ -593,13 +641,20 @@ export class GroupWorkspaceOperationCoordinator {
         if (advanced.status !== 'updated') return { status: 'unknown', journal };
         completed = advanced.journal;
       }
-      await this.dependencies.convergeSession({
+      const convergence = await this.dependencies.convergeSession({
         sessionId: completed.sessionId,
         expectedGeneration: completed.sessionGenerationAfter ?? completed.expectedSessionGeneration + 1,
         source: 'group',
         groupRevision: receipt.resultingRevision,
         workspaceIdentity: completed.targetWorkspaceIdentity,
       });
+      if (convergence === 'session_missing' && completed.phase === 'group_committed') {
+        const terminal = await this.dependencies.journalStore.transition(completed.operationKey, 'no_session_complete', {
+          updatedAt: this.dependencies.now(),
+        });
+        if (terminal.status !== 'updated') return { status: 'unknown', journal: completed };
+        completed = terminal.journal;
+      }
       return { status: 'group_committed', journal: completed, groupRevision: receipt.resultingRevision };
     }
     await this.dependencies.convergeSession({

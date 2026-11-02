@@ -102,6 +102,7 @@ export interface GroupWorkspaceSetMutation {
   sourceEventId: string;
   originMessageId?: string;
   requestedWorkingDir: string;
+  expectedWorkspaceIdentity?: WorkspaceIdentity;
   expectedRevision: number;
   expectedSessionGeneration?: number;
   actor: TenantHumanId;
@@ -706,7 +707,12 @@ export class GroupWorkspaceStore {
           } else {
             const usability = this.pathProbe(input.requestedWorkingDir);
             if (!usability.ok) outcome = 'invalid_dir';
-            else {
+            else if (input.expectedWorkspaceIdentity
+              && (usability.normalizedPath !== input.expectedWorkspaceIdentity.path
+                || usability.identity.dev !== input.expectedWorkspaceIdentity.dev
+                || usability.identity.ino !== input.expectedWorkspaceIdentity.ino)) {
+              outcome = 'invalid_dir';
+            } else {
               validatedIdentity = usability.identity;
               outcome = (current?.revision ?? 0) !== input.expectedRevision ? 'conflict' : 'committed';
             }

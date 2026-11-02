@@ -23,7 +23,9 @@ export type BusinessTurnSubmitOptions = {
 
 export type AdmittedTurnWorkerBoundary = {
   reserveGeneration(ds: DaemonSession): number;
-  forkBlank(ds: DaemonSession, permit: BlankBootstrapPermit, options: BusinessTurnSubmitOptions): Promise<boolean>;
+  forkBlank(ds: DaemonSession, permit: BlankBootstrapPermit, options: BusinessTurnSubmitOptions): Promise<
+    'started' | 'deferred' | 'rejected'
+  >;
   submit(ds: DaemonSession, payload: string | CliTurnPayload, permit: BusinessSubmitPermit,
     digest: string, options: BusinessTurnSubmitOptions): Promise<boolean>;
 };
@@ -101,7 +103,8 @@ async function waitForExactReady(ds: DaemonSession, permit: BlankBootstrapPermit
       if (!frozen || !backend) return undefined;
       return { actualGeneration: generation, cwd: frozen.workspace, backend };
     }
-    if (!ds.worker || ds.worker.killed) return undefined;
+    // A durable fork may be accepted but deferred by routing/device isolation.
+    // Keep waiting for the exact reserved generation until cancellation/timeout.
     await new Promise(resolve => setTimeout(resolve, 25));
   }
   return undefined;
@@ -114,7 +117,10 @@ export async function dispatchAdmittedBusinessTurn(input: {
   options: BusinessTurnSubmitOptions;
   boundary: AdmittedTurnWorkerBoundary;
   permitStore: Pick<TurnPermitStore, 'issueBlank' | 'proveReady' | 'issueBusiness' | 'abortBootstrap' | 'abortBusinessDispatch'>;
-  retireUnproven?(ds: DaemonSession, reservedGeneration: number): Promise<boolean>;
+  retireUnproven?(ds: DaemonSession, reservedGeneration: number): Promise<
+    | { retiredGeneration: number; workerPid: number | null }
+    | undefined
+  >;
   resource?: AdmittedBusinessResource;
 }): Promise<boolean> {
   const frozen = frozenSessionWorkspace(input.ds);
@@ -148,13 +154,16 @@ export async function dispatchAdmittedBusinessTurn(input: {
       },
       abortBlank: async (permit, phase) => {
         const currentGeneration = input.ds.workerGeneration ?? input.ds.session.workerGeneration ?? 0;
-        const retired = phase === 'pre_fork'
+        const retirement = phase === 'pre_fork'
           ? currentGeneration < permit.reservedGeneration
-          : await input.retireUnproven?.(input.ds, permit.reservedGeneration) === true;
+            ? { retiredGeneration: permit.reservedGeneration, workerPid: null }
+            : undefined
+          : await input.retireUnproven?.(input.ds, permit.reservedGeneration);
         await input.permitStore.abortBootstrap(permit, {
           phase,
           observedGeneration: currentGeneration,
-          orphanRetired: retired,
+          orphanRetired: retirement?.retiredGeneration === permit.reservedGeneration,
+          ...(retirement ? { retiredGeneration: retirement.retiredGeneration, retiredWorkerPid: retirement.workerPid } : {}),
         });
       },
       abortBusiness: permit => input.permitStore.abortBusinessDispatch(permit, payloadDigest(input.payload)).then(() => undefined),

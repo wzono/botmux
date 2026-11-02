@@ -15506,19 +15506,22 @@ export async function forkWorkerBlank(
   permit: BlankBootstrapPermit,
   options: Exclude<ForkResumeOrTurnId, boolean | string> = {},
   permitStore: Pick<TurnPermitStore, 'beginSpawn'> = productionTurnPermitStore,
-): Promise<boolean> {
-  if (permit.sessionId !== ds.session.sessionId) return false;
+): Promise<'started' | 'deferred' | 'rejected'> {
+  if (permit.sessionId !== ds.session.sessionId) return 'rejected';
   const transition = await permitStore.beginSpawn(permit);
-  if (transition.status !== 'acquired') return false;
+  if (transition.status !== 'acquired') return 'rejected';
   if (ds.adoptedFrom) {
     return forkAdoptWorker(ds, {
       prompt: '', turnId: permit.turnId, atMostOnce: options.atMostOnce,
       trustedCaller: options.trustedCaller,
       onWorkerGenerationReserved: options.onWorkerGenerationReserved,
       onIpcDispatchAttempted: options.onIpcDispatchAttempted,
-    }) === 'accepted';
+    }) === 'accepted' ? 'started' : 'rejected';
   }
-  return forkWorker(ds, '', { ...options, turnId: permit.turnId });
+  const before = ds.worker;
+  const accepted = forkWorker(ds, '', { ...options, turnId: permit.turnId });
+  if (!accepted) return 'rejected';
+  return ds.worker && ds.worker !== before ? 'started' : 'deferred';
 }
 
 export type PermitAwareSubmitOptions = Parameters<typeof sendWorkerInput>[3];

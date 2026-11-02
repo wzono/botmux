@@ -124,7 +124,7 @@ describe('durable turn permits', () => {
       phase: 'forked_unproven', observedGeneration: 4, orphanRetired: false,
     })).status).toBe('orphan_unproven');
     expect((await store.abortBootstrap(first, {
-      phase: 'forked_unproven', observedGeneration: 4, orphanRetired: true,
+      phase: 'forked_unproven', observedGeneration: 4, orphanRetired: true, retiredGeneration: 4,
     })).status).toBe('aborted');
     const [winner, duplicate] = await Promise.all([
       store.issueBlank({ ...base, reservedGeneration: 5, expiresAt: 200 }),
@@ -144,7 +144,7 @@ describe('durable turn permits', () => {
     })).status).toBe('orphan_unproven');
     expect(await store.issueBlank({ ...base, reservedGeneration: 5 })).toEqual(first);
     expect((await new TurnPermitStore(dataDir, { now: () => 101 }).abortBootstrap(first, {
-      phase: 'forked_unproven', observedGeneration: 4, orphanRetired: true,
+      phase: 'forked_unproven', observedGeneration: 4, orphanRetired: true, retiredGeneration: 4,
     })).status).toBe('aborted');
     const second = await store.issueBlank({ ...base, reservedGeneration: 5 });
     expect(second.permitId).not.toBe(first.permitId);
@@ -161,7 +161,7 @@ describe('durable turn permits', () => {
     })).status).toBe('orphan_unproven');
     expect(await store.issueBlank({ ...base, reservedGeneration: 5 })).toEqual(first);
     expect((await store.abortBootstrap(first, {
-      phase: 'forked_unproven', observedGeneration: 4, orphanRetired: true,
+      phase: 'forked_unproven', observedGeneration: 4, orphanRetired: true, retiredGeneration: 4,
     })).status).toBe('aborted');
     const reissued = await store.issueBlank({ ...base, reservedGeneration: 5 });
     expect(reissued.permitId).not.toBe(first.permitId);

@@ -216,7 +216,8 @@ describe('executeGroupWorkspaceUnbind', () => {
         const receipt = { operationKey, sourceEventId, kind: 'unbind', payloadDigest: input.payloadDigest
           ?? 'unused', chatId: BASE.chatId, outcome: 'committed', resultingRevision: revision,
           resultingDirectory: { kind: 'unbound' }, actor: ACTOR, completedAt: input.now,
-          expectedRevision: input.expectedRevision };
+          expectedRevision: input.expectedRevision,
+          ...(input.originMessageId !== undefined ? { originMessageId: input.originMessageId } : {}) };
         const { canonicalGroupOperationPayloadDigest } = await import('../src/services/group-workspace-store.js');
         receipt.payloadDigest = canonicalGroupOperationPayloadDigest(input);
         receipts.set(operationKey, receipt);
@@ -225,7 +226,7 @@ describe('executeGroupWorkspaceUnbind', () => {
       afterBoundary: async (boundary: string) => { if (boundary === crashAt) throw new Error(boundary); },
     };
     const request = { sourceEventId, chatId: BASE.chatId, actor: ACTOR, authorityFingerprint: 'authority-v1' };
-    return { deps, request, journalStore };
+    return { deps, request, journalStore, receipts, operationKey };
   }
 
   it.each(['commit_before_readback', 'readback_before_convergence', 'convergence_before_persisted_readback'])
@@ -239,6 +240,30 @@ describe('executeGroupWorkspaceUnbind', () => {
     await expect(h.journalStore.getByIntent(h.request.sourceEventId, 'unbind')).resolves.toMatchObject({
       status: 'found', journal: { phase: 'group_committed', groupRevisionAfter: 3 },
     });
+  });
+
+  it('freezes and replays the exact optional card origin in receipt matching', async () => {
+    const h = unbindHarness('commit_before_readback');
+    const request = { ...h.request, originMessageId: 'om_card_origin' };
+    await expect(executeGroupWorkspaceUnbind(request, h.deps)).rejects.toThrow('commit_before_readback');
+    expect(h.receipts.get(h.operationKey)).toMatchObject({ originMessageId: 'om_card_origin' });
+    h.deps.afterBoundary = async () => undefined;
+    await expect(executeGroupWorkspaceUnbind(request, h.deps)).resolves.toMatchObject({
+      status: 'group_committed', groupRevision: 3,
+    });
+    await expect(h.journalStore.get(h.operationKey)).resolves.toMatchObject({
+      status: 'found', journal: { originMessageId: 'om_card_origin', phase: 'group_committed' },
+    });
+  });
+
+  it('rejects replay that alters or omits the frozen card origin', async () => {
+    const h = unbindHarness();
+    const request = { ...h.request, originMessageId: 'om_card_origin' };
+    await expect(executeGroupWorkspaceUnbind(request, h.deps)).resolves.toMatchObject({ status: 'group_committed' });
+    await expect(executeGroupWorkspaceUnbind({ ...h.request, originMessageId: 'om_other' }, h.deps))
+      .resolves.toEqual({ status: 'protocol_conflict' });
+    await expect(executeGroupWorkspaceUnbind(h.request, h.deps))
+      .resolves.toEqual({ status: 'protocol_conflict' });
   });
 
   it('freezes authority and terminalizes revocation immediately before the group mutation', async () => {

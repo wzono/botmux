@@ -1,5 +1,5 @@
 import type { ChildProcess } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -200,7 +200,12 @@ async function productionComposition(input: {
         const requestIntentDigest = canonicalGroupWorkspaceRequestIntentDigest({ kind: 'set', chatId: route.chatId, selection: route.selection });
         const coordinator = createGroupWorkspaceSetCoordinator({
           journalStore: operationStore, groupStore, now: Date.now,
-          resolveCanonicalTarget: async () => ({ status: 'resolved', workingDir: input.targetDir, workspaceIdentity: { path: input.targetDir, dev: '1', ino: '2' } }),
+          resolveCanonicalTarget: async () => {
+            const target = realpathSync(input.targetDir);
+            const identity = statSync(target, { bigint: true });
+            return { status: 'resolved', workingDir: target,
+              workspaceIdentity: { path: target, dev: String(identity.dev), ino: String(identity.ino) } };
+          },
           readSession: async sessionId => {
             const current = sessions.get(sessionId);
             return current ? { status: 'available', generation: current.workerGeneration ?? 0, workingDir: current.workingDir }
@@ -305,9 +310,10 @@ describe('group workspace follow with real PTY workers', () => {
     const root = mkdtempSync(join(tmpdir(), `botmux-group-runtime-${crashAt}-`));
     roots.add(root);
     const oldDir = join(root, 'old');
-    const targetDir = join(root, 'target');
+    let targetDir = join(root, 'target');
     const dataDir = join(root, 'data');
     for (const directory of [oldDir, targetDir, dataDir]) mkdirSync(directory, { recursive: true });
+    targetDir = realpathSync(targetDir);
     const deliveries = join(root, 'deliveries');
     const fakeCli = join(root, 'fake-claude');
     writeFileSync(deliveries, '');
@@ -392,9 +398,10 @@ describe('group workspace follow with real PTY workers', () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-group-runtime-ambiguous-'));
     roots.add(root);
     const oldDir = join(root, 'old');
-    const targetDir = join(root, 'target');
+    let targetDir = join(root, 'target');
     const dataDir = join(root, 'data');
     for (const directory of [oldDir, targetDir, dataDir]) mkdirSync(directory, { recursive: true });
+    targetDir = realpathSync(targetDir);
     const deliveries = join(root, 'deliveries');
     const fakeCli = join(root, 'fake-claude');
     writeFileSync(deliveries, '');
