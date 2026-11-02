@@ -293,11 +293,11 @@ describe('executeGroupWorkspaceUnbind', () => {
     expect((await h.deps.readReceipt(groupWorkspaceOperationKey(h.request.sourceEventId, 'unbind'))).status).toBe('missing');
   });
 
-  it('terminalizes authority revoked by the under-lock group write guard', async () => {
+  it('terminalizes authority revoked by fresh evidence collected immediately before the locked write', async () => {
     const h = unbindHarness();
     let checks = 0;
-    h.deps.mutate = async (_input, revalidateUnderLock) => {
-      expect(await revalidateUnderLock()).toEqual({ status: 'unauthorized' });
+    h.deps.mutate = async (_input, authorityEvidence) => {
+      expect(authorityEvidence).toEqual({ status: 'unauthorized' });
       return { outcome: 'authorization_revoked' as const };
     };
     h.deps.revalidateAuthority = async () => ({

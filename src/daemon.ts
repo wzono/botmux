@@ -6577,7 +6577,10 @@ const commandDeps: CommandHandlerDeps = {
     const unresolvedOperations = await groupWorkspaceOperationStore.listUnresolved();
     const operation = unresolvedOperations.status === 'store_unavailable'
       ? { status: 'store_unavailable', detail: 'operation journal unavailable' }
-      : unresolvedOperations.journals.find(item => item.chatId === ds.chatId);
+      : unresolvedOperations.journals
+        .filter(item => item.chatId === ds.chatId && item.ownerLarkAppId === ds.larkAppId)
+        .sort((left, right) => right.updatedAt - left.updatedAt
+          || right.operationKey.localeCompare(left.operationKey))[0];
     const quarantinedOperation = operation && 'phase' in operation
       ? operation
       : undefined;

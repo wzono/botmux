@@ -102,7 +102,6 @@ export interface GroupWorkspaceOperationDependencies {
   commitGroup(
     input: RepoGroupOperationJournal,
     fencingToken?: number,
-    revalidateUnderLock?: () => Promise<{ status: 'authorized' | 'denied' | 'unauthorized' | 'unavailable' }>,
   ): Promise<GroupCommitResult>;
   convergeSession(input: {
     sessionId: string;
@@ -202,8 +201,11 @@ export function createGroupWorkspaceSetCoordinator(options: {
     resolveCanonicalTarget: options.resolveCanonicalTarget,
     readSession: options.readSession,
     switchSession: options.switchSession,
-    commitGroup: async (journal, _fencingToken, revalidateUnderLock) => {
+    commitGroup: async journal => {
       if (isQuarantinedSetJournal(journal)) return { status: 'unknown' };
+      const authority = options.revalidateAuthority
+        ? await options.revalidateAuthority(journal)
+        : { status: 'authorized' as const };
       const result = await options.groupStore.mutate({
         kind: 'set', chatId: journal.chatId, sourceEventId: journal.sourceEventId,
         ...(options.originMessageId ? { originMessageId: options.originMessageId } : {}),
@@ -211,7 +213,7 @@ export function createGroupWorkspaceSetCoordinator(options: {
         expectedRevision: journal.expectedGroupRevision,
         expectedSessionGeneration: journal.expectedSessionGeneration, actor: journal.actor,
         authorized: true, directoryValid: true, now: options.now(),
-      }, revalidateUnderLock);
+      }, authority);
       if (result.outcome === 'authorization_revoked') return { status: 'unauthorized' };
       if (result.outcome === 'committed') return { status: 'committed', resultingRevision: result.receipt.resultingRevision! };
       if (result.outcome === 'conflict') return { status: 'conflict', currentRevision: result.receipt.expectedRevision };
@@ -272,7 +274,7 @@ export interface GroupWorkspaceUnbindDependencies {
   readCurrentRevision(chatId: string): Promise<{ status: 'available'; revision: number } | { status: 'store_unavailable' }>;
   mutate(
     input: GroupWorkspaceUnbindMutation,
-    revalidateUnderLock: () => Promise<{ status: 'authorized' | 'denied' | 'unauthorized' | 'unavailable' }>,
+    authorityEvidence: { status: 'authorized' | 'denied' | 'unauthorized' | 'unavailable' },
   ): Promise<GroupWorkspaceMutationResult>;
   executorLeaseStore?: OperationExecutorLeaseStore;
   executorOwner?: string;
@@ -378,10 +380,13 @@ export async function executeGroupWorkspaceUnbind(
     }
     const fenced = lease && dependencies.executorLeaseStore
       ? await dependencies.executorLeaseStore.runFencedEffect(
-        operationKey, lease, () => dependencies.mutate(mutation, () => dependencies.revalidateAuthority(journal)),
+        operationKey, lease, async () => {
+          const commitAuthority = await dependencies.revalidateAuthority(journal);
+          return dependencies.mutate(mutation, commitAuthority);
+        },
       )
       : { status: 'applied' as const, value: await dependencies.mutate(
-        mutation, () => dependencies.revalidateAuthority(journal),
+        mutation, await dependencies.revalidateAuthority(journal),
       ) };
     if (fenced.status === 'stale_fence') return { status: 'unknown' };
     const result = fenced.value;
@@ -610,13 +615,11 @@ export class GroupWorkspaceOperationCoordinator {
         journal.operationKey, lease, () => this.dependencies.commitGroup(
           journal,
           lease?.fencingToken,
-          () => this.authority(journal).then(status => ({ status })),
         ),
       )
       : { status: 'applied' as const, value: await this.dependencies.commitGroup(
         journal,
         lease?.fencingToken,
-        () => this.authority(journal).then(status => ({ status })),
       ) };
     if (fencedCommit.status === 'stale_fence') return { status: 'unknown', journal };
     const groupResult = fencedCommit.value;

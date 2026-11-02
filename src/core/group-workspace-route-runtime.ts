@@ -7,6 +7,7 @@ import type {
 } from '../services/bot-admin-unions-store.js';
 import { loadFreshBotAdminUnionSnapshot } from '../services/bot-admin-unions-store.js';
 import { canManageGroupWorkspace, type GroupWorkspaceRouteAuthorityResult, type GroupWorkspaceRouteIntent } from './group-workspace-policy.js';
+import { localeForBot, t } from '../i18n/index.js';
 
 interface WorkspaceAclRead {
   status: 'available' | 'store_unavailable';
@@ -156,7 +157,7 @@ export function createGroupWorkspaceRouteRuntime(options: {
       return;
     }
     if (route.kind === 'unbind') {
-      await options.reply(route.chatId, '群目录解绑操作尚未接入持久化协调器；本次未写入群目录。');
+      await options.reply(route.chatId, t('cmd.repo.group.unbind_aborted', undefined, localeForBot(options.larkAppId)));
       return;
     }
     if (!session
@@ -171,7 +172,7 @@ export function createGroupWorkspaceRouteRuntime(options: {
         unionId: route.actor.unionId,
         humanProvenance: true,
       })) {
-      await options.reply(route.chatId, '当前群会话不支持安全切换，本次未切换会话，也未写入群目录。');
+      await options.reply(route.chatId, t('cmd.repo.group.switch_denied', undefined, localeForBot(options.larkAppId)));
       return;
     }
     await options.dispatchRepo(session, route.selection, {

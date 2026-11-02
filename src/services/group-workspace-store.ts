@@ -130,6 +130,16 @@ export type GroupWorkspaceMutationResult =
   | { outcome: 'protocol_conflict'; existingReceipt: GroupOperationReceipt }
   | { outcome: 'authorization_revoked' | 'store_unavailable' | 'unknown' };
 
+export type GroupWorkspaceAuthorityEvidence =
+  | { status: 'authorized' }
+  | { status: 'denied' | 'unauthorized' | 'unavailable' };
+
+export interface GroupWorkspaceLockAuthorityContext {
+  record: GroupWorkspaceRecord | undefined;
+  revision: number;
+  workspaceManagers: readonly TenantHumanId[];
+}
+
 export type GroupWorkspaceReadResult =
   | { status: 'available'; record: GroupWorkspaceRecord | undefined }
   | { status: 'store_unavailable' };
@@ -665,9 +675,14 @@ export class GroupWorkspaceStore {
 
   async mutate(
     input: GroupWorkspaceMutation,
-    revalidateUnderLock?: () => Promise<{ status: 'authorized' | 'denied' | 'unauthorized' | 'unavailable' }>,
+    authorityEvidence: GroupWorkspaceAuthorityEvidence = { status: 'authorized' },
+    revalidateUnderLock?: (context: GroupWorkspaceLockAuthorityContext) => GroupWorkspaceAuthorityEvidence,
   ): Promise<GroupWorkspaceMutationResult> {
     if (!validMutation(input)) return { outcome: 'store_unavailable' };
+    // Fresh external identity/config evidence is collected before entering the
+    // file-lock graph. The loaded record below remains the under-lock ACL and
+    // revision authority, so mutation never calls back into this store.
+    if (authorityEvidence.status === 'unavailable') return { outcome: 'store_unavailable' };
     const operationKey = groupWorkspaceOperationKey(input.sourceEventId, input.kind);
     const payloadDigest = canonicalGroupOperationPayloadDigest(input);
     try {
@@ -698,15 +713,22 @@ export class GroupWorkspaceStore {
           };
         }
 
+        if (authorityEvidence.status === 'denied' || authorityEvidence.status === 'unauthorized') {
+          return { outcome: 'authorization_revoked' as const };
+        }
+
+        const current = own(registry.records, input.chatId);
         if (revalidateUnderLock) {
-          const authority = await revalidateUnderLock();
+          const authority = revalidateUnderLock({
+            record: cloneRecord(current),
+            revision: current?.revision ?? 0,
+            workspaceManagers: current?.workspaceManagers?.map(manager => ({ ...manager })) ?? [],
+          });
           if (authority.status === 'unavailable') return { outcome: 'store_unavailable' as const };
           if (authority.status === 'denied' || authority.status === 'unauthorized') {
             return { outcome: 'authorization_revoked' as const };
           }
         }
-
-        const current = own(registry.records, input.chatId);
         let outcome: Exclude<GroupOperationTerminalOutcome, 'store_unavailable'>;
         let resultingRevision: number | undefined;
         let resultingDirectory: GroupDirectoryState | undefined;

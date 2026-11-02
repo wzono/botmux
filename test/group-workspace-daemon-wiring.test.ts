@@ -1,13 +1,16 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { DaemonSession } from '../src/core/types.js';
 import { createGroupWorkspaceRouteRuntime } from '../src/core/group-workspace-route-runtime.js';
 import { tryDispatchGroupWorkspaceTextRoute } from '../src/im/lark/event-dispatcher.js';
 import { tryDispatchGroupWorkspaceCardRoute } from '../src/im/lark/card-handler.js';
 import { VerifiedAppTenantRegistry } from '../src/core/workspace-authority.js';
+import { setDefaultLocale } from '../src/i18n/index.js';
 
 const APP = 'cli_b';
 const CHAT = 'oc_group';
 const ACTOR = { tenantKey: 'tenant-1', unionId: 'on_user' };
+
+afterEach(() => setDefaultLocale('zh'));
 
 function liveSession(overrides: Partial<DaemonSession> = {}): DaemonSession {
   return {
@@ -214,11 +217,15 @@ describe('production group-workspace route dependency assembly', () => {
       humanProvenance: true })).resolves.toEqual({ status: 'recognized_denied', reason: 'identity_unavailable' });
   });
 
-  it('keeps unbind on the authenticated no-write seam', async () => {
+  it.each([
+    ['zh', /解绑未执行/],
+    ['en', /Unbind was not executed/],
+  ] as const)('localizes the authenticated unbind denial in %s', async (locale, expected) => {
+    setDefaultLocale(locale);
     const { runtime, dispatchRepo, reply } = setup();
     await runtime.handleRoute({ kind: 'unbind', source: 'card', chatId: CHAT, actor: ACTOR,
       actorOpenId: 'ou_b', originMessageId: 'om_card', actionId: 'evt_action' });
     expect(dispatchRepo).not.toHaveBeenCalled();
-    expect(reply).toHaveBeenCalledWith(CHAT, expect.stringMatching(/尚未|未写入/));
+    expect(reply).toHaveBeenCalledWith(CHAT, expect.stringMatching(expected));
   });
 });
