@@ -2077,7 +2077,15 @@ const SESSION_WORKING_DIR_SOURCES = new Set<Session['workingDirSource']>([
 ]);
 
 export function normalizeSessionWorkingDirProvenance<T extends Session>(session: T): T {
-  session.workingDirSource ??= 'legacy-unknown';
+  if (session.workingDirSource === undefined) {
+    // Legacy rows may carry group-looking revision/identity fields from older
+    // partial rollouts, but without provenance they cannot prove that the cwd
+    // was inherited rather than explicitly pinned. Quarantine conservatively.
+    session.workingDirSource = 'legacy-unknown';
+    delete session.groupWorkspaceRevision;
+    delete session.groupWorkspaceIdentity;
+    delete session.groupWorkspaceDirectoryIdentity;
+  }
   if (!SESSION_WORKING_DIR_SOURCES.has(session.workingDirSource)) {
     throw new Error('invalid workingDirSource');
   }
