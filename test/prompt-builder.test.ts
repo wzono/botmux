@@ -648,6 +648,7 @@ describe('buildFollowUpContent', () => {
     });
 
     expect(content).not.toContain('<botmux_reminder>');
+    expect(content).not.toContain('<botmux_formatting>');
     expect(content).not.toContain('botmux send');
   });
 
@@ -1152,10 +1153,14 @@ describe('replyDelivery=transcript envelope', () => {
       .not.toContain('<botmux_reminder>');
   });
 
-  it('transcript + claude-code 续轮：不注入 <botmux_reminder>，非 solo 保留壳与 sender', () => {
+  it('transcript + claude-code 续轮：只注入格式提示，非 solo 保留壳与 sender', () => {
     mockBotConfig.replyDelivery = 'transcript';
     const out = buildFollowUpContent('继续', 'sess-t1', { ...base, cliId: 'claude-code', attachments, mentions });
     expect(out).not.toContain('<botmux_reminder>');
+    expect(out).toContain('<botmux_formatting>');
+    expect(out).toContain('短进度优先纯文本');
+    expect(out).not.toMatch(/<botmux_formatting>[^<]*botmux send/);
+    expect(out).not.toMatch(/<botmux_formatting>[^<]*BOTMUX_NOTHING_TO_SEND/);
     expect(out).toContain('<user_message>\n继续\n</user_message>');
     expect(out).toContain('<sender ');
     expect(out).toContain('<attachments');
@@ -1168,6 +1173,7 @@ describe('replyDelivery=transcript envelope', () => {
       ...base, cliId: 'claude-code', attachments, mentions, solo: true, selfMention,
     });
     expect(out).not.toContain('<botmux_reminder>');
+    expect(out).toContain('<botmux_formatting>');
     expect(out).not.toContain('<user_message>');
     expect(out).not.toContain('<sender');
     expect(out).not.toContain('<attachments');
@@ -1226,6 +1232,7 @@ describe('replyDelivery=transcript envelope', () => {
     expect(out).toContain('不要调用 botmux send，不要发飞书');
     expect(out).toContain('<user_message>');
     expect(out).not.toContain('BOTMUX_NOTHING_TO_SEND');
+    expect(out).not.toContain('<botmux_formatting>');
   });
 
   it('transcript 首轮（非注入式 codex）：routing 不提 botmux send、identity 无 short_routing；solo 时去壳', () => {
