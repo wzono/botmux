@@ -9,7 +9,12 @@ import {
   groupWorkspaceOperationKey,
 } from './services/group-workspace-store.js';
 import { GroupWorkspaceOperationStore } from './services/group-workspace-operation-store.js';
-import { WorkspaceSchemaMigrator, workspaceMigrationIngressReady } from './services/workspace-schema-migrator.js';
+import {
+  WorkspaceSchemaMigrator,
+  readWorkspaceMigrationManifest,
+  workspaceMigrationIngressReady,
+} from './services/workspace-schema-migrator.js';
+import { coordinateGroupWorkspaceQuarantineRepair } from './services/group-workspace-repair.js';
 import { OperationExecutorLeaseStore } from './services/operation-executor-lease-store.js';
 import { probePathUsability, type PathIdentity } from './core/path-usability.js';
 import {
@@ -70,6 +75,14 @@ import { buildDashboardUrls, reportDashboardUrls } from './core/dashboard-url.js
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { reloadExactDaemonBotConfig } from './core/daemon-config-fence.js';
 import { writeHeartbeat } from './core/daemon-heartbeat.js';
+import {
+  WORKSPACE_FENCE_PROTOCOL,
+  publishWorkspaceFenceAck,
+  publishWorkspaceFenceHeartbeat,
+  readWorkspaceFenceCommand,
+  type WorkspaceFenceCommand,
+} from './core/workspace-migration-supervisor.js';
+import { readDurableProcessIdentity } from './utils/process-identity.js';
 import { botmuxWrapperFiles, resolveBotmuxWrapperBinDir } from './core/botmux-wrapper.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
 import {
@@ -6520,6 +6533,31 @@ const commandDeps: CommandHandlerDeps = {
   prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
   prewarmDocCommentSession,
   submitQueuedMessage,
+  repairGroupWorkspace: async (ds, sender, requestedPath) => {
+    const runtime = groupWorkspaceRouteRuntimes.get(ds.larkAppId);
+    if (!runtime) return 'unauthorized';
+    const authority = await runtime.resolveAuthority({
+      chatId: ds.chatId,
+      senderOpenId: sender.openId,
+      senderUnionId: sender.unionId,
+      tenantKey: sender.tenantKey,
+      humanProvenance: sender.humanProvenance,
+    });
+    if (authority.status !== 'authorized') return 'unauthorized';
+    const current = await groupWorkspaceStore.read(ds.chatId);
+    const requested = requestedPath?.toLowerCase() === 'current' ? undefined : requestedPath;
+    if (requested && (current.status !== 'available' || current.record?.directory.kind !== 'bound'
+      || expandHome(requested) !== current.record.directory.workingDir)) return 'proof_mismatch';
+    return (await coordinateGroupWorkspaceQuarantineRepair({
+      sessionId: ds.session.sessionId, chatId: ds.chatId, actor: authority.actor,
+      authority: { authorize: () => runtime.revalidateAuthority({
+        chatId: ds.chatId,
+        actor: authority.actor,
+        authorityFingerprint: authority.configFingerprint,
+      }) },
+      groupStore: groupWorkspaceStore,
+    })).status;
+  },
   readGroupWorkspaceShow: async ds => {
     const group = await groupWorkspaceStore.read(ds.chatId);
     const oncall = findOncallChat(ds.larkAppId, ds.chatId);
@@ -31399,6 +31437,10 @@ async function waitForManagedActivationCommit(index: number, appId: string): Pro
 export async function startDaemon(botIndex?: number): Promise<void> {
   // The host-wide schema epoch is resolved before any optional subsystem,
   // session restore, durable queue driver, IPC release, or IM ingress starts.
+  const existingWorkspaceManifest = readWorkspaceMigrationManifest(config.session.dataDir);
+  if (existingWorkspaceManifest && existingWorkspaceManifest.phase !== 'complete') {
+    throw new Error('workspace migration requires the live supervisor quiescence coordinator');
+  }
   const workspaceMigration = await new WorkspaceSchemaMigrator(config.session.dataDir, {
     ownerId: `daemon:${process.pid}:${getDaemonBootId()}`,
   }).migrateOrRecover();
@@ -34546,6 +34588,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Cross-daemon busy heartbeat: each daemon reports how many of its sessions
   // are mid-CLI-turn so the primary daemon's maintenance gate sees activity
   // across all bots (one daemon per bot). See core/daemon-heartbeat.ts.
+  const fleetGeneration = Number(process.env.BOTMUX_FLEET_GENERATION ?? '0');
+  const processStart = readDurableProcessIdentity(process.pid) ?? '';
+  let migrationEpoch: number | undefined;
+  let lastFenceCommand: WorkspaceFenceCommand | undefined;
   const writeBusyHeartbeat = () => {
     try {
       let busy = 0;
@@ -34553,8 +34599,33 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         if (ds.worker && !ds.worker.killed && ds.lastScreenStatus === 'working') busy++;
       }
       writeHeartbeat(cfg.larkAppId, busy);
-    } catch { /* best-effort */ }
+      const command = readWorkspaceFenceCommand(config.session.dataDir, cfg.larkAppId);
+      if (command && (command.leaseId !== lastFenceCommand?.leaseId || command.action !== lastFenceCommand.action)) {
+        if (command.generation === fleetGeneration) {
+          const sqlite = command.action === 'quiesce'
+            ? sessionStore.quiesceForWorkspaceMigration()
+            : (sessionStore.reopenAfterWorkspaceMigration(), sessionStore.workspaceSqliteStatus());
+          migrationEpoch = command.action === 'quiesce' ? command.epoch : undefined;
+          publishWorkspaceFenceAck(config.session.dataDir, cfg.larkAppId, {
+            ...command, pid: process.pid, processStart, sqlite, at: Date.now(),
+          });
+          lastFenceCommand = command;
+        }
+      }
+      publishWorkspaceFenceHeartbeat(config.session.dataDir, {
+        larkAppId: cfg.larkAppId,
+        pid: process.pid,
+        processStart,
+        generation: fleetGeneration,
+        protocol: WORKSPACE_FENCE_PROTOCOL,
+        schemaVersion: 1,
+        sqlite: sessionStore.workspaceSqliteStatus(),
+        migrationEpoch,
+        at: Date.now(),
+      });
+    } catch (error) { logger.warn(`[workspace-fence] heartbeat failed: ${error instanceof Error ? error.message : error}`); }
   };
+  process.on('SIGUSR2', writeBusyHeartbeat);
   writeBusyHeartbeat();
   const maintenanceHeartbeat = setInterval(writeBusyHeartbeat, 15_000);
   maintenanceHeartbeat.unref?.();

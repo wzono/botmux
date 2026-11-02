@@ -1575,6 +1575,9 @@ export interface LarkMessage {
    *  undefined for events that don't carry it (older formats, API-fetched
    *  messages). */
   senderUnionId?: string;
+  /** Tenant proven by the signed Lark event envelope. Never synthesize this
+   * from an app id: union_id stability is tenant-scoped. */
+  tenantKey?: string;
   senderType: string;
   /** Server-provided sender display name (works for user AND bot senders).
    *  Only populated on API-fetched messages read with `with_sender_name=true`

@@ -723,6 +723,11 @@ export interface CommandHandlerDeps {
   /** 会前预热文档评论会话：立即启动 CLI、读取文档并进入待命。 */
   prewarmDocCommentSession?: (ds: DaemonSession, sub: DocSubscription) => Promise<void>;
   readGroupWorkspaceShow?: (ds: DaemonSession) => Promise<GroupWorkspaceRepoShowState>;
+  repairGroupWorkspace?: (ds: DaemonSession, sender: {
+    openId: string; unionId?: string; tenantKey?: string; humanProvenance: boolean;
+  }, requestedPath?: string) => Promise<
+    'repaired' | 'unauthorized' | 'not_quarantined' | 'group_unavailable' | 'unbound'
+    | 'identity_changed' | 'proof_mismatch' | 'conflict'>;
 }
 
 // ─── Schedule command ────────────────────────────────────────────────────────
@@ -3184,6 +3189,27 @@ export async function handleCommand(
         // directory for it, like the recovery card (the no-card reply says so).
         if (/^show$/i.test(repoArg) && ds && deps.readGroupWorkspaceShow) {
           await sessionReply(rootId, formatGroupWorkspaceRepoShow(await deps.readGroupWorkspaceShow(ds), loc));
+          break;
+        }
+        const repairMatch = /^repair(?:\s+(.+))?$/i.exec(repoArg);
+        if (repairMatch && ds && deps.repairGroupWorkspace) {
+          const result = await deps.repairGroupWorkspace(ds, {
+            openId: message.senderId,
+            unionId: message.senderUnionId,
+            tenantKey: message.tenantKey,
+            humanProvenance: message.senderType === 'user',
+          }, repairMatch[1]?.trim());
+          const messages: Record<typeof result, string> = {
+            repaired: '群目录隔离已按当前权威绑定修复；会话将在下次启动使用已验证目录。',
+            unauthorized: '无权修复群目录隔离。',
+            not_quarantined: '当前会话没有待修复的群目录隔离。',
+            group_unavailable: '群目录存储不可用，未执行修复。',
+            unbound: '当前群没有有效绑定目录，未执行修复。',
+            identity_changed: '当前目录身份与权威绑定不一致，未执行修复。',
+            proof_mismatch: '会话目录与当前权威绑定不一致，未执行修复。',
+            conflict: '会话在修复期间已变化，请重新查看后重试。',
+          };
+          await sessionReply(rootId, messages[result]);
           break;
         }
         if (ds && !ds.pendingRepo && repoArg) reclaimUnstartedOpening(ds);
