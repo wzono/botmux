@@ -484,6 +484,19 @@ describe('GroupWorkspaceStore', () => {
     expect(result.outcome).toBe('store_unavailable');
   });
 
+  it('denies under-lock authority revocation without writing a record or receipt', async () => {
+    const dir = dataDir();
+    const store = createStore(dir);
+    const input = setInput({ sourceEventId: textSource('om_revoked_at_lock'), workingDir: '/tmp/x', expectedRevision: 0 });
+    const result = await store.mutate(input, { status: 'authorized' }, context => {
+      expect(context).toMatchObject({ record: undefined, revision: 0, workspaceManagers: [] });
+      return { status: 'unavailable' };
+    });
+    expect(result).toEqual({ outcome: 'store_unavailable' });
+    expect(await store.read(CHAT)).toEqual({ status: 'available', record: undefined });
+    expect(await store.readReceipt(groupWorkspaceOperationKey(input.sourceEventId, 'set'))).toEqual({ status: 'missing' });
+  });
+
   it('serializes parallel writers so exactly one CAS commits', async () => {
     const dir = dataDir();
     const [left, right] = await Promise.all([

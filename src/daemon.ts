@@ -8,7 +8,10 @@ import {
   canonicalGroupWorkspaceRequestIntentDigest,
   groupWorkspaceOperationKey,
 } from './services/group-workspace-store.js';
-import { GroupWorkspaceOperationStore } from './services/group-workspace-operation-store.js';
+import {
+  GroupWorkspaceOperationStore,
+  selectGroupWorkspaceOperationForShow,
+} from './services/group-workspace-operation-store.js';
 import {
   readWorkspaceMigrationManifest,
   workspaceMigrationIngressReady,
@@ -6575,14 +6578,14 @@ const commandDeps: CommandHandlerDeps = {
       ? await groupWorkspaceStore.probeBoundDirectoryForConsumption(ds.chatId)
       : undefined;
     const unresolvedOperations = await groupWorkspaceOperationStore.listUnresolved();
+    const selectedOperation = unresolvedOperations.status === 'available'
+      ? selectGroupWorkspaceOperationForShow(unresolvedOperations.journals, ds.chatId, ds.larkAppId)
+      : undefined;
     const operation = unresolvedOperations.status === 'store_unavailable'
       ? { status: 'store_unavailable', detail: 'operation journal unavailable' }
-      : unresolvedOperations.journals
-        .filter(item => item.chatId === ds.chatId && item.ownerLarkAppId === ds.larkAppId)
-        .sort((left, right) => right.updatedAt - left.updatedAt
-          || right.operationKey.localeCompare(left.operationKey))[0];
-    const quarantinedOperation = operation && 'phase' in operation
-      ? operation
+      : selectedOperation;
+    const quarantinedOperation = operation && 'journal' in operation
+      ? operation.journal
       : undefined;
     const resolution = group.status === 'store_unavailable'
       ? { status: 'store_unavailable', detail: 'group workspace store unavailable' }
@@ -6611,7 +6614,8 @@ const commandDeps: CommandHandlerDeps = {
       ...(ds.session.groupWorkspaceQuarantine ? { quarantine: ds.session.groupWorkspaceQuarantine } : {}),
       ...(quarantinedOperation
         ? { operation: { status: quarantinedOperation.phase,
-            detail: quarantinedOperation.convergenceFailure ?? quarantinedOperation.legacyPhase } }
+            detail: quarantinedOperation.convergenceFailure ?? quarantinedOperation.legacyPhase,
+            owner: selectedOperation!.owner } }
         : operation && 'status' in operation ? { operation } : {}),
       ...(() => {
         try {
@@ -33459,7 +33463,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                   ? { status: 'available', revision: current.record?.revision ?? 0 }
                   : current;
               },
-              mutate: (input, revalidateUnderLock) => groupWorkspaceStore.mutate(input, revalidateUnderLock),
+              mutate: (input, authorityEvidence, revalidateUnderLock) =>
+                groupWorkspaceStore.mutate(input, authorityEvidence, revalidateUnderLock),
             executorLeaseStore: groupWorkspaceExecutorLeaseStore,
             executorOwner: groupWorkspaceExecutorOwner,
             });
@@ -33892,13 +33897,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                 ? { status: 'available', revision: current.record?.revision ?? 0 }
                 : current;
             },
-            mutate: (input, revalidateUnderLock) => groupWorkspaceStore.mutate(input, revalidateUnderLock),
+            mutate: (input, authorityEvidence, revalidateUnderLock) =>
+              groupWorkspaceStore.mutate(input, authorityEvidence, revalidateUnderLock),
             executorLeaseStore: groupWorkspaceExecutorLeaseStore,
             executorOwner: groupWorkspaceExecutorOwner,
           });
         } else {
           const session = findActiveBySessionId(journal.sessionId)
             ?? activeSessions.get(journal.sessionId);
+          // Migrated ownerless journals are recoverable only by the daemon that
+          // owns their matching durable session. A foreign or absent session is
+          // not evidence that this daemon may terminalize shared legacy state.
+          if (journal.ownerLarkAppId === undefined
+            && (!session || session.larkAppId !== cfg.larkAppId)) continue;
           if ((!session || session.larkAppId !== cfg.larkAppId)
             && journal.phase !== 'group_committed' && journal.phase !== 'unknown') {
             const executor = await groupWorkspaceExecutorLeaseStore.acquire(

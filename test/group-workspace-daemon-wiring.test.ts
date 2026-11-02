@@ -75,6 +75,25 @@ describe('production group-workspace route dependency assembly', () => {
     expect(dispatchRepo).toHaveBeenCalledWith(ds, '/repos/x', expect.objectContaining({ actor: ACTOR, actorOpenId: 'ou_b' }));
   });
 
+  it('revalidates delegated managers from the current under-lock record', async () => {
+    const delegated = { tenantKey: ACTOR.tenantKey, unionId: 'on_delegate' };
+    const { runtime } = setup();
+    const evidence = await runtime.revalidateAuthorityConfiguration({
+      chatId: CHAT,
+      actor: delegated,
+      authorityFingerprint: (await runtime.resolveAuthority({
+        chatId: CHAT, senderOpenId: 'ou_b', senderUnionId: ACTOR.unionId,
+        tenantKey: ACTOR.tenantKey, humanProvenance: true,
+      }) as any).configFingerprint,
+    });
+    expect(evidence.status).toBe('authorized');
+    if (evidence.status !== 'authorized') throw new Error('missing evidence');
+    expect(evidence.revalidateUnderLock({ record: undefined, revision: 1, workspaceManagers: [delegated] }))
+      .toEqual({ status: 'authorized' });
+    expect(evidence.revalidateUnderLock({ record: undefined, revision: 2, workspaceManagers: [ACTOR] }))
+      .toEqual({ status: 'denied' });
+  });
+
   it('denies a Bot-A group manager who lacks receiving Bot B canOperate with zero handler or fallback', async () => {
     const { runtime, dispatchRepo } = setup({ managers: [ACTOR], canOperate: false });
     const fallback = vi.fn(() => true);

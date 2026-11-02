@@ -104,7 +104,10 @@ describe('group workspace text pre-gate route', () => {
     expect(genericGate).not.toHaveBeenCalled();
   });
 
-  it('denies group manager without session-switch capability and never falls back', async () => {
+  it.each([
+    ['zh' as const, /会话|切换/],
+    ['en' as const, /session|replace/i],
+  ])('uses %s bot locale when denying a manager without session-switch capability', async (locale, expected) => {
     const route = vi.fn();
     const genericGate = vi.fn(() => true);
     const reply = vi.fn(async () => undefined);
@@ -116,9 +119,10 @@ describe('group workspace text pre-gate route', () => {
       handleRoute: route,
       canRunGenericCommand: genericGate,
       replyDenied: reply,
+      locale,
     });
     expect(result).toBe('switch_denied');
-    expect(reply).toHaveBeenCalledWith(expect.stringMatching(/会话|切换/));
+    expect(reply).toHaveBeenCalledWith(expect.stringMatching(expected));
     expect(route).not.toHaveBeenCalled();
     expect(genericGate).not.toHaveBeenCalled();
   });
@@ -167,7 +171,10 @@ describe('group workspace repo-card pre-gate route', () => {
     expect(genericGate).toHaveBeenCalledOnce();
   });
 
-  it('returns a visible denial without switching, writing, or falling back', async () => {
+  it.each([
+    ['zh' as const, /会话|切换/],
+    ['en' as const, /session|replace/i],
+  ])('returns a visible %s denial without switching, writing, or falling back', async (locale, expected) => {
     const route = vi.fn();
     const genericGate = vi.fn(() => true);
     const result = await tryDispatchGroupWorkspaceCardRoute({
@@ -177,9 +184,10 @@ describe('group workspace repo-card pre-gate route', () => {
       actionId: 'evt_action_1',
     }, {
       resolveAuthority: vi.fn(async () => authority(false)), handleRoute: route, canRunGenericCardAction: genericGate,
+      locale,
     });
     expect(result.status).toBe('switch_denied');
-    expect(result.toast).toMatch(/会话|切换/);
+    expect(result.toast).toMatch(expected);
     expect(route).not.toHaveBeenCalled();
     expect(genericGate).not.toHaveBeenCalled();
   });

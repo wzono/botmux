@@ -324,6 +324,7 @@ export interface GroupWorkspaceCardRouteDeps {
     authorityFingerprint: string; actorOpenId?: string; originMessageId: string; actionId: string;
   }) => Promise<void> | void;
   canRunGenericCardAction: () => boolean;
+  locale?: import('../../i18n/index.js').Locale;
 }
 
 /** Narrow card counterpart of the text pre-gate seam. It performs no saga/store write. */
@@ -339,7 +340,7 @@ export async function tryDispatchGroupWorkspaceCardRoute(
   const authority = await deps.resolveAuthority(input);
   if (!authorizeGroupWorkspaceRoute(authority)) {
     if (authority?.status === 'recognized_denied') {
-      return { status: 'recognized_denied', toast: t(`cmd.repo.group.denied_${authority.reason}`, undefined, 'zh') };
+      return { status: 'recognized_denied', toast: t(`cmd.repo.group.denied_${authority.reason}`, undefined, deps.locale) };
     }
     deps.canRunGenericCardAction();
     return { status: 'not_authorized' };
@@ -347,7 +348,7 @@ export async function tryDispatchGroupWorkspaceCardRoute(
   if (intent.kind === 'set' && !authority.canSwitchSession) {
     return {
       status: 'switch_denied',
-      toast: t('cmd.repo.group.switch_denied', undefined, 'zh'),
+      toast: t('cmd.repo.group.switch_denied', undefined, deps.locale),
     };
   }
   await deps.handleRoute({
@@ -5465,6 +5466,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       resolveAuthority: deps.resolveGroupWorkspaceRouteAuthority,
       handleRoute: deps.handleGroupWorkspaceRoute,
       canRunGenericCardAction: () => false,
+      locale: localeForBot(larkAppId),
     });
     if (groupRoute.status === 'dispatched') return;
     if (groupRoute.status === 'switch_denied' || groupRoute.status === 'recognized_denied') {

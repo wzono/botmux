@@ -686,7 +686,7 @@ export interface GroupWorkspaceRepoShowState {
     detail?: string;
   };
   migration?: { status: string; detail?: string };
-  operation?: { status: string; detail?: string };
+  operation?: { status: string; detail?: string; owner?: 'current' | 'unknown_legacy' };
   group: {
     state: 'bound' | 'unbound' | 'missing' | 'unavailable';
     workingDir?: string;
@@ -715,7 +715,7 @@ export function formatGroupWorkspaceRepoShow(state: GroupWorkspaceRepoShowState,
     `resolution: ${state.resolution?.status ?? none}${state.resolution?.detail ? ` (${state.resolution.detail})` : ''}`,
     `quarantine: ${state.quarantine?.kind ?? none}${state.quarantine?.expectedRevision !== undefined ? `; revision ${state.quarantine.expectedRevision}` : ''}${identity ? `; identity ${identity.path} dev=${identity.dev} ino=${identity.ino}` : ''}${state.quarantine?.detail ? `; ${state.quarantine.detail}` : ''}`,
     `migration: ${state.migration?.status ?? none}${state.migration?.detail ? ` (${state.migration.detail})` : ''}`,
-    `operation: ${state.operation?.status ?? none}${state.operation?.detail ? ` (${state.operation.detail})` : ''}`,
+    `operation: ${state.operation?.status ?? none}${state.operation?.owner === 'unknown_legacy' ? ` (${locale === 'en' ? 'owner unknown/legacy' : '所有者未知/旧版'})` : ''}${state.operation?.detail ? ` (${state.operation.detail})` : ''}`,
     layer('default', state.botDefault),
     layer('resolved', state.resolved),
   ].join('\n');

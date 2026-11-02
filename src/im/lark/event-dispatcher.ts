@@ -2461,6 +2461,7 @@ export interface GroupWorkspaceTextRouteDeps {
   }) => Promise<void> | void;
   canRunGenericCommand: () => boolean;
   replyDenied: (message: string) => Promise<void> | void;
+  locale?: import('../../i18n/index.js').Locale;
 }
 
 /**
@@ -2479,14 +2480,14 @@ export async function tryDispatchGroupWorkspaceTextRoute(
   const authority = await deps.resolveAuthority(input);
   if (!authorizeGroupWorkspaceRoute(authority)) {
     if (authority?.status === 'recognized_denied') {
-      await deps.replyDenied(t(`cmd.repo.group.denied_${authority.reason}`, undefined, 'zh'));
+      await deps.replyDenied(t(`cmd.repo.group.denied_${authority.reason}`, undefined, deps.locale));
       return 'recognized_denied';
     }
     deps.canRunGenericCommand();
     return 'not_authorized';
   }
   if (intent.kind === 'set' && !authority.canSwitchSession) {
-    await deps.replyDenied(t('cmd.repo.group.switch_denied', undefined, 'zh'));
+    await deps.replyDenied(t('cmd.repo.group.switch_denied', undefined, deps.locale));
     return 'switch_denied';
   }
   await deps.handleRoute({
@@ -5893,6 +5894,7 @@ export function createLarkEventDispatcherRuntime(
           handleRoute: handlers.handleGroupWorkspaceRoute,
           canRunGenericCommand: () => false,
           replyDenied: message => replyMessage(larkAppId, messageId, JSON.stringify({ text: message })).then(() => undefined),
+          locale: localeForBot(larkAppId),
         });
         if (routeResult === 'dispatched' || routeResult === 'switch_denied' || routeResult === 'recognized_denied') return;
       }

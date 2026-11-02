@@ -90,6 +90,25 @@ export interface GroupWorkspaceOperationStoreOptions {
   pathProbe?: (path: string) => PathUsabilityResult;
 }
 
+/** Select display-only unresolved evidence without crossing daemon ownership. */
+export function selectGroupWorkspaceOperationForShow(
+  journals: readonly RepoGroupOperationJournal[],
+  chatId: string,
+  larkAppId: string,
+): { journal: RepoGroupOperationJournal; owner: 'current' | 'unknown_legacy' } | undefined {
+  const ordered = journals
+    .filter(item => item.chatId === chatId
+      && (item.ownerLarkAppId === undefined || item.ownerLarkAppId === larkAppId))
+    .sort((left, right) => right.updatedAt - left.updatedAt
+      || right.operationKey.localeCompare(left.operationKey));
+  const ownerSpecific = ordered.find(item => item.ownerLarkAppId === larkAppId);
+  const ownerless = ordered.find(item => item.ownerLarkAppId === undefined);
+  if (ownerless && (!ownerSpecific || ownerless.updatedAt >= ownerSpecific.updatedAt)) {
+    return { journal: ownerless, owner: 'unknown_legacy' };
+  }
+  return ownerSpecific ? { journal: ownerSpecific, owner: 'current' } : undefined;
+}
+
 function emptyRegistry(): OperationRegistry {
   return {
     schemaVersion: SCHEMA_VERSION,

@@ -4,6 +4,8 @@ import {
   groupWorkspaceOperationKey,
   groupWorkspaceReceiptMatchesMutation,
   type GroupOperationKind,
+  type GroupWorkspaceAuthorityEvidence,
+  type GroupWorkspaceLockAuthorityContext,
   type GroupWorkspaceMutationResult,
   type GroupWorkspaceStore,
   type GroupWorkspaceUnbindMutation,
@@ -62,7 +64,9 @@ export type GroupWorkspaceOperationResult =
 export interface GroupWorkspaceOperationDependencies {
   journalStore: GroupWorkspaceOperationStore;
   now(): number;
-  revalidateAuthority?(journal: RepoGroupOperationJournal): Promise<{ status: 'authorized' | 'denied' | 'unauthorized' | 'unavailable' }>;
+  revalidateAuthority?(journal: RepoGroupOperationJournal): Promise<GroupWorkspaceAuthorityEvidence & {
+    revalidateUnderLock?: (context: GroupWorkspaceLockAuthorityContext) => GroupWorkspaceAuthorityEvidence;
+  }>;
   acquireExecutor?(operationKey: string): Promise<
     | { status: 'acquired'; lease: OperationExecutorLease }
     | { status: 'observer'; lease: OperationExecutorLease }
@@ -213,7 +217,7 @@ export function createGroupWorkspaceSetCoordinator(options: {
         expectedRevision: journal.expectedGroupRevision,
         expectedSessionGeneration: journal.expectedSessionGeneration, actor: journal.actor,
         authorized: true, directoryValid: true, now: options.now(),
-      }, authority);
+      }, authority, authority.status === 'authorized' ? authority.revalidateUnderLock : undefined);
       if (result.outcome === 'authorization_revoked') return { status: 'unauthorized' };
       if (result.outcome === 'committed') return { status: 'committed', resultingRevision: result.receipt.resultingRevision! };
       if (result.outcome === 'conflict') return { status: 'conflict', currentRevision: result.receipt.expectedRevision };
@@ -266,7 +270,9 @@ export type GroupWorkspaceUnbindResult =
 
 export interface GroupWorkspaceUnbindDependencies {
   journalStore: GroupWorkspaceOperationStore;
-  revalidateAuthority(journal: RepoGroupOperationJournal): Promise<{ status: 'authorized' | 'denied' | 'unauthorized' | 'unavailable' }>;
+  revalidateAuthority(journal: RepoGroupOperationJournal): Promise<GroupWorkspaceAuthorityEvidence & {
+    revalidateUnderLock?: (context: GroupWorkspaceLockAuthorityContext) => GroupWorkspaceAuthorityEvidence;
+  }>;
   readReceipt(operationKey: string): Promise<
     | { status: 'found'; receipt: import('../services/group-workspace-store.js').GroupOperationReceipt }
     | { status: 'missing' | 'store_unavailable' }
@@ -274,7 +280,8 @@ export interface GroupWorkspaceUnbindDependencies {
   readCurrentRevision(chatId: string): Promise<{ status: 'available'; revision: number } | { status: 'store_unavailable' }>;
   mutate(
     input: GroupWorkspaceUnbindMutation,
-    authorityEvidence: { status: 'authorized' | 'denied' | 'unauthorized' | 'unavailable' },
+    authorityEvidence: GroupWorkspaceAuthorityEvidence,
+    revalidateUnderLock?: (context: GroupWorkspaceLockAuthorityContext) => GroupWorkspaceAuthorityEvidence,
   ): Promise<GroupWorkspaceMutationResult>;
   executorLeaseStore?: OperationExecutorLeaseStore;
   executorOwner?: string;
@@ -382,12 +389,15 @@ export async function executeGroupWorkspaceUnbind(
       ? await dependencies.executorLeaseStore.runFencedEffect(
         operationKey, lease, async () => {
           const commitAuthority = await dependencies.revalidateAuthority(journal);
-          return dependencies.mutate(mutation, commitAuthority);
+          return dependencies.mutate(mutation, commitAuthority,
+            commitAuthority.status === 'authorized' ? commitAuthority.revalidateUnderLock : undefined);
         },
       )
-      : { status: 'applied' as const, value: await dependencies.mutate(
-        mutation, await dependencies.revalidateAuthority(journal),
-      ) };
+      : { status: 'applied' as const, value: await (async () => {
+        const commitAuthority = await dependencies.revalidateAuthority(journal);
+        return dependencies.mutate(mutation, commitAuthority,
+          commitAuthority.status === 'authorized' ? commitAuthority.revalidateUnderLock : undefined);
+      })() };
     if (fenced.status === 'stale_fence') return { status: 'unknown' };
     const result = fenced.value;
     if (result.outcome === 'authorization_revoked') {

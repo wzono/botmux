@@ -3,7 +3,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
-import { GroupWorkspaceOperationStore } from '../src/services/group-workspace-operation-store.js';
+import {
+  GroupWorkspaceOperationStore,
+  selectGroupWorkspaceOperationForShow,
+} from '../src/services/group-workspace-operation-store.js';
 import { OperationExecutorLeaseStore } from '../src/services/operation-executor-lease-store.js';
 import { groupWorkspaceOperationKey } from '../src/services/group-workspace-store.js';
 
@@ -16,6 +19,19 @@ const journal: any = { operationKey: groupWorkspaceOperationKey(sourceEventId, '
 const dir = () => mkdtempSync(join(tmpdir(), 'operation-v2-'));
 
 describe('same-source winner and executor lease', () => {
+  it('selects ownerless legacy show evidence only for the chat and without superseding a newer owned item', () => {
+    const ownerless = { ...journal, operationKey: 'ownerless', ownerLarkAppId: undefined, updatedAt: 3 };
+    const current = { ...journal, operationKey: 'current', ownerLarkAppId: 'app-a', updatedAt: 2 };
+    const foreign = { ...journal, operationKey: 'foreign', ownerLarkAppId: 'app-b', updatedAt: 9 };
+    expect(selectGroupWorkspaceOperationForShow([foreign, current, ownerless], 'chat', 'app-a'))
+      .toEqual({ journal: ownerless, owner: 'unknown_legacy' });
+    expect(selectGroupWorkspaceOperationForShow([
+      { ...ownerless, updatedAt: 2 }, { ...current, updatedAt: 4 }, foreign,
+    ], 'chat', 'app-a')).toEqual({ journal: { ...current, updatedAt: 4 }, owner: 'current' });
+    expect(selectGroupWorkspaceOperationForShow([foreign], 'chat', 'app-a')).toBeUndefined();
+    expect(selectGroupWorkspaceOperationForShow([{ ...ownerless, chatId: 'other' }], 'chat', 'app-a')).toBeUndefined();
+  });
+
   it.each(['prepared', 'session_committed', 'group_committed', 'unknown'] as const)(
     'quarantines unresolved schema-v1 set journal in %s without probing a replacement path', async phase => {
       const dataDir = dir();

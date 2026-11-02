@@ -5,7 +5,11 @@ import type {
   ResolveBotAllowedUser,
   TenantHumanId,
 } from '../services/bot-admin-unions-store.js';
-import { loadFreshBotAdminUnionSnapshot } from '../services/bot-admin-unions-store.js';
+import {
+  botAdminIdentityConfigFingerprint,
+  loadFreshBotAdminUnionSnapshot,
+} from '../services/bot-admin-unions-store.js';
+import type { GroupWorkspaceLockAuthorityContext } from '../services/group-workspace-store.js';
 import { canManageGroupWorkspace, type GroupWorkspaceRouteAuthorityResult, type GroupWorkspaceRouteIntent } from './group-workspace-policy.js';
 import { localeForBot, t } from '../i18n/index.js';
 
@@ -118,7 +122,11 @@ export function createGroupWorkspaceRouteRuntime(options: {
       : { status: 'recognized_denied', reason: 'unauthorized' };
   };
 
-  type Revalidation = { status: 'authorized' | 'denied' | 'unavailable' };
+  type LockRevalidation = { status: 'authorized' | 'denied' | 'unavailable' };
+  type Revalidation = { status: 'denied' | 'unavailable' } | {
+    status: 'authorized';
+    revalidateUnderLock: (context: GroupWorkspaceLockAuthorityContext) => LockRevalidation;
+  };
   const revalidateAuthorityConfiguration = async (
     route: Pick<GroupWorkspaceProductionRoute, 'chatId' | 'actor' | 'authorityFingerprint'>,
   ): Promise<Revalidation> => {
@@ -130,10 +138,19 @@ export function createGroupWorkspaceRouteRuntime(options: {
       ttlMs: 1,
     });
     if (!fresh) return { status: 'unavailable' };
-    return fresh.configFingerprint === route.authorityFingerprint
-      && canManageGroupWorkspace({ actor: route.actor, freshSnapshot: fresh })
-      ? { status: 'authorized' }
-      : { status: 'denied' };
+    if (fresh.configFingerprint !== route.authorityFingerprint) return { status: 'denied' };
+    return {
+      status: 'authorized',
+      revalidateUnderLock: context => {
+        const liveFingerprint = botAdminIdentityConfigFingerprint(options.registeredBots(route.actor.tenantKey));
+        if (liveFingerprint !== fresh.configFingerprint) return { status: 'unavailable' };
+        return canManageGroupWorkspace({
+          actor: route.actor,
+          freshSnapshot: fresh,
+          workspaceManagers: context.workspaceManagers,
+        }) ? { status: 'authorized' } : { status: 'denied' };
+      },
+    };
   };
 
   const revalidateAuthority = async (
@@ -143,11 +160,14 @@ export function createGroupWorkspaceRouteRuntime(options: {
     if (configuration.status !== 'authorized') return configuration;
     const workspace = await options.readWorkspace(route.chatId);
     if (workspace.status !== 'available') return { status: 'unavailable' };
-    return !workspace.record?.workspaceManagers?.length
-      || workspace.record.workspaceManagers.some(manager => manager.tenantKey === route.actor.tenantKey
-        && manager.unionId === route.actor.unionId)
-      ? { status: 'authorized' }
-      : { status: 'denied' };
+    const current = configuration.revalidateUnderLock({
+      record: workspace.record as GroupWorkspaceLockAuthorityContext['record'],
+      revision: 0,
+      workspaceManagers: workspace.record?.workspaceManagers ?? [],
+    });
+    if (current.status === 'unavailable') return { status: 'unavailable' };
+    if (current.status === 'denied') return { status: 'denied' };
+    return configuration;
   };
 
   const handleRoute = async (route: GroupWorkspaceProductionRoute): Promise<void> => {
