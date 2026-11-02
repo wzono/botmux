@@ -493,6 +493,7 @@ export function assertSqliteSupported(): void {
  *  busy_timeout, schema ensured). Durability matches the previous JSON
  *  tmp+rename (no fsync) — deliberately not upgraded in this step. */
 function openDbForOwnStore(path: string): SqliteDatabaseLike {
+  assertWorkspaceSqliteAdmission();
   requireSqliteEngine(`会话存储 ${basename(path)} `);
   const db = openDatabaseSyncOrThrow(path);
   // Neither engine validates the file in the constructor. `busy_timeout` is
@@ -510,6 +511,7 @@ function openDbForOwnStore(path: string): SqliteDatabaseLike {
   const rawExec = db.exec.bind(db);
   return {
     exec(sql: string): void {
+      assertWorkspaceSqliteAdmission();
       if (/^\s*(?:BEGIN|INSERT|UPDATE|DELETE|REPLACE|CREATE|ALTER|DROP|VACUUM|REINDEX)\b/i.test(sql)) {
         assertWorkspaceWriterFence(config.session.dataDir);
       }
@@ -518,9 +520,10 @@ function openDbForOwnStore(path: string): SqliteDatabaseLike {
     prepare(sql: string): SqliteStatementLike {
       const statement = rawPrepare(sql);
       return {
-        get: (...params) => statement.get(...params),
-        all: (...params) => statement.all(...params),
+        get: (...params) => { assertWorkspaceSqliteAdmission(); return statement.get(...params); },
+        all: (...params) => { assertWorkspaceSqliteAdmission(); return statement.all(...params); },
         run: (...params) => {
+          assertWorkspaceSqliteAdmission();
           assertWorkspaceWriterFence(config.session.dataDir);
           return statement.run(...params);
         },
@@ -614,6 +617,14 @@ let ownStore: OwnSqliteStore | undefined;
 let workspaceWriterCount = 0;
 let workspaceInflightCount = 0;
 let workspaceWriteAdmissionBlocked = false;
+let workspaceQuiescedEpoch: number | undefined;
+let workspaceMigrationInternalSqlite = false;
+
+function assertWorkspaceSqliteAdmission(): void {
+  if (!workspaceMigrationInternalSqlite && (workspaceWriteAdmissionBlocked || workspaceQuiescedEpoch !== undefined)) {
+    throw new WorkspaceMigrationFenceError(`session store is quiesced at epoch ${workspaceQuiescedEpoch ?? 'pending'}`);
+  }
+}
 
 /** Lock/busy contention is retryable. Swallowing it into loadFailure would let
  *  the daemon start with an empty cache while the durable store is healthy. */
@@ -634,7 +645,7 @@ function runOwnedWriteTransaction<T>(
   operation: () => T,
 ): T {
   assertWorkspaceWriterFence(config.session.dataDir);
-  if (workspaceWriteAdmissionBlocked) throw new WorkspaceMigrationFenceError('session store is quiescing');
+  assertWorkspaceSqliteAdmission();
   workspaceInflightCount++;
   if (nonblocking) store.db.exec('PRAGMA busy_timeout = 0;');
   try {
@@ -1088,26 +1099,35 @@ export interface WorkspaceSqliteQuiescenceStatus {
 /** Close the owning SQLite connection for a host migration. JavaScript writes
  * are synchronous, so reaching this function means no transaction callback is
  * in flight; WAL checkpoint must report no busy writer before close. */
-export function quiesceForWorkspaceMigration(): WorkspaceSqliteQuiescenceStatus {
+export function quiesceForWorkspaceMigration(epoch?: number): WorkspaceSqliteQuiescenceStatus {
   workspaceWriteAdmissionBlocked = true;
   if (workspaceWriterCount !== 0 || workspaceInflightCount !== 0) {
     return { open: !!ownStore, writers: workspaceWriterCount, inflight: workspaceInflightCount, checkpointed: false };
   }
   if (!ownStore) return { open: false, writers: 0, inflight: 0, checkpointed: true };
-  const checkpoint = ownStore.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as { busy?: number | bigint } | undefined;
+  workspaceMigrationInternalSqlite = true;
+  let checkpoint: { busy?: number | bigint } | undefined;
+  try {
+    checkpoint = ownStore.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as { busy?: number | bigint } | undefined;
+  } finally { workspaceMigrationInternalSqlite = false; }
   if (Number(checkpoint?.busy ?? 0) !== 0) return { open: true, writers: 0, inflight: 0, checkpointed: false };
   ownStore.db.close();
   ownStore = undefined;
   loaded = false;
+  if (epoch !== undefined) workspaceQuiescedEpoch = epoch;
   return { open: false, writers: 0, inflight: 0, checkpointed: true };
 }
 
 /** Reopen lazily from the current SQLite file after the supervisor releases the
  * migration block; no stale connection or WAL handle is retained. */
-export function reopenAfterWorkspaceMigration(): void {
+export function reopenAfterWorkspaceMigration(epoch?: number): void {
+  if (workspaceQuiescedEpoch !== undefined && epoch !== workspaceQuiescedEpoch) {
+    throw new WorkspaceMigrationFenceError('session store release epoch mismatch');
+  }
   loaded = false;
   loadFailure = undefined;
   sessions = new Map();
+  workspaceQuiescedEpoch = undefined;
   workspaceWriteAdmissionBlocked = false;
   // Force an actual open of the current post-migration SQLite file before the
   // daemon claims a release ACK. A lazy reopen would acknowledge a file it had
@@ -1730,6 +1750,7 @@ function recoverPoisonedSqliteStore(dbFp: string, jsonFp: string): {
 
 // Sessions persisted before 2026-04-29 lack `cliId`; consumers must fall back to 'unknown' at the render boundary.
 function load(): void {
+  assertWorkspaceSqliteAdmission();
   if (loaded) return;
   if (!currentAppId) {
     sessions = new Map();
@@ -2231,7 +2252,7 @@ function parseSessionRow(row: string): Session {
 
 function persistRow(session: Session): void {
   assertWorkspaceWriterFence(config.session.dataDir);
-  if (workspaceWriteAdmissionBlocked) throw new WorkspaceMigrationFenceError('session store is quiescing');
+  assertWorkspaceSqliteAdmission();
   workspaceInflightCount++;
   try {
   normalizeSessionWorkingDirProvenance(session);

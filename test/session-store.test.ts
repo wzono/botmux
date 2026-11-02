@@ -114,6 +114,9 @@ import {
   markMessageProvenanceUntrusted,
   recordMessageProvenance,
   readTrustedMessageProvenance,
+  quiesceForWorkspaceMigration,
+  reopenAfterWorkspaceMigration,
+  workspaceSqliteStatus,
 } from '../src/services/session-store.js';
 import { settlePrincipalLaneOutboundProvenance } from '../src/core/principal-lane-outbound-provenance.js';
 import { seedPersistedSessionRows, readPersistedSessionRows, sessionStorePath } from './helpers/session-store-disk.js';
@@ -185,6 +188,22 @@ beforeEach(() => {
   mockDeleteFrozenCards.mockReset();
   // Reset module state for each test
   init('test-app');
+});
+
+it('keeps SQLite closed and blocks ordinary readers and writers after quiescence until exact release', () => {
+  const session = createSession('chat-quiesce', 'root-quiesce', 'before');
+  expect(getSession(session.sessionId)).toBeDefined();
+  expect(quiesceForWorkspaceMigration(7)).toEqual({ open: false, writers: 0, inflight: 0, checkpointed: true });
+  expect(workspaceSqliteStatus().open).toBe(false);
+  expect(() => getSession(session.sessionId)).toThrow('quiesced at epoch 7');
+  session.title = 'blocked';
+  expect(() => updateSession(session)).toThrow('quiesced at epoch 7');
+  expect(workspaceSqliteStatus().open).toBe(false);
+  expect(() => reopenAfterWorkspaceMigration(8)).toThrow('release epoch mismatch');
+  expect(workspaceSqliteStatus().open).toBe(false);
+  reopenAfterWorkspaceMigration(7);
+  expect(workspaceSqliteStatus().open).toBe(true);
+  expect(getSession(session.sessionId)?.title).toBe('before');
 });
 
 it('rejects the real session writer while a migration epoch is active', () => {

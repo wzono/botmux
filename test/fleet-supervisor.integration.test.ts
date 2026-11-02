@@ -487,7 +487,7 @@ setInterval(() => {}, 1000);
     expect(pidAlive(startBotPid)).toBe(false);
   });
 
-  it('REGRESSION #3: a new supervisor safely reclaims a legacy live-but-unowned fleet', async () => {
+  it('REGRESSION #3: a new supervisor safely reclaims a live-but-unowned fleet', async () => {
     // A prior supervisor died hard (SIGKILL/OOM) while its daemon kept running.
     // The state still says that proc is 'online' with a live pid. A new supervisor
     // must NOT trust that and skip it — if it spawned nothing it would hold no
@@ -504,9 +504,7 @@ setInterval(() => {}, 1000);
       supervisorPid: 999_999, supervisorStartedAt: 'T-prior',
       procs: [{
         name: 'botmux-0', appId: 'cli_a', pid: orphan.pid!, generation: 1, status: 'online',
-        // Deliberately legacy: old releases did not persist processStart. The
-        // new supervisor must migrate this row using a stable sampled identity
-        // plus the expected daemon command, rather than fail the takeover.
+        processStart: readDurableProcessIdentity(orphan.pid!),
         restarts: 0, lastExitCode: null, startedAt: 'T',
       }],
     }));
@@ -675,6 +673,7 @@ setInterval(() => {}, 1000);
       supervisorPid: 999_999, supervisorStartedAt: 'T-prior',
       procs: [{
         name: 'botmux-0', appId: 'cli_a', pid: orphan.pid!, generation: 1, status: 'online',
+        processStart: readDurableProcessIdentity(orphan.pid!),
         restarts: 0, lastExitCode: null, startedAt: 'T',
       }],
     }));
@@ -714,6 +713,7 @@ setInterval(() => {}, 1000);
       supervisorPid: 999_999, supervisorStartedAt: 'T-prior',
       procs: [{
         name: 'botmux-0', appId: 'cli_a', pid: unrelated.pid!, generation: 1, status: 'online',
+        processStart: readDurableProcessIdentity(unrelated.pid!),
         restarts: 0, lastExitCode: null, startedAt: 'T',
       }],
     }));

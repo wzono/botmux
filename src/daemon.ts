@@ -34597,8 +34597,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (command && (command.leaseId !== lastFenceCommand?.leaseId || command.action !== lastFenceCommand.action)) {
         if (command.generation === fleetGeneration) {
           const sqlite = command.action === 'quiesce'
-            ? sessionStore.quiesceForWorkspaceMigration()
-            : (sessionStore.reopenAfterWorkspaceMigration(), sessionStore.workspaceSqliteStatus());
+            ? sessionStore.quiesceForWorkspaceMigration(command.epoch)
+            : (sessionStore.reopenAfterWorkspaceMigration(command.epoch), sessionStore.workspaceSqliteStatus());
           migrationEpoch = command.action === 'quiesce' ? command.epoch : undefined;
           publishWorkspaceFenceAck(config.session.dataDir, cfg.larkAppId, {
             ...command, pid: process.pid, processStart, sqlite, at: Date.now(),
