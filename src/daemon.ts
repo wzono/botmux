@@ -32124,7 +32124,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     getActiveCount,
     prepareRawInputTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
-    dispatchAdmittedBusinessTurn: input => dispatchAdmittedBusinessTurn({
+    dispatchAdmittedBusinessTurn: async input => {
+      if (await followGroupWorkspaceBeforeBusinessTurn(input.ds) === 'stop') return false;
+      return dispatchAdmittedBusinessTurn({
       ds: input.ds,
       turnId: input.turnId,
       payload: input.payload,
@@ -32140,7 +32142,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           ? { retiredGeneration: generation, workerPid }
           : undefined;
       },
-    }),
+    });
+    },
     onTriggerTurnStarted: (ds, title, turnId) => beginNewTurn(ds, title, turnId),
     closeSession(ds: DaemonSession): Promise<boolean> {
       // Route through the dashboard-aware helper so session.exited / session.update

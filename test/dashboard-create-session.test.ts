@@ -78,6 +78,12 @@ let activeRegistryMock: Map<string, DaemonSession> | null = null;
 vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: (...a: any[]) => forkWorkerMock(...a),
   sendWorkerInput: (...a: any[]) => sendWorkerInputMock(...a),
+  dispatchWorkspaceAdmittedBusinessTurn: vi.fn(async (input: any) => {
+    if (!await input.markAttempting()) return false;
+    return input.ds.worker && !input.ds.worker.killed
+      ? sendWorkerInputMock(input.ds, input.payload, input.turnId, { trustedCaller: input.trustedCaller })
+      : (forkWorkerMock(input.ds, input.payload, { resume: input.resume, turnId: input.turnId }), true);
+  }),
   forkAdoptWorker: vi.fn(),
   adoptSandboxBlocked: vi.fn((botCfg, session) => botCfg?.sandbox === true || botCfg?.readIsolation === true || session?.sandbox === true || process.env.BOTMUX_SANDBOX === '1'),
   killStalePids: vi.fn(),

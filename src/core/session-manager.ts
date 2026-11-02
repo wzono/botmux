@@ -4973,40 +4973,24 @@ export async function executeScheduledTask(
         });
         rememberLastCliInput(existing, task.prompt, input);
         if (silent) armSilentScheduledTurn(existing, scheduledTurnId);
-        if (existing.worker && !existing.worker.killed) {
-          try {
-            // sendWorkerInput reads the identity from OPTS, never from the
-            // payload (unlike forkWorker, which reads payload ?? opts). Passing
-            // it on `input` alone type-checks and then silently drops it — and
-            // this is the steady-state path for a recurring task (first fire
-            // creates the session, every later fire injects into it), so the
-            // failure shape would be "worked once, silently identity-less after".
-            if (await dispatchWorkspaceAdmittedBusinessTurn({
-              ds: existing,
-              turnId: scheduledTurnId,
-              payload: input,
-              resume: existing.hasHistory,
-              ...(scheduledTrustedCaller ? { trustedCaller: scheduledTrustedCaller } : {}),
-              markAttempting: async () => true,
-            })) {
-              logger.info(`[scheduler] Task "${task.name}" injected into live session ${existing.session.sessionId}${silent ? ' (silent)' : ''}`);
-              return;
-            }
-          } catch (err: any) {
-            logger.warn(`[scheduler] Live injection threw (${err.message}); cold-resuming registered session`);
-          }
-        }
-        if (activeSessions.get(key) !== existing || existing.session.status !== 'active') {
-          if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
-          throw new Error(`scheduled continuation lost active session ${existing.session.sessionId}`);
-        }
         try {
-          forkWorker(existing, input, { resume: existing.hasHistory, turnId: scheduledTurnId });
+          const accepted = await dispatchWorkspaceAdmittedBusinessTurn({
+            ds: existing,
+            turnId: scheduledTurnId,
+            payload: input,
+            resume: existing.hasHistory,
+            ...(scheduledTrustedCaller ? { trustedCaller: scheduledTrustedCaller } : {}),
+            markAttempting: async () => true,
+          });
+          if (!accepted) {
+            if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
+            throw new Error(`scheduled task ${task.id} workspace admission rejected`);
+          }
         } catch (err) {
           if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
           throw err;
         }
-        logger.info(`[scheduler] Task "${task.name}" cold-resumed session ${existing.session.sessionId}${silent ? ' (silent)' : ''}`);
+        logger.info(`[scheduler] Task "${task.name}" admitted in session ${existing.session.sessionId}${silent ? ' (silent)' : ''}`);
         return;
       }
 
@@ -5056,6 +5040,17 @@ export async function executeScheduledTask(
       };
     }
     session.lastMessageAt = new Date(now).toISOString();
+    const scheduleWorkspace = await resolveIngressWorkspace({
+      larkAppId, chatId: task.chatId, chatType: task.chatType === 'p2p' ? 'p2p' : 'group',
+      dataDir: config.session.dataDir, explicitWorkingDir: task.workingDir,
+      oncall: findOncallChat(larkAppId, task.chatId),
+      botDefaultWorkingDir: effectiveDefaultWorkingDir(bot.config),
+    });
+    if (scheduleWorkspace.status !== 'resolved') {
+      sessionStore.closeSession(session.sessionId);
+      throw new Error(`scheduled task ${task.id} workspace_${scheduleWorkspace.status}`);
+    }
+    setSessionWorkingDirMetadata(session, scheduleWorkspace.mutation);
     // Effort is persisted with the session (mirroring trigger-session): unlike
     // the model it is not re-resolved from the bot on every spawn, so a later
     // resume of this scheduled session must find it here.

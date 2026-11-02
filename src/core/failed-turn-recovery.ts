@@ -283,7 +283,15 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
             return true;
           },
         });
-        if (!accepted) return setState(ipcAttempted ? 'dispatch_unknown' : 'cancelled');
+        if (!accepted) {
+          if (transaction.cancelled) return setState('cancelled');
+          // Admission rejected before IPC: release this claim so the same failed
+          // turn remains retryable after the workspace/follow condition heals.
+          record.recovery = undefined;
+          persistRecord();
+          abandonUndispatched();
+          return { ok: false, error: 'workspace_admission_rejected' };
+        }
         rememberLastCliInput(target, record.userPrompt, input);
         store.updateSession(target.session);
         return setState('accepted');
