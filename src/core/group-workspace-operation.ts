@@ -18,6 +18,7 @@ import type { OperationExecutorLease, OperationExecutorLeaseStore } from '../ser
 export type GroupCommitResult =
   | { status: 'committed'; resultingRevision: number }
   | { status: 'conflict'; currentRevision: number }
+  | { status: 'unauthorized' }
   | { status: 'store_unavailable' }
   | { status: 'unknown' };
 
@@ -95,7 +96,11 @@ export interface GroupWorkspaceOperationDependencies {
     | { status: 'store_unavailable' }
     | { status: 'unknown' }
   >;
-  commitGroup(input: RepoGroupOperationJournal, fencingToken?: number): Promise<GroupCommitResult>;
+  commitGroup(
+    input: RepoGroupOperationJournal,
+    fencingToken?: number,
+    revalidateUnderLock?: () => Promise<{ status: 'authorized' | 'unauthorized' }>,
+  ): Promise<GroupCommitResult>;
   convergeSession(input: {
     sessionId: string;
     expectedGeneration: number;
@@ -193,14 +198,15 @@ export function createGroupWorkspaceSetCoordinator(options: {
     resolveCanonicalTarget: options.resolveCanonicalTarget,
     readSession: options.readSession,
     switchSession: options.switchSession,
-    commitGroup: async journal => {
+    commitGroup: async (journal, _fencingToken, revalidateUnderLock) => {
       const result = await options.groupStore.mutate({
         kind: 'set', chatId: journal.chatId, sourceEventId: journal.sourceEventId,
         ...(options.originMessageId ? { originMessageId: options.originMessageId } : {}),
         requestedWorkingDir: journal.targetWorkingDir!, expectedRevision: journal.expectedGroupRevision,
         expectedSessionGeneration: journal.expectedSessionGeneration, actor: journal.actor,
         authorized: true, directoryValid: true, now: options.now(),
-      });
+      }, revalidateUnderLock);
+      if (result.outcome === 'authorization_revoked') return { status: 'unauthorized' };
       if (result.outcome === 'committed') return { status: 'committed', resultingRevision: result.receipt.resultingRevision! };
       if (result.outcome === 'conflict') return { status: 'conflict', currentRevision: result.receipt.expectedRevision };
       if (result.outcome === 'unknown') return { status: 'unknown' };
@@ -224,10 +230,17 @@ function sameIntent(journal: RepoGroupOperationJournal, request: GroupWorkspaceO
 }
 
 function receiptMatchesJournal(receipt: GroupCommitReceipt, journal: RepoGroupOperationJournal): boolean {
+  const targetIdentity = journal.target.kind === 'workspace'
+    ? journal.target.identity
+    : journal.targetWorkspaceIdentity;
   return receipt.operationKey === journal.operationKey
     && receipt.payloadDigest === journal.payloadDigest
     && receipt.chatId === journal.chatId
-    && receipt.targetWorkingDir === journal.targetWorkingDir;
+    && receipt.targetWorkingDir === journal.targetWorkingDir
+    && targetIdentity !== undefined
+    && receipt.workspaceIdentity.path === targetIdentity.path
+    && receipt.workspaceIdentity.dev === targetIdentity.dev
+    && receipt.workspaceIdentity.ino === targetIdentity.ino;
 }
 
 export type GroupWorkspaceUnbindResult =
@@ -502,11 +515,20 @@ export class GroupWorkspaceOperationCoordinator {
     if (!(await this.hasFence(journal.operationKey, lease))) return { status: 'unknown', journal };
     const fencedCommit = lease && this.dependencies.runFencedEffect
       ? await this.dependencies.runFencedEffect(
-        journal.operationKey, lease, () => this.dependencies.commitGroup(journal, lease?.fencingToken),
+        journal.operationKey, lease, () => this.dependencies.commitGroup(
+          journal,
+          lease?.fencingToken,
+          () => this.hasAuthority(journal).then(authorized => ({ status: authorized ? 'authorized' : 'unauthorized' })),
+        ),
       )
-      : { status: 'applied' as const, value: await this.dependencies.commitGroup(journal, lease?.fencingToken) };
+      : { status: 'applied' as const, value: await this.dependencies.commitGroup(
+        journal,
+        lease?.fencingToken,
+        () => this.hasAuthority(journal).then(authorized => ({ status: authorized ? 'authorized' : 'unauthorized' })),
+      ) };
     if (fencedCommit.status === 'stale_fence') return { status: 'unknown', journal };
     const groupResult = fencedCommit.value;
+    if (groupResult.status === 'unauthorized') return this.markUnauthorized(journal, lease);
     if (groupResult.status === 'unknown') return this.markUnknown(journal);
     await this.dependencies.afterBoundary?.('group_committed_before_convergence');
     if (groupResult.status === 'committed') {

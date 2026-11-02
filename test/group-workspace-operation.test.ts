@@ -127,6 +127,7 @@ function receipt(result: Exclude<GroupCommitResult, { status: 'unknown' }>, patc
     payloadDigest: BASE.payloadDigest,
     chatId: BASE.chatId,
     targetWorkingDir: BASE.targetWorkingDir,
+    workspaceIdentity: BASE.targetWorkspaceIdentity,
     ...patch,
   };
 }
@@ -535,6 +536,22 @@ describe('GroupWorkspaceOperationCoordinator', () => {
     await expect(h.store.get(BASE.operationKey)).resolves.toMatchObject({
       status: 'found', journal: { phase: 'unknown' },
     });
+    expect(h.calls.some(call => call.startsWith('converge:'))).toBe(false);
+  });
+
+  it.each([
+    ['path', { path: '/repo/Y', dev: '1', ino: '2' }],
+    ['device', { path: '/repo/X', dev: '9', ino: '2' }],
+    ['inode', { path: '/repo/X', dev: '1', ino: '9' }],
+  ])('rejects a receipt whose canonical workspace identity differs by %s', async (_field, workspaceIdentity) => {
+    const h = harness();
+    const dependencies = (h.coordinator as any).dependencies;
+    dependencies.afterBoundary = async (boundary: string) => {
+      if (boundary === 'group_committed_before_convergence') {
+        h.receipts.set(BASE.operationKey, receipt({ status: 'committed', resultingRevision: 3 }, { workspaceIdentity }));
+      }
+    };
+    await expect(h.coordinator.execute(REQUEST)).resolves.toMatchObject({ status: 'unknown' });
     expect(h.calls.some(call => call.startsWith('converge:'))).toBe(false);
   });
 
