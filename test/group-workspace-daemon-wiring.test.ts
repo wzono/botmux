@@ -1,6 +1,16 @@
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { DaemonSession } from '../src/core/types.js';
 import { createGroupWorkspaceRouteRuntime } from '../src/core/group-workspace-route-runtime.js';
+import { GroupWorkspaceStore } from '../src/services/group-workspace-store.js';
+import {
+  acquireBotAdminIdentityPublicationLease,
+  botAdminIdentityConfigFingerprint,
+  withBotAdminIdentityPublication,
+} from '../src/services/bot-admin-unions-store.js';
+import { withFileLock } from '../src/utils/file-lock.js';
 import { tryDispatchGroupWorkspaceTextRoute } from '../src/im/lark/event-dispatcher.js';
 import { tryDispatchGroupWorkspaceCardRoute } from '../src/im/lark/card-handler.js';
 import { VerifiedAppTenantRegistry } from '../src/core/workspace-authority.js';
@@ -30,7 +40,7 @@ function liveSession(overrides: Partial<DaemonSession> = {}): DaemonSession {
   } as DaemonSession;
 }
 
-function setup(overrides: { active?: boolean; managers?: typeof ACTOR[]; canOperate?: boolean } = {}) {
+function setup(overrides: { active?: boolean; managers?: typeof ACTOR[]; canOperate?: boolean; now?: () => number } = {}) {
   const ds = liveSession();
   const dispatchRepo = vi.fn(async () => undefined);
   const reply = vi.fn(async () => undefined);
@@ -53,7 +63,7 @@ function setup(overrides: { active?: boolean; managers?: typeof ACTOR[]; canOper
       && overrides.canOperate !== false,
     dispatchRepo,
     reply,
-    now: () => 1_000,
+    now: overrides.now ?? (() => 1_000),
   });
   return { runtime, dispatchRepo, reply, ds };
 }
@@ -93,6 +103,143 @@ describe('production group-workspace route dependency assembly', () => {
     expect(evidence.revalidateUnderLock({ record: undefined, revision: 2, workspaceManagers: [ACTOR] }))
       .toEqual({ status: 'denied' });
   });
+
+  it('keeps freshly resolved admin evidence valid across ordinary no-contention pre-lock overhead', async () => {
+    let now = 1_000;
+    const { runtime } = setup({ now: () => now });
+    const initial = await runtime.resolveAuthority({ chatId: CHAT, senderOpenId: 'ou_b', senderUnionId: ACTOR.unionId,
+      tenantKey: ACTOR.tenantKey, humanProvenance: true });
+    expect(initial).toMatchObject({ status: 'authorized' });
+    const evidence = await runtime.revalidateAuthorityConfiguration({
+      chatId: CHAT, actor: ACTOR, authorityFingerprint: (initial as any).configFingerprint,
+    });
+    expect(evidence.status).toBe('authorized');
+    if (evidence.status !== 'authorized') throw new Error('missing evidence');
+    now += 25;
+    expect(evidence.revalidateUnderLock({ record: undefined, revision: 0, workspaceManagers: [] }))
+      .toEqual({ status: 'authorized' });
+  });
+
+  it('releases the publication lease when workspace revalidation throws', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'group-workspace-workspace-throw-'));
+    const registeredBots = [
+      { larkAppId: APP, tenantKey: ACTOR.tenantKey, resolvedAllowedUsers: ['ou_owner'] },
+    ];
+    const runtime = createGroupWorkspaceRouteRuntime({
+      larkAppId: APP, dataDir, activeSessions: new Map(), sessionKey: (chatId, appId) => `${appId}:${chatId}`,
+      registeredBots: () => registeredBots,
+      resolveAllowedUser: vi.fn(async () => ACTOR), resolveActorUnion: vi.fn(),
+      readWorkspace: vi.fn(async () => { throw new Error('workspace read failed'); }),
+      canSwitchSession: () => true, dispatchRepo: vi.fn(), reply: vi.fn(),
+    });
+    await expect(runtime.revalidateAuthority({
+      chatId: CHAT, actor: ACTOR,
+      authorityFingerprint: botAdminIdentityConfigFingerprint(registeredBots),
+    })).rejects.toThrow('workspace read failed');
+    await expect(withBotAdminIdentityPublication(dataDir, async () => 'released', { maxWaitMs: 100 }))
+      .resolves.toBe('released');
+  });
+
+  it('releases the publication lease when evidence collection throws', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'group-workspace-publication-throw-'));
+    const runtime = createGroupWorkspaceRouteRuntime({
+      larkAppId: APP, dataDir, activeSessions: new Map(), sessionKey: (chatId, appId) => `${appId}:${chatId}`,
+      registeredBots: () => { throw new Error('config publication failed'); },
+      resolveAllowedUser: vi.fn(), resolveActorUnion: vi.fn(), readWorkspace: vi.fn(),
+      canSwitchSession: () => true, dispatchRepo: vi.fn(), reply: vi.fn(),
+    });
+    await expect(runtime.revalidateAuthorityConfiguration({ chatId: CHAT, actor: ACTOR, authorityFingerprint: 'f' }))
+      .rejects.toThrow('config publication failed');
+    await expect(withBotAdminIdentityPublication(dataDir, async () => 'released', { maxWaitMs: 100 }))
+      .resolves.toBe('released');
+  });
+
+  it('propagates publication lease acquisition timeout instead of hanging', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'group-workspace-publication-timeout-'));
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let acquired!: () => void;
+    const ready = new Promise<void>(resolve => { acquired = resolve; });
+    const holder = withBotAdminIdentityPublication(dataDir, async () => { acquired(); await held; });
+    await ready;
+    await expect(acquireBotAdminIdentityPublicationLease(dataDir, { maxWaitMs: 20 }))
+      .rejects.toThrow(/file-lock timeout/);
+    release();
+    await holder;
+  });
+
+  it('serializes cross-daemon admin publication behind a mutation holding the publication lease', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'group-workspace-publication-order-'));
+    const events: string[] = [];
+    let releaseMutation!: () => void;
+    const mutationHeld = new Promise<void>(resolve => { releaseMutation = resolve; });
+    let mutationAcquired!: () => void;
+    const mutationReady = new Promise<void>(resolve => { mutationAcquired = resolve; });
+    const mutation = withBotAdminIdentityPublication(dataDir, async () => {
+      events.push('mutation-start'); mutationAcquired(); await mutationHeld; events.push('mutation-end');
+    });
+    await mutationReady;
+    const publication = withBotAdminIdentityPublication(dataDir, async () => { events.push('publication'); });
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(events).toEqual(['mutation-start']);
+    releaseMutation();
+    await Promise.all([mutation, publication]);
+    expect(events).toEqual(['mutation-start', 'mutation-end', 'publication']);
+  });
+
+  it.each(['expired', 'resolved-membership-changed'] as const)(
+    'fails the final mutation after a lock wait when admin evidence is %s', async change => {
+      const dataDir = mkdtempSync(join(tmpdir(), 'group-workspace-authority-lock-'));
+      let now = 1_000;
+      let resolvedAdmin = ACTOR;
+      const registeredBots = vi.fn(() => [
+        { larkAppId: APP, tenantKey: ACTOR.tenantKey, resolvedAllowedUsers: ['ou_owner'] },
+      ]);
+      const runtime = createGroupWorkspaceRouteRuntime({
+        larkAppId: APP, activeSessions: new Map(), sessionKey: (chatId, appId) => `${appId}:${chatId}`,
+        registeredBots,
+        resolveAllowedUser: vi.fn(async () => resolvedAdmin),
+        resolveActorUnion: vi.fn(async () => ACTOR.unionId),
+        readWorkspace: vi.fn(async () => ({ status: 'available' as const })),
+        canSwitchSession: () => true, dispatchRepo: vi.fn(), reply: vi.fn(), now: () => now,
+      });
+      const initial = await runtime.resolveAuthority({ chatId: CHAT, senderOpenId: 'ou_user',
+        senderUnionId: ACTOR.unionId, tenantKey: ACTOR.tenantKey, humanProvenance: true });
+      expect(initial).toMatchObject({ status: 'authorized' });
+      const authorityFingerprint = (initial as any).configFingerprint as string;
+      const evidence = await runtime.revalidateAuthorityConfiguration({ chatId: CHAT, actor: ACTOR, authorityFingerprint });
+      expect(evidence.status).toBe('authorized');
+      if (evidence.status !== 'authorized') throw new Error('missing evidence');
+
+      const store = new GroupWorkspaceStore(dataDir, { lockTimeoutMs: 1_000 });
+      const sourceEventId = `group-workspace-text-source-v1:sha256:${(change === 'expired' ? 'a' : 'b').repeat(64)}`;
+      const lockPath = join(dataDir, 'group-workspaces.json');
+      let release!: () => void;
+      const held = new Promise<void>(resolve => { release = resolve; });
+      let acquired!: () => void;
+      const acquiredLock = new Promise<void>(resolve => { acquired = resolve; });
+      const holder = withFileLock(lockPath, async () => { acquired(); await held; });
+      await acquiredLock;
+      const mutation = store.mutate({ kind: 'unbind', chatId: CHAT, sourceEventId,
+        expectedRevision: 0, actor: ACTOR, authorized: true, now }, evidence, evidence.revalidateUnderLock);
+      await new Promise(resolve => setTimeout(resolve, 30));
+      if (change === 'expired') now += 10 * 60_000;
+      else {
+        resolvedAdmin = { tenantKey: ACTOR.tenantKey, unionId: 'on_replacement' };
+        await runtime.revalidateAuthorityConfiguration({
+          chatId: CHAT, actor: resolvedAdmin, authorityFingerprint,
+        });
+      }
+      const registrationsBeforeLockRelease = registeredBots.mock.calls.length;
+      release();
+      await holder;
+      await expect(mutation).resolves.toMatchObject({
+        outcome: change === 'expired' ? 'store_unavailable' : 'authorization_revoked',
+      });
+      expect(registeredBots).toHaveBeenCalledTimes(registrationsBeforeLockRelease);
+      await expect(store.read(CHAT)).resolves.toMatchObject({ status: 'available', record: undefined });
+    },
+  );
 
   it('denies a Bot-A group manager who lacks receiving Bot B canOperate with zero handler or fallback', async () => {
     const { runtime, dispatchRepo } = setup({ managers: [ACTOR], canOperate: false });

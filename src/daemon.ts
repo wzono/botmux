@@ -21,6 +21,7 @@ import { OperationExecutorLeaseStore } from './services/operation-executor-lease
 import { probePathUsability, type PathIdentity } from './core/path-usability.js';
 import {
   createGroupWorkspaceSetCoordinator,
+  daemonOwnsGroupWorkspaceRecovery,
   executeGroupWorkspaceUnbind,
 } from './core/group-workspace-operation.js';
 import { DecisionBoardService } from './core/decision-board/service.js';
@@ -33284,6 +33285,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     });
     groupWorkspaceRouteRuntime = createGroupWorkspaceRouteRuntime({
       larkAppId: cfg.larkAppId,
+      dataDir: config.session.dataDir,
       activeSessions,
       sessionKey,
       registeredBots: tenantKey => verifiedAppTenantRegistry.registeredBots(
@@ -33873,7 +33875,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (recoverable.status !== 'available') throw new Error('group workspace operation store unavailable');
       for (const journal of recoverable.journals) {
         let result: { status: string };
-        if (journal.ownerLarkAppId !== undefined && journal.ownerLarkAppId !== cfg.larkAppId) continue;
+        const session = journal.kind === 'set'
+          ? findActiveBySessionId(journal.sessionId) ?? activeSessions.get(journal.sessionId)
+          : undefined;
+        if (!daemonOwnsGroupWorkspaceRecovery(journal, cfg.larkAppId, session)) continue;
         if (journal.kind === 'unbind') {
           result = await executeGroupWorkspaceUnbind({
             sourceEventId: journal.sourceEventId,
@@ -33903,13 +33908,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             executorOwner: groupWorkspaceExecutorOwner,
           });
         } else {
-          const session = findActiveBySessionId(journal.sessionId)
-            ?? activeSessions.get(journal.sessionId);
-          // Migrated ownerless journals are recoverable only by the daemon that
-          // owns their matching durable session. A foreign or absent session is
-          // not evidence that this daemon may terminalize shared legacy state.
-          if (journal.ownerLarkAppId === undefined
-            && (!session || session.larkAppId !== cfg.larkAppId)) continue;
           if ((!session || session.larkAppId !== cfg.larkAppId)
             && journal.phase !== 'group_committed' && journal.phase !== 'unknown') {
             const executor = await groupWorkspaceExecutorLeaseStore.acquire(

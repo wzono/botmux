@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { DaemonSession } from './types.js';
 import type {
   BotAdminIdentityConfig,
@@ -5,10 +6,7 @@ import type {
   ResolveBotAllowedUser,
   TenantHumanId,
 } from '../services/bot-admin-unions-store.js';
-import {
-  botAdminIdentityConfigFingerprint,
-  loadFreshBotAdminUnionSnapshot,
-} from '../services/bot-admin-unions-store.js';
+import { acquireBotAdminIdentityPublicationLease, loadFreshBotAdminUnionSnapshot } from '../services/bot-admin-unions-store.js';
 import type { GroupWorkspaceLockAuthorityContext } from '../services/group-workspace-store.js';
 import { canManageGroupWorkspace, type GroupWorkspaceRouteAuthorityResult, type GroupWorkspaceRouteIntent } from './group-workspace-policy.js';
 import { localeForBot, t } from '../i18n/index.js';
@@ -46,8 +44,16 @@ export type GroupWorkspaceProductionRoute = GroupWorkspaceRouteIntent & {
   actionId?: string;
 };
 
+function resolvedAdminSnapshotFingerprint(snapshot: FreshBotAdminUnionSnapshot): string {
+  const admins = snapshot.admins
+    .map(admin => [admin.tenantKey, admin.unionId] as const)
+    .sort((left, right) => left[0].localeCompare(right[0]) || left[1].localeCompare(right[1]));
+  return createHash('sha256').update(JSON.stringify([snapshot.configFingerprint, admins])).digest('hex');
+}
+
 export function createGroupWorkspaceRouteRuntime(options: {
   larkAppId: string;
+  dataDir?: string;
   activeSessions: Map<string, DaemonSession>;
   sessionKey: (chatId: string, larkAppId: string) => string;
   registeredBots: (tenantKey: string) => readonly BotAdminIdentityConfig[];
@@ -123,27 +129,48 @@ export function createGroupWorkspaceRouteRuntime(options: {
   };
 
   type LockRevalidation = { status: 'authorized' | 'denied' | 'unavailable' };
-  type Revalidation = { status: 'denied' | 'unavailable' } | {
+  type Revalidation = { status: 'denied' | 'unavailable'; releasePublicationLease?: () => Promise<void> } | {
     status: 'authorized';
     revalidateUnderLock: (context: GroupWorkspaceLockAuthorityContext) => LockRevalidation;
+    releasePublicationLease?: () => Promise<void>;
   };
   const revalidateAuthorityConfiguration = async (
     route: Pick<GroupWorkspaceProductionRoute, 'chatId' | 'actor' | 'authorityFingerprint'>,
   ): Promise<Revalidation> => {
-    const registered = options.registeredBots(route.actor.tenantKey);
-    const fresh = await loadFreshBotAdminUnionSnapshot({
-      registeredBots: registered,
-      resolveAllowedUser: options.resolveAllowedUser,
-      now: options.now,
-      ttlMs: 1,
-    });
-    if (!fresh) return { status: 'unavailable' };
-    if (fresh.configFingerprint !== route.authorityFingerprint) return { status: 'denied' };
+    const releasePublicationLease = options.dataDir
+      ? await acquireBotAdminIdentityPublicationLease(options.dataDir)
+      : undefined;
+    let registered: readonly BotAdminIdentityConfig[];
+    let fresh: FreshBotAdminUnionSnapshot | undefined;
+    try {
+      registered = options.registeredBots(route.actor.tenantKey);
+      fresh = await loadFreshBotAdminUnionSnapshot({
+        registeredBots: registered,
+        resolveAllowedUser: options.resolveAllowedUser,
+        now: options.now,
+      });
+    } catch (error) {
+      await releasePublicationLease?.();
+      throw error;
+    }
+    if (!fresh) {
+      await releasePublicationLease?.();
+      return { status: 'unavailable' };
+    }
+    if (fresh.configFingerprint !== route.authorityFingerprint) {
+      await releasePublicationLease?.();
+      return { status: 'denied' };
+    }
+    snapshot = fresh;
+    const resolvedGeneration = resolvedAdminSnapshotFingerprint(fresh);
     return {
       status: 'authorized',
+      ...(releasePublicationLease ? { releasePublicationLease } : {}),
       revalidateUnderLock: context => {
-        const liveFingerprint = botAdminIdentityConfigFingerprint(options.registeredBots(route.actor.tenantKey));
-        if (liveFingerprint !== fresh.configFingerprint) return { status: 'unavailable' };
+        const lockedAt = options.now?.() ?? Date.now();
+        if (!Number.isFinite(lockedAt) || lockedAt >= fresh.expiresAt) return { status: 'unavailable' };
+        const publishedGeneration = snapshot ? resolvedAdminSnapshotFingerprint(snapshot) : undefined;
+        if (publishedGeneration !== resolvedGeneration) return { status: 'denied' };
         return canManageGroupWorkspace({
           actor: route.actor,
           freshSnapshot: fresh,
@@ -158,15 +185,31 @@ export function createGroupWorkspaceRouteRuntime(options: {
   ): Promise<Revalidation> => {
     const configuration = await revalidateAuthorityConfiguration(route);
     if (configuration.status !== 'authorized') return configuration;
-    const workspace = await options.readWorkspace(route.chatId);
-    if (workspace.status !== 'available') return { status: 'unavailable' };
-    const current = configuration.revalidateUnderLock({
-      record: workspace.record as GroupWorkspaceLockAuthorityContext['record'],
-      revision: 0,
-      workspaceManagers: workspace.record?.workspaceManagers ?? [],
-    });
-    if (current.status === 'unavailable') return { status: 'unavailable' };
-    if (current.status === 'denied') return { status: 'denied' };
+    let workspace: WorkspaceAclRead;
+    let current: LockRevalidation;
+    try {
+      workspace = await options.readWorkspace(route.chatId);
+      if (workspace.status !== 'available') {
+        await configuration.releasePublicationLease?.();
+        return { status: 'unavailable' };
+      }
+      current = configuration.revalidateUnderLock({
+        record: workspace.record as GroupWorkspaceLockAuthorityContext['record'],
+        revision: 0,
+        workspaceManagers: workspace.record?.workspaceManagers ?? [],
+      });
+    } catch (error) {
+      await configuration.releasePublicationLease?.();
+      throw error;
+    }
+    if (current.status === 'unavailable') {
+      await configuration.releasePublicationLease?.();
+      return { status: 'unavailable' };
+    }
+    if (current.status === 'denied') {
+      await configuration.releasePublicationLease?.();
+      return { status: 'denied' };
+    }
     return configuration;
   };
 

@@ -15,6 +15,7 @@
 import { createHash } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { withFileLock } from '../utils/file-lock.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { assertWorkspaceWriterFence } from './workspace-schema-migrator.js';
 import { isJsonObject, readJsonFileSoft } from '../utils/json-file.js';
@@ -74,6 +75,49 @@ export interface FreshBotAdminUnionSnapshot {
 
 /** Default authorization snapshot lifetime: five minutes. */
 export const DEFAULT_BOT_ADMIN_UNION_SNAPSHOT_TTL_MS = 5 * 60_000;
+
+/**
+ * Cross-process publication fence. Lock order is always publication → group-store;
+ * admin mutation paths never acquire the group-store lock.
+ */
+export function withBotAdminIdentityPublication<T>(
+  dataDir: string,
+  effect: () => Promise<T>,
+  options: { maxWaitMs?: number } = {},
+): Promise<T> {
+  return withFileLock(join(dataDir, 'bot-admin-identity-publication'), effect, options);
+}
+
+/** Robust split-phase publication lease for evidence collection followed by group mutation. */
+export async function acquireBotAdminIdentityPublicationLease(
+  dataDir: string,
+  options: { maxWaitMs?: number } = {},
+): Promise<() => Promise<void>> {
+  let releaseHeld!: () => void;
+  const held = new Promise<void>(resolve => { releaseHeld = resolve; });
+  let resolveReady!: () => void;
+  let rejectReady!: (error: unknown) => void;
+  const ready = new Promise<void>((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
+  const completion = withBotAdminIdentityPublication(dataDir, async () => {
+    resolveReady();
+    await held;
+  }, options).then(
+    () => ({ ok: true as const }),
+    error => {
+      rejectReady(error);
+      return { ok: false as const, error };
+    },
+  );
+  await ready;
+  let released = false;
+  return async () => {
+    if (released) return;
+    released = true;
+    releaseHeld();
+    const result = await completion;
+    if (!result.ok) throw result.error;
+  };
+}
 
 export type ResolveBotAllowedUser = (
   bot: BotAdminIdentityConfig,
@@ -329,8 +373,10 @@ export function createBotAdminUnionsPublisher(deps: BotAdminUnionsPublisherDeps)
         if (key === publishedKey) return;
         const { snapshot, complete } = await computeBotAdminUnions(
           state.rawAllowedUsers, state.resolution, lookup, Date.now(), state.ownerOpenId);
-        writeBotAdminUnions(deps.dataDir, deps.larkAppId, snapshot);
-        if (complete) publishedKey = key;
+        await withBotAdminIdentityPublication(deps.dataDir, async () => {
+          writeBotAdminUnions(deps.dataDir, deps.larkAppId, snapshot);
+          if (complete) publishedKey = key;
+        });
       } catch (err) {
         deps.onError?.(err);
       } finally {

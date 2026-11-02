@@ -66,6 +66,7 @@ export interface GroupWorkspaceOperationDependencies {
   now(): number;
   revalidateAuthority?(journal: RepoGroupOperationJournal): Promise<GroupWorkspaceAuthorityEvidence & {
     revalidateUnderLock?: (context: GroupWorkspaceLockAuthorityContext) => GroupWorkspaceAuthorityEvidence;
+    releasePublicationLease?: () => Promise<void>;
   }>;
   acquireExecutor?(operationKey: string): Promise<
     | { status: 'acquired'; lease: OperationExecutorLease }
@@ -210,14 +211,19 @@ export function createGroupWorkspaceSetCoordinator(options: {
       const authority = options.revalidateAuthority
         ? await options.revalidateAuthority(journal)
         : { status: 'authorized' as const };
-      const result = await options.groupStore.mutate({
-        kind: 'set', chatId: journal.chatId, sourceEventId: journal.sourceEventId,
-        ...(options.originMessageId ? { originMessageId: options.originMessageId } : {}),
-        requestedWorkingDir: journal.targetWorkingDir!, expectedWorkspaceIdentity: journal.targetWorkspaceIdentity,
-        expectedRevision: journal.expectedGroupRevision,
-        expectedSessionGeneration: journal.expectedSessionGeneration, actor: journal.actor,
-        authorized: true, directoryValid: true, now: options.now(),
-      }, authority, authority.status === 'authorized' ? authority.revalidateUnderLock : undefined);
+      let result: GroupWorkspaceMutationResult;
+      try {
+        result = await options.groupStore.mutate({
+          kind: 'set', chatId: journal.chatId, sourceEventId: journal.sourceEventId,
+          ...(options.originMessageId ? { originMessageId: options.originMessageId } : {}),
+          requestedWorkingDir: journal.targetWorkingDir!, expectedWorkspaceIdentity: journal.targetWorkspaceIdentity,
+          expectedRevision: journal.expectedGroupRevision,
+          expectedSessionGeneration: journal.expectedSessionGeneration, actor: journal.actor,
+          authorized: true, directoryValid: true, now: options.now(),
+        }, authority, authority.status === 'authorized' ? authority.revalidateUnderLock : undefined);
+      } finally {
+        await authority.releasePublicationLease?.();
+      }
       if (result.outcome === 'authorization_revoked') return { status: 'unauthorized' };
       if (result.outcome === 'committed') return { status: 'committed', resultingRevision: result.receipt.resultingRevision! };
       if (result.outcome === 'conflict') return { status: 'conflict', currentRevision: result.receipt.expectedRevision };
@@ -268,10 +274,22 @@ export type GroupWorkspaceUnbindResult =
   | { status: 'group_committed'; groupRevision: number }
   | { status: 'conflict' | 'invalid_dir' | 'unauthorized' | 'store_unavailable' | 'unknown' | 'protocol_conflict' };
 
+/** Deterministic daemon ownership gate for startup recovery of shared journals. */
+export function daemonOwnsGroupWorkspaceRecovery(
+  journal: RepoGroupOperationJournal,
+  daemonLarkAppId: string,
+  durableSession?: { larkAppId: string },
+): boolean {
+  if (journal.ownerLarkAppId !== undefined) return journal.ownerLarkAppId === daemonLarkAppId;
+  if (journal.kind === 'unbind') return false;
+  return durableSession?.larkAppId === daemonLarkAppId;
+}
+
 export interface GroupWorkspaceUnbindDependencies {
   journalStore: GroupWorkspaceOperationStore;
   revalidateAuthority(journal: RepoGroupOperationJournal): Promise<GroupWorkspaceAuthorityEvidence & {
     revalidateUnderLock?: (context: GroupWorkspaceLockAuthorityContext) => GroupWorkspaceAuthorityEvidence;
+    releasePublicationLease?: () => Promise<void>;
   }>;
   readReceipt(operationKey: string): Promise<
     | { status: 'found'; receipt: import('../services/group-workspace-store.js').GroupOperationReceipt }
@@ -370,6 +388,7 @@ export async function executeGroupWorkspaceUnbind(
   if (!receipt) {
     if (journal.phase !== 'session_committed') return { status: 'unknown' };
     const authority = await dependencies.revalidateAuthority(journal);
+    await authority.releasePublicationLease?.();
     if (authority.status === 'unavailable') return { status: 'store_unavailable' };
     if (authority.status === 'denied' || authority.status === 'unauthorized') {
       const denied = await dependencies.journalStore.transition(operationKey, 'unauthorized', {
@@ -389,14 +408,22 @@ export async function executeGroupWorkspaceUnbind(
       ? await dependencies.executorLeaseStore.runFencedEffect(
         operationKey, lease, async () => {
           const commitAuthority = await dependencies.revalidateAuthority(journal);
-          return dependencies.mutate(mutation, commitAuthority,
-            commitAuthority.status === 'authorized' ? commitAuthority.revalidateUnderLock : undefined);
+          try {
+            return await dependencies.mutate(mutation, commitAuthority,
+              commitAuthority.status === 'authorized' ? commitAuthority.revalidateUnderLock : undefined);
+          } finally {
+            await commitAuthority.releasePublicationLease?.();
+          }
         },
       )
       : { status: 'applied' as const, value: await (async () => {
         const commitAuthority = await dependencies.revalidateAuthority(journal);
-        return dependencies.mutate(mutation, commitAuthority,
-          commitAuthority.status === 'authorized' ? commitAuthority.revalidateUnderLock : undefined);
+        try {
+          return await dependencies.mutate(mutation, commitAuthority,
+            commitAuthority.status === 'authorized' ? commitAuthority.revalidateUnderLock : undefined);
+        } finally {
+          await commitAuthority.releasePublicationLease?.();
+        }
       })() };
     if (fenced.status === 'stale_fence') return { status: 'unknown' };
     const result = fenced.value;
@@ -770,8 +797,9 @@ export class GroupWorkspaceOperationCoordinator {
 
   private async authority(journal: RepoGroupOperationJournal): Promise<'authorized' | 'denied' | 'unavailable'> {
     if (!this.dependencies.revalidateAuthority) return 'authorized';
-    const status = (await this.dependencies.revalidateAuthority(journal)).status;
-    return status === 'unauthorized' ? 'denied' : status;
+    const authority = await this.dependencies.revalidateAuthority(journal);
+    await authority.releasePublicationLease?.();
+    return authority.status === 'unauthorized' ? 'denied' : authority.status;
   }
 
   private async quarantineConvergence(

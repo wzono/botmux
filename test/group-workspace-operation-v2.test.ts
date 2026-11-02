@@ -9,6 +9,7 @@ import {
 } from '../src/services/group-workspace-operation-store.js';
 import { OperationExecutorLeaseStore } from '../src/services/operation-executor-lease-store.js';
 import { groupWorkspaceOperationKey } from '../src/services/group-workspace-store.js';
+import { daemonOwnsGroupWorkspaceRecovery } from '../src/core/group-workspace-operation.js';
 
 const identity = { path: '/repo/x', dev: '1', ino: '2' };
 const sourceEventId = 'group-workspace-text-source-v1:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
@@ -19,6 +20,37 @@ const journal: any = { operationKey: groupWorkspaceOperationKey(sourceEventId, '
 const dir = () => mkdtempSync(join(tmpdir(), 'operation-v2-'));
 
 describe('same-source winner and executor lease', () => {
+  it('leaves a shared migrated ownerless unbind untouched when two Bot daemons perform startup recovery', async () => {
+    const dataDir = dir();
+    const store = new GroupWorkspaceOperationStore(dataDir);
+    const { targetWorkingDir: _targetWorkingDir, targetWorkspaceIdentity: _targetWorkspaceIdentity, ...withoutTarget } = journal;
+    const ownerlessUnbind = { ...withoutTarget, operationKey: groupWorkspaceOperationKey(sourceEventId, 'unbind'),
+      kind: 'unbind' as const, ownerLarkAppId: undefined, sessionId: 'group-workspace-unbind',
+      expectedSessionGeneration: 0, target: { kind: 'absent' as const } };
+    await expect(store.prepare(ownerlessUnbind)).resolves.toMatchObject({ status: 'created' });
+    let transitions = 0;
+    let mutations = 0;
+    for (const daemonLarkAppId of ['app-a', 'app-b']) {
+      const recoverable = await store.listRecoverable();
+      if (recoverable.status !== 'available') throw new Error('operation store unavailable');
+      for (const candidate of recoverable.journals) {
+        if (!daemonOwnsGroupWorkspaceRecovery(candidate, daemonLarkAppId)) continue;
+        transitions += 1;
+        mutations += 1;
+      }
+    }
+    expect({ transitions, mutations }).toEqual({ transitions: 0, mutations: 0 });
+    const persisted = await store.get(ownerlessUnbind.operationKey);
+    expect(persisted).toMatchObject({ status: 'found', journal: { phase: 'prepared' } });
+    if (persisted.status !== 'found') throw new Error('journal missing');
+    expect(persisted.journal.ownerLarkAppId).toBeUndefined();
+
+    expect(daemonOwnsGroupWorkspaceRecovery({ ...ownerlessUnbind, ownerLarkAppId: 'app-a' }, 'app-a')).toBe(true);
+    expect(daemonOwnsGroupWorkspaceRecovery({ ...ownerlessUnbind, ownerLarkAppId: 'app-a' }, 'app-b')).toBe(false);
+    expect(daemonOwnsGroupWorkspaceRecovery(journal, 'app-a', { larkAppId: 'app-a' })).toBe(true);
+    expect(daemonOwnsGroupWorkspaceRecovery(journal, 'app-b', { larkAppId: 'app-a' })).toBe(false);
+  });
+
   it('selects ownerless legacy show evidence only for the chat and without superseding a newer owned item', () => {
     const ownerless = { ...journal, operationKey: 'ownerless', ownerLarkAppId: undefined, updatedAt: 3 };
     const current = { ...journal, operationKey: 'current', ownerLarkAppId: 'app-a', updatedAt: 2 };
