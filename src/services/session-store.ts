@@ -837,6 +837,7 @@ function sessionStatusText(value: unknown): string {
 }
 
 let testOnlyBeforeRowPersist: ((sessionId: string) => void) | undefined;
+let testOnlyBeforeQuarantineRepairCas: ((sessionId: string, rawRow: string) => string | undefined) | undefined;
 let testOnlyBeforePrincipalLaneCreateTransaction: (() => void) | undefined;
 let testOnlyBeforePrincipalLaneWorktreeCommit: (() => void) | undefined;
 let testOnlyAfterPrincipalLaneWorktreeCommit: (() => void) | undefined;
@@ -845,6 +846,9 @@ let testOnlyAfterPrincipalLaneWorktreeCommit: (() => void) | undefined;
 export function __testOnly_setBeforeRowPersist(hook: ((sessionId: string) => void) | undefined): void {
   testOnlyBeforeRowPersist = hook;
 }
+export function __testOnly_setBeforeQuarantineRepairCas(
+  hook: ((sessionId: string, rawRow: string) => string | undefined) | undefined,
+): void { testOnlyBeforeQuarantineRepairCas = hook; }
 
 /** Failure/race injection between the authority snapshot and the write
  * transaction. Production code never assigns this hook. */
@@ -1127,12 +1131,19 @@ export function reopenAfterWorkspaceMigration(epoch?: number): void {
   loaded = false;
   loadFailure = undefined;
   sessions = new Map();
+  // Temporarily allow only this exact reopen attempt. If attach/parse fails,
+  // restore the durable quiescence guard before propagating the failure.
+  workspaceMigrationInternalSqlite = true;
+  try {
+    if (sqliteBootstrapAllowed) loadForWrite();
+  } catch (error) {
+    workspaceWriteAdmissionBlocked = true;
+    throw error;
+  } finally {
+    workspaceMigrationInternalSqlite = false;
+  }
   workspaceQuiescedEpoch = undefined;
   workspaceWriteAdmissionBlocked = false;
-  // Force an actual open of the current post-migration SQLite file before the
-  // daemon claims a release ACK. A lazy reopen would acknowledge a file it had
-  // never parsed or attached.
-  if (sqliteBootstrapAllowed) loadForWrite();
 }
 
 export function workspaceSqliteStatus(): WorkspaceSqliteQuiescenceStatus {
@@ -3135,7 +3146,8 @@ export function repairGroupWorkspaceQuarantineExact(input: {
       priorQuarantine: structuredClone(prior),
     };
     delete durable.groupWorkspaceQuarantine;
-    const updated = store.updateExact.run(sessionStatusText(durable), JSON.stringify(durable), input.sessionId, hit.row);
+    const expectedRaw = testOnlyBeforeQuarantineRepairCas?.(input.sessionId, hit.row) ?? hit.row;
+    const updated = store.updateExact.run(sessionStatusText(durable), JSON.stringify(durable), input.sessionId, expectedRaw);
     if (Number(updated.changes) !== 1) return { status: 'conflict' as const };
     sessions.set(input.sessionId, durable);
     return { status: 'repaired' as const, session: structuredClone(durable) };

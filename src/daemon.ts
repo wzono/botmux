@@ -34603,7 +34603,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           publishWorkspaceFenceAck(config.session.dataDir, cfg.larkAppId, {
             ...command, pid: process.pid, processStart, sqlite, at: Date.now(),
           });
-          lastFenceCommand = command;
+          // Consume only a complete transition. A busy writer/checkpoint or a
+          // failed reopen is retried on the next heartbeat for the same command.
+          if ((command.action === 'quiesce' && !sqlite.open && sqlite.writers === 0
+            && sqlite.inflight === 0 && sqlite.checkpointed)
+            || (command.action === 'release' && sqlite.open && sqlite.writers === 0 && sqlite.inflight === 0)) {
+            lastFenceCommand = command;
+          }
         }
       }
       publishWorkspaceFenceHeartbeat(config.session.dataDir, {

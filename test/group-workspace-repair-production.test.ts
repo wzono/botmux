@@ -47,6 +47,31 @@ describe('production group workspace quarantine repair coordinator', () => {
     expect(repaired.groupWorkspaceQuarantine).toBeUndefined();
   });
 
+  it('returns conflict and preserves newer durable row when exact CAS loses', async () => {
+    const repo = join(dataDir, 'repo'); mkdirSync(repo); seed('session', repo);
+    const stat = await import('node:fs').then(fs => fs.statSync(repo, { bigint: true }));
+    const identity = { path: repo, dev: stat.dev.toString(), ino: stat.ino.toString() };
+    sessionStore.__testOnly_setBeforeQuarantineRepairCas((_sessionId, raw) => {
+      // The production UPDATE is exact-CAS on the selected raw row. Return an
+      // obsolete expected value to deterministically model another committed
+      // writer winning between selection and update without violating SQLite's
+      // single-writer transaction rule.
+      return JSON.stringify({ ...JSON.parse(raw), title: 'obsolete-row' });
+    });
+    const result = await coordinateGroupWorkspaceQuarantineRepair({ sessionId: 'session', chatId: 'chat',
+      actor: { tenantKey: 'tenant', unionId: 'on_admin' }, authority: { authorize: () => true },
+      groupStore: { read: async () => ({ status: 'available', record: { chatId: 'chat', revision: 2,
+        directory: { kind: 'bound', workingDir: repo }, workspaceIdentity: identity,
+        updatedAt: 1, updatedBy: { tenantKey: 'tenant', unionId: 'on_admin' } } }) }, operationId: 'repair-race' });
+    expect(result).toEqual({ status: 'conflict' });
+    sessionStore.__testOnly_setBeforeQuarantineRepairCas(undefined);
+    sessionStore.init('cli_repair');
+    const durable = sessionStore.getSessionFresh('session')!;
+    expect(durable.title).toBe('repair');
+    expect(durable.groupWorkspaceQuarantine).toBeDefined();
+    expect(durable.groupWorkspaceRepairReceipt).toBeUndefined();
+  });
+
   it('leaves quarantine durable when fresh authority denies', async () => {
     const repo = join(dataDir, 'repo'); mkdirSync(repo); seed('session', repo);
     const result = await coordinateGroupWorkspaceQuarantineRepair({ sessionId: 'session', chatId: 'chat',
