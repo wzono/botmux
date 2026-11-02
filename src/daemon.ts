@@ -32124,6 +32124,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     getActiveCount,
     prepareRawInputTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
+    dispatchAdmittedBusinessTurn: input => dispatchAdmittedBusinessTurn({
+      ds: input.ds,
+      turnId: input.turnId,
+      payload: input.payload,
+      options: input.options,
+      boundary: centralTurnWorkerBoundary,
+      permitStore: centralTurnPermitStore,
+      ...(input.markAttempting ? { resource: { markAttempting: async () => input.markAttempting!() } } : {}),
+      retireUnproven: async (current, reservedGeneration) => {
+        const generation = current.workerGeneration ?? current.session.workerGeneration ?? 0;
+        if (generation !== reservedGeneration) return undefined;
+        const workerPid = current.worker?.pid ?? current.session.pid ?? null;
+        return await retireWorkerForReplacement(current)
+          ? { retiredGeneration: generation, workerPid }
+          : undefined;
+      },
+    }),
     onTriggerTurnStarted: (ds, title, turnId) => beginNewTurn(ds, title, turnId),
     closeSession(ds: DaemonSession): Promise<boolean> {
       // Route through the dashboard-aware helper so session.exited / session.update

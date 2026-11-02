@@ -1082,6 +1082,16 @@ export interface WorkerPoolCallbacks {
   getActiveCount: () => number;
   /** Prepare trigger-user CLI identity before a delayed raw-input turn. */
   prepareRawInputTurn?: (ds: DaemonSession, turnId: string) => void | Promise<void>;
+  /** Host-owned workspace + typed-permit admission for non-ordinary business
+   * ingress. The callback performs the actual send/fork; callers must not
+   * deliver the payload again after it returns. */
+  dispatchAdmittedBusinessTurn?: (input: {
+    ds: DaemonSession;
+    turnId: string;
+    payload: string | CliTurnPayload;
+    options: { resume: boolean; atMostOnce?: true; trustedCaller?: TrustedCaller };
+    markAttempting?: () => Promise<boolean>;
+  }) => Promise<boolean>;
   /** Connector-owned live card for a handoff whose exact input has started. */
   onTriggerTurnStarted?: (ds: DaemonSession, title: string, turnId: string) => void;
   /** Close a stale session (message withdrawn, etc.). `false` means the
@@ -13071,6 +13081,27 @@ function forgetScheduledTurnCaller(ds: DaemonSession, turnId: string | undefined
 export async function prepareFailedTurnRecoveryIdentity(ds: DaemonSession, turnId: string): Promise<void> {
   if (!callbacks?.prepareRawInputTurn) throw new Error('recovery_identity_preparation_unavailable');
   await callbacks.prepareRawInputTurn(ds, turnId);
+}
+
+export async function dispatchWorkspaceAdmittedBusinessTurn(input: {
+  ds: DaemonSession;
+  turnId: string;
+  payload: string | CliTurnPayload;
+  resume: boolean;
+  trustedCaller?: TrustedCaller;
+  markAttempting(): Promise<boolean>;
+}): Promise<boolean> {
+  if (!callbacks?.dispatchAdmittedBusinessTurn) {
+    throw new Error('recovery_workspace_admission_unavailable');
+  }
+  return callbacks.dispatchAdmittedBusinessTurn({
+    ds: input.ds,
+    turnId: input.turnId,
+    payload: input.payload,
+    options: { resume: input.resume, atMostOnce: true,
+      ...(input.trustedCaller ? { trustedCaller: input.trustedCaller } : {}) },
+    markAttempting: input.markAttempting,
+  });
 }
 
 /** Send one normal (non-raw) worker turn while applying the per-bot Codex App

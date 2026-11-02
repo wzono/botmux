@@ -2,61 +2,13 @@ import { mkdirSync, mkdtempSync, realpathSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import {
-  resolveIngressWorkspace,
-  runWorkspaceIngressAdapter,
-  type WorkspaceIngressOrigin,
-} from '../src/core/session-manager.js';
+import { resolveIngressWorkspace } from '../src/core/session-manager.js';
 import { canonicalTextSourceEventId, GroupWorkspaceStore } from '../src/services/group-workspace-store.js';
 import { composeRowFromActive, composeRowFromClosed } from '../src/core/dashboard-rows.js';
 import { normalizeGroupWorkspaceRouteText } from '../src/im/lark/event-dispatcher.js';
 
-const origins: WorkspaceIngressOrigin[] = [
-  'ordinary_new', 'ordinary_existing', 'listener_realtime', 'listener_polled',
-  'trigger_new', 'trigger_existing', 'dashboard_create', 'dashboard_start',
-  'dashboard_board', 'dashboard_resume', 'scheduler_tick', 'scheduler_manual',
-  'failed_turn_retry', 'failed_turn_fresh',
-];
-
 describe('group workspace ingress adapters', () => {
   afterEach(() => vi.restoreAllMocks());
-
-  it.each(origins)('%s resolves, follows and proves identity before business effects', async origin => {
-    const trace: string[] = [];
-    const result = await runWorkspaceIngressAdapter({
-      origin,
-      resolve: async () => {
-        trace.push('resolve');
-        return { status: 'resolved', workspace: { path: '/repo', dev: '1', ino: '2' }, groupRevision: 7 };
-      },
-      follow: async () => { trace.push('follow'); return true; },
-      prove: async () => { trace.push('prove'); return true; },
-      acquire: async () => { trace.push('lease'); return true; },
-      markAttempting: async () => { trace.push('attempting'); return true; },
-      deliver: async () => { trace.push('deliver'); return true; },
-    });
-    expect(result).toEqual({ status: 'delivered' });
-    expect(trace).toEqual(['resolve', 'follow', 'prove', 'lease', 'attempting', 'deliver']);
-  });
-
-  it.each(origins)('%s fails closed on resolver, follow, or identity failure', async origin => {
-    for (const failed of ['resolve', 'follow', 'prove'] as const) {
-      const effects: string[] = [];
-      const result = await runWorkspaceIngressAdapter({
-        origin,
-        resolve: async () => failed === 'resolve'
-          ? { status: 'store_unavailable', detail: 'locked' }
-          : { status: 'resolved', workspace: { path: '/repo', dev: '1', ino: '2' }, groupRevision: 7 },
-        follow: async () => failed !== 'follow',
-        prove: async () => failed !== 'prove',
-        acquire: async () => { effects.push('lease'); return true; },
-        markAttempting: async () => { effects.push('attempting'); return true; },
-        deliver: async () => { effects.push('deliver'); return true; },
-      });
-      expect(result.status).toBe('rejected');
-      expect(effects).toEqual([]);
-    }
-  });
 
   it('normalizes leading @Bot /repo exactly like the generic command route', () => {
     const message = {

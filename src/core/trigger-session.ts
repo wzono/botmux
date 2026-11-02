@@ -240,8 +240,9 @@ async function resolveTriggerWorkspace(larkAppId: string, chatId: string): Promi
   const bot = getBot(larkAppId);
   const oncall = oncallStore.getOncallStatus(larkAppId, chatId);
   const botDefaultWorkingDir = effectiveDefaultWorkingDir(bot.config) ?? bot.config.workingDir ?? '~';
+  const chatType = isHttpVirtualSession(chatId) ? 'p2p' : (await getChatMode(larkAppId, chatId)) === 'p2p' ? 'p2p' : 'group';
   const resolution = await resolveIngressWorkspace({
-    larkAppId, chatId, chatType: 'group', dataDir: config.session.dataDir,
+    larkAppId, chatId, chatType, dataDir: config.session.dataDir,
     oncall, botDefaultWorkingDir,
   });
   if (resolution.status !== 'resolved') {

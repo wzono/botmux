@@ -51,6 +51,14 @@ beforeEach(() => {
   vi.spyOn(pool, 'forkWorker').mockImplementation((_target, _input, _resume, options) => {
     order.push('fork'); options?.onAdmission?.('accepted'); return true;
   });
+  vi.spyOn(pool, 'dispatchWorkspaceAdmittedBusinessTurn').mockImplementation(async input => {
+    order.push('admit');
+    if (!await input.markAttempting()) return false;
+    return input.ds.worker && !input.ds.worker.killed
+      ? pool.sendWorkerInput(input.ds, input.payload, input.turnId, { trustedCaller: input.trustedCaller, atMostOnce: true })
+      : pool.forkWorker(input.ds, input.payload, { resume: input.resume, turnId: input.turnId,
+          trustedCaller: input.trustedCaller, atMostOnce: true }, { onAdmission: () => undefined });
+  });
   vi.spyOn(permissions, 'canTalk').mockReturnValue(true);
   vi.spyOn(pool, 'prepareFailedTurnRecoveryIdentity').mockResolvedValue(undefined);
   vi.spyOn(manager, 'rememberLastCliInput').mockImplementation(() => undefined);
@@ -73,7 +81,7 @@ describe('controlled failed-turn recovery', () => {
   });
   it('rebuilds a clean native conversation in the original topic with fresh prompt context', async () => {
     ds.session.cliSessionId = 'poisoned-native';
-    Object.assign(ds.session, { workingDir: '/tmp/stale', workingDirSource: 'group', groupWorkspaceRevision: 9 });
+    Object.assign(ds.session, { workingDir: '/tmp/work', workingDirSource: 'explicit' });
     ds.workingDir = '/tmp/work';
     const result = await recoverFailedTurn('old', { ...request, mode: 'fresh' });
     expect(result).toMatchObject({ ok: true, state: 'accepted', sessionId: 'new' });
@@ -84,7 +92,7 @@ describe('controlled failed-turn recovery', () => {
     expect(target.session.ownerOpenId).toBe('ou_owner_b');
     expect(target.session.failedTurnRecovery?.caller.requestUserOpenId).toBe('ou_user_a');
     expect(target.session).toMatchObject({
-      workingDir: '/tmp/work', workingDirSource: 'group', groupWorkspaceRevision: 9,
+      workingDir: '/tmp/work', workingDirSource: 'explicit',
     });
     expect(pool.forkWorker).toHaveBeenCalledWith(target, { content: 'new:original task' }, expect.objectContaining({ resume: false, atMostOnce: true }), expect.anything());
     expect(order.indexOf('persist')).toBeLessThan(order.indexOf('close'));

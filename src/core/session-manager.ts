@@ -21,7 +21,7 @@ import { scheduledWorkingDirSwapReason, updateRuntimeTaskState } from './schedul
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart, dispatchWorkspaceAdmittedBusinessTurn } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
@@ -135,14 +135,6 @@ type RefreshCliVersion = (
   botConfig: Pick<BotConfig, 'cliId' | 'cliRuntime' | 'cliPathOverride'>,
 ) => boolean;
 
-export type WorkspaceIngressOrigin =
-  | 'ordinary_new' | 'ordinary_existing'
-  | 'listener_realtime' | 'listener_polled'
-  | 'trigger_new' | 'trigger_existing'
-  | 'dashboard_create' | 'dashboard_start' | 'dashboard_board' | 'dashboard_resume'
-  | 'scheduler_tick' | 'scheduler_manual'
-  | 'failed_turn_retry' | 'failed_turn_fresh';
-
 export type IngressWorkspaceResolution =
   | { status: 'resolved'; workspace: WorkspaceIdentity; mutation: SessionWorkingDirMutation; groupRevision?: number }
   | { status: 'unbound' }
@@ -187,7 +179,13 @@ export async function resolveIngressWorkspace(input: {
   const proof = probePathUsability(resolution.workingDir,
     resolution.source === 'group' && resolution.groupWorkspaceDirectoryIdentity
       ? { expectedIdentity: resolution.groupWorkspaceDirectoryIdentity } : undefined);
-  if (!proof.ok) return { status: proof.reason === 'inaccessible' ? 'inaccessible' : 'invalid_dir', detail: resolution.workingDir };
+  if (!proof.ok) {
+    // An invalid optional Bot default still means "pick a repository". A bound
+    // group/oncall/explicit target is authoritative and therefore fails closed.
+    if (resolution.source === 'bot-default') return { status: 'unbound' };
+    if (proof.reason === 'changed') return { status: 'identity_changed', detail: resolution.workingDir };
+    return { status: proof.reason === 'inaccessible' ? 'inaccessible' : 'invalid_dir', detail: resolution.workingDir };
+  }
   const workspace = { path: proof.normalizedPath, ...proof.identity };
   const mutation: SessionWorkingDirMutation = resolution.source === 'group'
     ? { workingDir: workspace.path, source: 'group', groupWorkspaceRevision: resolution.groupWorkspaceRevision!,
@@ -195,27 +193,6 @@ export async function resolveIngressWorkspace(input: {
     : { workingDir: workspace.path, source: resolution.source };
   return { status: 'resolved', workspace, mutation,
     ...(resolution.groupWorkspaceRevision === undefined ? {} : { groupRevision: resolution.groupWorkspaceRevision }) };
-}
-
-/** Behavior-level adapter contract shared by real ingress owners. It centralizes
- * the invariant ordering while callers retain their existing delivery mechanics. */
-export async function runWorkspaceIngressAdapter(input: {
-  origin: WorkspaceIngressOrigin;
-  resolve(): Promise<Omit<IngressWorkspaceResolution & { status: 'resolved' }, 'mutation'> | Exclude<IngressWorkspaceResolution, { status: 'resolved' }>>;
-  follow(resolution: { workspace: WorkspaceIdentity; groupRevision?: number }): Promise<boolean>;
-  prove(resolution: { workspace: WorkspaceIdentity; groupRevision?: number }): Promise<boolean>;
-  acquire(): Promise<boolean>;
-  markAttempting(): Promise<boolean>;
-  deliver(): Promise<boolean>;
-}): Promise<{ status: 'delivered' } | { status: 'rejected'; reason: string }> {
-  const resolution = await input.resolve();
-  if (resolution.status !== 'resolved') return { status: 'rejected', reason: resolution.status };
-  if (!await input.follow(resolution)) return { status: 'rejected', reason: 'follow_failed' };
-  if (!await input.prove(resolution)) return { status: 'rejected', reason: 'identity_changed' };
-  if (!await input.acquire()) return { status: 'rejected', reason: 'lease_refused' };
-  if (!await input.markAttempting()) return { status: 'rejected', reason: 'attempting_refused' };
-  if (!await input.deliver()) return { status: 'rejected', reason: 'delivery_refused' };
-  return { status: 'delivered' };
 }
 
 function sessionCreatedAtMs(session: { createdAt?: string }): number {
@@ -5004,12 +4981,14 @@ export async function executeScheduledTask(
             // this is the steady-state path for a recurring task (first fire
             // creates the session, every later fire injects into it), so the
             // failure shape would be "worked once, silently identity-less after".
-            if (sendWorkerInput(
-              existing,
-              input,
-              scheduledTurnId,
-              scheduledTrustedCaller ? { trustedCaller: scheduledTrustedCaller } : {},
-            )) {
+            if (await dispatchWorkspaceAdmittedBusinessTurn({
+              ds: existing,
+              turnId: scheduledTurnId,
+              payload: input,
+              resume: existing.hasHistory,
+              ...(scheduledTrustedCaller ? { trustedCaller: scheduledTrustedCaller } : {}),
+              markAttempting: async () => true,
+            })) {
               logger.info(`[scheduler] Task "${task.name}" injected into live session ${existing.session.sessionId}${silent ? ' (silent)' : ''}`);
               return;
             }
@@ -5682,6 +5661,12 @@ export async function spawnDashboardSession(
   }
 
   refreshCliVersion?.(bot.config);
+  // Resolve before any visible banner/image side effect. A broken group binding
+  // is a failed business ingress, not permission to announce work that cannot run.
+  const initialWorkspace = await resolveDashboardWorkspace(larkAppId, chatId);
+  if (initialWorkspace.status !== 'resolved' && initialWorkspace.status !== 'unbound') {
+    return { ok: false, error: `workspace_${initialWorkspace.status}` };
+  }
 
   // 可见任务横幅：只由 creator/lead 那次 spawn 发一条，给群成员交代这群是干嘛的。
   // 纯文本、不 @ 任何 bot，不会误触发其它 bot。rootMessageId 存它仅为留痕（chat-scope
@@ -5747,11 +5732,7 @@ export async function spawnDashboardSession(
       session.kanbanColumn = 'backlog';
     }
 
-    const workingDirResolution = await resolveDashboardWorkspace(larkAppId, chatId);
-    if (workingDirResolution.status !== 'resolved' && workingDirResolution.status !== 'unbound') {
-      sessionStore.closeSession(session.sessionId);
-      return { error: `workspace_${workingDirResolution.status}` };
-    }
+    const workingDirResolution = initialWorkspace;
     const workingDir = workingDirResolution.status === 'resolved'
       ? workingDirResolution.workspace.path : undefined;
     if (workingDirResolution.status === 'resolved') {

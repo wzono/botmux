@@ -14,8 +14,9 @@ import { localeForBot } from '../i18n/index.js';
 import { inheritSessionLaunchConfiguration } from './session-launch-inheritance.js';
 import { armSilentScheduledTurn, disarmSilentScheduledTurn, isSilentScheduledTurn } from './silent-schedule-turns.js';
 import {
-  findActiveBySessionId, closeSessionForBackgroundCleanup, forkWorker, sendWorkerInput,
+  findActiveBySessionId, closeSessionForBackgroundCleanup,
   getActiveSessionsRegistry, setActiveSessionIfActive, prepareFailedTurnRecoveryIdentity,
+  dispatchWorkspaceAdmittedBusinessTurn,
 } from './worker-pool.js';
 
 export interface FailedTurnRecoveryRequest {
@@ -188,7 +189,9 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
         ds.session.lastFailedTurn = record;
         store.updateSession(ds.session);
       };
-      // Throws before close/IPC when persistence is unavailable.
+      // Persist the claim before fresh teardown. This is not business
+      // `attempting`; the admitted callback below persists that state again only
+      // after workspace proof and a typed permit, immediately before IPC.
       persistRecord();
       const setState = (state: NonNullable<FailedTurnRecord['recovery']>['state']) => {
         record.recovery!.state = state;
@@ -263,20 +266,24 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
             ...(codexAppInput.localImages ? { localImages: structuredClone(codexAppInput.localImages) } : {}) };
         }
         store.updateSession(target.session);
-        persistRecord();
         await prepareFailedTurnRecoveryIdentity(target, turnId);
         if (record.silent) armSilentScheduledTurn(target, turnId);
         // Synchronous final check + worker admission is the linearization edge.
         if (transaction.cancelled) { abandonUndispatched(); return setState('cancelled'); }
-        let rejected = false;
-        ipcAttempted = true;
-        const accepted = target.worker && !target.worker.killed
-          ? sendWorkerInput(target, input, turnId, { trustedCaller: recoveredCaller, atMostOnce: true })
-          : forkWorker(target, input, { resume: request.mode === 'retry' && target.hasHistory,
-            turnId, trustedCaller: recoveredCaller, atMostOnce: true }, {
-            onAdmission: admission => { rejected = admission === 'rejected'; },
-          });
-        if (!accepted || rejected) return setState('dispatch_unknown');
+        const accepted = await dispatchWorkspaceAdmittedBusinessTurn({
+          ds: target,
+          turnId,
+          payload: input,
+          resume: request.mode === 'retry' && target.hasHistory,
+          trustedCaller: recoveredCaller,
+          markAttempting: async () => {
+            if (transaction.cancelled) return false;
+            persistRecord();
+            ipcAttempted = true;
+            return true;
+          },
+        });
+        if (!accepted) return setState(ipcAttempted ? 'dispatch_unknown' : 'cancelled');
         rememberLastCliInput(target, record.userPrompt, input);
         store.updateSession(target.session);
         return setState('accepted');
