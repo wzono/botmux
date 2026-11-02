@@ -5118,7 +5118,12 @@ export async function executeScheduledTask(
     rememberLastCliInput(ds, task.prompt, prompt);
     if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
     try {
-      forkWorker(ds, prompt, scheduledTurnId);
+      const accepted = await dispatchWorkspaceAdmittedBusinessTurn({
+        ds, turnId: scheduledTurnId, payload: prompt, resume: false,
+        ...(scheduledTrustedCaller ? { trustedCaller: scheduledTrustedCaller } : {}),
+        markAttempting: async () => true,
+      });
+      if (!accepted) throw new Error(`scheduled task ${task.id} workspace admission rejected`);
     } catch (err) {
       if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
       await releaseStartRefusedForMissingDir(ds, err);
@@ -5571,7 +5576,13 @@ async function forkOrShowRepoCard(
   ensureSessionWhiteboard(ds);
   const prompt = buildPrompt();
   rememberLastCliInput(ds, userContent, prompt);
-  forkWorker(ds, prompt);
+  const turnId = ds.currentReplyTarget?.turnId ?? ds.session.rootMessageId;
+  const accepted = await dispatchWorkspaceAdmittedBusinessTurn({
+    ds, turnId, payload: prompt, resume: false,
+    ...(ds.pendingTrustedCaller ? { trustedCaller: ds.pendingTrustedCaller } : {}),
+    markAttempting: async () => true,
+  });
+  if (!accepted) throw new Error('dashboard opening workspace admission rejected');
   // forkWorker pre-accept is synchronous. Keep the reservation and all input
   // buffers intact if it throws; only expose the normal worker state after it
   // has accepted the first turn.
@@ -5973,11 +5984,16 @@ export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: bo
     try {
       const exactRetry = ds.session.queuedActivationInput;
       if (exactRetry) {
-        forkWorker(ds, exactRetry, {
+        const retryTurnId = ds.session.queuedActivationTurnId ?? ds.session.rootMessageId;
+        const accepted = await dispatchWorkspaceAdmittedBusinessTurn({
+          ds, turnId: retryTurnId, payload: exactRetry,
           resume: ds.session.queuedActivationResume ?? ds.hasHistory,
-          turnId: ds.session.queuedActivationTurnId,
-          dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
+          ...(ds.session.queuedActivationDispatchAttempt === undefined ? {} : {
+            dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
+          }),
+          markAttempting: async () => true,
         });
+        if (!accepted) throw new Error('queued activation workspace admission rejected');
         outcome = 'forked';
       } else {
         outcome = await forkOrShowRepoCard(ds, content);
