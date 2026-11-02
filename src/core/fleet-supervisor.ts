@@ -12,7 +12,13 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { closeSync, mkdirSync } from 'node:fs';
+import {
+  WorkspaceMigrationSupervisorFence,
+  workspaceRestartBlocked,
+  type WorkspaceRestartBlockLease,
+} from './workspace-migration-supervisor.js';
+import { WorkspaceSchemaMigrator } from '../services/workspace-schema-migrator.js';
+import { closeSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { openRotatedAppendLog } from '../utils/log-rotate.js';
 import { isStandaloneBinary, resolveEntrySpawn, type BotmuxEntry } from './self-spawn.js';
@@ -159,6 +165,10 @@ export class FleetSupervisor {
    *  Returns false — having touched nothing — when fleet-state names ANOTHER
    *  live, identity-verified supervisor: that one owns the fleet. */
   start(bots: readonly FleetBotSpec[]): boolean {
+    if (workspaceRestartBlocked(this.opts.daemonEnv.SESSION_DATA_DIR ?? this.opts.cwd)) {
+      this.log('workspace migration restart block is held; refusing fleet start');
+      return false;
+    }
     const identityRuntime = this.opts.processIdentityRuntime ?? fleetProcessIdentityRuntime;
     const owner = this.claimFleetOwnership(identityRuntime);
     if (owner !== undefined) {
@@ -331,7 +341,7 @@ export class FleetSupervisor {
    *  Registers the spec so a later exit is handled with the right identity, and
    *  clears any explicit-stop mark (an explicit start overrides a prior stop). */
   startOneBot(spec: FleetBotSpec): void {
-    if (this.stopping) return;
+    if (this.stopping || workspaceRestartBlocked(this.opts.daemonEnv.SESSION_DATA_DIR ?? this.opts.cwd)) return;
     this.knownSpecs.set(spec.name, spec);
     this.explicitStop.delete(spec.name);
     // Cancel any pending crash-restart timer FIRST (mirrors stopOneBot). A bot
@@ -408,6 +418,36 @@ export class FleetSupervisor {
   /** Drain + execute queued single-bot commands (SIGHUP handler). Each command is
    *  resolved to a spec (queue carries name/appId/botIndex, so no config re-read
    *  is required) and applied via startOneBot/stopOneBot. */
+  /** Host migration entrypoint. The supervisor owns the restart-block lease,
+   * addresses the exact active daemon generations, and releases only after the
+   * coordinator returns a completed durable epoch. */
+  async migrateWorkspaceSchema(options: { timeoutMs?: number } = {}): Promise<{ epoch: number }> {
+    const dataDir = this.opts.daemonEnv.SESSION_DATA_DIR ?? this.opts.cwd;
+    const state = readFleetState(this.opts.statePath);
+    const active: WorkspaceRestartBlockLease['targets'] = (state?.procs ?? [])
+      .filter(proc => proc.status === 'online' && proc.pid > 1 && proc.appId && proc.processStart)
+      .map(proc => ({ larkAppId: proc.appId, pid: proc.pid, processStart: proc.processStart!, generation: proc.generation }));
+    const currentEpoch = (() => {
+      try { return JSON.parse(readFileSync(join(dataDir, 'workspace-migration-manifest.json'), 'utf8')).epoch as number; }
+      catch { return 0; }
+    })();
+    const gate = new WorkspaceMigrationSupervisorFence(dataDir);
+    const proof = await gate.acquire(currentEpoch + 1, active, {
+      timeoutMs: options.timeoutMs,
+      signal: pid => { try { process.kill(pid, 'SIGUSR2'); } catch { /* ACK timeout fails closed */ } },
+    });
+    try {
+      const result = await new WorkspaceSchemaMigrator(dataDir, {
+        ownerId: `supervisor:${process.pid}:${proof.lease.leaseId}`,
+        supervisorProofToken: proof.proofToken,
+      }).migrateOrRecover();
+      if (result.status !== 'complete') throw new Error('workspace migration did not complete');
+      return { epoch: result.epoch };
+    } finally {
+      await gate.release(proof.proofToken);
+    }
+  }
+
   async drainCommands(commands: readonly FleetCommand[]): Promise<void> {
     for (const cmd of commands) {
       // PREFER THE KNOWN SPEC over the command payload. The queue carries only
@@ -428,7 +468,7 @@ export class FleetSupervisor {
   }
 
   private spawnBot(spec: FleetBotSpec, isRestart: boolean): void {
-    if (this.stopping) return;
+    if (this.stopping || workspaceRestartBlocked(this.opts.daemonEnv.SESSION_DATA_DIR ?? this.opts.cwd)) return;
     const entry = spec.entry ?? 'daemon';
     // An external member (a plugin service) runs an arbitrary command instead of
     // one of our entry modules. Everything BELOW this point — logs, state,
@@ -492,7 +532,12 @@ export class FleetSupervisor {
       childEnv = { ...this.opts.daemonEnv, ...(spec.external.env ?? {}) };
       scrubExternalMemberEnv(childEnv);
     } else if (entry === 'daemon') {
-      childEnv = { ...this.opts.daemonEnv, BOTMUX_BOT_INDEX: String(spec.botIndex) };
+      const priorGeneration = readFleetState(this.opts.statePath)?.procs.find(proc => proc.name === spec.name)?.generation ?? 0;
+      childEnv = {
+        ...this.opts.daemonEnv,
+        BOTMUX_BOT_INDEX: String(spec.botIndex),
+        BOTMUX_FLEET_GENERATION: String(priorGeneration + 1),
+      };
     } else {
       childEnv = { ...this.opts.daemonEnv };
     }

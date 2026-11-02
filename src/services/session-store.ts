@@ -1070,6 +1070,38 @@ function remoteOwnersEqual(left: RemoteDurableOwner, right: RemoteDurableOwner):
  * imports the SQLite store. Only the owning daemon may create the on-disk
  * engine.
  */
+export interface WorkspaceSqliteQuiescenceStatus {
+  open: boolean;
+  writers: number;
+  inflight: number;
+  checkpointed: boolean;
+}
+
+/** Close the owning SQLite connection for a host migration. JavaScript writes
+ * are synchronous, so reaching this function means no transaction callback is
+ * in flight; WAL checkpoint must report no busy writer before close. */
+export function quiesceForWorkspaceMigration(): WorkspaceSqliteQuiescenceStatus {
+  if (!ownStore) return { open: false, writers: 0, inflight: 0, checkpointed: true };
+  const checkpoint = ownStore.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as { busy?: number | bigint } | undefined;
+  if (Number(checkpoint?.busy ?? 0) !== 0) return { open: true, writers: 1, inflight: 1, checkpointed: false };
+  ownStore.db.close();
+  ownStore = undefined;
+  loaded = false;
+  return { open: false, writers: 0, inflight: 0, checkpointed: true };
+}
+
+/** Reopen lazily from the current SQLite file after the supervisor releases the
+ * migration block; no stale connection or WAL handle is retained. */
+export function reopenAfterWorkspaceMigration(): void {
+  loaded = false;
+  loadFailure = undefined;
+  sessions = new Map();
+}
+
+export function workspaceSqliteStatus(): WorkspaceSqliteQuiescenceStatus {
+  return { open: !!ownStore, writers: 0, inflight: 0, checkpointed: !ownStore };
+}
+
 export function init(appId: string, opts: {
   owner?: boolean;
   occupancy?: OccupancyHolder;

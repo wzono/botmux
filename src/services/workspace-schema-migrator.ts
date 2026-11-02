@@ -59,7 +59,7 @@ export interface WorkspaceMigrationManifest {
   stores: Record<string, WorkspaceMigrationStoreEntry>;
   createdAt: number;
   updatedAt: number;
-  fleetQuiescence?: { provenAt: number; restartBlocked: boolean };
+  fleetQuiescence?: { provenAt: number; restartBlocked: boolean; supervisorProofToken?: string };
 }
 
 export interface WorkspaceWriterFence {
@@ -424,6 +424,10 @@ export interface WorkspaceSchemaMigratorOptions {
   requiredStores?: WorkspaceMigrationStoreKind[];
   transform?: (kind: WorkspaceMigrationStoreKind, source: string, staged: string) => Promise<void> | void;
   crashProbe?: (point: string, manifest: Readonly<WorkspaceMigrationManifest>) => void;
+  /** Durable token issued by the live supervisor after exact-generation daemon
+   * quiescence. Required by the production supervisor path; tests may exercise
+   * the offline migrator without one. */
+  supervisorProofToken?: string;
 }
 
 export class WorkspaceSchemaMigrator {
@@ -463,6 +467,11 @@ export class WorkspaceSchemaMigrator {
       stores: Object.create(null) as Record<string, WorkspaceMigrationStoreEntry>,
       createdAt: now,
       updatedAt: now,
+      ...(this.options.supervisorProofToken ? { fleetQuiescence: {
+        provenAt: now,
+        restartBlocked: true,
+        supervisorProofToken: this.options.supervisorProofToken,
+      } } : {}),
     };
     // Publish the enforceable host fence before discovery, checkpoint, checksum,
     // or copying. Every current/future production writer consults this manifest.

@@ -133,6 +133,28 @@ describe('host-wide workspace schema migration', () => {
     expect(readWorkspaceMigrationManifest(root)!.writer.fencingToken).toBe(2);
   });
 
+  it.each([
+    'group_json', 'operation_json', 'session_sqlite', 'admin_snapshot',
+  ] as const)('rejects stale and missing epoch writers for %s while another process owns the fence', async kind => {
+    const root = dataDir();
+    if (kind === 'group_json') writeFileSync(join(root, 'group-workspaces.json'), JSON.stringify({ schemaVersion: 2, records: {}, receipts: {} }));
+    if (kind === 'operation_json') writeFileSync(join(root, 'group-workspace-operations.json'), JSON.stringify({ schemaVersion: 2, operations: {}, sourceIndex: {} }));
+    if (kind === 'session_sqlite') {
+      const path = join(root, 'session-stores', 'cli_a', 'sessions.db');
+      mkdirSync(join(root, 'session-stores', 'cli_a'), { recursive: true });
+      const db = openDatabaseSyncOrThrow(path); db.exec('CREATE TABLE sessions(session_id TEXT PRIMARY KEY,status TEXT,row TEXT)'); db.close();
+    }
+    if (kind === 'admin_snapshot') {
+      mkdirSync(join(root, 'bot-admin-unions'), { recursive: true });
+      writeFileSync(join(root, 'bot-admin-unions', 'cli_a.json'), '{}');
+    }
+    await new WorkspaceSchemaMigrator(root, { ownerId: 'process-a', requiredStores: [kind] })
+      .migrateOrRecover({ stopAfter: 'prepared' });
+    expect(() => assertWorkspaceWriterFence(root)).toThrow('active');
+    expect(() => assertWorkspaceWriterFence(root, { epoch: 0, fencingToken: 0 })).toThrow('stale');
+    expect(() => assertWorkspaceWriterFence(root, { epoch: 1, fencingToken: 1 })).not.toThrow();
+  });
+
   it('exports separate downgrade copies without mutating v2 data, sessions, or manifest', async () => {
     const root = dataDir();
     writeFileSync(join(root, 'group-workspaces.json'), JSON.stringify({ schemaVersion: 2, records: {}, receipts: { retained: true } }));
