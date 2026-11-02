@@ -1255,9 +1255,15 @@ export function initWorkerPool(cb: WorkerPoolCallbacks): void {
 /** Embedded IPC/test seam; production normally supplies this in initWorkerPool. */
 export function setWorkspaceAdmittedBusinessTurnDispatcher(
   dispatcher: WorkerPoolCallbacks['dispatchAdmittedBusinessTurn'] | undefined,
-): void {
+): () => void {
+  const previousEmbedded = embeddedWorkspaceDispatcher;
+  const previousCallback = callbacks?.dispatchAdmittedBusinessTurn;
   embeddedWorkspaceDispatcher = dispatcher;
   if (callbacks) callbacks.dispatchAdmittedBusinessTurn = dispatcher;
+  return () => {
+    embeddedWorkspaceDispatcher = previousEmbedded;
+    if (callbacks) callbacks.dispatchAdmittedBusinessTurn = previousCallback;
+  };
 }
 
 function requireCallbacks(): WorkerPoolCallbacks {

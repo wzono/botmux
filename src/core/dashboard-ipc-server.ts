@@ -10903,9 +10903,9 @@ export function startIpcServer(opts: {
    * the trusted-host HMAC — this does NOT disable auth wholesale (codex P1). */
   coreOnlyPublicRoutes?: boolean;
 }): Promise<IpcServerHandle> {
-  if (opts.dispatchAdmittedBusinessTurn) {
-    setWorkspaceAdmittedBusinessTurnDispatcher(opts.dispatchAdmittedBusinessTurn);
-  }
+  const restoreWorkspaceDispatcher = opts.dispatchAdmittedBusinessTurn
+    ? setWorkspaceAdmittedBusinessTurnDispatcher(opts.dispatchAdmittedBusinessTurn)
+    : undefined;
   let boundPort = opts.port;
   const server: Server = createServer(async (req, res) => {
     try {
@@ -10981,7 +10981,10 @@ export function startIpcServer(opts: {
     });
     return {
     port,
-    close: () => new Promise<void>(r => server.close(() => r())),
+    close: () => new Promise<void>(r => server.close(() => {
+      restoreWorkspaceDispatcher?.();
+      r();
+    })),
   };
   });
 }
