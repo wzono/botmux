@@ -3286,7 +3286,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   const detachedScheduled = backgroundInput ? resolveRegisteredBackgroundContext(backgroundInput) : null;
   const targetLarkAppId = ds?.larkAppId ?? detachedScheduled?.larkAppId;
   const targetChatId = ds?.chatId ?? detachedScheduled?.chatId;
-  let botConfig: { larkToolBinding?: boolean } | undefined;
+  let botConfig: { larkToolBinding?: boolean; apiOnly?: boolean } | undefined;
   try { botConfig = targetLarkAppId ? getBot(targetLarkAppId).config : undefined; } catch { /* bot missing */ }
   if ((!ds && !detachedScheduled)
     || (ds && ds.session.status !== 'active')
