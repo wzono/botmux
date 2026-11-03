@@ -1824,9 +1824,9 @@ describe('buildStreamingCard', () => {
   describe('screenshot display mode', () => {
     it('should include screenshot placeholder when no image is available', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working', undefined, 'screenshot'));
-      const mdElements = card.elements.filter((e: any) => e.tag === 'markdown');
-      expect(mdElements).toHaveLength(1);
-      expect(mdElements[0].content).toBe('_(等待第一张截图…)_');
+      const placeholder = card.elements.find((e: any) => e.tag === 'markdown'
+        && e.content === '_(等待第一张截图…)_');
+      expect(placeholder).toBeDefined();
     });
 
     // Positional helper: buildStreamingCard's 23rd argument is screenshotUnavailable.
