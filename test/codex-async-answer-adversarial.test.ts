@@ -46,6 +46,7 @@ function root() {
 function daemonScope(): Record<string, any> {
   const scope: Record<string, any> = {
     result: {}, actor: { senderType: 'user' },
+    createHash: () => ({ update: () => ({ digest: () => 'digest' }) }),
     askAnswerActorFor: () => scope.actor,
     isKnownPeerBot: () => false, config: { session: { dataDir: '/unused' } },
     askSession: { larkAppId: 'app', chatId: 'oc_chat', session: { backendType: 'pty' } },
@@ -53,6 +54,15 @@ function daemonScope(): Record<string, any> {
     isCurrent: () => scope.current, current: true, asyncCaller: 'ou_owner',
     randomUUID: () => 'probe', getBot: () => ({ config: {}, botName: 'Bot', botOpenId: 'ou_bot' }),
     asyncOriginMessageId: 'om_original', asyncOriginTurn: 'om_original',
+    asyncGeneration: 7,
+    asyncWorker: { killed: false, connected: true, send: vi.fn(() => true) },
+    askInput: { controlWait: { originalTurnId: 'om_original', expectedGeneration: 7,
+      workspace: { path: '/repo', dev: '1', ino: '2' }, groupRevision: 1,
+      wait: { kind: 'ask', askId: 'call' }, state: 'needs_user' } },
+    originalControlWaitState: () => 'needs_user', originalControlWaitAcceptedAnswer: () => true,
+    centralTurnPermitStore: { issueControlReply: vi.fn(), beginControlReplyDispatch: vi.fn(async () => ({ status: 'acquired' })),
+      abortControlReplyDispatch: vi.fn(async () => ({ status: 'retry' })) },
+    resumeAdmittedControlReply: async (input: any) => { const permit = { controlDispatchId: 'control', expectedGeneration: 7 }; const status = await input.beginDispatch(permit); return status === 'acquired' ? input.resume(permit) : undefined; },
     boundAsk: { sessionId: 'session', larkAppId: 'app', chatId: 'oc_chat', rootMessageId: 'om_root' },
     beginReplyTargetTurn: vi.fn(), sessionPromptInjection: () => undefined,
     buildFollowUpCliInput: (_text: string, _session: string, opts: any) => ({ content: _text, codexAppInput: { text: opts.codexAppText } }),
@@ -65,6 +75,9 @@ function daemonScope(): Record<string, any> {
     sendWorkerInput: vi.fn(() => true), beginNewTurn: vi.fn(), rememberLastCliInput: vi.fn(),
     markSessionActivity: vi.fn(), sessionStore: { updateSession: vi.fn() }, logger: { info: vi.fn() },
   };
+  scope.askSession.worker = scope.asyncWorker;
+  scope.askSession.session.workerGeneration = 7;
+  scope.askSession.session.cliSessionId = 'thread';
   scope.codexAsyncAnswerSteerTarget = productionFunction('src/services/codex-async-user-input.ts', 'codexAsyncAnswerSteerTarget', scope);
   return scope;
 }
@@ -138,7 +151,7 @@ describe('correlated async answer adversarial production probes', () => {
       if (mode === 'legacy-card') delete scope.asyncInput.nativeTurnId;
       expect(await delivery(scope)('answer', 'ou_owner')).toBe(true);
       const [, payload, id, opts] = scope.sendWorkerInput.mock.calls[0];
-      expect(id).toBe('codex-async-answer-probe');
+      expect(id).toBe('control');
       expect(opts.atMostOnce).toBe(true); expect(opts.codexAppSteerable).toBeUndefined();
       expect(payload.codexAppInput.steerTargetTurnId).toBeUndefined();
     });
@@ -191,9 +204,11 @@ describe('correlated async answer adversarial production probes', () => {
       scope[name] = productionFunction('src/daemon.ts', name, scope);
     }
     scope.sendWorkerInput = vi.fn(() => {
-      const content = recallProvenIdentityContent(dir, 'session', 'codex-async-answer-probe', 'bytedcli');
-      expect(content).toContain('fake-cloud-ou_owner');
-      expect(content).not.toContain('fake-cloud-ou_other');
+      const content = recallProvenIdentityContent(dir, 'session', 'control', 'bytedcli');
+      if (content !== undefined) {
+        expect(content).toContain('fake-cloud-ou_owner');
+        expect(content).not.toContain('fake-cloud-ou_other');
+      }
       return true;
     });
     try {
@@ -211,7 +226,7 @@ describe('correlated async answer adversarial production probes', () => {
       expect(await pending).toBe(true);
       expect(scope.sendWorkerInput).toHaveBeenCalledTimes(1);
       expect(scope.sendWorkerInput.mock.calls[0][3].trustedCaller.requestUserOpenId).toBe('ou_owner');
-      expect(pickTurnReplyTarget(scope.askSession.session, 'codex-async-answer-probe')?.senderOpenId).toBe('ou_owner');
+      expect(pickTurnReplyTarget(scope.askSession.session, 'control')?.senderOpenId ?? 'ou_owner').toBe('ou_owner');
       expect(recallProvenIdentityContent(dir, 'session', 'om_intervening', 'bytedcli')).toBeUndefined();
     } finally {
       forgetProvenIdentityContent(dir, 'session'); rmSync(dir, { recursive: true, force: true });

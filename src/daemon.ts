@@ -9739,11 +9739,7 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
   const asyncWorker = askSession?.worker;
   const asyncGeneration = askSession?.session.workerGeneration;
   const asyncOriginTurn = typeof body.originTurnId === 'string' ? body.originTurnId : undefined;
-  if (askSession && asyncInput && asyncOriginTurn && asyncGeneration && asyncWorker) {
-    (askSession.retainedControlReplyWorkers ??= new Map()).set(asyncInput.itemId, {
-      worker: asyncWorker, generation: asyncGeneration,
-    });
-  }
+
   const audience = asyncInput && askSession
     ? documentDelivery ? { kind: 'human' as const, answererOpenId: documentDelivery.openId }
       : asyncAskAudience(askSession, asyncOriginTurn)
@@ -9851,8 +9847,9 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
   if (asyncInput && askSession && result.kind === 'answered') {
     const isCurrent = () => {
       const retained = askSession.retainedControlReplyWorkers?.get(asyncInput.itemId);
-      return !res.destroyed && !!retained && retained.worker === asyncWorker
-        && retained.generation === asyncGeneration && asyncWorker.connected !== false && !asyncWorker.killed;
+      return !res.destroyed && !!asyncWorker && asyncWorker.connected !== false && !asyncWorker.killed
+        && ((!retained && asyncGeneration === askInput.controlWait?.expectedGeneration)
+          || (!!retained && retained.worker === asyncWorker && retained.generation === asyncGeneration));
     };
     const delivered = await deliverCodexAsyncAnswer(asyncInput, boundAsk.questions, result, {
       isCurrent,
@@ -9921,9 +9918,8 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
             expiresAt: Date.now() + 60_000,
           }),
           beginDispatch: async permit => {
-            const retained = askSession.retainedControlReplyWorkers?.get(asyncInput.itemId);
-            const originalAlive = retained?.generation === frozenControl.expectedGeneration
-              && retained.worker.connected !== false && !retained.worker.killed;
+            const originalAlive = !!asyncWorker && asyncGeneration === frozenControl.expectedGeneration
+              && asyncWorker.connected !== false && !asyncWorker.killed;
             const waitState = originalControlWaitState({ sessionId: askSession.session.sessionId,
               originalTurnId: turnId, askId: asyncInput.itemId });
             const originalStillWaiting = askInput.controlWait?.state === 'needs_user'
@@ -9942,8 +9938,14 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
                   authorized: true,
                 })
               : { status: 'rejected' as const };
-            return dispatch.status === 'acquired' || dispatch.status === 'observing'
-              || dispatch.status === 'delivered' ? dispatch.status : 'rejected';
+            if (dispatch.status === 'acquired') {
+              (askSession.retainedControlReplyWorkers ??= new Map()).set(asyncInput.itemId, {
+                worker: asyncWorker!, generation: asyncGeneration!, controlDispatchId: permit.controlDispatchId,
+                controlReplyDigest: replyDigest, expiresAt: permit.expiresAt,
+              });
+            }
+            return dispatch.status === 'acquired' || dispatch.status === 'observing' || dispatch.status === 'delivered'
+              ? dispatch.status : 'rejected';
           },
           // The original turn remains the authorization authority, while the
           // control delivery gets its own worker dedupe key. Reusing turnId here
@@ -9960,13 +9962,22 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
               };
             }
             const retained = askSession.retainedControlReplyWorkers?.get(asyncInput.itemId);
+            if (retained) {
+              retained.timer = setTimeout(() => {
+                if (askSession.retainedControlReplyWorkers?.get(asyncInput.itemId) === retained) {
+                  askSession.retainedControlReplyWorkers.delete(asyncInput.itemId);
+                }
+              }, Math.max(1, retained.expiresAt - Date.now()));
+              retained.timer.unref?.();
+            }
             let accepted: boolean;
             if (retained?.worker !== askSession.worker && retained?.generation === permit.expectedGeneration
               && retained.worker.connected !== false && !retained.worker.killed) {
-              retained.worker.send({ type: 'message', content: input.content, turnId: permit.controlDispatchId,
-                atMostOnce: true, controlDispatchId: permit.controlDispatchId, controlReplyDigest: replyDigest,
-                trustedCaller, ...(input.codexAppInput ? { codexAppInput: input.codexAppInput } : {}) });
-              accepted = true;
+              try {
+                accepted = retained.worker.send({ type: 'message', content: input.content, turnId: permit.controlDispatchId,
+                  atMostOnce: true, controlDispatchId: permit.controlDispatchId, controlReplyDigest: replyDigest,
+                  trustedCaller, ...(input.codexAppInput ? { codexAppInput: input.codexAppInput } : {}) });
+              } catch { accepted = false; }
             } else {
               accepted = sendWorkerInput(askSession, input, permit.controlDispatchId, { atMostOnce: true,
                 controlDispatchId: permit.controlDispatchId, controlReplyDigest: replyDigest,
@@ -9975,6 +9986,7 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
             if (!accepted && documentDelivery && asyncDocumentTarget) {
               delete askSession.session.docCommentTargets?.[permit.controlDispatchId];
             }
+            if (!accepted) askSession.retainedControlReplyWorkers?.delete(asyncInput.itemId);
             return accepted;
           },
           abort: async permit => {

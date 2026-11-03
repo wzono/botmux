@@ -640,7 +640,8 @@ export interface DaemonSession {
   /** One exact durable head may cross admission for a worker generation. */
   principalLaneDispatchFlight?: { generation: number; turnId: string; promise: Promise<boolean> };
   principalLaneDispatchRejectedCount?: Record<string, number>;
-  retainedControlReplyWorkers?: Map<string, { worker: import('node:child_process').ChildProcess; generation: number }>;
+  retainedControlReplyWorkers?: Map<string, { worker: import('node:child_process').ChildProcess; generation: number;
+    controlDispatchId?: string; controlReplyDigest?: string; expiresAt: number; timer?: ReturnType<typeof setTimeout> }>;
   /** Host-owned classification/approval driver currently attached to disk state. */
   crossPrincipalInterruptionDriving?: boolean;
   /** Runtime wake-up for the bounded wait until the current owner turn ends. */

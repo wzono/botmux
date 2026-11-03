@@ -1318,9 +1318,12 @@ export async function reconcileTurnPermitDispatches(
     const ds = sessionsById.get(permit.sessionId);
     const observed = ds?.workerGeneration ?? ds?.session.workerGeneration ?? 0;
     const aliveReserved = !!ds?.worker && !ds.worker.killed && observed === permit.reservedGeneration;
-    if (ds && !aliveReserved) await store.recoverExpiredSpawn?.(permit, {
+    const positivelyAbsent = !!ds && !ds.worker && !ds.session.pid
+      && !ds.session.persistentBackendTarget && !ds.session.adoptedFrom;
+    if (positivelyAbsent && !aliveReserved) await store.recoverExpiredSpawn?.(permit, {
       observedGeneration: observed,
-      reservedGenerationRetired: observed < permit.reservedGeneration,
+      reservedGenerationRetired: observed <= permit.reservedGeneration,
+      noChildForReservedGeneration: observed === permit.reservedGeneration,
     });
   }
   await reconcilePersistedTurnPermitDispatches({
@@ -16171,16 +16174,22 @@ function setupWorkerHandlers(
     // tokens, readiness, transcript metadata, or durable turn state.
     if (ds.worker !== worker) {
       if (msg.type === 'turn_input_committed' && msg.controlDispatchId && msg.controlReplyDigest) {
-        const retained = [...(ds.retainedControlReplyWorkers?.values() ?? [])]
-          .some(binding => binding.worker === worker && binding.generation === workerGeneration);
-        if (retained) {
+        const retainedEntry = [...(ds.retainedControlReplyWorkers?.entries() ?? [])]
+          .find(([, binding]) => binding.worker === worker && binding.generation === workerGeneration
+            && binding.controlDispatchId === msg.controlDispatchId
+            && binding.controlReplyDigest === msg.controlReplyDigest);
+        if (retainedEntry) {
           const receipts = ds.session.controlDispatchReceipts ??= {};
           receipts[msg.controlDispatchId] = { replyDigest: msg.controlReplyDigest,
             committedAt: new Date().toISOString(), workerGeneration };
           sessionStore.updateSession(ds.session);
           void productionTurnPermitStore.acknowledgeControlReplyByDispatch({
             controlDispatchId: msg.controlDispatchId, replyDigest: msg.controlReplyDigest, workerGeneration,
-          });
+          }).then(result => {
+            if (result.status !== 'delivered') return;
+            if (retainedEntry[1].timer) clearTimeout(retainedEntry[1].timer);
+            ds.retainedControlReplyWorkers?.delete(retainedEntry[0]);
+          }).catch(err => logger.warn(`[${t}] retained control ACK failed: ${err instanceof Error ? err.message : String(err)}`));
           return;
         }
       }
@@ -16442,6 +16451,11 @@ function setupWorkerHandlers(
         // receipt ACK was delayed or dropped on the reverse IPC channel.
         completeOrdinaryImDelivery(ds, msg.turnId, workerGeneration);
         if (msg.controlDispatchId && msg.controlReplyDigest) {
+          const retainedEntry = [...(ds.retainedControlReplyWorkers?.entries() ?? [])]
+            .find(([, binding]) => binding.worker === worker && binding.generation === workerGeneration
+              && binding.controlDispatchId === msg.controlDispatchId
+              && binding.controlReplyDigest === msg.controlReplyDigest);
+          if (ds.retainedControlReplyWorkers?.size && !retainedEntry) break;
           const receipts = ds.session.controlDispatchReceipts ??= {};
           receipts[msg.controlDispatchId] = {
             replyDigest: msg.controlReplyDigest,
@@ -16457,6 +16471,10 @@ function setupWorkerHandlers(
           }).catch(err => logger.warn(
             `[${t}] durable control ACK failed: ${err instanceof Error ? err.message : String(err)}`,
           ));
+          if (retainedEntry) {
+            if (retainedEntry[1].timer) clearTimeout(retainedEntry[1].timer);
+            ds.retainedControlReplyWorkers?.delete(retainedEntry[0]);
+          }
         }
         const permitAckKey = businessPermitAckKey(ds.session.sessionId, msg.turnId, workerGeneration);
         const permitStore = activeBusinessPermitStores.get(permitAckKey) ?? productionTurnPermitStore;
@@ -20441,7 +20459,24 @@ function setupWorkerHandlers(
     }
   });
 
+  worker.on('disconnect', () => {
+    for (const [askId, binding] of ds.retainedControlReplyWorkers ?? []) {
+      if (binding.worker !== worker) continue;
+      if (binding.timer) clearTimeout(binding.timer);
+      ds.retainedControlReplyWorkers?.delete(askId);
+      if (binding.controlDispatchId && !ds.session.controlDispatchReceipts?.[binding.controlDispatchId]) {
+        logger.warn(`[${t}] retained control dispatch disconnected after IPC; permit remains ambiguous ${binding.controlDispatchId}`);
+      }
+    }
+  });
+
   worker.on('exit', (code, signal) => {
+    for (const [askId, binding] of ds.retainedControlReplyWorkers ?? []) {
+      if (binding.worker === worker) {
+        if (binding.timer) clearTimeout(binding.timer);
+        ds.retainedControlReplyWorkers?.delete(askId);
+      }
+    }
     clearInterval(cliNoticeTimer);
     if (ownsLifecycleMutation()) {
       cliNoticeExitGeneration = workerGeneration + 1;

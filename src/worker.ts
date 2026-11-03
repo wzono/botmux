@@ -3739,7 +3739,8 @@ async function sendRawCommandLine(be: NonNullable<typeof backend>, content: stri
   const accepted = await writeRawCommandLine(
     be,
     content,
-    rawCommandWriteOptionsFor(cliAdapter ?? undefined, lastInitConfig?.cliId),
+    { ...rawCommandWriteOptionsFor(cliAdapter ?? undefined, lastInitConfig?.cliId),
+      isCurrent: () => backend === be && canWriteTerminalBytes() },
   );
   if (accepted === false) {
     throw new Error('backend rejected command text or submit key input');
@@ -29893,10 +29894,12 @@ process.on('message', async (raw: unknown) => {
         const backendPid = backend?.getChildPid?.() ?? undefined;
         const observedCwd = backendPid ? readCwd(backendPid) : undefined;
         const hostWorkingDirContract = backend?.validatedHostWorkingDirContract?.();
+        const effectiveWorkspaceProof = backend?.effectiveWorkspaceProof?.();
         send({
           type: 'ready',
           ...(observedCwd ? { cwd: observedCwd } : {}),
           ...(hostWorkingDirContract ? { hostWorkingDirContract } : {}),
+          ...(effectiveWorkspaceProof ? { effectiveWorkspaceProof } : {}),
           port,
           token: writeToken,
           viewToken,
