@@ -19,7 +19,8 @@ In Feishu you can also run `/config set steward {"enabled":true,"chatId":"oc_…
 - In the steward chat each turn carries one extra system line pointing at the board and at `botmux board guide`; the rules themselves are not resident.
 - By default the steward posts in other chats **as its own bot** (`botmux send`). Target bots must accept the steward bot's messages (enable "receive messages that @ this bot from other bots" in the Feishu developer console, and grant the steward bot talk permission in botmux).
 - Anything it cannot decide, or anything irreversible, becomes a "needs decision" item with options, consequences and a recommendation.
-- Scheduled patrols are not part of this feature. Use a [scheduled task](./schedule.md) for the steward if you want one.
+- **Scheduled patrol**: tell the steward in its chat, for example, "patrol every day at 9:30", and it creates a silent [scheduled task](./schedule.md) in the steward chat. Each patrol first checks unfinished board items against reality (closing what is done), then looks at the owner's open PRs and new activity in linked chats from the last 7 days, writes what needs your decision as decision items, and reports only what is new; with nothing new it stays quiet. The rules are the "Scheduled patrol" section of `botmux board guide`; change them (for example the time window) in the custom prompt.
+- `botmux board add` with an existing dedupe key (`--key`) updates that item, but it is refused when the item is done or closed, so a patrol cannot bring old items back. Reopen with `botmux board set`.
 
 ## Adding the steward to new chats
 
@@ -33,11 +34,19 @@ To post in a chat as itself, the steward has to be a member. So once a steward i
 
 ## The board
 
-- **Overview**: Needs your decision / In progress / All. ● = the steward wrote something since you last looked; ✎ = you have an unsubmitted draft.
-- **Item page**: summary, current progress, the question and options (recommended one marked), your decision (with images), the history timeline, and linked PRs / chats / sessions / commits. **Previous / Next** buttons at the top and under the decision box walk the list you came from (from "Needs you" they stay within it); opened straight from a Feishu link, they walk the view the item belongs to. Your draft is saved before switching.
+- **Overview**: Needs your decision / In progress / All. ● = the steward wrote something since you last looked; ✎ = you have an unsubmitted draft. Under each title is the item's main chat ("+N more" when there are several), and **Open chat** on the right opens it in Feishu. Rows without a chat show "No chat: <reason>", or "⚠ No chat linked" when no reason was given either.
+- **Item page**: right under the title, every chat of the item, main chat first and marked "Main", each with its own Open chat button; chats that could not be verified when linked are marked "Unverified". Below that: summary, current progress, the question and options (recommended one marked), your decision (with images), the history timeline, and linked PRs / sessions / commits. **Previous / Next** buttons at the top and under the decision box walk the list you came from (from "Needs you" they stay within it); opened straight from a Feishu link, they walk the view the item belongs to. Your draft is saved before switching.
 - **Drafts** are saved on the server and never sent on their own. Your desktop and the Feishu sidebar share the same draft.
 - **Submit N decisions** turns the selected drafts into one batch = one turn in the steward session (queued behind a running turn). Failed deliveries show the reason and can be retried; undelivered batches are retried automatically after the daemon restarts.
-- What you submitted is also posted verbatim in the steward chat: each item's number, title, chosen option and your note, followed by the images. Long content is split across several messages, never cut.
+- What you submitted is also posted verbatim in the steward chat: each item's number, title, main chat link, chosen option and your note, followed by the images. Long content is split across several messages, never cut.
+
+## Chats linked to items
+
+Every item links the Feishu chat where the work happens, so the board can take you there in one click:
+
+- **New items need a chat**: `botmux board add` is rejected without `--link chat=oc_…`. If there really is no chat (only an issue, not started, or the steward handles it itself), give the reason with `--no-chat "<reason>"`; the board shows "No chat: <reason>". Adding a chat later clears the reason. `board set` does not enforce this and existing items are not migrated; `board list` marks items with neither a chat nor a reason as missing a chat so the steward can fill them in.
+- **Chats are verified when linked**: the steward bot's daemon looks the chat up (`im/v1/chats/:chat_id`) with the credentials of the bots on this machine: the steward bot first, then the other bots in turn (same owner as the steward, same brand, with Feishu credentials; on a machine shared by several people, other people's bots are never used; if the steward does not trust same-owner bots on this machine, only the steward bot itself is used). If found, the chat name becomes the default label (a label given by the steward wins). If no bot can find it, the write is rejected with each bot's reason; to write it anyway, add `--allow-unverified-chat` and the board marks it "Unverified". Credentials are only used inside the daemon process on this machine; they are never stored or printed. Linking an existing chat again re-verifies it: the chat name and verification status are refreshed, the steward's own label is left alone, and older links get their name filled in.
+- **Main chat**: with several chats (a task chat plus some PR review chats) the first one is the main chat, opened by the overview's Open chat button; change it with `--primary-chat oc_…`. Batches posted in the steward chat carry each item's main chat link too.
 
 There are six states: needs decision, needs review, in progress, waiting, done, closed. Finer workflow words (in review, fixing, mergeable …) go into the free-text stage.
 
@@ -57,7 +66,9 @@ Every item link opens in the **chat's right sidebar** on Feishu desktop (`applin
 botmux board guide
 botmux board list [--view decide|active|all]
 botmux board show <n|key>
-botmux board add <title> --key pr:owner/repo#12 --link pr=owner/repo#12 --link chat=oc_…
+botmux board add <title> --key pr:owner/repo#12 --link chat=oc_… --link pr=owner/repo#12
+botmux board add <title> --no-chat "only an issue so far"            # no chat: say why
+botmux board set <n> --link chat=oc_… --primary-chat oc_…            # add a chat / change the main chat
 botmux board set <n> --state decide --ask "question" \
   --option "A=approach → outcome" --option "B=…" --recommend A --reason "why"
 botmux board set <n> --unlink doc=https://old --link "doc=https://new|Board doc"   # remove / replace a link
@@ -66,7 +77,7 @@ botmux board attach <n> shot.png --note "repro"
 botmux board pending
 ```
 
-In `--link kind=ref|label` everything after the last `|` is the label (write a literal `|` inside a URL as `%7C`). `--link` only appends; remove a wrong one with `--unlink kind=ref`. See `botmux board --help` for every option.
+In `--link kind=ref|label` everything after the last `|` is the label (write a literal `|` inside a URL as `%7C`). `--link` only appends; remove a wrong one with `--unlink kind=ref`. To write a chat that cannot be found, add `--allow-unverified-chat`. See `botmux board --help` for every option.
 
 ## Data
 

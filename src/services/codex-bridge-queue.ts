@@ -94,6 +94,11 @@ export interface CodexPendingTurn {
   /** Wall-clock millis when an authoritative adapter/history check confirmed
    *  the submit. Unverified writes deliberately leave this unset. */
   submitConfirmedAtMs?: number;
+  /** Local time the CLI reported it accepted this input while busy and is
+   *  holding it until its current work ends (`input_queued`). While set the
+   *  pre-start lease cannot expire: the user record is coming, just late.
+   *  Cleared when the turn starts or the CLI settles without taking it up. */
+  cliQueuedAtMs?: number;
   /** Wall-clock millis anchoring the bounded attribution-only lease for an
    *  unconfirmed mark. Unlike verification/confirmation leases, this never
    *  gates screen-ready or reports the CLI busy. */
@@ -121,6 +126,10 @@ export interface CodexPendingTurn {
   /** Native provider turn id learned from the transcript user event. */
   sourceTurnId?: string;
   sourceMessageId?: string;
+  /** A fresh lifecycle observed while this HOL successor still owns the
+   * input. It is only a candidate until a terminal or another user arrives;
+   * replay reconstructs it from lifecycle records, never from a pending mark. */
+  replacementNativeTurnId?: string;
   /** Inputs folded into this native execution by a confirmed same-turn steer.
    * Their send attribution must retire with the single native terminal. */
   supersededTurns?: Array<Pick<CodexPendingTurn, 'turnId' | 'dispatchAttempt'>>;
@@ -263,6 +272,25 @@ export class CodexBridgeQueue {
       && this.sourceSessionsCompatible(turn.sourceSessionId, ev.sourceSessionId));
     if (exact) return exact;
     const fallback = this.collecting;
+    // A same-native HOL steer can inherit an abandoned task_started id X,
+    // while Codex completes the execution as Y without another start. Only a
+    // terminal may replace that inherited identity. Require exact session
+    // evidence and no competing active turn; ordinary native turns and CoT
+    // retain exact-id routing. Credit from X cannot suppress Y's answer.
+    if (fallback?.sourceTurnId && fallback.supersededTurns?.length
+      && (ev.kind === 'assistant_final' || ev.kind === 'turn_aborted')
+      && fallback.sourceSessionId === ev.sourceSessionId
+      && fallback.transcriptStartTimeMs !== undefined
+      && ev.timestampMs >= fallback.transcriptStartTimeMs
+      // With multiple active turns and no exact match, refuse an ambiguous
+      // reassignment to avoid merging independent replies. Exact-id routing
+      // above stays available; if X never terminates, its turn may stay pending.
+      && !this.queue.some(turn => turn !== fallback && turn.started && turn.finalText === undefined)) {
+      this.rememberClosedNativeTurn(fallback);
+      fallback.sourceTurnId = ev.sourceTurnId;
+      fallback.supersededTurns = undefined;
+      return fallback;
+    }
     if (!fallback
       || this.isProvisionalTaskStart(fallback)
       || fallback.sourceTurnId
@@ -328,6 +356,11 @@ export class CodexBridgeQueue {
     linkRefMode?: 'observe' | 'enabled';
     jsonlPath?: string;
     offsetAtMark?: number;
+    mergedExecution?: {
+      sourceTurnId: string;
+      sourceSessionId?: string;
+      supersededTurnIds: readonly string[];
+    };
   }[]): void {
     const existing = new Set(this.queue.map(turn => turn.turnId));
     const restored: CodexPendingTurn[] = [];
@@ -339,6 +372,11 @@ export class CodexBridgeQueue {
         contentFingerprint: makeFingerprint(entry.fingerprint), markTimeMs: entry.markTimeMs,
         recoveryJsonlPathAtMark: entry.jsonlPath,
         recoveryOffsetAtMark: entry.offsetAtMark,
+        ...(entry.mergedExecution ? {
+          sourceTurnId: entry.mergedExecution.sourceTurnId,
+          sourceSessionId: entry.mergedExecution.sourceSessionId,
+          supersededTurns: entry.mergedExecution.supersededTurnIds.map(turnId => ({ turnId })),
+        } : {}),
         unconfirmedAttributionStartedAtMs: entry.markTimeMs });
     }
     this.queue.unshift(...restored);
@@ -415,6 +453,9 @@ export class CodexBridgeQueue {
       // prune it — that would falsely release idle while the app-server is still
       // executing. Keep it until the terminal edge or explicit stop.
       if (head.rpcActive) break;
+      // The CLI holds this input in its own queue (input_queued); its user
+      // record will start it, or cli_settled restarts the lease.
+      if (head.cliQueuedAtMs !== undefined) break;
 
       // An authoritative adapter/history check can legitimately outlive the
       // shorter attribution lease. Do not prune under that in-flight await;
@@ -596,6 +637,7 @@ export class CodexBridgeQueue {
       if (turn.finalText !== undefined) return false;
       if (turn.started) return true;
       if (turn.rpcActive) return true;
+      if (turn.cliQueuedAtMs !== undefined) return true;
       const confirmed = turn.submitConfirmedAtMs !== undefined
         && nowMs - turn.submitConfirmedAtMs <= STRUCTURED_SUBMIT_START_GRACE_MS;
       const verifying = turn.submitVerificationStartedAtMs !== undefined
@@ -609,7 +651,8 @@ export class CodexBridgeQueue {
    *  lease expires. Started turns return undefined because their eventual
    *  assistant_final is the authoritative re-drive. */
   preStartLeaseRemainingMs(nowMs: number = this.now()): number | undefined {
-    if (this.queue.some(turn => ((turn.started && !this.isProvisionalTaskStart(turn)) || turn.rpcActive)
+    if (this.queue.some(turn => ((turn.started && !this.isProvisionalTaskStart(turn)) || turn.rpcActive
+      || turn.cliQueuedAtMs !== undefined)
       && turn.finalText === undefined)) return undefined;
     const activeRemaining = this.queue.flatMap(candidate => {
       if (candidate.finalText !== undefined) return [];
@@ -688,6 +731,15 @@ export class CodexBridgeQueue {
     }
   }
 
+  private revalidateRestoredMerge(turn: CodexPendingTurn, ev: CodexBridgeEvent): void {
+    // A pending mark may carry merge evidence from a previous worker. A new
+    // provider execution (or missing proof) cannot inherit its send credit.
+    if (turn.supersededTurns?.length && (turn.sourceTurnId !== ev.sourceTurnId
+      || turn.sourceSessionId !== ev.sourceSessionId)) {
+      turn.supersededTurns = undefined;
+    }
+  }
+
   private ingestOne(ev: CodexBridgeEvent, bufferUnmatched: boolean): void {
     // A stable-id replay from a closed turn is never evidence for the current
     // id-less turn. Reject it before any compatibility fallback can run.
@@ -729,6 +781,22 @@ export class CodexBridgeQueue {
           // new start supersede it and reclaim the same queue head below.
           if (this.isProvisionalTaskStart(active)) {
             this.rollbackProvisionalTaskStart(active);
+          } else if (active.supersededTurns?.length
+            && active.sourceSessionId === ev.sourceSessionId
+            && active.transcriptStartTimeMs !== undefined
+            && ev.timestampMs >= active.transcriptStartTimeMs
+            // With multiple active turns, refuse a candidate that could make
+            // a later user handoff drop an independent reply. Exact native ids
+            // still route; if X never terminates, its turn may stay pending.
+            && !this.queue.some(turn => turn !== active && turn.started && turn.finalText === undefined)) {
+            // A new start can replace the abandoned execution containing the
+            // HOL successor. Do not let an unread pending input claim it. If
+            // that input's user record arrives, its fingerprint below decides
+            // the handoff; otherwise the terminal still belongs to active.
+            // This is only a candidate: exact X terminals can still settle active
+            // until a valid user handoff removes it or a terminal replaces its id.
+            active.replacementNativeTurnId = ev.sourceTurnId;
+            return;
           }
         } else {
           // A native start cannot precede the user record of the same turn.
@@ -746,6 +814,7 @@ export class CodexBridgeQueue {
       const tooOld = next.markTimeMs !== undefined
         && ev.timestampMs < next.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS;
       if (tooOld) return;
+      this.revalidateRestoredMerge(next, ev);
       next.started = true;
       next.submitVerificationStartedAtMs = undefined;
       next.unconfirmedAttributionStartedAtMs = undefined;
@@ -757,6 +826,30 @@ export class CodexBridgeQueue {
         ? ev.timestampMs
         : Math.max(next.markTimeMs, ev.timestampMs);
       this.collecting = next;
+      return;
+    }
+    if (ev.kind === 'input_queued') {
+      // One accepted input per marker, in submit order. Never starts the
+      // head: the work still running belongs to an earlier turn.
+      const next = this.queue.find(turn => !turn.started && turn.finalText === undefined
+        && turn.cliQueuedAtMs === undefined && !turn.rpcActive);
+      if (!next) return;
+      if (next.markTimeMs !== undefined
+        && ev.timestampMs < next.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS) return;
+      next.cliQueuedAtMs = this.now();
+      return;
+    }
+    if (ev.kind === 'cli_settled') {
+      // Queued input is taken up before the CLI settles. A head still held
+      // here went back to the editor (abort) or was otherwise dropped, so its
+      // normal lease runs again from now.
+      const observedAtMs = this.now();
+      for (const turn of this.queue) {
+        if (turn.cliQueuedAtMs === undefined || turn.started || turn.finalText !== undefined) continue;
+        turn.cliQueuedAtMs = undefined;
+        if (turn.submitConfirmedAtMs !== undefined) turn.submitConfirmedAtMs = observedAtMs;
+        else turn.unconfirmedAttributionStartedAtMs = observedAtMs;
+      }
       return;
     }
     if (ev.kind === 'cot') {
@@ -821,7 +914,11 @@ export class CodexBridgeQueue {
       // Without a native message id retain the historical turn-level mirror
       // guard. A previously unseen message id is a genuine same-turn steer;
       // its fingerprint/freshness checks below still decide whether it starts.
+      // A task_started-only claim is not a corroborated user record. It must
+      // not hide the fingerprinted successor that actually owns this native
+      // turn when an older, missing input temporarily claimed the start.
       if (ev.sourceTurnId && !messageKey && this.queue.some(turn => turn.started
+        && !this.isProvisionalTaskStart(turn)
         && turn.sourceTurnId === ev.sourceTurnId)) return;
       // First decide whether this user event is a REAL turn-start: either it
       // matches the head pending Lark turn's fingerprint (and isn't tooOld),
@@ -835,6 +932,7 @@ export class CodexBridgeQueue {
       }
       const willStartNext = !!next && !tooOld && fingerprintOk;
       const willSynthLocal = !willStartNext && this.localTurnsEnabled && ev.timestampMs >= this.localLowerBoundMs - UNMATCHED_REPLAY_WINDOW_MS;
+      if (willStartNext) this.revalidateRestoredMerge(next!, ev);
 
       // HOL-block drop (codex 0.134.0 active-turn steer): when a real new
       // turn-start arrives while a turn is still collecting with no finalText,
@@ -850,9 +948,18 @@ export class CodexBridgeQueue {
       // is ignored rather than treated as a turn boundary. Mirrors Claude's
       // BridgeTurnQueue.handleTurnStart HOL drop (which keys off "no assistant
       // text yet" — the streaming-transcript equivalent of "no finalText").
+      // A same-session replacement candidate permits a valid user handoff below.
+      // Once that handoff removes the old HOL successor, late X terminals cannot
+      // settle that removed turn; X's receipt credit is not inherited by Y.
+      // This treats X as abandoned, assuming no separate X answer is still owed.
+      // The handoff does not tombstone X: a late terminal may still be absorbed
+      // by a later started turn lacking a native id. This unhandled ordering
+      // boundary is synthetically reachable, without production evidence (#2707).
       const isDistinctNativeTurn = !!ev.sourceTurnId
         && !!this.collecting?.sourceTurnId
-        && ev.sourceTurnId !== this.collecting.sourceTurnId;
+        && ev.sourceTurnId !== this.collecting.sourceTurnId
+        && !(this.collecting.replacementNativeTurnId === ev.sourceTurnId
+          && this.collecting.sourceSessionId === ev.sourceSessionId);
       if ((willStartNext || willSynthLocal)
         && this.collecting
         && this.collecting.finalText === undefined
@@ -861,6 +968,7 @@ export class CodexBridgeQueue {
         && ev.preserveCollecting !== true) {
         const superseded = this.collecting;
         if (willStartNext && ev.sourceTurnId && ev.sourceTurnId === superseded.sourceTurnId
+          && ev.sourceSessionId === superseded.sourceSessionId
           && this.sourceSessionsCompatible(superseded.sourceSessionId, ev.sourceSessionId)) {
           next!.supersededTurns = [...(superseded.supersededTurns ?? []),
             { turnId: superseded.turnId, dispatchAttempt: superseded.dispatchAttempt }];
@@ -877,6 +985,7 @@ export class CodexBridgeQueue {
         next!.started = true;
         next!.submitVerificationStartedAtMs = undefined;
         next!.unconfirmedAttributionStartedAtMs = undefined;
+        next!.cliQueuedAtMs = undefined;
         next!.provisionalTaskStartedAtMs = undefined;
         next!.taskStartedRollbackAtMs = undefined;
         next!.sourceSessionId = ev.sourceSessionId;

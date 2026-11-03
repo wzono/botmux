@@ -27,6 +27,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync 
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { claimPromptContext, fingerprintPromptText, prefixOf } from '../src/services/prompt-context-store.js';
+import { t } from '../src/i18n/index.js';
 
 const mocks = vi.hoisted(() => {
   process.env.SESSION_DATA_DIR = `${process.env.TMPDIR ?? '/tmp'}/botmux-initial-turn-${process.pid}`;
@@ -377,6 +378,7 @@ describe('empty-started session — first real business turn must use the new-to
     expect(followUp).toContain('短进度优先纯文本');
     expect(followUp).toContain('强调仅包短词或无中文标点的短语');
     expect(followUp).toContain('标点和后文放在 `**` 外');
+    expect(followUp).toContain(t('ai.followup.feishu_safe_emphasis', undefined, 'zh'));
   });
 
   it('live resumed Claude hook receives current Feishu emphasis guidance in its sidecar', async () => {
@@ -410,6 +412,7 @@ describe('empty-started session — first real business turn must use the new-to
     expect(envelope).toContain('短进度优先纯文本');
     expect(envelope).toContain('强调仅包短词或无中文标点的短语');
     expect(envelope).toContain('标点和后文放在 `**` 外');
+    expect(envelope).toContain(t('ai.followup.feishu_safe_emphasis', undefined, 'zh'));
   });
 
   it('live resumed transcript Claude hook receives format-only guidance in its sidecar', async () => {
@@ -443,6 +446,7 @@ describe('empty-started session — first real business turn must use the new-to
     );
     expect(envelope).toContain('<botmux_formatting>');
     expect(envelope).toContain('短进度优先纯文本');
+    expect(envelope).toContain(t('ai.followup.feishu_safe_emphasis', undefined, 'zh'));
     expect(envelope).not.toContain('botmux send');
     expect(envelope).not.toContain('BOTMUX_NOTHING_TO_SEND');
   });

@@ -7,7 +7,7 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { isHeadlessSessionChatId, larkTransportEnabled } from './types.js';
 import { isRemoteBackendId } from './remote-cli-ids.js';
 import { normalizeBrand, type Brand } from '../im/lark/lark-hosts.js';
-import { findRealToolBinary, installLoginShellPathShim, sessionIdentityDataDir, sessionIdentityBinDir } from './cli-identity.js';
+import { findRealToolBinary, installLoginShellPathShim, sessionIdentityDataDir, sessionIdentityBinDir, sessionVisiblePath } from './cli-identity.js';
 import { resolveEntrySpawn } from './self-spawn.js';
 import { headlessChatId, isHeadlessId } from '../services/headless-session-store.js';
 import { clearLarkToolDelegations } from './lark-tool-delegation.js';
@@ -180,6 +180,9 @@ export function prepareLarkToolEnv(input: {
   defaultAs?: 'bot' | 'user';
   effectivePath?: string;
   runner?: { command: string; args: string[] };
+  /** Sandboxed session: the wrapper must name its runner by realpath, since a
+   *  fresh bwrap root has no alias for a symlinked home. */
+  canonicalPaths?: boolean;
 }): LarkToolBinding {
   const rootDir = resolveLarkToolDataDir(input.dataDir);
   const binDir = sessionIdentityBinDir(rootDir, input.sessionId);
@@ -215,13 +218,14 @@ export function prepareLarkToolEnv(input: {
   const runner = input.runner ?? (moduleDir.endsWith('/src/core')
     ? { command: process.execPath, args: [...sourceExecArgs, resolve(moduleDir, '../lark-tool-runner.ts')] }
     : resolveEntrySpawn('lark-tool-runner', resolve(moduleDir, '..')));
-  const sourceTsconfigPath = moduleDir.endsWith('/src/core') ? join(process.cwd(), 'tsconfig.json') : undefined;
+  const sourceTsconfigPath = moduleDir.endsWith('/src/core')
+    ? sessionVisiblePath(join(process.cwd(), 'tsconfig.json'), input.canonicalPaths) : undefined;
   if (sourceTsconfigPath) input.env.TSX_TSCONFIG_PATH = sourceTsconfigPath;
   const quote = (v: string) => `'${v.replaceAll("'", "'\\''")}'`;
   atomicWriteFileSync(join(binDir, 'lark-cli'), [
     '#!/bin/sh', '# botmux managed lark-cli — application and caller are host-bound.',
     ...(sourceTsconfigPath ? [`TSX_TSCONFIG_PATH=${quote(sourceTsconfigPath)}`, 'export TSX_TSCONFIG_PATH'] : []),
-    `exec ${[runner.command, ...runner.args, '--binding', bindingPath, '--'].map(quote).join(' ')} "$@"`, '',
+    `exec ${[...[runner.command, ...runner.args].map(p => sessionVisiblePath(p, input.canonicalPaths)), '--binding', bindingPath, '--'].map(quote).join(' ')} "$@"`, '',
   ].join('\n'), { mode: 0o755 });
   const { zdotdir, bashEnv } = installLoginShellPathShim(binDir);
   input.env.PATH = [binDir, ...(input.env.PATH ?? '').split(':').filter(p => p !== binDir)].join(':');

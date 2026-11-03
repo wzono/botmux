@@ -88,13 +88,13 @@ describe('botmux ask — CLI boundary', () => {
     }
   });
 
-  it('rejects buttons when it appears after alias flags instead of leaking it into the prompt', async () => {
-    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-misplaced-subcommand-'));
+  it('preserves a bare-alias prompt that starts with the word buttons', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-buttons-prompt-'));
     tempDirs.push(dataDir);
-    let requestCount = 0;
-    const server = createServer((req, res) => {
-      requestCount++;
-      req.resume();
+    let requestBody: Record<string, unknown> | undefined;
+    const server = createServer(async (req, res) => {
+      const body = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
+      if (body !== undefined) requestBody = body;
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ kind: 'answered', answers: [['yes']], by: 'ou_test', comment: null }));
     });
@@ -106,12 +106,10 @@ describe('botmux ask — CLI boundary', () => {
         larkAppId: 'cli_test', ipcPort: (server.address() as AddressInfo).port, lastHeartbeat: Date.now(),
       }));
       const result = await runAsk(dataDir, [
-        'ask', '--options', 'yes,no', '--timeout', '300', 'buttons', '继续吗？',
+        'ask', '--options', 'yes,no', 'buttons', '是否继续？',
       ]);
-      expect(result.status).toBe(2);
-      expect(result.stdout).toBe('');
-      expect(result.stderr).toContain('botmux ask buttons');
-      expect(requestCount).toBe(0);
+      expect(result.status).toBe(0);
+      expect(requestBody?.prompt).toBe('buttons 是否继续？');
     } finally {
       await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
     }
@@ -409,49 +407,6 @@ describe('botmux ask — CLI boundary', () => {
     }
   });
 
-  it('--mention <ou_id> 透传 mentionedOpenId 到 daemon', async () => {
-    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-cli-'));
-    tempDirs.push(dataDir);
-    let requestBody: Record<string, unknown> | undefined;
-
-    const server = createServer(async (req, res) => {
-      let body = '';
-      for await (const chunk of req) body += chunk;
-      requestBody = JSON.parse(body) as Record<string, unknown>;
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({
-        kind: 'answered',
-        answers: [['yes']],
-        by: 'ou_test',
-        comment: null,
-        timedOut: false,
-      }));
-    });
-    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-
-    try {
-      const port = (server.address() as AddressInfo).port;
-      const registryDir = join(dataDir, 'dashboard-daemons');
-      mkdirSync(registryDir, { recursive: true });
-      writeFileSync(
-        join(registryDir, 'cli_test.json'),
-        JSON.stringify({ larkAppId: 'cli_test', ipcPort: port, lastHeartbeat: Date.now() }),
-      );
-
-      const result = await runAsk(dataDir, [
-        'ask', 'buttons',
-        '--mention', 'ou_humanTarget0001',
-        '--options', 'yes,no', '继续吗？',
-      ]);
-      expect(result.status).toBe(0);
-      expect(requestBody?.mentionedOpenId).toBe('ou_humanTarget0001');
-    } finally {
-      await new Promise<void>((resolve, reject) => {
-        server.close((err) => err ? reject(err) : resolve());
-      });
-    }
-  });
-
   it('--json 完整输出超出 pipe 容量的文字作答', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-cli-'));
     tempDirs.push(dataDir);
@@ -491,65 +446,12 @@ describe('botmux ask — CLI boundary', () => {
         comment,
         timedOut: false,
       });
-
     } finally {
       await new Promise<void>((resolve, reject) => {
         server.close((err) => err ? reject(err) : resolve());
       });
     }
   }, 30_000);
-
-  it('--mention ou_id:显示名 形态只取冒号前 open_id', async () => {
-    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-cli-'));
-    tempDirs.push(dataDir);
-    let requestBody: Record<string, unknown> | undefined;
-
-    const server = createServer(async (req, res) => {
-      let body = '';
-      for await (const chunk of req) body += chunk;
-      requestBody = JSON.parse(body) as Record<string, unknown>;
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({
-        kind: 'answered', answers: [['yes']], by: 'ou_test', comment: null, timedOut: false,
-      }));
-    });
-    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-
-    try {
-      const port = (server.address() as AddressInfo).port;
-      const registryDir = join(dataDir, 'dashboard-daemons');
-      mkdirSync(registryDir, { recursive: true });
-      writeFileSync(
-        join(registryDir, 'cli_test.json'),
-        JSON.stringify({ larkAppId: 'cli_test', ipcPort: port, lastHeartbeat: Date.now() }),
-      );
-
-      const result = await runAsk(dataDir, [
-        'ask', 'buttons',
-        '--mention', 'ou_abcdef123456:张伟',
-        '--options', 'yes,no', '继续吗？',
-      ]);
-      expect(result.status).toBe(0);
-      expect(requestBody?.mentionedOpenId).toBe('ou_abcdef123456');
-    } finally {
-      await new Promise<void>((resolve, reject) => {
-        server.close((err) => err ? reject(err) : resolve());
-      });
-    }
-  });
-
-  it('--mention 非 ou_ 形态（union_id/乱填）直接 exit 2，不请求 daemon', async () => {
-    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-cli-'));
-    tempDirs.push(dataDir);
-
-    const result = await runAsk(dataDir, [
-      'ask', 'buttons',
-      '--mention', 'on_6741d98b6423c1b46e1ef7a5e6dd',
-      '--options', 'yes,no', '继续吗？',
-    ]);
-    expect(result.status).toBe(2);
-    expect(result.stderr).toContain('open_id');
-  });
 });
 
 describe('question file CLI', () => {
@@ -591,5 +493,63 @@ describe('question file CLI', () => {
     const result = await runAsk(dataDir, ['ask', 'buttons', ...args]);
     expect(result.status).toBe(2); expect(result.stderr).toContain('--questions-file');
     expect(result.stdout).toBe('');
+  });
+});
+
+describe('botmux ask — atomic input form CLI', () => {
+  const questions = [
+    { prompt: 'Next action', multiSelect: false, options: [{ key: 'go', label: 'Continue' }, { key: 'stop', label: 'Stop' }] },
+    { prompt: 'Hours', multiSelect: false, options: [], input: { type: 'number', min: 0 } },
+    { prompt: 'Note', multiSelect: false, options: [], input: { type: 'text', required: false } },
+  ];
+  it.each([
+    { response: { kind: 'answered', answers: [['go'], [], []], inputs: [null, '2.50', null], by: 'ou_actual', comment: null, timedOut: false }, status: 0, inputs: [null, '2.50', null] },
+    { response: { kind: 'answered', answers: [[], [], []], by: 'ou_actual', comment: 'Stop; need more evidence', timedOut: false }, status: 0, inputs: [null, null, null] },
+    { response: { kind: 'timedOut', selected: null, by: null, comment: null, timedOut: true }, status: 124, inputs: null },
+    { response: { kind: 'invalidated', reason: 'cancelled', selected: null, by: null, comment: null, timedOut: false }, status: 3, inputs: null },
+  ])('preserves form result and acknowledges the original request: $response.kind', async ({ response, status, inputs }) => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-form-cli-')); tempDirs.push(dataDir);
+    const file = join(dataDir, 'form.json'); writeFileSync(file, JSON.stringify(questions));
+    const requests: any[] = [];
+    const server = createServer(async (req, res) => {
+      expect(req.url).toBe('/api/asks/form-v1');
+      requests.push(await readRequestBodyJson(req, { strict: true }));
+      res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(response));
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const registry = join(dataDir, 'dashboard-daemons'); mkdirSync(registry);
+      writeFileSync(join(registry, 'cli_test.json'), JSON.stringify({ larkAppId: 'cli_test', ipcPort: (server.address() as AddressInfo).port, lastHeartbeat: Date.now() }));
+      const result = await runAsk(dataDir, ['ask', 'buttons', '--questions-file', file, '--answerer=ou_actual', '--json']);
+      expect(result.status).toBe(status);
+      expect(JSON.parse(result.stdout)).toMatchObject({ inputs, answers: response.kind === 'answered' ? response.answers : null, selected: null, comment: response.comment });
+      expect(requests).toHaveLength(2);
+      expect(requests[0]).toMatchObject({ originKind: 'explicit', answererOpenId: 'ou_actual', questions: [questions[0], { ...questions[1], input: { ...questions[1].input, required: true, maxLength: 1000 } }, { ...questions[2], input: { ...questions[2].input, maxLength: 1000 } }] });
+      expect(requests[1]).toEqual({ ...requests[0], acknowledge: true });
+    } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+  });
+
+  it.each([true, false])('fails once on an old receiver without dropping form/answerer restrictions (form=%s)', async form => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-old-cli-')); tempDirs.push(dataDir);
+    const file = join(dataDir, 'form.json'); writeFileSync(file, JSON.stringify(questions));
+    let calls = 0;
+    const server = createServer(async (req, res) => {
+      await readRequestBodyJson(req, { strict: true }); calls++;
+      expect(req.url).toBe('/api/asks/form-v1');
+      res.writeHead(404, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'not_found' }));
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const registry = join(dataDir, 'dashboard-daemons'); mkdirSync(registry);
+      writeFileSync(join(registry, 'cli_test.json'), JSON.stringify({ larkAppId: 'cli_test', ipcPort: (server.address() as AddressInfo).port, lastHeartbeat: Date.now() }));
+      const result = await runAsk(dataDir, ['ask', 'buttons', ...(form ? ['--questions-file', file] : ['--options', 'yes,no', 'Decide']), '--answerer', 'ou_actual']);
+      expect(result.status).not.toBe(0); expect(result.stdout).toBe(''); expect(calls).toBe(1);
+    } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+  });
+
+  it.each(['bad-user', '', 'on_other_app'])('rejects malformed respondent before transport: %s', async answerer => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-answerer-')); tempDirs.push(dataDir);
+    const result = await runAsk(dataDir, ['ask', 'buttons', '--options', 'yes,no', `--answerer=${answerer}`, 'Decide']);
+    expect(result.status).toBe(2); expect(result.stdout).toBe(''); expect(result.stderr).toContain('--answerer');
   });
 });

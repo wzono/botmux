@@ -62,6 +62,7 @@ async function managed(
   customize?: (proof: ManagedOriginAttestation, index: number) => void,
   managedTurnId = 'om_live',
   observedRequests?: Array<Record<string, unknown>>,
+  refuseWith?: string,
 ) {
   seedPersistedSessionRows(f.dataDir, app, { [sid]: {
     sessionId: sid, status: 'active', larkAppId: app, chatId: 'oc_chat', rootMessageId: 'om_root',
@@ -78,6 +79,10 @@ async function managed(
       scheduleOperator: { ok: true } };
     calls++;
     customize?.(proof, calls);
+    if (refuseWith && (req.url === SCHEDULE_DELEGATED_ADD_ROUTE || req.url === SCHEDULE_MANAGED_MUTATE_ROUTE)) {
+      res.statusCode = 403;
+      return res.end(JSON.stringify({ ok: false, error: refuseWith }));
+    }
     if (req.url === SCHEDULE_DELEGATED_ADD_ROUTE) {
       if (proof.turnId !== managedTurnId) {
         res.statusCode = 409;
@@ -166,7 +171,79 @@ async function managed(
   return () => calls;
 }
 
+/** Host-terminal shape: no session, a real loopback daemon IPC port and the
+ *  host secret on disk. The route itself is covered by
+ *  schedule-delegation-route.test.ts; what this pins is the CLI half — whether
+ *  `--run-as` actually reaches the request body in each flag form. */
+async function hostDaemon(f: ReturnType<typeof fixture>, observed: Array<Record<string, unknown>>) {
+  mkdirSync(join(f.root, '.botmux'), { recursive: true, mode: 0o700 });
+  writeFileSync(join(f.root, '.botmux', '.dashboard-secret'), 'host-secret', { mode: 0o600 });
+  const server = createServer(async (req, res) => {
+    const request = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
+    if (!request) { res.statusCode = 400; return res.end(JSON.stringify({ ok: false, error: 'bad_json' })); }
+    observed.push(request);
+    res.statusCode = 201;
+    res.end(JSON.stringify({ ok: true, task: { ...(request.task as Record<string, unknown>), nextRunAt: null } }));
+  });
+  servers.push(server);
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  f.env.BOTMUX_DAEMON_IPC_PORT = String((server.address() as { port: number }).port);
+}
+
 describe('schedule CLI prompt updates', () => {
+  it.each([
+    ['add', 'schedule_working_dir_forbidden', '当前工作目录'],
+    ['add', 'schedule_direct_task_limit', '已达上限'],
+    ['update', 'schedule_mutation_scope_forbidden', '本会话所在群'],
+    ['update', 'schedule_working_dir_forbidden', '当前工作目录'],
+  ] as const)('turns a sandbox %s refusal %s into actionable text', async (action, code, text) => {
+    const f = fixture();
+    await managed(f, undefined, 'om_live', undefined, code);
+    const result = action === 'add'
+      ? await f.run(['add', '0 12 * * *', 'new task', '--id', '11223344'])
+      : await f.run(['update', f.task.id, '--prompt', 'changed']);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain(text);
+    expect(result.output).not.toContain(code);
+  });
+
+  it.each([
+    ['spaced', ['--run-as', 'ou_victim']],
+    ['equals', ['--run-as=ou_victim']],
+  ])('refuses %s --run-as inside a session before reaching the delegated add route', async (_label, flag) => {
+    const f = fixture();
+    const observed: Array<Record<string, unknown>> = [];
+    await managed(f, undefined, 'om_live', observed);
+    const result = await f.run(['add', '0 12 * * *', 'new task', ...flag, '--id', '11223344']);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain('只能在宿主终端');
+    expect(f.read()['11223344']).toBeUndefined();
+    // Session detection may hit the attestation endpoint, but the task body
+    // must never reach SCHEDULE_DELEGATED_ADD_ROUTE.
+    expect(observed.some(request => 'task' in request)).toBe(false);
+  });
+
+  it.each([
+    ['spaced', ['--run-as', 'ou_runner'], 'ou_runner'],
+    ['equals', ['--run-as=ou_runner'], 'ou_runner'],
+  ])('sends the host-terminal %s --run-as to the delegated add route', async (_label, flag, expected) => {
+    const f = fixture();
+    const observed: Array<Record<string, unknown>> = [];
+    await hostDaemon(f, observed);
+    const result = await f.run(['add', '0 12 * * *', 'new task', '--chat-id', 'oc_chat', ...flag, '--id', '11223344']);
+    expect(result.code, result.output).toBe(0);
+    expect(observed).toHaveLength(1);
+    expect((observed[0].task as Record<string, unknown>).runAs).toBe(expected);
+  });
+
+  it('omits runAs entirely when the host terminal names nobody', async () => {
+    const f = fixture();
+    const observed: Array<Record<string, unknown>> = [];
+    await hostDaemon(f, observed);
+    expect((await f.run(['add', '0 12 * * *', 'new task', '--chat-id', 'oc_chat', '--id', '11223344'])).code).toBe(0);
+    expect(observed[0].task as Record<string, unknown>).not.toHaveProperty('runAs');
+  });
+
   it.each(['--topic', '--follow-active'])('binds %s to the current topic in a reused chat session', async flag => {
     const f = fixture();
     await managed(f);
@@ -491,6 +568,24 @@ describe('schedule CLI prompt updates', () => {
       expect(result.output).toContain(errors[mode]);
       expect(readFileSync(f.path, 'utf8')).toBe(before);
     });
+});
+
+describe('schedule CLI pause/remove admission', () => {
+  // A bot turn cannot prove a current human operator, yet it may be cleaning
+  // up a bot-policy task in that task's original topic. Only the owning daemon
+  // can tell, so pause/remove must reach it instead of stopping at the CLI's
+  // human-operator check; other management actions still stop there.
+  it('leaves pause and remove from a turn without a human operator to the daemon', async () => {
+    const f = fixture();
+    const observed: Array<Record<string, unknown>> = [];
+    await managed(f, proof => { proof.scheduleOperator = { ok: false, error: 'caller_not_allowed' }; }, 'om_live', observed);
+    await f.run(['pause', f.task.id]);
+    await f.run(['remove', f.task.id]);
+    const resumed = await f.run(['resume', f.task.id]);
+    expect(resumed.code, resumed.output).not.toBe(0);
+    expect(observed.filter(request => typeof request.action === 'string').map(request => request.action))
+      .toEqual(['pause', 'remove']);
+  });
 });
 
 describe('work calendar CLI configuration and persisted manual intent', () => {

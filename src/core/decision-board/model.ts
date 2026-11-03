@@ -48,8 +48,18 @@ export interface BoardOption {
 export interface BoardLink {
   kind: BoardLinkKind;
   ref: string;
+  /** 管家给的标签。展示优先用它，其次（chat）查到的群名。 */
   label?: string;
+  /**
+   * 仅 chat：写入时有没有用本机 bot 查到这个群。verified = 查到了；unverified = 查不到、管家显式
+   * 允许先写上。缺省 = 这条核实功能上线前写的旧关联，不打标。
+   */
+  chatCheck?: BoardChatCheck;
+  /** 仅 chat：最近一次核实时查到的群名。和管家的标签分开存，重新核实只刷新它、不碰标签。 */
+  chatName?: string;
 }
+
+export type BoardChatCheck = 'verified' | 'unverified';
 
 export type BoardActor = 'steward' | 'owner' | 'system';
 export type BoardEventKind = 'create' | 'note' | 'state' | 'edit' | 'decision' | 'reply' | 'attach' | 'link';
@@ -74,6 +84,10 @@ export interface BoardItem {
   stateAt: number;
   stewardEventAt?: number;
   ownerSeenAt?: number;
+  /** 主群（`oc_…`）。指向的群不在关联里时按第一条 chat 关联算，见 {@link effectivePrimaryChat}。 */
+  primaryChat?: string;
+  /** 确实没有群时管家写的原因；只在这一项没有 chat 关联时生效。 */
+  noChatReason?: string;
 }
 
 export interface BoardEvent {
@@ -179,11 +193,13 @@ export function parseOptionSpec(raw: string): BoardOption | { error: string } {
   return { key: key.toUpperCase(), label, ...(effect ? { effect } : {}) };
 }
 
+export const CHAT_REF_PATTERN = /^oc_[A-Za-z0-9_-]{1,128}$/;
+
 const LINK_REF_PATTERNS: Record<BoardLinkKind, RegExp> = {
   pr: /^[\w.-]+\/[\w.-]+#\d+$/,
   issue: /^[\w.-]+\/[\w.-]+#\d+$/,
   commit: /^[\w.-]+\/[\w.-]+@[0-9a-f]{7,40}$/i,
-  chat: /^oc_[A-Za-z0-9_-]{1,128}$/,
+  chat: CHAT_REF_PATTERN,
   thread: /^oc_[A-Za-z0-9_-]{1,128}\/omt_[A-Za-z0-9_-]{1,128}$/,
   session: /^[A-Za-z0-9-]{8,64}$/,
   doc: /^https?:\/\/\S+$/,
@@ -278,12 +294,28 @@ export function linkUrl(link: BoardLink, ctx: LinkRenderContext): string | undef
   }
 }
 
-export function linkDefaultLabel(link: BoardLink): string {
+/** 关联的展示文字：管家的标签 > 查到的群名 > 按类型的默认写法。 */
+export function linkText(link: BoardLink, locale: Locale = 'zh'): string {
+  return link.label ?? link.chatName ?? linkDefaultLabel(link, locale);
+}
+
+/**
+ * 查到的群名进看板前规整：控制字符和连续空白压成一个空格，截到短文本上限。群名会进标签位和批次
+ * 文本，不能带换行或超长（手写标签有同样的上限）。
+ */
+export function cleanChatName(raw: string): string {
+  // eslint-disable-next-line no-control-regex
+  const flat = raw.replace(/[\u0000-\u001f\u007f\s]+/g, ' ').trim();
+  return flat.length > BOARD_LIMITS.shortText ? `${flat.slice(0, BOARD_LIMITS.shortText - 1)}…` : flat;
+}
+
+export function linkDefaultLabel(link: BoardLink, locale: Locale = 'zh'): string {
   switch (link.kind) {
     case 'pr': return `PR ${link.ref.slice(link.ref.indexOf('#'))}`;
     case 'issue': return `issue ${link.ref.slice(link.ref.indexOf('#'))}`;
     case 'commit': return link.ref.slice(link.ref.indexOf('@') + 1, link.ref.indexOf('@') + 8);
-    case 'chat': return 'chat';
+    // 没有标签的群（核实功能上线前写的旧关联）：至少带上 ID 开头，几个群之间分得清。
+    case 'chat': return `${locale === 'en' ? 'Chat' : '群'} ${link.ref.length > 11 ? `${link.ref.slice(0, 11)}…` : link.ref}`;
     case 'thread': return 'thread';
     case 'session': return `session ${link.ref.slice(0, 8)}`;
     case 'doc':
@@ -291,6 +323,20 @@ export function linkDefaultLabel(link: BoardLink): string {
       try { return new URL(link.ref).host; } catch { return link.ref.slice(0, 40); }
     }
   }
+}
+
+/**
+ * 一项的主群：管家指定的主群还挂在关联里就用它，否则取第一条 chat 关联（按写入顺序）。
+ * 存量数据没有指定主群，也照这条规则有主群，不用迁移。没有 chat 关联时返回 undefined。
+ */
+export function effectivePrimaryChat(links: readonly BoardLink[], primaryChat?: string): BoardLink | undefined {
+  const chats = links.filter(l => l.kind === 'chat');
+  return (primaryChat ? chats.find(l => l.ref === primaryChat) : undefined) ?? chats[0];
+}
+
+/** 没有群、也没写无群原因：list / show / 页面据此标「缺群」，提醒管家补。 */
+export function itemMissingChat(item: Pick<BoardItem, 'noChatReason'>, links: readonly BoardLink[]): boolean {
+  return !links.some(l => l.kind === 'chat') && !item.noChatReason?.trim();
 }
 
 /** 单项详情页的路径入口；Dashboard 收到后 302 到 `/#/board/<app>/<seq>`。 */
@@ -423,8 +469,11 @@ const GUIDE_PRESET_ZH = `你是 owner 的管家，帮 owner 推进他交代的�
 - 每次开工先看 \`botmux board pending\`（owner 已提交、你还没标记执行的决定），再看 \`botmux board list\`。
 
 ## 接任务（owner 在管家群里交代事情时）
-- 每件要跟的事建一项：\`botmux board add <标题> --key <去重键> --link pr=owner/repo#12 --link chat=oc_…\`。
-  已经有的用 \`botmux board set\` 更新，不重复建。交代得不清楚的，先在群里问清楚。
+- 每件要跟的事建一项，**必须带上这件事所在的飞书群**：\`botmux board add <标题> --key <去重键> --link chat=oc_… --link pr=owner/repo#12\`。
+  群名会自动查出来当标签；挂多个群（任务群 + 几个 PR 评审群）时第一个是主群，owner 在看板上点「进群」打开的就是它，要换用 \`--primary-chat oc_…\`。
+  确实没有群（只有 issue、还没开工、你自己处理）：写明原因 \`--no-chat "<原因>"\`，看板上显示「无群：<原因>」。
+  群查不到时会拒绝写入：先核对群 ID；确实要先写上，加 \`--allow-unverified-chat\`（看板上标「未核实」）。
+- 已经有的用 \`botmux board set\` 更新，不重复建。\`botmux board list\` 里标「缺群」的项，补上群（\`set <编号> --link chat=oc_…\`）或无群原因。交代得不清楚的，先在群里问清楚。
 
 ## 推进
 - 默认用你自己的 bot 身份到相关群发消息推进：\`botmux send --chat-id <群> --top-level --mention <open_id:名字> "…"\`。
@@ -437,13 +486,28 @@ const GUIDE_PRESET_ZH = `你是 owner 的管家，帮 owner 推进他交代的�
 - 不能自己定的、不可逆的、会推翻 owner 以前决定的事，写成待拍板：
   \`botmux board set <编号> --state decide --ask "要你定的问题" --option "A=做法 → 结果和风险" --option "B=…" --recommend A --reason "理由"\`。
   给两三个选项，写清后果和你的推荐。
-- 写完在管家群里用 \`botmux send --attention=decision --mention-back "…"\` 说一声，附上 \`botmux board list\` 给出的链接。
+- 写完在管家群里用 \`botmux send --attention=decision --mention-back "…"\` 说一声，附上 \`botmux board list\` 给出的链接；发出去之后给每项记一句 \`botmux board history <编号> "已报 owner"\`。
 
 ## 执行一批决定（收到「决策看板 · 批次」消息时）
 - 逐项处理：先 \`botmux board show <编号>\` 看最新内容，再按决定执行。
 - 每项做完：\`botmux board history <编号> --handled "做了什么、结果"\`，需要时改状态。
 - 决定看不懂，或者和现状冲突：不要猜，写 \`--handled "要你再确认：…"\`，并把状态设回 decide。
 - 最后回一条汇总。
+
+## 定时巡检（收到「决策看板 · 巡检」消息时）
+- owner 要你定时巡检时，在管家群建一条定时任务：\`botmux schedule add "<频率，如 每天 09:30；工作日用 cron：30 9 * * 1-5>" "【决策看板 · 巡检】按 botmux board guide 里「定时巡检」一节执行" --silent\`。改频率、暂停、删除都用 \`botmux schedule\`。
+- 先收口：看板上没结束的项（\`botmux board list --view decide\` 和 \`--view active\`）逐项核对现状——PR 合没合、关联群和会话的最新进展；办完的改成 done 或 closed，有变化的更新进展。
+- 再发现：只看最近 7 天有动静的事——owner 名下没完成的 PR（GitHub 作者取本仓 \`git config user.name\` / \`user.email\` 对应的账号，或管家历史里 owner 关联过的账号；再用仓库工具查，如 \`gh pr list --author <该 GitHub 账号>\`）、看板事项关联的群和会话里的新消息。更早的、看板上没有的不翻。
+- 每件要写进看板的事：
+  - 带上原文的定位链接和按原文来源写的 \`--key\`。原文是触发这件事的那条飞书消息或那个话题，也就是 owner 判断这件事要看的上下文，点开要能直接跳过去。找不到原文的不写；群按「接任务」的规则带。
+    - 话题：\`--link thread=oc_…/omt_…\`，key \`thread:omt_…\`
+    - 单条消息：\`--link url=<这条消息的飞书链接>\`，key \`msg:om_…\`（消息 ID，不用链接）
+    - botmux 会话：\`--link session=<会话 id>\`，key \`session:<会话 id>\`
+    - PR / issue：\`--link pr=owner/repo#N\` / \`issue=owner/repo#N\`，key \`pr:owner/repo#N\` / \`issue:owner/repo#N\`
+    同一件事用同一个 key，add 会更新已有项。
+  - 写之前核对现状：已合、已关、已经定了的，不写成待拍板。add 碰到已完成、已关闭的项会被拒绝；不要用 set 绕开，确实像要重开的写进汇总，由 owner 定。
+  - 只有真要 owner 定的写成 decide，其余写 active 或 waiting。
+- 只报增量：本轮新建的和新转成待拍板的，汇总成一条 \`botmux send --attention=decision --no-mention "…"\`，附上链接（巡检是定时回合，没有触发消息的发送者，\`--mention-back\` 会被拒绝；确实要 @ owner 就显式写 \`--mention <owner 的 open_id>\`）；发出去之后照「要 owner 拍板」一节给每项记「已报 owner」；已经在待拍板、记过「已报 owner」、没有变化的不再提醒，没记过的这轮补报。没有增量就不发消息。
 
 ## 推进标准
 （owner 没有写。只汇报和催办，不做不可逆操作。）`;
@@ -454,8 +518,11 @@ const GUIDE_PRESET_EN = `You are the owner's steward. You push forward the devel
 - Every time you start, check \`botmux board pending\` (decisions the owner submitted that you have not marked handled), then \`botmux board list\`.
 
 ## Taking a task (when the owner asks for something in the steward chat)
-- Create one item per thing to track: \`botmux board add <title> --key <dedupe key> --link pr=owner/repo#12 --link chat=oc_…\`.
-  Update existing items with \`botmux board set\` instead of creating duplicates. Ask in the chat first if the request is unclear.
+- Create one item per thing to track, and **always link the Feishu chat where the work happens**: \`botmux board add <title> --key <dedupe key> --link chat=oc_… --link pr=owner/repo#12\`.
+  The chat name is looked up and used as the label. With several chats (task chat plus PR review chats) the first one is the main chat, which the owner's "Open chat" button opens; change it with \`--primary-chat oc_…\`.
+  If there really is no chat (only an issue, not started yet, or you handle it yourself), say why: \`--no-chat "<reason>"\`; the board shows "No chat: <reason>".
+  A chat that cannot be found is rejected: check the chat ID first; to write it anyway, add \`--allow-unverified-chat\` (shown as "Unverified").
+- Update existing items with \`botmux board set\` instead of creating duplicates. For items marked "missing chat" in \`botmux board list\`, add the chat (\`set <n> --link chat=oc_…\`) or a no-chat reason. Ask in the chat first if the request is unclear.
 
 ## Pushing work forward
 - By default, post as your own bot in the relevant chat: \`botmux send --chat-id <chat> --top-level --mention <open_id:name> "…"\`.
@@ -467,13 +534,28 @@ const GUIDE_PRESET_EN = `You are the owner's steward. You push forward the devel
 ## Asking the owner to decide
 - Anything you cannot decide, anything irreversible, or anything that would overturn an earlier owner decision becomes a decision item:
   \`botmux board set <n> --state decide --ask "question" --option "A=approach → outcome and risk" --option "B=…" --recommend A --reason "why"\`.
-- Then tell the owner in the steward chat with \`botmux send --attention=decision --mention-back "…"\`, including the links from \`botmux board list\`.
+- Then tell the owner in the steward chat with \`botmux send --attention=decision --mention-back "…"\`, including the links from \`botmux board list\`; once sent, note \`botmux board history <n> "reported to owner"\` on each item.
 
 ## Executing a batch (when a "Decision board · batch" message arrives)
 - Item by item: \`botmux board show <n>\` for the latest state, then act on the decision.
 - After each one: \`botmux board history <n> --handled "what you did and the result"\`, and update the state if needed.
 - If a decision is unclear or conflicts with reality, do not guess: \`--handled "Please confirm: …"\` and set the state back to decide.
 - Finish with one summary reply.
+
+## Scheduled patrol (when a "Decision board · patrol" message arrives)
+- When the owner wants regular patrols, create a scheduled task in the steward chat: \`botmux schedule add "<frequency, e.g. every 2h; weekdays at 09:30 is the cron 30 9 * * 1-5>" '[Decision board · patrol] Follow "Scheduled patrol" in botmux board guide' --silent\`. Change, pause or delete it with \`botmux schedule\`.
+- Close out first: check every unfinished item (\`botmux board list --view decide\` and \`--view active\`) against reality — is the PR merged, what is the latest in its chats and sessions. Mark finished ones done or closed; update progress where it changed.
+- Then discover: only things with activity in the last 7 days — the owner's open PRs (derive the GitHub author from the repo's \`git config user.name\` / \`user.email\` or an account the owner used in earlier tasks, then use the repository's tools, e.g. \`gh pr list --author <that GitHub account>\`) and new messages in chats and sessions linked from board items. Do not dig up anything older that is not already on the board.
+- For every item you write:
+  - Link the source and pass a \`--key\` derived from it. The source is the Feishu message or thread that triggered this item, i.e. the context the owner needs to judge it, and the link must jump straight there. If you cannot find the source, do not write the item; link chats as in "Taking a task".
+    - Thread: \`--link thread=oc_…/omt_…\`, key \`thread:omt_…\`
+    - Single message: \`--link url=<the message's Feishu link>\`, key \`msg:om_…\` (the message ID, not the link)
+    - botmux session: \`--link session=<session id>\`, key \`session:<session id>\`
+    - PR / issue: \`--link pr=owner/repo#N\` / \`issue=owner/repo#N\`, key \`pr:owner/repo#N\` / \`issue:owner/repo#N\`
+    The same thing always gets the same key, so add updates the existing item.
+  - Check reality before writing: merged, closed or already decided things are not decision items. add refuses done and closed items; do not work around it with set — if something looks like it should reopen, put it in your summary for the owner.
+  - Only things the owner really has to decide become decide; everything else is active or waiting.
+- Report only what is new: items created this run and items that newly became decide go into one \`botmux send --attention=decision --no-mention "…"\` with links (a patrol is a scheduled turn with no triggering message sender, so \`--mention-back\` is refused; use an explicit \`--mention <owner open_id>\` if the owner must be @-ed); after sending, note "reported to owner" on each as in "Asking the owner to decide". Items already waiting for a decision with that note and no change are not repeated; ones without it are reported this run. If nothing is new, send nothing.
 
 ## Standard
 (The owner has not written one. Only report and nudge; take no irreversible action.)`;
@@ -535,6 +617,8 @@ export interface BatchMessageEntry {
   recommended?: boolean;
   text: string;
   fileCount: number;
+  /** 这一项的主群：管家群里的回显和批次消息都带上，点了直接进群。 */
+  primaryChat?: { text: string; url: string };
 }
 
 export interface BatchMessageInput {
@@ -560,7 +644,7 @@ function formatClock(ms: number, timeZone?: string): string {
 }
 
 /**
- * 一批决定里逐项的那部分：编号、标题、状态、选的选项（键 + 选项原文）、说明原文、附图数。
+ * 一批决定里逐项的那部分：编号、标题、状态、主群链接、选的选项（键 + 选项原文）、说明原文、附图数。
  * 管家会话里的批次消息和管家群里的回显共用这一份，两边对 owner 写了什么的呈现逐字一致。
  * 说明原文不改写、不截断、不缩进、不 trim：单行多行一样，「说明：」后另起一行原样接上
  *（首尾空白留在原文里，不会挤在冒号后面像格式问题）。
@@ -574,6 +658,8 @@ export function formatBatchEntries(
   const blocks = entries.map(e => {
     const stateLabel = BOARD_STATE_LABELS[zh ? 'zh' : 'en'][e.state];
     const lines = [`#${e.seq} ${e.title}（${stateLabel}${e.stage ? `·${e.stage}` : ''}）`];
+    // 主群紧跟标题：说明原文可能多行，放在它后面会像说明的一部分。群名 / 标签压成一行，不能借换行伪造下一行。
+    if (e.primaryChat) lines.push(`${zh ? '主群：' : 'Main chat: '}${e.primaryChat.text.replace(/\s+/g, ' ').trim()} ${e.primaryChat.url}`);
     if (e.choice) {
       const tag = e.recommended ? (zh ? '（管家推荐）' : ' (recommended)') : '';
       lines.push(zh

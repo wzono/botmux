@@ -1,3 +1,4 @@
+import { botAcceptsLaunchModel } from '../core/launch-model-capability.js';
 import { parseGroupCreationDefaults } from './group-creation-options.js';
 import { normalizeStewardConfig } from '../core/decision-board/model.js';
 import { formatZcodeModelChoice, resolveZcodeModelReference, zcodeAmbiguousModelIds } from './zcode-models.js';
@@ -16,6 +17,12 @@ import { normalizeMojoConfig } from '../adapters/backend/mojo-types.js';
 import { normalizeHerdrBackendConfig, resolveHerdrBackendConfig } from '../adapters/backend/types.js';
 import { normalizeRemoteRunnerConfig } from '../adapters/backend/remote-runner-config.js';
 import { parseTriggerUserAuthConfig } from './trigger-user-auth.js';
+import { sharedBotSandboxAdvice, type SharedBotSandboxAdvice } from '../core/shared-bot-sandbox-advice.js';
+import { resolveLocalSandboxMode, localSandboxApplies } from '../adapters/backend/sandbox.js';
+import { backendSandboxCompatibilityError } from '../adapters/backend/session-backend-selector.js';
+import type { BackendType } from '../adapters/backend/types.js';
+import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
+import { isSessionGroup } from './session-groups-store.js';
 import type { BotConfig } from '../bot-registry.js';
 import { getBot, getOwnerOpenId, readBotSkillPolicy } from '../bot-registry.js';
 import { republishResolvedAllowedUsersDescriptor, scheduleAllowedUsersResolveRetryFromMutation } from '../bot-registry.js';
@@ -124,7 +131,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'cli', configKey: 'cliId', kind: 'cli', effect: 'next-session', clearable: false, hint: 'CLI 适配器（序号 1-16 或 id，如 claude-code）' },
   { key: 'launchShell', configKey: 'launchShell', kind: 'string', effect: 'next-session', clearable: true, hint: '启动 CLI 用的 shell（zsh|bash|fish|sh 或绝对路径），覆盖 $SHELL；用于 .bashrc/.zshrc 里 exec 切到别的 shell 导致会话起不来的场景；fish 用户把 PATH/nvm 放进 ~/.config/fish/config.fish，无需回填 bash/zsh；unset 回 $SHELL' },
   { key: 'lang', configKey: 'lang', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['zh', 'en'], hint: '机器人 UI 语言 zh|en；unset 回全局默认' },
-  { key: 'skillInjection', configKey: 'skillInjection', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['global', 'prompt', 'off'], hint: 'botmux skills 注入方式（仅影响 codex/gemini 等全局 skills 目录的 CLI）：prompt=注入会话不落全局盘(默认)｜global=装进 CLI 全局目录(会被独立 CLI 看到)｜off=只留提示+botmux --help；切到/离开 global 需重启 daemon 才完全生效；unset 回机器级默认' },
+  { key: 'skillInjection', configKey: 'skillInjection', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['global', 'prompt', 'off'], hint: 'botmux skills 注入方式（仅影响 codex/opencode 等全局 skills 目录的 CLI）：prompt=注入会话不落全局盘(默认)｜global=装进 CLI 全局目录(会被独立 CLI 看到)｜off=只留提示+botmux --help；切到/离开 global 需重启 daemon 才完全生效；unset 回机器级默认' },
   { key: 'defaultWorkingDir', configKey: 'defaultWorkingDir', kind: 'dir', effect: 'next-session', clearable: true, hint: '新话题默认工作目录（跳过仓库选择卡片）' },
   { key: 'brandLabel', configKey: 'brandLabel', kind: 'string', effect: 'immediate', clearable: true, hint: '卡片页脚品牌文案；unset 回默认 botmux 链接' },
   { key: 'replyFooterEnabled', configKey: 'replyFooterEnabled', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '回复页脚总开关 on|off（默认 on）；总开关关闭时保留各信息块配置' },
@@ -148,6 +155,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'pinStreamingCard', configKey: 'pinStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '置顶当前公开实时卡片 on|off（失败不影响会话）' },
   { key: 'cotEnabled', configKey: 'cotEnabled', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '思考过程消息 on|off（默认 on）：turn 进行中把模型思考过程以飞书原生 CoT 消息（message_cot）流式展示（客户端需 PC ≥7.70 / 移动端 ≥7.74；支持 claude-code / codex / traex / pi 等适配器）。这是 bot 级总开关，单个群可用 /cot off 关闭' },
   { key: 'thinkingCardToolResult', configKey: 'thinkingCardToolResult', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '思考气泡是否贴工具输出 on|off（默认 on）：off 时气泡只保留思考段落与工具节点标题（工具名 · 命令/路径），不再附带命令输出/文件内容代码块，与 Claude Code 自身界面一致' },
+  { key: 'replyCardShowTools', configKey: 'replyCardShowTools', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '动态单卡是否显示工具调用 on|off（默认 on）：仅 replyCardMode=unified 时生效，legacy 模式无效（切换模式保留该值）；off 时卡片隐藏工具节点、命令、结果与工具次数，思考摘要和公开进度仍显示；不影响原生思考气泡，/cot show 也不会显示被隐藏的工具' },
   { key: 'silentTurnReactions', configKey: 'silentTurnReactions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭无卡片模式下的 GoGoGo/DONE reaction 和 Codex App 追加指令确认回执 on|off' },
   { key: 'writableTerminalLinkInCard', configKey: 'writableTerminalLinkInCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '卡片内嵌可写终端链接 on|off' },
   { key: 'privateCard', configKey: 'privateCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/card 发 owner-only 私有快照 on|off' },
@@ -415,35 +423,50 @@ export async function applyBotSessionEnvOps(
  * 调用方负责按 kind 校验后再传值；本函数只负责落盘 + 同步内存。
  * 不处理 allowedUsers（异步，见 {@link setBotAllowedUsers}）。
  */
+/** Optional picker snapshot, checked inside the same file lock as the write. */
+export interface ConfigSelectionPrecondition {
+  selectionKey: string;
+  /** null means the CLI default model; omitted means no model condition. */
+  model?: string | null;
+  requireLaunchModelSupport?: boolean;
+  actorOpenId?: string;
+}
+
 export async function applyConfigField(
   larkAppId: string,
   spec: ConfigFieldSpec,
   value: unknown,
+  precondition?: ConfigSelectionPrecondition,
 ): Promise<ApplyFieldResult> {
   if (spec.configKey === 'pinStreamingCard') {
     return serializePinStreamingCardConfigChange(
       larkAppId,
-      () => applyConfigFieldInternal(larkAppId, spec, value),
+      () => applyConfigFieldInternal(larkAppId, spec, value, precondition),
     );
   }
-  return applyConfigFieldInternal(larkAppId, spec, value);
+  return applyConfigFieldInternal(larkAppId, spec, value, precondition);
 }
 
 async function applyConfigFieldInternal(
   larkAppId: string,
   spec: ConfigFieldSpec,
   value: unknown,
+  precondition?: ConfigSelectionPrecondition,
 ): Promise<ApplyFieldResult> {
   if (spec.kind === 'allowedUsers') return { ok: false, reason: 'use_setBotAllowedUsers' };
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  const expectedAllowedUsers = precondition?.actorOpenId ? JSON.stringify(bot.config.allowedUsers ?? []) : undefined;
   if (spec.configKey === 'envPolicy' && value !== null) {
     try { value = normalizeEnvPolicy(value); } catch { return { ok: false, reason: 'invalid_env_policy' }; }
   }
   if (spec.configKey === 'sandboxNetworkPolicy' && value !== null) {
     try {
       value = parseSandboxNetworkPolicy(value);
-      const reason = networkPolicySupportError({ platform: process.platform, backendType: bot.config.backendType ?? 'pty', sandbox: bot.config.sandbox, policy: value });
+      // Judge the backend new sessions launch on: the override, else the
+      // daemon default (tmux unless BACKEND_TYPE says otherwise), CLI-paired.
+      const backendType = resolvePairedBackendId(bot.config.cliId, bot.config.backendType, config.daemon.backendType) ?? 'pty';
+      const reason = networkPolicySupportError({ platform: process.platform, backendType, sandbox: bot.config.sandbox, policy: value });
       if (reason) return { ok: false, reason };
     } catch (error) { return { ok: false, reason: (error as Error).message }; }
   }
@@ -513,6 +536,21 @@ async function applyConfigFieldInternal(
     const currentModel = typeof entry.model === 'string' && entry.model.trim()
       ? entry.model.trim()
       : undefined;
+    if (precondition) {
+      if (precondition.actorOpenId && (!bot.resolvedAllowedUsers.length
+        || !bot.resolvedAllowedUsers.includes(precondition.actorOpenId)
+        || JSON.stringify(entry.allowedUsers ?? []) !== expectedAllowedUsers)) {
+        return { write: false, result: 'config_selection_changed' };
+      }
+      const currentSelectionKey = selectionKeyForBot(currentCliId,
+        typeof entry.wrapperCli === 'string' ? entry.wrapperCli : undefined,
+        entry.cliLaunchMode as BotConfig['cliLaunchMode']);
+      if (currentSelectionKey !== precondition.selectionKey
+        || (Object.hasOwn(precondition, 'model') && (currentModel ?? null) !== precondition.model)
+        || (precondition.requireLaunchModelSupport && !botAcceptsLaunchModel({ cliId: currentCliId as BotConfig['cliId'], backendType: entry.backendType }))) {
+        return { write: false, result: 'config_selection_changed' };
+      }
+    }
     const zeroPrompt = spec.configKey === 'promptInjection'
       ? effective === 'none'
       : entry.promptInjection === 'none';
@@ -1248,6 +1286,8 @@ export interface ConfigCardData {
   quota: number | null;
   admins: number;
   booleans: Array<{ key: string; on: boolean }>;
+  /** Other people use this bot while the allowlist sandbox is off (display only). */
+  sandboxAdvice?: SharedBotSandboxAdvice & { cliId: string };
 }
 
 export function getConfigCardData(larkAppId: string, modelChoices: readonly string[] = []): ConfigCardData | null {
@@ -1291,5 +1331,65 @@ export function getConfigCardData(larkAppId: string, modelChoices: readonly stri
     booleans: CONFIG_FIELDS.filter(f => f.kind === 'boolean').map(f => ({
       key: f.key, on: (cfg as any)[f.configKey] === true,
     })),
+    ...(() => {
+      // p2pMode='group' session groups carry an oncall binding that only pins
+      // their workingDir: the talk gate treats them as owner-only, so they are
+      // not a "whole group can talk" signal. allowedChatGroups is talk-open for
+      // every member, except where the id is itself a session group.
+      const sharedOncallChats = (cfg.oncallChats ?? []).filter(c => !isSessionGroup(c.chatId));
+      const sharedAllowedChatGroups = (cfg.allowedChatGroups ?? []).filter(id => !isSessionGroup(id));
+      // Mirror the WORKER's pairing, not an open-coded override chain: a remote
+      // CLI id (riff / mojo / remote-runner) dictates its backend even when
+      // backendType is not written (the common config), and a non-remote CLI
+      // resolved onto a remote backend reconciles to the daemon default / pty.
+      // Pass cfg.mojo so a provably-remote mojo session is exempt too.
+      const backendType = resolvePairedBackendId(cfg.cliId, cfg.backendType, config.daemon.backendType) ?? 'pty';
+      const localApplies = localSandboxApplies(backendType, cfg.mojo);
+      // The worker's spawn gate, exactly: even a LOCAL backend may refuse a file
+      // sandbox (herdr / zellij / zmx / orca; local mojo without a remote
+      // proof). undefined = it would spawn; non-undefined = it would throw.
+      const sandboxCapable = backendSandboxCompatibilityError({
+        backendType: backendType as BackendType,
+        cliId: cfg.cliId,
+        fileSandboxRequested: true,
+        effectiveReadIsolationRequested: false,
+        ...(backendType === 'mojo' ? { mojoConfig: cfg.mojo } : {}),
+      }) === undefined;
+      // DISPLAY-only path: a typo'd BOTMUX_SANDBOX makes the resolver throw (the
+      // worker fail-closes at spawn). Fall back to the config-only mode (still
+      // honouring the legacy readIsolation flag, which implies oncall), so a bad
+      // env value neither kills /botconfig nor re-advises an isolated bot.
+      let effectiveSandboxMode: ReturnType<typeof resolveLocalSandboxMode>;
+      try {
+        effectiveSandboxMode = resolveLocalSandboxMode({
+          backendType,
+          mojoConfig: cfg.mojo,
+          configSandbox: cfg.sandbox,
+          readIsolation: cfg.readIsolation === true,
+          envValue: process.env.BOTMUX_SANDBOX,
+        });
+      } catch {
+        effectiveSandboxMode = resolveSandboxMode({
+          configSandbox: cfg.sandbox,
+          readIsolation: cfg.readIsolation === true,
+        });
+      }
+      const advice = sharedBotSandboxAdvice({
+        sandboxMode: effectiveSandboxMode,
+        localSandboxApplies: localApplies,
+        sandboxCapable,
+        cliId: cfg.cliId,
+        oncallChatCount: sharedOncallChats.length,
+        allowedChatGroupsCount: sharedAllowedChatGroups.length,
+        defaultOncallEnabled: cfg.defaultOncall?.enabled,
+        // Resolved identities, same source as `admins` above: a stale
+        // unresolvable entry must not make the bot look multi-user.
+        allowedUsersCount: bot.resolvedAllowedUsers.length,
+        triggerUserAuthEnabled: cfg.triggerUserAuth?.enabled,
+        wrapperCli: cfg.wrapperCli,
+        cliRuntimeConfigured: cfg.cliRuntime !== undefined,
+      });
+      return advice ? { sandboxAdvice: { ...advice, cliId: cfg.cliId } } : {};
+    })(),
   };
 }

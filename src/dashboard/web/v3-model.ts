@@ -14,6 +14,115 @@ export const V3_NODE_LABEL: Record<RunNodeView['status'], string> = {
   failed: '失败',
 };
 
+/**
+ * The five states people read a workflow by, plus the three "this path did
+ * not run" states. Gate waits and blocked nodes both need a person, so they
+ * share one bucket; the node panel still names the precise raw state.
+ */
+export type V3DisplayStatus =
+  | 'waiting'
+  | 'running'
+  | 'done'
+  | 'failed'
+  | 'needsHuman'
+  | 'skipped'
+  | 'cancelled'
+  | 'superseded';
+
+export const V3_DISPLAY_STATUS: Record<RunNodeView['status'], V3DisplayStatus> = {
+  pending: 'waiting',
+  running: 'running',
+  done: 'done',
+  failed: 'failed',
+  gateWaiting: 'needsHuman',
+  blocked: 'needsHuman',
+  skipped: 'skipped',
+  cancelled: 'cancelled',
+  superseded: 'superseded',
+};
+
+export const V3_DISPLAY_LABEL: Record<V3DisplayStatus, string> = {
+  waiting: '等待',
+  running: '进行中',
+  done: '完成',
+  failed: '失败',
+  needsHuman: '等人工确认',
+  skipped: '已跳过',
+  cancelled: '已取消',
+  superseded: '已替代',
+};
+
+/** Legend order: the five states first, then the not-run states. */
+export const V3_DISPLAY_LEGEND: V3DisplayStatus[] = [
+  'waiting', 'running', 'done', 'failed', 'needsHuman', 'skipped', 'cancelled',
+];
+
+export const V3_ATTEMPT_OUTCOME_LABEL: Record<string, string> = {
+  succeeded: '完成',
+  failed: '失败',
+  blocked: '受阻',
+  cancelled: '已取消',
+  interrupted: '中断',
+  superseded: '已替代',
+};
+
+/** Compact duration for an SVG node row: 45秒 / 6分 / 1时20分 / 2天3时. */
+export function formatV3Duration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  if (totalSeconds < 60) return `${totalSeconds}秒`;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  if (totalMinutes < 60) return `${totalMinutes}分`;
+  const totalHours = Math.floor(totalMinutes / 60);
+  if (totalHours < 24) {
+    const minutes = totalMinutes % 60;
+    return minutes ? `${totalHours}时${minutes}分` : `${totalHours}时`;
+  }
+  const days = Math.floor(totalHours / 24);
+  const hours = totalHours % 24;
+  return hours ? `${days}天${hours}时` : `${days}天`;
+}
+
+/** How long the node has been working (running) or worked (finished), measured
+ *  on the server clock carried by the view. Undefined when it never started. */
+export function nodeElapsedMs(node: RunNodeView, generatedAt: number): number | undefined {
+  if (node.startedAt === undefined) return undefined;
+  const end = node.endedAt ?? (node.status === 'running' ? generatedAt : undefined);
+  return end === undefined ? undefined : Math.max(0, end - node.startedAt);
+}
+
+/** How long a person has been needed: gate wait, or time since it blocked. */
+export function nodeWaitingMs(node: RunNodeView, generatedAt: number): number | undefined {
+  const since = node.status === 'gateWaiting'
+    ? node.gateSince
+    : node.status === 'blocked' ? node.endedAt : undefined;
+  return since === undefined ? undefined : Math.max(0, generatedAt - since);
+}
+
+/** Third row of a graph node: display state, then elapsed / attempt count. */
+export function nodeStatusLine(node: RunNodeView, generatedAt: number | undefined): string {
+  const label = V3_DISPLAY_LABEL[V3_DISPLAY_STATUS[node.status]];
+  const parts = [label];
+  if (node.status === 'gateWaiting') parts.push('审批');
+  else if (node.status === 'blocked') parts.push('受阻');
+  if (generatedAt !== undefined) {
+    const elapsed = nodeElapsedMs(node, generatedAt);
+    if (elapsed !== undefined && (node.status === 'running' || node.status === 'done' || node.status === 'failed')) {
+      parts.push(formatV3Duration(elapsed));
+    }
+  }
+  if (node.attempts.length > 1 && node.status !== 'pending') parts.push(`第${node.attempts.length}次`);
+  return parts.join(' · ');
+}
+
+/** Second row of a graph node: who executes it. */
+export function nodeBotLine(node: RunNodeView): string {
+  if (node.host) return `宿主动作 · ${node.host.executor}`;
+  const bot = node.bot;
+  if (!bot) return '';
+  const who = bot.name ?? bot.larkAppId ?? bot.selector ?? '默认 Bot';
+  return bot.cliId ? `${who} · ${bot.cliId}` : who;
+}
+
 export const V3_DECISION_LABEL: Record<string, string> = {
   exit: '✓ 通过',
   continue: '↻ 继续返工',
@@ -21,10 +130,10 @@ export const V3_DECISION_LABEL: Record<string, string> = {
 };
 
 export const V3_GRAPH = {
-  nodeWidth: 168,
-  plainHeight: 48,
+  nodeWidth: 196,
+  plainHeight: 66,
   loopHeight: 70,
-  columnGap: 226,
+  columnGap: 254,
   verticalGap: 30,
   padding: 26,
   maxDots: 8,
@@ -80,6 +189,8 @@ export interface V3GraphEdgeLayout {
   x2: number;
   y2: number;
   mx: number;
+  /** Vertical layouts only: the curve's vertical midpoint (edges run top → bottom). */
+  my?: number;
   live: boolean;
 }
 
@@ -150,6 +261,77 @@ export function buildGraphLayout(view: RunView): V3GraphLayout {
     }
   }
 
+  return { width, height, nodes: laidOutNodes, edges };
+}
+
+/** Spacing of the sidebar's top-to-bottom layout (design §11.4, 350–800px). */
+export const V3_VERTICAL_GRAPH = {
+  padding: 10,
+  horizontalGap: 10,
+  verticalGap: 34,
+  /** Three parallel nodes still fit the narrowest (350px) sidebar's graph area. */
+  minNodeWidth: 88,
+} as const;
+
+/**
+ * Top-to-bottom variant of {@link buildGraphLayout} for the Feishu sidebar
+ * (350–800px wide): one row per depth, rows centered, a uniform box width that
+ * shrinks to fit the widest row into `containerWidth` (never below
+ * `minNodeWidth` — a wider row scrolls sideways instead of becoming unreadable).
+ */
+export function buildVerticalGraphLayout(view: RunView, containerWidth: number): V3GraphLayout {
+  const nodes = graphNodes(view);
+  const depthOf = computeDepth(nodes);
+  const byDepth = new Map<number, RunNodeView[]>();
+  for (const node of nodes) {
+    const depth = depthOf.get(node.id) ?? 0;
+    const bucket = byDepth.get(depth);
+    if (bucket) bucket.push(node);
+    else byDepth.set(depth, [node]);
+  }
+  const depths = [...byDepth.keys()].sort((a, b) => a - b);
+  const G = V3_VERTICAL_GRAPH;
+  const widest = Math.max(1, ...depths.map((depth) => byDepth.get(depth)!.length));
+  const avail = Math.max(G.minNodeWidth, Math.floor(containerWidth) - G.padding * 2);
+  const nodeWidth = Math.max(
+    G.minNodeWidth,
+    Math.min(V3_GRAPH.nodeWidth, Math.floor((avail - (widest - 1) * G.horizontalGap) / widest)),
+  );
+  const rowWidth = (count: number) => count * nodeWidth + Math.max(0, count - 1) * G.horizontalGap;
+  const width = Math.max(Math.floor(containerWidth), G.padding * 2 + rowWidth(widest));
+
+  const laidOutNodes: V3GraphNodeLayout[] = [];
+  const pos = new Map<string, V3GraphNodeLayout>();
+  let y = G.padding;
+  for (const depth of depths) {
+    const row = byDepth.get(depth)!;
+    let x = Math.round((width - rowWidth(row.length)) / 2);
+    let rowHeight = 0;
+    for (const node of row) {
+      const box = { node, x, y, width: nodeWidth, height: nodeHeight(node) };
+      laidOutNodes.push(box);
+      pos.set(node.id, box);
+      x += nodeWidth + G.horizontalGap;
+      rowHeight = Math.max(rowHeight, box.height);
+    }
+    y += rowHeight + G.verticalGap;
+  }
+  const height = depths.length ? y - G.verticalGap + G.padding : G.padding * 2;
+
+  const edges: V3GraphEdgeLayout[] = [];
+  for (const node of nodes) {
+    const to = pos.get(node.id);
+    if (!to) continue;
+    for (const dep of node.depends) {
+      const from = pos.get(dep);
+      if (!from) continue;
+      const x1 = from.x + from.width / 2;
+      const y1 = from.y + from.height;
+      const x2 = to.x + to.width / 2;
+      const y2 = to.y;
+      edges.push({ fromId: dep, toId: node.id, x1, y1, x2, y2, mx: (x1 + x2) / 2, my: (y1 + y2) / 2, live: node.status === 'running' });
+    }
+  }
   return { width, height, nodes: laidOutNodes, edges };
 }
 
