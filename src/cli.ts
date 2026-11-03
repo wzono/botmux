@@ -16762,12 +16762,6 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   const useJson = rest.includes('--json') || questionsFile !== undefined;
   const multiSelect = rest.includes('--multi');
   const positionalArgs = positionals(rest, ['--json', '--multi']);
-  if (!sub && positionalArgs[0] === 'buttons') {
-    console.error(
-      'botmux ask: `buttons` 必须紧跟 `ask`。请使用 `botmux ask buttons --options ... \"问题\"`',
-    );
-    process.exit(2);
-  }
 
   let options;
   let questions;
