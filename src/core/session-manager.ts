@@ -1,3 +1,5 @@
+import { deploymentContinuationCandidate, claimDeploymentContinuation, deploymentContinuationClaimCurrent, setDeploymentContinuation } from '../services/deployment-continuation.js';
+import { canTalk } from '../im/lark/event-dispatcher.js';
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { renderStewardHintBlock } from './decision-board/model.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './prompt-injection.js';
@@ -14,8 +16,7 @@ import { expandHome, validateWorkingDir } from './working-dir.js';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import { groupContextEpoch, groupContextForPrompt } from '../services/group-context-prompt.js';
-import * as scheduleStore from '../services/schedule-store.js';
-import { updateRuntimeTaskState } from './scheduler.js';
+import { getRuntimeTask, scheduledWorkingDirSwapReason, updateRuntimeTaskState } from './scheduler.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
@@ -97,7 +98,7 @@ import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import { armSilentScheduledTurn, disarmSilentScheduledTurn } from './silent-schedule-turns.js';
 import { getAttachmentsDir } from './attachment-path.js';
 import { resolveRegularGroupMode } from '../services/chat-reply-mode-store.js';
-import { beginReplyTargetTurn } from './reply-target.js';
+import { beginReplyTargetTurn, pickTurnReplyTarget } from './reply-target.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
 import {
   hasScheduleTopicTitleRuntimeTemplate,
@@ -113,6 +114,7 @@ import { restoreCodexCleanupArchive } from '../services/codex-cleanup-archive.js
 import { isSharedAdoptPersistedSession, isSharedAdoptSession } from './shared-adopt.js';
 import { readGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
 import { createHeadlessRecord, headlessChatId, newHeadlessId, saveHeadlessSession } from '../services/headless-session-store.js';
+import type { WorkflowSessionKind } from '../workflows/session-kind.js';
 import {
   reconcileXpiSharedCwdRecovery,
   type XpiSharedCwdStartupNotice,
@@ -339,7 +341,7 @@ function quarantineUnregisteredRestoreSession(session: Session, reason: string):
 function sameUsageLimit(a: DaemonSession['usageLimit'], b: DaemonSession['usageLimit']): boolean {
   if (!a && !b) return true;
   if (!a || !b) return false;
-  return usageLimitStateKey(a) === usageLimitStateKey(b) && a.retryReady === b.retryReady;
+  return usageLimitStateKey(a) === usageLimitStateKey(b) && a.retryReady === b.retryReady && a.source === b.source;
 }
 
 function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli: string } | null {
@@ -1312,6 +1314,12 @@ function frozenSessionSandbox(sessionId: string): Session['sandbox'] | undefined
 
 /** All public builders share the durable session policy, including callers
  * outside the daemon (repo selection, scheduled turns and comment replies). */
+/** The session row carries a verified workflow-node marker (design
+ *  2026-11-03 §4.2); set before its opening input is built. */
+function isWorkflowNodeSessionRow(sessionId: string): boolean {
+  return !!sessionStore.getSession(sessionId)?.workflowNode;
+}
+
 function inputPromptInjection(sessionId: string, larkAppId?: string, cliId?: string): PromptInjection {
   const session = sessionStore.getSession(sessionId);
   if (session) return session.promptInjection ?? 'default';
@@ -1348,6 +1356,9 @@ function mergeBackgroundAttachments(current: LarkAttachment[] | undefined, backg
  *  turnId（= 发给 worker 的 turnId，最终成为 managedTurnOrigin.turnId），用于
  *  sidecar 绑定；sessionBackendType 取会话冻结的后端类型（远端后端无本地 hook 进程）。 */
 type NewTopicOpts = {
+  /** A workflow node session (design 2026-11-03 §4.2): no workflow discovery
+   *  hint and no workflow skill family in the opening input. */
+  workflowNodeSession?: boolean;
   promptInjection?: PromptInjection;
   larkAppId?: string;
   chatId?: string;
@@ -1421,18 +1432,21 @@ function buildNewTopicBlocks(
   const noTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
   const replyDelivery: ReplyDelivery = noTransport ? 'send' : replyDeliveryFor(opts?.larkAppId, cliId, opts?.promptInjection);
   const bare = replyDelivery === 'transcript' && opts?.solo === true;
+  // Built by the daemon, whose own env never carries a session marker: the
+  // session row decides (a legacy node worker never comes through here).
+  const sessionKind: WorkflowSessionKind = opts?.workflowNodeSession ? 'botNode' : 'ordinary';
   // cliId only adds the Cursor background-task note (#1504); every other CLI's
   // hint list is unchanged.
   const hints = adapter.injectsSessionContext
     ? []
-    : buildBotmuxShellHints(locale, noTransport, replyDelivery, cliId);
+    : buildBotmuxShellHints(locale, noTransport, replyDelivery, cliId, { sessionKind });
 
   const routingBlock = hints.length > 0
     ? `<botmux_routing>\n${hints.join('\n')}\n</botmux_routing>`
     : '';
 
   // Built-in skill delivery for CLIs without a per-session skill channel
-  // (codex/gemini/opencode/… — those with a global `skillsDir`). In `prompt`
+  // (codex/opencode/… — those with a global `skillsDir`). In `prompt`
   // mode we inline a compact skill catalog here instead of installing files
   // into the CLI's shared global dir; in `off` mode we only point at the CLI
   // help. `global` mode installs files (worker-pool ensureCliSkills) and adds
@@ -1461,10 +1475,11 @@ function buildNewTopicBlocks(
         whiteboardEnabled: whiteboardEnabled(),
         chatManagerEnabled: chatManagerEnabledForApp(opts?.larkAppId),
         excludeRoutingCovered: true,
+        sessionKind,
       });
       skillBlock = buildBuiltinSkillCatalogBlock(entries, locale);
     } else if (mode === 'off') {
-      skillBlock = builtinSkillHelpPointer(locale);
+      skillBlock = builtinSkillHelpPointer(locale, { sessionKind });
     }
   }
 
@@ -1536,7 +1551,7 @@ function buildNewTopicBlocks(
     if (identityBlock) blocks.push({ key: 'identity', text: identityBlock });
     // Trigger-user auth: the same credential boundary the claude-family adapters
     // get via --append-system-prompt. Without it the inline-prompt CLIs
-    // (codex/gemini/…) would run with NO constraint at all — and since that is
+    // (codex/opencode/…) would run with NO constraint at all — and since that is
     // this release's only protection, a missing block there is a silent hole.
     //
     // Deliberately NOT added to ENVELOPE_KEYS. Today that choice is inert:
@@ -1607,7 +1622,11 @@ export function buildNewTopicPrompt(
   sender?: ResolvedSender,
   opts?: NewTopicOpts,
 ): string {
-  opts = { ...opts, promptInjection: opts?.promptInjection ?? inputPromptInjection(sessionId, opts?.larkAppId, cliId) };
+  opts = {
+    ...opts,
+    promptInjection: opts?.promptInjection ?? inputPromptInjection(sessionId, opts?.larkAppId, cliId),
+    workflowNodeSession: opts?.workflowNodeSession ?? isWorkflowNodeSessionRow(sessionId),
+  };
   return buildNewTopicBlocks(
     userMessage, sessionId, cliId, cliPathOverride, attachments, mentions,
     availableBots, followUps, botIdentity, locale, sender, opts,
@@ -1661,9 +1680,15 @@ export function buildNewTopicCliInput(
     sessionBackendType?: BackendType;
     /** 见 NewTopicOpts 同名字段。 */
     larkToolResume?: boolean;
+    /** 见 NewTopicOpts 同名字段。 */
+    workflowNodeSession?: boolean;
   },
 ): CliTurnPayload {
-  opts = { ...opts, promptInjection: opts?.promptInjection ?? inputPromptInjection(sessionId, opts?.larkAppId, cliId) };
+  opts = {
+    ...opts,
+    promptInjection: opts?.promptInjection ?? inputPromptInjection(sessionId, opts?.larkAppId, cliId),
+    workflowNodeSession: opts?.workflowNodeSession ?? isWorkflowNodeSessionRow(sessionId),
+  };
   const background = backgroundForInput(sessionId, cliId, opts);
   if (background) {
     opts = { ...opts, sharedGroupContext: background.body };
@@ -2378,11 +2403,20 @@ export function rememberLastCliInput(
     botCfg.codexAppCleanInput === true &&
     !ds.adoptedFrom
   );
-  if (keepCodexAppInput && normalized.codexAppInput) ds.lastCodexAppInput = normalized.codexAppInput;
+  // steerTargetTurnId is a one-shot host routing constraint for a correlated
+  // async answer: it may match only the still-running native turn that asked
+  // the question. Strip it before the sidecar is persisted, so a later
+  // retry_last_task / failed-turn replay cannot carry a stale target (replay
+  // has no steer grant anyway, but keeping it out of the stored shape makes
+  // that boundary explicit). The in-flight payload object is left untouched.
+  const replayCodexAppInput = keepCodexAppInput && normalized.codexAppInput
+    ? (({ steerTargetTurnId: _steerTargetTurnId, ...input }) => input)(normalized.codexAppInput)
+    : undefined;
+  if (replayCodexAppInput) ds.lastCodexAppInput = replayCodexAppInput;
   else delete ds.lastCodexAppInput;
   ds.session.lastUserPrompt = userPrompt;
   ds.session.lastCliInput = normalized.content;
-  if (keepCodexAppInput && normalized.codexAppInput) ds.session.lastCodexAppInput = normalized.codexAppInput;
+  if (replayCodexAppInput) ds.session.lastCodexAppInput = replayCodexAppInput;
   else delete ds.session.lastCodexAppInput;
   ds.session.replyThreadAliases = ds.replyThreadAliases;
   ds.session.currentReplyTarget = ds.currentReplyTarget;
@@ -3481,6 +3515,10 @@ export async function restoreActiveSessions(
         toReattach.push(ds);
         continue;
       }
+      if (deploymentContinuationCandidate(ds.session)) {
+        toReattach.push(ds);
+        continue;
+      }
       // A missing backing pane is NEVER an auto-close trigger for a managed
       // session. Whatever wiped the pane — a host reboot (whole multiplexer
       // server gone, every pane at once), the idle-worker sweeper reclaiming
@@ -3577,7 +3615,33 @@ export async function restoreActiveSessions(
           }
         : true;
       if (liveBackendReattach.has(ds)) forkWorker(ds, prompt, resume, { reattachLiveBackend: true });
-      else forkWorker(ds, prompt, resume);
+      else {
+        const candidate = deploymentContinuationCandidate(ds.session);
+        if (candidate && !recoverExactNonCodex) {
+          const caller = candidate.caller;
+          if (!canTalk(ds.larkAppId, ds.chatId, caller.requestUserOpenId, undefined,
+            caller.requestUserUnionId, ds.chatType)) return;
+          const claimed = claimDeploymentContinuation(ds.session, candidate,
+            previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
+          if (!claimed) return;
+          ds.currentReplyTarget = { rootMessageId: pickTurnReplyTarget(ds.session, claimed.turnId)?.rootMessageId ?? ds.session.rootMessageId,
+            turnId: claimed.turnId, updatedAt: new Date().toISOString() };
+          ds.session.currentReplyTarget = { ...ds.currentReplyTarget };
+          let ipcAttempted = false;
+          const releaseUndispatchedClaim = () => {
+            if (!ipcAttempted && deploymentContinuationClaimCurrent(ds.session, claimed)) {
+              setDeploymentContinuation(ds.session, { ...claimed, state: 'running' },
+                previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
+            }
+          };
+          try {
+            forkWorker(ds, '', { resume: true, onIpcDispatchAttempted: () => { ipcAttempted = true; } }, {
+              deploymentContinuation: claimed,
+              onAdmission: admission => { if (admission === 'rejected') releaseUndispatchedClaim(); },
+            });
+          } catch (error) { releaseUndispatchedClaim(); throw error; }
+        } else forkWorker(ds, prompt, resume);
+      }
     },
     RECOVERY_FORK_BATCH_SIZE,
     RECOVERY_FORK_DELAY_MS,
@@ -4406,6 +4470,15 @@ export async function executeScheduledTask(
   }
   const larkAppId = bot.config.larkAppId;
 
+  // Refuse — before any session is chosen or spawned — a turn-created task whose
+  // canonical workingDir has been swapped for a symlink since creation. The
+  // throw is recorded as this fire's failure; it is never skipped silently.
+  const workingDirSwap = scheduledWorkingDirSwapReason(task);
+  if (workingDirSwap) {
+    logger.error(`[scheduler] refusing to fire: ${workingDirSwap}`);
+    throw new Error(workingDirSwap);
+  }
+
   // --follow-active: keep the last landing point while a human holds it open;
   // otherwise re-target to where a human spoke most recently (persisting the
   // new landing point); with no human-active topic, stay in the landing point
@@ -4533,7 +4606,9 @@ export async function executeScheduledTask(
         activeSessions,
         sessionKey(`schedule-task:${task.id}`, larkAppId),
         async () => {
-          const existingRoot = scheduleStore.getTask(task.id, larkAppId)?.rootMessageId?.trim();
+          // Authority, not schedules.json: a sandboxed agent can write a root
+          // into the projection and steer this fire into a topic of its choosing.
+          const existingRoot = getRuntimeTask(task.id, larkAppId)?.rootMessageId?.trim();
           if (existingRoot) {
             return { anchor: existingRoot, rootMessageId: existingRoot, isContinuation: true };
           }
@@ -4736,7 +4811,7 @@ export async function executeScheduledTask(
       // materialization would overwrite the task root and split the task's
       // history. Lock order stays virtual→real, identical to the promotion
       // helper, so no lock-order inversion is possible.
-      const promotedRoot = scheduleStore.getTask(task.id, larkAppId)?.rootMessageId?.trim();
+      const promotedRoot = getRuntimeTask(task.id, larkAppId)?.rootMessageId?.trim();
       if (promotedRoot) {
         logger.info(
           `[scheduler] Task "${task.name}" (${task.id}) first fire raced topic materialization; `
@@ -5248,6 +5323,140 @@ export async function deliverOwnerBatchTurn(
     ds.initialStartPending = false;
     ds.pendingPrompt = undefined;
     logger.info(`[decision-board] Batch turn ${turnId} spawned steward session ${session.sessionId} (anchor ${anchor})`);
+    return { sessionId: session.sessionId };
+  });
+}
+
+// ─── Workflow：主 Bot 自己执行的节点 → 节点话题里的一个回合 ───────────────────
+
+export interface WorkflowNodeTurnInput {
+  larkAppId: string;
+  chatId: string;
+  /** Node card id: the node topic this turn runs in. */
+  publishRoot: string;
+  /** The handoff message (turn id; the bot reports with it). */
+  handoffMessageId: string;
+  marker: import('../types.js').WorkflowNodeSessionMarker;
+  prompt: string;
+  attachments: LarkAttachment[];
+  sessionTitle: string;
+}
+
+/**
+ * Design 2026-11-03 §6.5: Lark never delivers a bot's own message back to it,
+ * so a node assigned to the main bot itself is started in-process — the same
+ * low-level primitives the decision board's batch turn uses, anchored at the
+ * node topic. The turn id is the handoff message id, so the worker writes the
+ * same durable input receipt an inbound handoff would, and acceptance is
+ * proven the same way for every bot. Idempotent per handoff: a re-dispatch
+ * with the same handoff id never starts a second turn.
+ */
+export async function deliverWorkflowNodeTurn(
+  input: WorkflowNodeTurnInput,
+  activeSessions: Map<string, DaemonSession>,
+  refreshCliVersion: RefreshCliVersion,
+): Promise<{ sessionId: string }> {
+  const bot = getAllBots().find(b => b.config.larkAppId === input.larkAppId);
+  if (!bot) throw new Error(`workflow node bot ${input.larkAppId} is not loaded`);
+  const { larkAppId, chatId, handoffMessageId: turnId } = input;
+  const anchor = input.publishRoot;
+  refreshCliVersion(bot.config);
+  const key = sessionKey(anchor, larkAppId);
+  return withActiveSessionKeyLock(activeSessions, key, async () => {
+    const existing = activeSessions.get(key);
+    if (existing) {
+      if (existing.session.workflowNode?.handoffMessageId === turnId) {
+        return { sessionId: existing.session.sessionId };
+      }
+      const reserved = existing.pendingRepo || existing.pendingRepoCommitInFlight
+        || existing.initialStartPending || existing.worktreeCreating || existing.session.queued;
+      if (reserved) throw new Error(`workflow node session ${existing.session.sessionId} is still starting`);
+      if (hasProtectedSessionMutationOwnership(existing)) {
+        throw new Error(`workflow node session ${existing.session.sessionId} is being recovered`);
+      }
+      if (isRelayableRealSession(existing) || existing.session.suspendedColdResume) {
+        existing.session.workflowNode = input.marker;
+        sessionStore.updateSession(existing.session);
+        markSessionActivity(existing, Date.now(), { human: false });
+        const payload = buildFollowUpCliInput(input.prompt, existing.session.sessionId, {
+          isAdoptMode: false,
+          cliId: existing.session.cliLaunchSnapshot?.cliId ?? existing.session.cliId ?? bot.config.cliId,
+          cliPathOverride: existing.session.cliLaunchSnapshot?.cliPathOverride ?? existing.session.cliPathOverride ?? bot.config.cliPathOverride,
+          locale: localeForBot(larkAppId),
+          larkAppId,
+          chatId,
+          whiteboardId: existing.session.whiteboardId,
+          sessionBackendType: existing.session.backendType,
+          promptInjection: sessionPromptInjection(existing),
+          attachments: input.attachments,
+          turnId,
+        });
+        rememberLastCliInput(existing, input.prompt, payload);
+        if (existing.worker && !existing.worker.killed && sendWorkerInput(existing, payload, turnId)) {
+          return { sessionId: existing.session.sessionId };
+        }
+        forkWorker(existing, payload, { resume: existing.hasHistory, turnId });
+        return { sessionId: existing.session.sessionId };
+      }
+      if (isDisposableCommandScratch(existing)) {
+        await closeSession(existing.session.sessionId);
+        if (activeSessions.get(key) === existing) activeSessions.delete(key);
+      }
+    }
+
+    const session = sessionStore.createSession(chatId, anchor, input.sessionTitle, 'group', undefined, { source: 'ordinary-feishu' });
+    const now = Date.now();
+    session.larkAppId = larkAppId;
+    session.scope = 'thread';
+    session.workflowNode = input.marker;
+    session.lastMessageAt = new Date(now).toISOString();
+    sessionStore.updateSession(session);
+    messageQueue.ensureQueue(anchor);
+    const ds: DaemonSession = {
+      session,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId,
+      chatId,
+      chatType: 'group',
+      scope: 'thread',
+      spawnedAt: sessionCreatedAtMs(session),
+      cliVersion: getCurrentCliVersion(),
+      lastMessageAt: now,
+      hasHistory: false,
+      workingDir: effectiveDefaultWorkingDir(bot.config),
+      initialStartPending: true,
+      pendingPrompt: input.prompt,
+    };
+    ensureSessionWhiteboard(ds);
+    const prompt = buildNewTopicCliInput(input.prompt, session.sessionId,
+      ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId,
+      ds.session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride,
+      input.attachments, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId },
+      localeForBot(larkAppId), undefined, {
+        larkAppId,
+        chatId,
+        whiteboardId: ds.session.whiteboardId,
+        promptInjection: sessionPromptInjection(ds),
+        larkToolResume: false,
+        turnId,
+        workflowNodeSession: true,
+      });
+    if (!setActiveSessionIfActive(activeSessions, key, ds)) {
+      await closeSession(session.sessionId);
+      throw new Error(`workflow node turn lost active-session registration for ${anchor}`);
+    }
+    rememberLastCliInput(ds, input.prompt, prompt);
+    try {
+      forkWorker(ds, prompt, turnId);
+    } catch (err) {
+      await releaseStartRefusedForMissingDir(ds, err);
+      throw err;
+    }
+    ds.initialStartPending = false;
+    ds.pendingPrompt = undefined;
+    logger.info(`[workflow] node turn ${turnId} spawned session ${session.sessionId} (topic ${anchor})`);
     return { sessionId: session.sessionId };
   });
 }

@@ -2089,6 +2089,9 @@ function persistRow(session: Session): void {
       // be erased by a stale metadata write or by changing workingDir.
       session = { ...session, workspaceRetirement: durable.workspaceRetirement };
     }
+    // Task continuation has its own compare-and-set writer. Metadata writers
+    // holding an old row must neither erase a live task nor resurrect a stop.
+    session = { ...session, deploymentContinuation: durable.deploymentContinuation };
     // Pre-migration whole-row writers must not erase the frozen input policy.
     if (session.promptInjection === undefined && durable.promptInjection !== undefined) {
       session = { ...session, promptInjection: durable.promptInjection };
@@ -2661,6 +2664,7 @@ export function markMojoCloseUnresolved(
 export function closeSession(
   sessionId: string,
   opts: {
+    backgroundExecutionCleanup?: boolean;
     cleanupBridgeMarkers?: boolean;
     workspaceRetirement?: Session['workspaceRetirement'];
     clearRiffParentTaskId?: boolean;
@@ -2719,6 +2723,7 @@ export function closeSession(
     const next: Session = { ...session };
     const applied = applySessionRowCommand(next, {
       type: 'close',
+      ...(opts.backgroundExecutionCleanup ? { backgroundExecutionCleanup: true } : {}),
       ...(tokenUsage !== undefined ? { tokenUsage } : {}),
       clearMojoCloseJournal: true,
       ...(opts.workspaceRetirement ? { workspaceRetirement: opts.workspaceRetirement } : {}),
@@ -2787,6 +2792,7 @@ export function reactivateClosedSession(
   const next: Session = { ...session };
   next.status = 'active';
   next.closedAt = undefined;
+  next.backgroundExecutionCleanupClosedAt = undefined;
   next.lastMessageAt = new Date().toISOString();
   next.codexAppDispatchLedger = undefined;
   next.codexAppGenerationCommits = undefined;
@@ -2870,6 +2876,28 @@ export function updateSession(session: Session): void {
   const durable = ownStore?.selectRow.get(session.sessionId) as { row: string } | undefined;
   if (durable) Object.assign(session, JSON.parse(durable.row));
   sessions.set(session.sessionId, session);
+}
+
+/** Exact task authority mutation; ordinary metadata updates cannot write it. */
+export function updateDeploymentContinuation(
+  session: Session,
+  expected: Session['deploymentContinuation'],
+): void {
+  loadForWrite();
+  const db = ownStore;
+  if (!db) throw new SessionStoreUnavailableError(new Error('owned session store is not attached'));
+  const hit = db.selectRow.get(session.sessionId) as { row: string } | undefined;
+  if (!hit) throw new Error('continuation session is missing');
+  const durable = JSON.parse(hit.row) as Session;
+  if (durable.status !== 'active'
+    || JSON.stringify(durable.deploymentContinuation) !== JSON.stringify(expected)) {
+    throw new Error('continuation authority changed');
+  }
+  durable.deploymentContinuation = structuredClone(session.deploymentContinuation);
+  const result = db.updateExact.run(sessionStatusText(durable), JSON.stringify(durable), session.sessionId, hit.row);
+  if (Number(result.changes) !== 1) throw new Error('continuation session changed concurrently');
+  const cached = sessions.get(session.sessionId);
+  if (cached) cached.deploymentContinuation = structuredClone(durable.deploymentContinuation);
 }
 
 /**

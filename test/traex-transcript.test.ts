@@ -582,6 +582,53 @@ describe('drainTraexRollout', () => {
     expect(queue.drainEmittable()).toEqual([]);
   });
 
+  it('holds a cold first turn whose UserMessage lands long after task_started', () => {
+    const turnId = '00000000-0000-7000-8000-000000000010';
+    const markMs = Date.parse('2000-01-01T00:00:00.000Z');
+    let nowMs = markMs;
+    const queue = new CodexBridgeQueue(() => nowMs);
+    queue.mark('remote-turn', 'scan the alerts', markMs);
+    writeFileSync(path, line({
+      timestamp: '2000-01-01T00:00:01.000Z',
+      type: 'event_msg',
+      payload: { type: 'task_started', turn_id: turnId, root_turn_id: turnId },
+    }));
+    const started = drainTraexRollout(path, 0);
+    expect(started.events).toEqual([
+      expect.objectContaining({ kind: 'turn_started', sourceTurnId: turnId, sourceSessionId: SID }),
+    ]);
+    queue.ingest(started.events);
+
+    // Well past the 20s submit lease: the native start keeps the head alive.
+    nowMs = markMs + 90_000;
+    expect(queue.pruneExpiredPreStartHeads(nowMs)).toEqual([]);
+    expect(queue.preStartLeaseRemainingMs(nowMs)).toBeGreaterThan(0);
+
+    const input = itemCompleted({
+      type: 'UserMessage', id: 'cold-user',
+      content: [{ type: 'text', text: 'scan the alerts' }],
+    }, turnId, '2000-01-01T00:01:31.000Z');
+    appendFileSync(path, line(canonicalCompletion(input.payload.item, input.timestamp))
+      + line({ ...taskComplete('alerts are clear'), timestamp: '2000-01-01T00:05:00.000Z' }));
+    queue.ingest(drainTraexRollout(path, started.newOffset).events);
+    expect(queue.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'remote-turn', finalText: 'alerts are clear' }),
+    ]);
+  });
+
+  it('does not surface a nested task_started as a turn start', () => {
+    writeFileSync(path, line({
+      timestamp: '2000-01-01T00:00:01.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_started',
+        turn_id: '00000000-0000-7000-8000-000000000011',
+        root_turn_id: '00000000-0000-7000-8000-000000000010',
+      },
+    }));
+    expect(drainTraexRollout(path, 0).events).toEqual([]);
+  });
+
   it('recovers a canonical final without treating commentary as completion', () => {
     const display = (text: string, phase: string) => canonicalCompletion({
       type: 'AgentMessage', id: `agent-${phase}`, phase,
@@ -2308,6 +2355,13 @@ describe('drainTraexRollout', () => {
     expect(drainTraexRollout(path, 0).events.at(-1)).toMatchObject({
       terminalStatus: 'failed',
       terminalErrorCode: 'codex_output_limit_exceeded',
+    });
+  });
+
+  it.each(['usageLimitExceeded', 'usage_limit_exceeded'])('preserves the explicit quota code %s', code => {
+    writeFileSync(path, line(user('continue task')) + line(taskCompleteWithError({ codex_error_info: code })));
+    expect(drainTraexRollout(path, 0).events.at(-1)).toMatchObject({
+      terminalStatus: 'failed', terminalErrorCode: 'traex_usage_limit_exceeded',
     });
   });
 

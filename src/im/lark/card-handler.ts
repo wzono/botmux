@@ -71,6 +71,7 @@ import {
   type CompletionProposalCardHandlerDeps,
 } from './completion-proposal-card.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
+import { frozenSessionSandboxMode } from '../../adapters/cli/sandbox-mode.js';
 import { buildClosedSessionCard } from '../../core/closed-session-card.js';
 import { cleanupSessionWorktree } from '../../core/session-worktree-cleanup.js';
 import { CLEANUP_SESSION_WORKTREE_ACTION, handleSessionWorktreeCleanupAction } from './session-worktree-cleanup-card.js';
@@ -78,6 +79,9 @@ import { recordCreatedWorktree } from '../../services/botmux-worktree-store.js';
 import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
+import { applyIdleAutoCompactSetting, idleAutoCompactMinutes, isIdleAutoCompactEnabled } from '../../core/idle-auto-compact.js';
+import { cancelDeploymentContinuation } from '../../services/deployment-continuation.js';
+import { deploymentContinuationAuthority } from '../../core/deployment-continuation-authority.js';
 import { retryCooldownRemaining, markRetryAttempt } from '../../services/failed-turn-retry.js';
 import { buildTurnContinuePrompt } from '../../services/turn-failure-notice.js';
 import { AutoWorktreeFailClosedError } from '../../services/default-worktree.js';
@@ -89,7 +93,7 @@ import { modelCatalogProbeContext } from '../../dashboard/model-catalog-request.
 import { selectionKeyForBot } from '../../setup/cli-selection.js';
 import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
 import { REPLY_CARD_MENU_ACTION } from './reply-card-actions.js';
-import { setSessionReasoningEffort, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
+import { setSessionReasoningEffort, sessionSupportsIdleAutoCompact, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
@@ -178,6 +182,15 @@ export interface CardHandlerDeps {
       replyRootId?: string;
     },
   ) => void;
+  /** Signed single-use button. The handler admits the clicker and returns a
+   *  continuation that starts the turn after the card callback is acked. */
+  cardClickTurn?: (input: {
+    larkAppId: string;
+    operatorOpenId?: string;
+    operatorUnionId?: string;
+    payload?: string;
+    sig?: string;
+  }) => Promise<{ ok: true; chatId: string; run: () => Promise<unknown> } | { ok: false; reason: string }>;
 }
 
 /**
@@ -1180,6 +1193,7 @@ export async function runAutoWorktreeCommit(deps: {
         ds, rootId: anchor, larkAppId, operatorOpenId, activeSessions,
         // Never reached under suppressConfirmReply for a pendingRepo session.
         sessionReply: async () => '',
+        prepareTurn,
       },
       targetDir,
       pathBasename(targetDir),
@@ -1446,6 +1460,7 @@ async function deliverMenuTerminalLink(
         loc,
         isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
         sessionRuntimeDisplayName(ds),
+        frozenSessionSandboxMode(ds.session.sandbox),
       );
       // viewToken is read-only and already present on the in-chat streaming
       // card, so this card needs no private delivery; ephemeral just keeps it
@@ -1467,6 +1482,7 @@ async function deliverMenuTerminalLink(
       loc,
       isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
       sessionRuntimeDisplayName(ds),
+      frozenSessionSandboxMode(ds.session.sandbox),
     );
     void deliverWriteLinkCard(ds, operatorOpenId, cardJson);
     return 'write-sent';
@@ -1546,6 +1562,28 @@ function buildMenuModelPickerCard(
       },
     ],
   });
+}
+
+function cardClickTurnToastKey(reason: string): string {
+  switch (reason) {
+    case 'expired': return 'card.click_turn.expired';
+    case 'replayed': return 'card.click_turn.replayed';
+    case 'no_identity': return 'card.click_turn.no_identity';
+    case 'bot_or_app': return 'card.click_turn.bot_or_app';
+    case 'blocked': return 'card.click_turn.blocked';
+    case 'not_allowed': return 'card.click_turn.not_allowed';
+    case 'cannot_operate': return 'card.click_turn.cannot_operate';
+    case 'grant_blocked': return 'card.click_turn.grant_blocked';
+    case 'session_not_found': return 'card.action.session_gone';
+    case 'working_dir_mismatch': return 'card.click_turn.working_dir_mismatch';
+    case 'working_dir_required': return 'card.click_turn.working_dir_required';
+    case 'working_dir_missing': return 'card.click_turn.working_dir_missing';
+    case 'chat_type_mismatch': return 'card.click_turn.chat_type_mismatch';
+    case 'delivery_failed': return 'card.click_turn.delivery_failed';
+    case 'principal_lane': return 'card.click_turn.principal_lane';
+    case 'cross_principal': return 'card.click_turn.cross_principal';
+    default: return 'card.click_turn.rejected';
+  }
 }
 
 export async function handleCardAction(input: unknown, deps: CardHandlerDeps, larkAppId?: string): Promise<any> {
@@ -1996,6 +2034,35 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         if (cardMessageId) await updateMessage(larkAppId, cardMessageId, resultCard);
         else await sendUserMessage(larkAppId, operatorOpenId, resultCard, 'interactive');
       },
+    };
+  }
+
+  if (value?.action === 'card_click_turn' && larkAppId) {
+    const loc = localeForBot(larkAppId);
+    if (!deps.cardClickTurn) {
+      return { toast: { type: 'error', content: t('card.click_turn.unavailable', undefined, loc) } };
+    }
+    const accepted = await deps.cardClickTurn({
+      larkAppId,
+      operatorOpenId,
+      operatorUnionId: typeof data?.operator?.union_id === 'string' ? data.operator.union_id : undefined,
+      payload: value.payload,
+      sig: value.sig,
+    });
+    if (!accepted.ok) {
+      return { toast: { type: 'error', content: t(cardClickTurnToastKey(accepted.reason), undefined, loc) } };
+    }
+    return {
+      toast: { type: 'info', content: t('card.click_turn.pending', undefined, loc) },
+      afterAck: () => accepted.run().then(async result => {
+        const failed = result && typeof result === 'object' && 'ok' in result && result.ok === false;
+        const key = failed ? 'card.click_turn.delivery_failed' : 'card.click_turn.started';
+        try {
+          await sendMessage(larkAppId, accepted.chatId, t(key, undefined, loc), 'text');
+        } catch (err) {
+          logger.warn(`[card-click-turn] ${failed ? 'failure' : 'started'} notice failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }),
     };
   }
 
@@ -3279,6 +3346,44 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       return { toast: { type: 'success', content: t('card.voice.toast_wait', undefined, locDs) } };
     }
 
+    // 「⏲️ 闲置自动压缩：开/关」：本会话 opt-in（core/idle-auto-compact.ts）。按钮值带目标
+    // 状态 desired，旧卡片重复点击幂等；设置落在会话行上，daemon 重启后仍生效。
+    if (actionType === 'toggle_idle_compact') {
+      const loc = localeForBot(ds?.larkAppId ?? larkAppId);
+      if (!ds) {
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, loc) } };
+      }
+      // canOperate is enforced by the sensitive-action gate (card-action-routes.ts).
+      if (!sessionSupportsIdleAutoCompact(ds)) {
+        return { toast: { type: 'warning', content: t('card.idle_compact.unsupported', undefined, loc) } };
+      }
+      const enabled = value?.desired === 'on'
+        ? true
+        : value?.desired === 'off' ? false : !isIdleAutoCompactEnabled(ds.session);
+      const previous = ds.session.idleAutoCompact ? { ...ds.session.idleAutoCompact } : undefined;
+      const setting = applyIdleAutoCompactSetting(ds.session, { enabled });
+      try {
+        sessionStore.updateSession(ds.session);
+      } catch (err) {
+        if (previous) ds.session.idleAutoCompact = previous;
+        else delete ds.session.idleAutoCompact;
+        logger.warn(`[${tag(ds)}] toggle_idle_compact save failed: ${err instanceof Error ? err.message : String(err)}`);
+        return { toast: { type: 'warning', content: t('card.idle_compact.save_failed', undefined, loc) } };
+      }
+      logger.info(`[${tag(ds)}] idle auto-compact ${enabled ? 'on' : 'off'} via card by ${operatorOpenId ?? '?'}`);
+      return {
+        toast: {
+          type: 'success',
+          content: enabled
+            ? t('card.idle_compact.enabled', { minutes: idleAutoCompactMinutes(setting) }, loc)
+            : t('card.idle_compact.disabled', undefined, loc),
+        },
+        ...(cardMessageId && ds.streamCardId === cardMessageId ? {
+          card: { type: 'raw' as const, data: JSON.parse(buildStreamingCardJson(ds, ds.session.suspendedColdResume ? 'idle' : undefined)) },
+        } : {}),
+      };
+    }
+
     if (actionType === 'set_reasoning_effort') {
       const loc = localeForBot(ds?.larkAppId ?? larkAppId);
       const warning = (key: string) => ({
@@ -3750,7 +3855,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
 
       let cardJson: string | undefined;
       if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && workerHasInitialized(ds)) {
-        const readUrl = readableTerminalUrlFor(ds);
+        const readUrl = liveReadableTerminalUrlFor(ds);
         cardJson = buildStreamingCard(
           ds.session.sessionId,
           sessionAnchorId(ds),
@@ -3796,6 +3901,35 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     //     failed-turn-retry.test 有用例钉住），因为一次重试也可能再失败。
     // 两道都 fail-closed：宁可让用户多发一条消息，也不重复提交可能带外部副作用
     // 的任务。
+    // 自动恢复失败卡的「重试」：重新投递那一轮的原消息。刻意不在
+    // SENSITIVE_CARD_ACTIONS 里——通用 canOperate 门会把原发起人（oncall 群里常是
+    // talk-only 成员）挡在外面；权限门在 handleOrdinaryRecoveryRetryClick 里：
+    // 原发起人（仍能和 bot 对话）或 bot 管理员，其余人一律拒绝。
+    if (actionType === 'retry_recovery_turn') {
+      if (!ds) {
+        return {
+          toast: {
+            type: 'warning',
+            content: t('card.action.retry_recovery_missing', undefined, localeForBot(larkAppId)),
+          },
+        };
+      }
+      if (isSessionTransferring(ds)) {
+        return {
+          toast: {
+            type: 'warning',
+            content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)),
+          },
+        };
+      }
+      const { handleOrdinaryRecoveryRetryClick } = await import('../../core/ordinary-recovery-retry.js');
+      return handleOrdinaryRecoveryRetryClick(ds, {
+        logicalTurnId: typeof value?.logical_turn_id === 'string' ? value.logical_turn_id : undefined,
+        operatorOpenId,
+        ...(data?.operator?.union_id ? { operatorUnionId: data.operator.union_id } : {}),
+      });
+    }
+
     if (actionType === 'retry_turn' && ds) {
       const locDs = localeForBot(ds.larkAppId);
       if (isSessionTransferring(ds)) {
@@ -4151,6 +4285,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       // Atomic IPC — worker handles keys + text in one flow to avoid race
       ds.tuiPromptProcessing = true;
       try {
+        // Persist cancellation before input, while retaining the IPC callback
+        // receipt that releases this card's processing claim on send failure.
+        cancelDeploymentContinuation(ds.session,
+          previous => sessionStore.updateDeploymentContinuation(ds.session, previous),
+          deploymentContinuationAuthority(ds)?.turnId, true);
         await sendWorkerIpc(ds.worker, {
           type: 'tui_text_input',
           keys: inputKeys,
@@ -4214,6 +4353,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           locDs,
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           sessionRuntimeDisplayName(ds),
+          frozenSessionSandboxMode(ds.session.sandbox),
         );
         // 普通群发「仅自己可见」私密卡，话题群 / 单聊自动回退私聊 DM（两条通道都私密，
         // 不泄露写入 token）。fire-and-forget，保持卡片回调快速返回。
@@ -4345,7 +4485,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         opts: { canReceiveFreshFrame: boolean; serviceTierBadge: string | undefined; idleLabel: ReturnType<typeof streamCardLabel> },
       ): { cardJson: string; unavailable: boolean } => {
         const effectiveCliId = sessionCliId(ds);
-        const readUrl = readableTerminalUrlFor(ds);
+        const readUrl = liveReadableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         // Only a frame whose capturing turn may be shown here (silent /
         // managed / substitute sources are filtered out).
@@ -4547,7 +4687,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       // fresh screenshot PATCH (~1s).
       if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && workerHasInitialized(ds)) {
         const effectiveCliId = sessionCliId(ds);
-        const readUrl = readableTerminalUrlFor(ds);
+        const readUrl = liveReadableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         // workerHasInitialized() also passes for a restored session that kept
         // its Web Terminal port, so the status cannot assume a running CLI.
@@ -4628,7 +4768,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       // 唯一差异是 status 参数传 'interrupted' 而非 ds.lastScreenStatus。
       if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && workerHasInitialized(ds)) {
         const effectiveCliId = sessionCliId(ds);
-        const readUrl = readableTerminalUrlFor(ds);
+        const readUrl = liveReadableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
@@ -4834,7 +4974,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       }
       if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && workerHasInitialized(ds)) {
         const effectiveCliId = sessionCliId(ds);
-        const readUrl = readableTerminalUrlFor(ds);
+        const readUrl = liveReadableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         // workerHasInitialized() also passes for a restored session that kept
         // its Web Terminal port, so the status cannot assume a running CLI.

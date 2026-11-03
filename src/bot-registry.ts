@@ -10,6 +10,7 @@ import { normalizeCodexInstancePool, registerCodexInstanceBot, clearCodexInstanc
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { underReadIsolation } from './adapters/cli/read-isolation.js';
+import { retiredCli, retiredCliNotice } from './adapters/cli/retired-cli.js';
 import {
   normalizeSandboxMode,
   normalizeScratchStorage,
@@ -52,7 +53,8 @@ import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
 import { DAEMON_COMMANDS } from './core/passthrough-commands.js';
-import { sanitizePerBotEnv } from './core/per-bot-env.js';
+import { droppedReservedPerBotEnvKeys, sanitizePerBotEnv } from './core/per-bot-env.js';
+import { shouldWarnDroppedReservedEnv } from './core/dropped-env-warn-latch.js';
 import { botEnvLayer } from './core/session-env.js';
 import { normalizeDispatchLaunchPolicy } from './core/dispatch-launch-contract.js';
 import { normalizeEnvPolicy, type EnvPolicy } from './core/env-policy.js';
@@ -118,7 +120,7 @@ import {
   type TraexAutoModelConfig,
 } from './services/traex-auto-model.js';
 import { normalizeCardActionAckTimeoutMs } from './core/card-action-ack.js';
-import { cliSupportsConfigDir, normalizeCliConfigDir } from './core/cli-config-dir.js';
+import { cliConfigDirEnvKey, cliSupportsConfigDir, normalizeCliConfigDir } from './core/cli-config-dir.js';
 import { normalizeStewardConfig, type StewardConfig } from './core/decision-board/model.js';
 import type {
   VcMeetingConsumerAgentConfig,
@@ -1778,7 +1780,8 @@ export interface BotConfig {
    *     docs/design/2026-09-21-sandbox-scratch-mode.md.
    *   false/"off"/missing — no local file isolation.
    * Env BOTMUX_SANDBOX=1 forces oncall, BOTMUX_SANDBOX=scratch forces scratch
-   * (testing/global).
+   * (testing/global); unset/0/false means no force and never turns this off
+   * (see resolveSandboxMode).
    */
   sandbox?: boolean | 'oncall' | 'scratch' | 'off';
   /**
@@ -1939,7 +1942,7 @@ export interface BotConfig {
   /** UI language for this bot: 'zh' or 'en'. Falls back to BOTMUX_LANG / LANG env when unset. */
   lang?: Locale;
   /** How this bot's built-in botmux bridge skills reach its CLI (only meaningful
-   *  for CLIs with a global `skillsDir` — codex/gemini/opencode/…):
+   *  for CLIs with a global `skillsDir` — codex/opencode/…):
    *   - `global`: install into the CLI's shared global skills dir (leaks into the
    *     user's own standalone CLI). For users who never run the CLI by hand.
    *   - `prompt`: inject a session-scoped skill catalog into the prompt +
@@ -2238,6 +2241,8 @@ export interface BotConfig {
   cotEnabled?: boolean;
   /** Legacy tool-output preference; false still suppresses result bodies. */
   thinkingCardToolResult?: boolean;
+  /** Show tool-call nodes in unified reply cards. Default on; false keeps thinking text. */
+  replyCardShowTools?: boolean;
   /** chat_id list: chats where the CoT (thinking process) message is suppressed
    *  even when {@link cotEnabled} is on. Written by `/cot off|on`. */
   noCotChats?: string[];
@@ -2848,6 +2853,31 @@ export function getBotClient(larkAppId: string): Lark.Client {
   return bot.client;
 }
 
+/**
+ * 用另一个 bot 的凭据建一个只在本进程内存里用的 Lark 客户端：不进 bots 表、不落盘。决策看板核实群时用：
+ * 管家 bot 查不到的群，换本机其他 bot 再查。apiOnly / 没有 secret 的 bot 没有飞书凭据，调用方先滤掉。
+ * SDK 日志只进 debug：查不到时调用方会把各 bot 的原因汇总报给管家，一次查不到不该在 daemon 日志里
+ * 刷几十行 WARN；格式仍走只打 status / code / msg 的 fmtLark（不带请求体和请求头，凭据不会进日志）。
+ */
+const detachedLarkLogger = {
+  error: (...msg: any[]) => logger.debug(`[lark:detached] ${fmtLark(msg)}`),
+  warn: (...msg: any[]) => logger.debug(`[lark:detached] ${fmtLark(msg)}`),
+  info: (..._msg: any[]) => { /* client ready 之类，没有信息量 */ },
+  debug: (...msg: any[]) => logger.debug(`[lark:detached] ${fmtLark(msg)}`),
+  trace: (..._msg: any[]) => { /* dropped */ },
+};
+
+export function createDetachedLarkClient(cfg: Pick<BotConfig, 'larkAppId' | 'larkAppSecret' | 'brand'>): Lark.Client {
+  const client = new Lark.Client({
+    appId: cfg.larkAppId,
+    appSecret: cfg.larkAppSecret,
+    domain: sdkDomain(normalizeBrand(cfg.brand)),
+    logger: detachedLarkLogger,
+  });
+  configureLarkClientHttpTimeout(client);
+  return client;
+}
+
 /** Client bound to the looser upload timeout. Use only for media uploads
  * (image/file); every other call uses `getBotClient` and its interactive bound. */
 export function getBotUploadClient(larkAppId: string): Lark.Client {
@@ -3386,6 +3416,14 @@ function resolveBotConfigPath(): string {
   );
 }
 
+const warnedRetiredCliApps = new Set<string>();
+/** Once per process and Bot: the loader runs on every bots.json read. */
+function warnRetiredCliOnce(cliId: string, appId: string): void {
+  if (warnedRetiredCliApps.has(appId)) return;
+  warnedRetiredCliApps.add(appId);
+  logger.warn(`[bot-registry] ${retiredCliNotice(cliId, appId)}`);
+}
+
 /** Warn once per relevant cycle and identify only the Bot rows whose handoff must be disabled. */
 function warnAndCollectCyclicQuotaFallbackIds(
   entries: any[],
@@ -3432,6 +3470,10 @@ export function loadBotConfigAtIndex(index: number): BotConfig {
   }
   const selectedAppId = String((entry as Record<string, unknown>).larkAppId ?? '');
   const cyclicQuotaFallbackIds = warnAndCollectCyclicQuotaFallbackIds(parsed, selectedAppId);
+  const entryCliId = (entry as Record<string, unknown>).cliId;
+  if (retiredCli(entryCliId)) {
+    throw new Error(`Bot config [${index}]: ${retiredCliNotice(entryCliId as string, selectedAppId)} (file: ${filePath})`);
+  }
   if ((entry as Record<string, unknown>).activationPending === true) {
     throw new Error(`Bot config [${index}] activation pending (file: ${filePath})`);
   }
@@ -3641,6 +3683,14 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       || entry.activationStarting !== undefined
       || entry.activationCommitted !== undefined
     ) {
+      continue;
+    }
+    // A removed CLI (gemini): the row stays in bots.json for the owner to fix,
+    // but the Bot is not loaded, so nothing builds an adapter for it. The
+    // fleet skips it the same way (fleet-runtime) and start/restart/Dashboard
+    // show the notice.
+    if (retiredCli(entry.cliId)) {
+      warnRetiredCliOnce(entry.cliId, entry.larkAppId);
       continue;
     }
 
@@ -3939,6 +3989,24 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     // sanitizePerBotEnv 过滤非法/保留键、字符串化基本类型；空 → undefined（保持 bots.json 干净）。
     const envPolicy = normalizeEnvPolicy(entry.envPolicy);
     const sanitizedEnv = sanitizePerBotEnv(entry.env);
+    const droppedReservedEnv = droppedReservedPerBotEnvKeys(entry.env);
+    // Once per (bot, dropped-key set) per process: this parser runs on every turn
+    // via the uncached loadBotConfigs() lookups, and the config cannot change
+    // between reloads — see core/dropped-env-warn-latch.ts for the reset rules.
+    if (droppedReservedEnv.length > 0 && shouldWarnDroppedReservedEnv(entry.larkAppId, droppedReservedEnv)) {
+      // The hint names the field that ACTUALLY carries this CLI's profile dir.
+      // cliConfigDir only applies to clis for which cliConfigDirEnvKey() is set
+      // (claude-code → CLAUDE_CONFIG_DIR); a codex bot's CODEX_HOME has no
+      // cliConfigDir mapping, so pointing there would be a second silent failure.
+      const configDirKey = cliConfigDirEnvKey(entryCliId);
+      const cliHomeKeys = configDirKey && droppedReservedEnv.includes(configDirKey) ? [configDirKey] : [];
+      const cliHomeHint = cliHomeKeys.length > 0
+        ? `；要为该 bot 单独指定 CLI 配置目录，请改用顶层 cliConfigDir 字段（不要在 env 里写 ${cliHomeKeys.join(' / ')}）`
+        : '';
+      logger.warn(
+        `[bot-registry:${entry.larkAppId}] env 中的保留变量由 botmux 托管，已忽略且不会生效: ${droppedReservedEnv.join(' ')}${cliHomeHint}`,
+      );
+    }
     const env = Object.keys(sanitizedEnv).length > 0 ? sanitizedEnv : undefined;
     const envUnsetList = botEnvLayer({ env: entry.env, envUnset: entry.envUnset }).unset;
     const envUnset = envUnsetList.length > 0 ? envUnsetList : undefined;
@@ -4324,6 +4392,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       disableStreamingCard: entry.disableStreamingCard === true || entry.replyCardMode === 'final-only' || undefined,
       replyCardMode: entry.replyCardMode === 'unified' || entry.replyCardMode === 'final-only' ? 'unified' : undefined,
       thinkingCardToolResult: entry.thinkingCardToolResult === false ? false : undefined,
+      replyCardShowTools: entry.replyCardShowTools === false ? false : undefined,
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons),
       pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).

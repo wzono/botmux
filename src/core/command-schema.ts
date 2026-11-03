@@ -81,6 +81,14 @@ export const COMMANDS: readonly CommandSpec[] = [
   { name: '/restart', sessionPolicy: 'default', help: ['help.restart'] },
   { name: '/status', sessionPolicy: 'default', help: ['help.status'] },
   { name: '/retry', sessionPolicy: 'default', help: ['help.retry'] },
+  {
+    name: '/rewind', sessionPolicy: 'existingOnly', help: ['help.rewind'],
+    notes: '可选 `<n>` 预览、`<n> confirm` 执行；只对 Claude Code（append-only transcript）生效',
+  },
+  {
+    name: '/idlecompact', sessionPolicy: 'existingOnly', help: ['help.idlecompact'],
+    notes: '可选 `on` / `off` / `<分钟 1–59>`，不带参数看状态；只改本会话的闲置自动压缩设置，只对 Claude Code / tmux 后端 Codex 生效',
+  },
   { name: '/queue', sessionPolicy: 'existingOnly', multiline: true, literalBody: true, help: ['help.queue'],
     notes: 'Codex App 活会话中的文字消息按原生 FIFO 新轮次执行；其它 CLI 明确拒绝，不创建会话' },
   { name: '/help', sessionPolicy: 'default', help: ['help.help'] },
@@ -121,6 +129,11 @@ export const COMMANDS: readonly CommandSpec[] = [
   { name: '/pair', sessionPolicy: 'default', help: ['help.pair'] },
   {
     name: '/login', sessionPolicy: 'default', help: ['help.login', 'help.login_status'],
+  },
+  {
+    name: '/logout', sessionPolicy: 'sessionless', permission: 'talk',
+    help: ['help.logout'],
+    notes: '只撤销发送者自己的触发人凭据；撤销他人走 dashboard IPC',
   },
   { name: '/adopt', sessionPolicy: 'default', help: ['help.adopt', 'help.adopt_pane', 'help.adopt_orca'] },
   {
@@ -190,7 +203,7 @@ export const COMMANDS: readonly CommandSpec[] = [
     notes: '恰好 1 个 token（清理任务 ID）；主干 #956 引入，rebase 时与 oracle 同步登记',
   },
   { name: '/cli', sessionPolicy: 'default', help: [], notes: '恰好 1 个 token；`/help` 不展示' },
-  { name: '/effort', cliId: ['codex-app', 'codex'], sessionPolicy: 'existingOnly', help: ['cmd.effort.usage'] },
+  { name: '/effort', cliId: ['codex-app', 'codex'], sessionPolicy: 'existingOnly', multiline: true, literalBody: true, help: ['cmd.effort.usage'] },
   {
     name: '/resume', claimWithoutSessionOnly: true, permission: 'talk', sessionPolicy: 'sessionless', help: ['help.resume'],
     notes: '无会话时恢复本话题/本群已关闭的会话（不带参数 = 最近一个）；有会话时透传给 CLI 自带的 /resume。'
@@ -213,6 +226,26 @@ const BY_NAME: ReadonlyMap<string, CommandSpec> = new Map(
 /** 按命令 token（含别名，小写）查 spec。 */
 export function commandSpec(cmd: string): CommandSpec | undefined {
   return BY_NAME.get(cmd.trim().toLowerCase());
+}
+
+/**
+ * Commands consumed before slash routing by `im/lark/event-dispatcher.ts` or
+ * the daemon's admitted entries. They are not in the table above, but a plugin
+ * declaring one would never receive it.
+ */
+const PRE_ROUTING_COMMANDS: ReadonlySet<string> = new Set([
+  '/grant', '/revoke', '/introduce', '/summary', '/tabs', '/tab', '/mention-mode',
+  '/substitute', '/reply-mode', '/workflow', '/template', '/invite',
+]);
+
+/**
+ * Every slash token Botmux itself owns: table names and aliases (including
+ * CLI-specific ones such as `/effort`), the topic-header commands and the
+ * pre-routing commands. Plugin commands may never claim one of these.
+ */
+export function isBuiltinSlashCommandName(cmd: string): boolean {
+  const key = cmd.trim().toLowerCase();
+  return BY_NAME.has(key) || FORCE_TOPIC_COMMANDS.has(key) || PRE_ROUTING_COMMANDS.has(key);
 }
 
 // ─── 从表推导的集合（名字与今天一致，消费方无感） ─────────────────────────────

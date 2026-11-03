@@ -1223,6 +1223,20 @@ describe('CodexBridgeQueue', () => {
     ]);
   });
 
+  it('a replayed attempt terminal never satisfies an exact-attempt lookup for the retired attempt', () => {
+    // #2648 follow-up: a stale deferred submit timer keeps the OLD
+    // dispatchAttempt. Once a replay with the same turnId has run and closed,
+    // hasTerminalTurn must answer only for the new attempt — otherwise the
+    // stale timer would settle against the replacement delivery.
+    const q = new CodexBridgeQueue();
+    q.mark('delivery', 'same durable body', 100, 1);
+    expect(q.dropPendingTurn('delivery', 1, true)?.turnId).toBe('delivery');
+    q.mark('delivery', 'same durable body', 200, 2);
+    q.ingest([userEv('same durable body', 'u2', 300), asstEv('done', 'a2', 400)]);
+    expect(q.hasTerminalTurn('delivery', 2)).toBe(true);
+    expect(q.hasTerminalTurn('delivery', 1)).toBe(false);
+  });
+
   it('does not let stale submit lifecycle callbacks mutate a replay attempt with the same turnId', () => {
     const q = new CodexBridgeQueue();
     q.mark('same-turn', 'durable prompt', 100, 1);
@@ -1949,5 +1963,111 @@ describe('CodexBridgeQueue + bridge-fallback gate (type-ahead suppression window
       asstEv('merged reply', 'a1', 15_000),
     ]);
     expect(emitDecisions(q, [])).toEqual([{ turnId: 't2', suppressed: false }]);
+  });
+});
+
+describe('CodexBridgeQueue provisional task_started corroboration', () => {
+  it('reports a provisional claim as started once its own user record corroborates it', () => {
+    const q = new CodexBridgeQueue(() => 1_000);
+    const started: string[] = [];
+    q.setTurnStartObserver(turn => started.push(turn.turnId));
+    q.mark('t1', 'hello there', 0);
+    q.ingest([startedEv('native-1', 's1', 100)]);
+    expect(started).toEqual([]);
+    q.ingest([{ ...userEv('hello there', 'u1', 90_000), sourceTurnId: 'native-1' }]);
+    expect(started).toEqual(['t1']);
+  });
+
+  it.each([undefined, 'msg-2'])('routes the terminal past a lost provisional claim (message id=%s)', sourceMessageId => {
+    let now = 5_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('lost', 'first message lost', 0);
+    q.mark('t2', 'second message', 500);
+    q.ingest([
+      startedEv('native-1', 's1', 1_000),
+      { ...userEv('second message', 'u1', 1_100), sourceTurnId: 'native-1', sourceMessageId },
+      { ...asstEv('answer two', 'a1', 2_000), sourceTurnId: 'native-1' },
+    ]);
+    now += STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS + 1;
+    expect(q.pruneExpiredPreStartHeads(now).map(turn => turn.turnId)).toEqual(['lost']);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 't2', finalText: 'answer two' }),
+    ]);
+    expect(q.hasBlockingTurn()).toBe(false);
+  });
+});
+
+// Pi persists input submitted while it is busy only when it dequeues it after
+// the current work, which can be minutes past the pre-start lease. The CLI's
+// own "accepted, queued" marker must keep the head; a settle that did not take
+// it up must hand it back to the normal lease.
+describe('input the CLI holds in its own queue', () => {
+  const queuedEv = (uuid: string, ts: number): CodexBridgeEvent => ({ uuid, timestampMs: ts, kind: 'input_queued', text: '' });
+  const settledEv = (uuid: string, ts: number): CodexBridgeEvent => ({ uuid, timestampMs: ts, kind: 'cli_settled', text: '' });
+
+  it('keeps a queued head past its lease until its user record starts it', () => {
+    let now = 1_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('held', 'steer while busy', now);
+    q.confirmPendingTurn('held');
+    q.ingest([queuedEv('queued-1', now + 300)]);
+    // No lease timer to wait out while the CLI holds the input: its user
+    // record (or a settle) is what moves the turn on, not elapsed time.
+    expect(q.preStartLeaseRemainingMs()).toBeUndefined();
+
+    now += STRUCTURED_SUBMIT_START_GRACE_MS + 60_000;
+    expect(q.pruneExpiredPreStartHeads()).toEqual([]);
+    expect(q.hasBlockingTurn()).toBe(true);
+    expect(q.preStartLeaseRemainingMs()).toBeUndefined();
+
+    q.ingest([userEv('steer while busy', 'user-held', now)]);
+    expect(q.peek()[0]).toMatchObject({ turnId: 'held', started: true });
+  });
+
+  it('never starts the head on the marker: the running work belongs to an earlier turn', () => {
+    let now = 1_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('held', 'steer while busy', now);
+    q.ingest([queuedEv('queued-1', now + 300)]);
+    q.ingest([{ uuid: 'final-earlier', timestampMs: now + 400, kind: 'assistant_final', text: 'earlier answer' }]);
+    expect(q.peek()[0]).toMatchObject({ turnId: 'held', started: false });
+    expect(q.peek()[0].finalText).toBeUndefined();
+  });
+
+  it('runs the normal lease again from a settle that did not take the input up', () => {
+    let now = 1_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('held', 'returned to editor', now);
+    q.confirmPendingTurn('held');
+    q.ingest([queuedEv('queued-1', now + 300)]);
+    now += 60_000;
+    q.ingest([settledEv('settled-1', now)]);
+
+    now += STRUCTURED_SUBMIT_START_GRACE_MS;
+    expect(q.pruneExpiredPreStartHeads()).toEqual([]);
+    now += 1;
+    expect(q.pruneExpiredPreStartHeads().map(turn => turn.turnId)).toEqual(['held']);
+  });
+
+  it('ignores a marker that predates the head', () => {
+    let now = 10_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('fresh', 'new turn', now);
+    q.confirmPendingTurn('fresh');
+    q.ingest([queuedEv('old-marker', now - 60_000)]);
+
+    now += STRUCTURED_SUBMIT_START_GRACE_MS + 1;
+    expect(q.pruneExpiredPreStartHeads().map(turn => turn.turnId)).toEqual(['fresh']);
+  });
+
+  it('holds one head per marker, in submit order', () => {
+    let now = 1_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('first', 'first queued', now);
+    q.mark('second', 'second queued', now + 1);
+    q.ingest([queuedEv('queued-1', now + 300)]);
+    expect(q.peek().map(turn => turn.cliQueuedAtMs !== undefined)).toEqual([true, false]);
+    q.ingest([queuedEv('queued-2', now + 400)]);
+    expect(q.peek().map(turn => turn.cliQueuedAtMs !== undefined)).toEqual([true, true]);
   });
 });
