@@ -2,7 +2,9 @@ import { isRemoteCliId } from '../../core/remote-cli-ids.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import type { CliId, ResumableSession } from '../../adapters/cli/types.js';
-import { CLI_DISPLAY_NAMES } from '../../adapters/cli/display-names.js';
+import type { SandboxMode } from '../../adapters/cli/sandbox-mode.js';
+import { CLI_DISPLAY_NAMES, lookupCliDisplayName } from '../../adapters/cli/display-names.js';
+import { allowlistSandboxVerifiedClis } from '../../core/shared-bot-sandbox-advice.js';
 import { adoptTargetKey, adoptTargetLabel, type AdoptableSession } from '../../core/session-discovery.js';
 import type { ZellijAdoptableSession } from '../../core/zellij-adopt-discovery.js';
 import type { OrcaAdoptableSession } from '../../core/orca-adopt-discovery.js';
@@ -176,6 +178,37 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
       }, locale),
     },
   });
+
+  if (data.sandboxAdvice) {
+    // Short lines, one fact each: why, how to turn it on, the current CLI; the
+    // verified list folds away.
+    const advice = data.sandboxAdvice;
+    const sep = t('card.config.sandbox_advice.sep', undefined, locale);
+    const name = (id: string) => lookupCliDisplayName(id) ?? id;
+    // A sandbox-refusing backend (herdr/zellij/zmx/orca/…): skip the "turn it
+    // on" line and the matrix list — the backend-blocked line is the action.
+    const backendBlocked = advice.cliSupport === 'blocked';
+    const lines = [
+      t('card.config.sandbox_advice', undefined, locale),
+      t('card.config.sandbox_advice.reasons', {
+        reasons: advice.reasons.map(r => t(`card.config.sandbox_advice.${r}`, undefined, locale)).join(sep),
+      }, locale),
+    ];
+    if (!backendBlocked) lines.push(t('card.config.sandbox_advice.action', undefined, locale));
+    lines.push(t(`card.config.sandbox_advice.${advice.cliSupport}`, { cli: name(advice.cliId) }, locale));
+    elements.push({ tag: 'markdown', content: lines.join('\n') });
+    if (!backendBlocked) {
+      elements.push({
+        tag: 'collapsible_panel', expanded: false,
+        header: {
+          title: { tag: 'plain_text', content: t('card.config.sandbox_advice.list_title', undefined, locale) },
+          icon: { tag: 'standard_icon', token: 'down_outlined', color: 'grey' },
+          icon_position: 'right', icon_expanded_angle: -180,
+        },
+        elements: [{ tag: 'markdown', content: allowlistSandboxVerifiedClis().map(name).join(sep) }],
+      });
+    }
+  }
 
   // ── 🧠 运行: cli / model / lang ─────────────────────────────────────────
   elements.push({ tag: 'hr' });
@@ -487,6 +520,7 @@ export function buildSessionCard(
   locale?: Locale,
   localCliReady = false,
   runtimeDisplayName?: string,
+  sessionSandbox?: SandboxMode,
 ): string {
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId ?? 'claude-code');
   const effectiveCliId = cliId ?? 'claude-code';
@@ -527,6 +561,15 @@ export function buildSessionCard(
   const card = wideCard({
     header: cardHeader(`🖥️ ${cliName} · ${plainTitle(title)}`, 'blue'),
     elements: [
+      // Frozen session sandbox (oncall / scratch) gets one notation line; an
+      // unsandboxed session keeps the legacy card byte-for-byte.
+      ...(sessionSandbox === 'oncall' || sessionSandbox === 'scratch'
+        ? [{
+            tag: 'markdown',
+            content: t(sessionSandbox === 'scratch' ? 'card.body.session_sandbox_scratch' : 'card.body.session_sandbox_oncall', undefined, locale),
+            text_size: 'notation',
+          }]
+        : []),
       { tag: 'action', actions },
     ],
   });
@@ -542,7 +585,7 @@ export function buildSessionCard(
  * `claude --resume <id>`), built by the per-CLI adapter's
  * `buildResumeCommand`. That keeps the conversation portable: users can
  * pick it up locally without going through botmux. CLIs that can't resume
- * a specific session from CLI args (gemini's "latest only") surface a
+ * a specific session from CLI args (a "latest only" mode) surface a
  * fallback note instead of a fake command.
  *
  * The "▶️ 恢复会话" button still goes through botmux — it re-enables the
@@ -876,8 +919,14 @@ export interface BackgroundWaitCardLabel {
   backgroundTasks: number;
 }
 
+export interface ActivityCardLabel {
+  activity: 'working' | 'tool' | 'model_queue';
+  elapsedSeconds: number;
+  progressAgeSeconds?: number;
+}
+
 /** 卡头的替代标签：idle 专用的 {@link IdleCardLabel}，或 {@link BackgroundWaitCardLabel}。 */
-export type StreamCardLabel = IdleCardLabel | BackgroundWaitCardLabel;
+export type StreamCardLabel = IdleCardLabel | BackgroundWaitCardLabel | ActivityCardLabel;
 
 /** 兼容旧调用：布尔 `true` 等价于 'silent'。 */
 function normalizeIdleLabel(v: boolean | StreamCardLabel | undefined): IdleCardLabel | undefined {
@@ -889,7 +938,7 @@ function normalizeIdleLabel(v: boolean | StreamCardLabel | undefined): IdleCardL
 /** 后台子任务数；仅当标签是 {@link BackgroundWaitCardLabel} 且状态为 working/idle 时有值。 */
 function backgroundWaitCount(status: StreamStatus, label: boolean | StreamCardLabel | undefined): number | undefined {
   if (status !== 'working' && status !== 'idle') return undefined;
-  if (!label || typeof label !== 'object' || !(label.backgroundTasks > 0)) return undefined;
+  if (!label || typeof label !== 'object' || !('backgroundTasks' in label) || !(label.backgroundTasks > 0)) return undefined;
   return label.backgroundTasks;
 }
 
@@ -904,6 +953,10 @@ export function frozenIdleLabel(fc: { idleLabel?: IdleCardLabel; silentIdle?: bo
 function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, idleLabel?: boolean | StreamCardLabel): string {
   const backgroundTasks = backgroundWaitCount(status, idleLabel);
   if (backgroundTasks !== undefined) return t('card.status.background_wait', { count: backgroundTasks }, locale);
+  if (status === 'working' && idleLabel && typeof idleLabel === 'object' && 'activity' in idleLabel) {
+    if (idleLabel.activity === 'model_queue') return t('card.status.model_queue', undefined, locale);
+    if (idleLabel.activity === 'tool') return t('card.status.tool_running', undefined, locale);
+  }
   switch (status) {
     case 'starting': return t('card.status.starting', undefined, locale);
     case 'working': return t('card.status.working', undefined, locale);
@@ -939,9 +992,17 @@ const MODEL_FALLBACK_NOTICE_TEXT_SIZE = 'x-small';
 
 function pushStreamBody(
   elements: any[],
-  opts: { status: StreamStatus; usageLimit?: CliUsageLimitState; displayMode: DisplayMode; imageKey?: string; cliName: string; locale?: Locale; usage?: CardUsageSnapshot; screenshotUnavailable?: boolean },
+  opts: { status: StreamStatus; usageLimit?: CliUsageLimitState; displayMode: DisplayMode; imageKey?: string; cliName: string; locale?: Locale; usage?: CardUsageSnapshot; screenshotUnavailable?: boolean; activity?: boolean | StreamCardLabel },
 ): void {
   const { status, usageLimit, displayMode, imageKey, cliName, locale, usage, screenshotUnavailable } = opts;
+  const activity = opts.activity;
+  if (status === 'working' && activity && typeof activity === 'object' && 'activity' in activity) {
+    const elapsed = t('card.status.activity_elapsed', { seconds: activity.elapsedSeconds }, locale);
+    const progress = activity.progressAgeSeconds === undefined ? ''
+      : ` · ${t('card.status.activity_progress_age', { seconds: activity.progressAgeSeconds }, locale)}`;
+    elements.push({ tag: 'markdown', element_id: 'botmux_stream_activity', text_size: 'notation_small_v2',
+      content: `<font color='grey'>${elapsed}${progress}</font>` });
+  }
   if (status === 'limited' && usageLimit) {
     elements.push({
       tag: 'markdown',
@@ -1063,7 +1124,7 @@ export function buildStreamingCard(
   const elements: any[] = [];
 
   // ── Output body (shared with the private snapshot card) ──────────────────
-  pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale, usage, screenshotUnavailable });
+  pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale, usage, screenshotUnavailable, activity: silentIdle });
 
   // ── 上下文余量：**不再单独渲染一行** ────────────────────────────────────
   // 曾经这里 push 过一行 `📊 上下文 N%`，但卡片下方本来就有 usage footer
@@ -1135,6 +1196,18 @@ export function buildStreamingCard(
   // handler 侧另有一道同谓词的拒绝兜底（compact_session），两层都不依赖百分比。
   if (!hidden.has('compact') && !isRemoteCliId(cliId) && !cliHasNoRawPassthroughSurface(effectiveCliId, { dshRuntime })) {
     headerActions.push(callbackButton(t('card.btn.compact', undefined, locale), 'default', { action: 'compact_session', ...actionBase }));
+  }
+  // 「⏲️ 闲置自动压缩：开/关」：本会话 opt-in 的闲置自动 /compact（core/idle-auto-compact.ts）。
+  // 状态随 usage 快照到卡（与 modelFallback 同理，所有调用点都已转发），快照里没有 ⇒ 该
+  // CLI/后端不支持，不渲染。跟随「压缩」按钮的隐藏配置：隐藏压缩即一并隐藏。按钮值带目标
+  // 状态 desired（而非「翻转」），旧卡片重复点击是幂等的。
+  const idleCompact = !adoptMode && !hidden.has('compact') ? usage?.idleAutoCompact : undefined;
+  if (idleCompact) {
+    headerActions.push(callbackButton(
+      t(idleCompact.enabled ? 'card.btn.idle_compact_on' : 'card.btn.idle_compact_off', { minutes: idleCompact.minutes }, locale),
+      'default',
+      { action: 'toggle_idle_compact', desired: idleCompact.enabled ? 'off' : 'on', ...actionBase },
+    ));
   }
   // 「⏹ 停止」：常驻主控制行（不再受 displayMode==='hidden' 折叠态限制——折叠态是 turn
   // 跑飞时用户唯一可见的一行，此前只能 /close 杀整个会话丢上下文）。点击走已有的
@@ -2082,6 +2155,128 @@ export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
   }));
 }
 
+export interface RecoveryFailedCardOpts {
+  rootId: string;
+  sessionId: string;
+  cliId: CliId | undefined;
+  cliName: string;
+  /** Logical turn the notice is about; pins the retry button to it. */
+  logicalTurnId: string;
+  /** Original sender, @-mentioned first (never a bot). */
+  mentionOpenId?: string;
+  /** i18n key of the human-readable cause (see recoveryCauseI18nKey). */
+  causeKey: string;
+  /** i18n key of how far automatic recovery got (see recoveryOutcomeI18nKey). */
+  outcomeKey: string;
+  continuations: number;
+  /** Closed-set error codes, shown de-emphasised for whoever debugs it. */
+  errorCodes: string[];
+  task?: string;
+  failedAt?: Date;
+  /** `available` renders the retry button; `retried` replaces it with who
+   *  retried and when; `none` explains why there is nothing to re-deliver. */
+  retry:
+    | { kind: 'available' }
+    | { kind: 'retried'; byOpenId: string; at: Date }
+    /** No re-delivery material, but the session's `lastFailedTurn` is this
+     *  very turn: keep the pre-existing admin「继续这一轮」button (retry_turn,
+     *  continue mode) that recovery cards used to carry. */
+    | { kind: 'continue_legacy'; turnId: string }
+    | { kind: 'none'; reason: 'no_input' | 'scheduled' | 'unsupported' };
+  terminalUrl?: string;
+  locale?: Locale;
+}
+
+/** 自动恢复失败卡：一轮普通消息的自动续跑最终失败（重试用尽 / 续跑结果无法确认 /
+ *  交接被打断……）时发到原群（原话题）的唯一一张卡。
+ *
+ *  与 {@link buildTurnFailedCard} 的区别：
+ *  1. 原因按错误码归类成一句人话（`causeKey`），错误码只作为次要信息附在后面——
+ *     从不出现 provider 原文、堆栈或内部地址；
+ *  2. 「重试」按钮重新投递**这条消息本身**（logical turn 的原始输入，按原发起人身份），
+ *     按钮钉在 logical turn 上，而不是会被后续失败覆盖的 `lastFailedTurn`；
+ *  3. 发起人与管理员都能点（handler 校验），点过后卡片原地换成「已由谁重试」。 */
+export function buildRecoveryFailedCard(o: RecoveryFailedCardOpts): string {
+  const { locale } = o;
+  const lines: string[] = [];
+  if (o.mentionOpenId) lines.push(`<at id=${o.mentionOpenId}></at>`);
+  lines.push(t('card.recovery_failed.field_cause', { cause: t(o.causeKey, undefined, locale) }, locale));
+  if (o.task) {
+    lines.push(t('card.recovery_failed.field_task', { task: escapeMd(o.task) }, locale));
+  }
+  if (o.failedAt) {
+    lines.push(t('card.recovery_failed.field_when', {
+      when: o.failedAt.toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN', { hour12: false }),
+    }, locale));
+  }
+  lines.push(t('card.recovery_failed.field_recovery', {
+    outcome: t(o.outcomeKey, { count: String(o.continuations) }, locale),
+  }, locale));
+  const codes = [...new Set(o.errorCodes.filter(Boolean))]
+    .map(code => `\`${code.replace(/[`<>]/g, '')}\``);
+  if (codes.length > 0) {
+    lines.push(t('card.recovery_failed.field_codes', { codes: codes.join(' · ') }, locale));
+  }
+
+  const elements: any[] = [
+    { tag: 'markdown', content: lines.join('\n') },
+    { tag: 'hr' },
+  ];
+  const advice = o.retry.kind === 'available'
+    ? t('card.recovery_failed.retry_hint', undefined, locale)
+    : o.retry.kind === 'continue_legacy'
+      ? t('card.turn_failed.retry_caveated', undefined, locale)
+    : o.retry.kind === 'retried'
+      ? t('card.recovery_failed.retried', {
+        who: `<at id=${o.retry.byOpenId}></at>`,
+        when: o.retry.at.toLocaleTimeString(locale === 'en' ? 'en-US' : 'zh-CN', {
+          hour12: false, hour: '2-digit', minute: '2-digit',
+        }),
+      }, locale)
+      : t(`card.recovery_failed.no_retry_${o.retry.reason}`, undefined, locale);
+  elements.push({ tag: 'markdown', content: advice });
+
+  const actions: any[] = [];
+  if (o.retry.kind === 'available') {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.retry_recovery_turn', undefined, locale) },
+      type: 'primary',
+      value: {
+        action: 'retry_recovery_turn',
+        root_id: o.rootId,
+        session_id: o.sessionId,
+        cli_id: o.cliId ?? 'claude-code',
+        logical_turn_id: o.logicalTurnId,
+      },
+    });
+  }
+  if (o.retry.kind === 'continue_legacy') {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.continue_turn', undefined, locale) },
+      type: 'default',
+      value: {
+        action: 'retry_turn',
+        turn_id: o.retry.turnId,
+        mode: 'continue',
+        root_id: o.rootId,
+        session_id: o.sessionId,
+        cli_id: o.cliId ?? 'claude-code',
+      },
+    });
+  }
+  if (o.terminalUrl) {
+    actions.push(urlButton(t('card.btn.open_terminal', undefined, locale), 'default', terminalMultiUrl(o.terminalUrl)));
+  }
+  if (actions.length > 0) elements.push({ tag: 'action', actions });
+
+  return JSON.stringify(wideCard({
+    header: cardHeader(t('card.recovery_failed.title', { cliName: plainTitle(o.cliName) }, locale), 'red'),
+    elements,
+  }));
+}
+
 /** 授权处置后的终态卡（无按钮，防重复点击）。 */
 function formatGrantExpiry(expiresAt: number, locale?: Locale): string {
   return new Date(expiresAt).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN', { hour12: false });
@@ -2364,6 +2559,22 @@ function relayPickerFilter(entries: RelayPickerEntry[], query: string | undefine
 }
 
 /**
+ * "Show all" button for the no-match state of the search pickers (relay /
+ * quote / adopt). Re-fires the picker's own `*_search` action; a button click
+ * has no `input_value`, so the handler reads the query as '' and re-renders
+ * the full list.
+ */
+function buildClearSearchButton(value: Record<string, unknown>, locale?: Locale): any {
+  return {
+    tag: 'button',
+    text: { tag: 'plain_text', content: t('card.picker.btn_clear_search', undefined, locale) },
+    type: 'default',
+    width: 'fill',
+    behaviors: [{ type: 'callback', value }],
+  };
+}
+
+/**
  * Card listing the operator's relayable sessions, paginated 5 per page with
  * a search box at the top and a confirm button at the bottom. Layout:
  *
@@ -2486,8 +2697,13 @@ export function buildRelayPickerCard(
   if (filtered.length === 0) {
     elements.push({
       tag: 'markdown',
-      content: t('card.relay.empty_filtered', { query: searchQuery }, locale),
+      content: t('card.relay.empty_filtered', { query: escapeMd(searchQuery) }, locale),
     });
+    // Without this the only way back to the full list is to clear the input
+    // and submit an empty string, which Lark won't fire — the card dead-ends.
+    // A button click carries no input_value, so the relay_search handler
+    // resolves it to '' and re-renders the unfiltered list.
+    elements.push(buildClearSearchButton({ action: 'relay_search', ...stateValue, selected: '' }, locale));
     return JSON.stringify(wrapCard(elements, locale, targetChatType));
   }
 
@@ -2780,7 +2996,8 @@ export function buildQuotePickerCard(
     return JSON.stringify(wrapQuoteCard(elements, locale));
   }
   if (filtered.length === 0) {
-    elements.push({ tag: 'markdown', content: t('card.quote.empty_filtered', { query: searchQuery }, locale) });
+    elements.push({ tag: 'markdown', content: t('card.quote.empty_filtered', { query: escapeMd(searchQuery) }, locale) });
+    elements.push(buildClearSearchButton({ action: 'quote_search', ...stateValue, selected: '' }, locale));
     return JSON.stringify(wrapQuoteCard(elements, locale));
   }
 
@@ -3170,8 +3387,9 @@ export function buildAdoptSelectCard(
     // markdown element, so an unescaped `![](http://x)` would render as an
     // image (external fetch = tracking beacon / SSRF surface). Neutralising
     // [ ] ` etc. defuses that. (buildRelayPickerCard echoes its query the
-    // same way and shares the same latent risk — tracked separately.)
+    // same way and now escapes it too.)
     elements.push({ tag: 'markdown', content: t('card.adopt.empty_filtered', { query: escapeMd(searchQuery) }, locale) });
+    elements.push(buildClearSearchButton({ action: 'adopt_search', ...stateValue, selected: '' }, locale));
     return JSON.stringify(wrapAdoptCard(elements, locale));
   }
 
