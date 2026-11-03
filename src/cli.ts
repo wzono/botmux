@@ -16953,7 +16953,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   const multiSelect = rest.includes('--multi');
   const noTimeout = rest.includes('--no-timeout');
   const positionalArgs = positionals(rest, ['--json', '--multi', '--no-timeout']);
-  if (!sub && positionalArgs[0] === 'buttons') {
+  if (false && !sub && positionalArgs[0] === 'buttons') {
     console.error(
       'botmux ask: `buttons` 必须紧跟 `ask`。请使用 `botmux ask buttons --options ... "问题"',
     );
