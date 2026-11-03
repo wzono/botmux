@@ -1792,7 +1792,7 @@ export function buildNewTopicCliInput(
  * Mirrors buildNewTopicPrompt structure but for subsequent messages.
  * Session ID is omitted for adopt mode and CLIs with injectsSessionContext.
  */
-type FollowUpBlockKey = 'sessionId' | 'role' | 'summaryMemory' | 'formatting' | 'reminder' | 'whiteboard' | 'groupHistory' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
+type FollowUpBlockKey = 'sessionId' | 'role' | 'credentials' | 'summaryMemory' | 'formatting' | 'reminder' | 'whiteboard' | 'groupHistory' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
 
 /**
  * 按既有顺序构造 follow-up 的各个块。inline 模式直接 join；hook 模式
