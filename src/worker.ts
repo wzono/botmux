@@ -665,7 +665,6 @@ import {
   type TraexAutoModelAction,
   type TraexAutoModelPreflightDecision,
 } from './services/traex-auto-model.js';
-import { readTraexModelLoads } from './services/traex-model-load.js';
 import {
   createCapacityWaitTracker,
   type CapacityCaptureIdentity,

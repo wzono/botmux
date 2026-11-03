@@ -517,7 +517,6 @@ import {
   resolveDetachedScheduledExecutionIdentity,
 } from './detached-scheduled-identity.js';
 import { noteSenderUnionId } from './platform-credential-source.js';
-import { larkToolBindingPath, readLarkToolBinding } from './lark-tool-binding.js';
 import { sessionAuthRequests } from './session-auth-requests.js';
 import { resolveUserToken } from '../utils/user-token.js';
 import { getLarkToolDelegation } from './lark-tool-delegation.js';
@@ -4335,13 +4334,6 @@ function sessionTransportDisabled(s: { chatId?: string; larkAppId?: string }): b
   let apiOnly = false;
   if (appId) { try { apiOnly = getBot(appId).config.apiOnly === true; } catch { /* unknown bot → not apiOnly */ } }
   return !larkTransportEnabled({ chatId: s.chatId ?? '', apiOnly });
-}
-
-function sessionLarkToolIdentityDisabled(s: { chatId?: string; larkAppId?: string; session: { headless?: { id: string; source: string } } }): boolean {
-  if (!s.larkAppId) return true;
-  try {
-    return !larkToolIdentityEnabled({ chatId: s.chatId ?? '', apiOnly: getBot(s.larkAppId).config.apiOnly, headless: s.session.headless });
-  } catch { return true; }
 }
 
 /** Mutating IPC routes may only touch this daemon's own bot-partitioned store. */

@@ -76,7 +76,7 @@ import {
 } from './initial-native-rename.js';
 import { effectiveReplyDelivery } from './reply-delivery.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
-import { updateMessage, deleteMessage, listChatMessages, listThreadMessages, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
+import { updateMessage, deleteMessage, listChatMessages, listThreadMessages, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildTurnTerminalFooterPatch, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildRecoveryFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type StreamCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
 import { cardMessageTitle, staleWorkingCardIds, streamingCardTitleClaimsWork } from './restored-card-status.js';
