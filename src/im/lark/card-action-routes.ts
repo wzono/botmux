@@ -219,6 +219,10 @@ export interface SensitiveCardActionMeta {
 
 const NO_META: SensitiveCardActionMeta = {};
 
+// 不在本表、但有自己权限门的动作（别「顺手」补进来，会把合法点击者挡掉）：
+// - `retry_recovery_turn`（自动恢复失败卡的「重试」）：原发起人（仍能对话）或
+//   bot 管理员可点，门在 core/ordinary-recovery-retry.ts 的 handleOrdinaryRecoveryRetryClick。
+
 export const SENSITIVE_CARD_ACTIONS: ReadonlyMap<string, SensitiveCardActionMeta> = new Map<string, SensitiveCardActionMeta>([
   ['restart', NO_META],
   ['close', NO_META],
@@ -250,6 +254,8 @@ export const SENSITIVE_CARD_ACTIONS: ReadonlyMap<string, SensitiveCardActionMeta
   ['wf_cancel', NO_META],
   ['stop_turn', NO_META],
   ['compact_session', NO_META],
+  // 闲置自动压缩开关（core/idle-auto-compact.ts）：改的是会话持久设置，同样过 canOperate。
+  ['toggle_idle_compact', { denyToastKey: 'card.idle_compact.no_permission' }],
   ['quote_confirm', NO_META],
   ['set_reasoning_effort', NO_META],
   // 普通回复卡右下角操作菜单（#1877）：展开菜单与模型选择注入都必须过 canOperate。

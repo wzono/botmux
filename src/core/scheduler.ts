@@ -114,6 +114,14 @@ function runtimeTasks(): ScheduledTask[] {
   return authorityStore.listTasks(appId);
 }
 
+/** The task as the daemon executes it: the host authority row once the app is
+ *  enrolled, never the agent-writable schedules.json projection; undefined
+ *  while authority is unavailable. Runtime writes (updateRuntimeTaskState)
+ *  land here first, so read-after-write within one fire is consistent. */
+export function getRuntimeTask(id: string, appId?: string): ScheduledTask | undefined {
+  return runtimeTask(id, appId);
+}
+
 function runtimeTask(id: string, appId?: string): ScheduledTask | undefined {
   if (authorityUnavailable) return;
   if (!authorityStore) return scheduleStore.getTask(id, appId);
@@ -123,6 +131,31 @@ function runtimeTask(id: string, appId?: string): ScheduledTask | undefined {
   }
   const record = authorityStore.getRecord(effectiveAppId, id);
   return record?.state === 'revoked' ? undefined : record?.task;
+}
+
+export function getScheduleAuthorityRecord(
+  id: string,
+  appId?: string,
+): import('../services/schedule-authority-store.js').ScheduleAuthorityRecord | undefined {
+  if (authorityUnavailable || !authorityStore) return undefined;
+  const effectiveAppId = authorityAppId(appId);
+  if (!effectiveAppId || !authorityStore.isInitialized(effectiveAppId)) return undefined;
+  return authorityStore.getRecord(effectiveAppId, id);
+}
+
+export function registerBackgroundExecution(job: import('./background-execution-policy.js').BackgroundExecutionRegistration): void {
+  if (authorityUnavailable || !authorityStore) throw new Error('schedule_authority_unavailable');
+  authorityStore.registerBackgroundExecution(job);
+}
+
+export function backgroundExecutions(appId: string, sessionId: string): import('./background-execution-policy.js').BackgroundExecutionRegistration[] {
+  if (authorityUnavailable || !authorityStore || !authorityStore.isInitialized(appId)) return [];
+  return authorityStore.backgroundExecutions(appId, sessionId);
+}
+
+export function revokeBackgroundExecution(id: string): void {
+  if (authorityUnavailable || !authorityStore) throw new Error('schedule_authority_unavailable');
+  authorityStore.revokeBackgroundExecution(id);
 }
 
 /** Fire-time guard for tasks created through a live conversation turn.

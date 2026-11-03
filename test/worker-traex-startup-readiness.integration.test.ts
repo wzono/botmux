@@ -23,11 +23,13 @@ function redraw(rows: string[]): string {
   return '\x1b[2J\x1b[H' + rows.map((row, index) => `\x1b[${index + 1};1H${row}`).join('');
 }
 
-type Scenario = 'fresh' | 'resume' | 'loaded-banner' | 'blocked-screens' | 'hostile-first' | 'hostile-dialog';
+// per-bot-home: TRAE_HOME comes only from the bot's env (the worker's own env
+// has none), so the submit receipt is only visible if the worker follows it.
+type Scenario = 'fresh' | 'resume' | 'loaded-banner' | 'blocked-screens' | 'hostile-first' | 'hostile-dialog' | 'per-bot-home' | 'repository-notice';
 
 const tmuxAvailable = probeTmuxFunctional().ok;
 for (const backendType of process.env.BOTMUX_TEST_WORKER_BINARY ? ['tmux'] as const : ['pty', 'tmux'] as const) {
-  for (const mode of ['fresh', 'resume', 'loaded-banner', 'blocked-screens', 'hostile-first', 'hostile-dialog'] as const) {
+  for (const mode of ['fresh', 'resume', 'loaded-banner', 'blocked-screens', 'hostile-first', 'hostile-dialog', 'per-bot-home', 'repository-notice'] as const) {
     it.skipIf(backendType === 'tmux' && !tmuxAvailable)(
       `TraeX ${backendType} ${mode}: admits a quiet cursor-painted composer and submits the first input once`,
       () => runScenario(backendType, mode),
@@ -41,7 +43,7 @@ async function runScenario(backendType: 'pty' | 'tmux', mode: Scenario): Promise
   const sessionId = randomUUID();
   const nativeId = randomUUID();
   const dataDir = join(root, 'data');
-  const traeHome = join(root, '.trae');
+  const traeHome = mode === 'per-bot-home' ? join(root, 'bot-trae') : join(root, '.trae');
   const sessionsDir = join(traeHome, 'cli', 'sessions', '2026', '10', '23');
   mkdirSync(dataDir, { recursive: true });
   mkdirSync(sessionsDir, { recursive: true });
@@ -60,7 +62,11 @@ async function runScenario(backendType: 'pty' | 'tmux', mode: Scenario): Promise
     renameSync(`${frameFile}.tmp`, frameFile);
     return id;
   }
-  const initial = mode === 'hostile-first'
+  const initial = mode === 'repository-notice'
+    ? ['  █ ◆ ◆ █  TRAE CLI (v0.212.1)', '  ~/projects', '  permissions: YOLO mode',
+        ...COMPOSER.slice(0, 3).map(row => row.replace('Use /skills to list available skills', 'Ask TRAE CLI to do anything')),
+        '  无法访问 Git 仓库 `git@example.invalid`，请确认该仓库权限或地址。']
+    : mode === 'hostile-first'
     ? COMPOSER.map(row => row.replace('GPT-6-Astra xhigh', 'loading'))
     : mode === 'hostile-dialog'
       ? ['Sign in to TraeCode CLI', '❯ 1. Sign in with browser', ...COMPOSER.slice(2)]
@@ -118,7 +124,7 @@ setInterval(() => {
 `);
   chmodSync(fakeCli, 0o755);
   const env = privateTmuxEnv(root, {
-    HOME: root, TRAE_HOME: traeHome, SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId,
+    HOME: root, ...(mode === 'per-bot-home' ? {} : { TRAE_HOME: traeHome }), SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId,
     CLI_EXTRA_ARGS: '', LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'test',
   });
   const messages: WorkerToDaemon[] = [];
@@ -143,6 +149,7 @@ setInterval(() => {
       type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_test',
       workingDir: dataDir, cliId: 'traex', cliPathOverride: fakeCli, backendType,
       ...(mode === 'resume' ? { resume: true, cliSessionId: nativeId } : {}),
+      ...(mode === 'per-bot-home' ? { env: { TRAE_HOME: traeHome } } : {}),
       prompt: 'only-this-traex-startup-input', turnId: 'om_first',
       dispatchAttempt: 1, durablePrimaryInbox: true,
       larkAppId: 'app_test', larkAppSecret: 'test',

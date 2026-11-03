@@ -657,6 +657,10 @@ export interface Session {
   /** Crash-safe bounded recovery state for an ordinary Claude/Lark logical
    * turn. Timer ownership is runtime-only; this record re-arms it on restore. */
   ordinaryTurnRecovery?: import('./services/ordinary-turn-recovery.js').OrdinaryTurnRecoveryState;
+  /** One failure notice per logical turn whose ordinary recovery ended failed:
+   * durable delivery state (retried until Feishu accepts it, never re-sent once
+   * delivered) plus the material for the card's retry button. Bounded. */
+  ordinaryRecoveryNotices?: import('./services/ordinary-recovery-notice.js').OrdinaryRecoveryNoticeRecord[];
   /**
    * Bounded, crash-recoverable proof that a durable-primary Inbox message
    * crossed the Remote Runner provider submission boundary. The turn id is the
@@ -670,6 +674,9 @@ export interface Session {
     committedAt: string;
     dispatchAttempt?: number;
   }>;
+  /** Confirmed settings for an exact durable Inbox task that may retry before
+   * provider submission. Never itself authorizes a business-turn replay. */
+  codexEffortTaskConfirmations?: import('./services/codex-effort-task-state.js').EffortTaskConfirmation[];
   /** Explicit opt-in lease for one authorization-inheriting long-running task.
    * The field name is retained for persisted-state compatibility. */
   readonlyTaskContinuation?: import('./services/readonly-task-continuation.js').ReadonlyTaskContinuationState;
@@ -752,6 +759,11 @@ export interface Session {
    *  a bot's own output. */
   lastHumanMessageAt?: string;
   closedAt?: string;
+  /** Owning-daemon automatic scratch cleanup, tied to this exact close. It
+   * preserves existing registered jobs, never permission to admit a new turn. */
+  backgroundExecutionCleanupClosedAt?: string;
+  /** Explicit close invalidates registrations across a later session resume. */
+  backgroundExecutionEpoch?: number;
   /** Permanent retirement after successful workspace reclamation. Written with
    * the closed row; generic resume must never reuse this conversation's cwd. */
   workspaceRetirement?: {
@@ -1115,6 +1127,11 @@ export interface Session {
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
   /** Codex service tier frozen at session creation; legacy missing means inherit. */
   serviceTier?: CodexServiceTierPreference;
+  /** Per-session opt-in idle auto-compaction (core/idle-auto-compact.ts).
+   *  Absent / enabled=false = off (the default). `idleSince` / `handledIdleSince`
+   *  are the persisted idle-stretch bookkeeping that lets the timer survive a
+   *  daemon restart; only written while the feature is on. */
+  idleAutoCompact?: import('./core/idle-auto-compact.js').IdleAutoCompactSetting;
   /** Optional TraeX backend variant frozen when this session first launches.
    * Missing preserves the historical inherit-from-TraeX-global behavior. */
   modelBackendVariant?: 'standard' | 'max';
@@ -1986,7 +2003,7 @@ type DaemonToWorkerBase =
    *  IPCs would race: process.on('message') handlers don't serialize, and the
    *  raw_input branch awaits 200ms between sendText and Enter, a window where
    *  a separate `message` IPC could write into the PTY first. */
-  | { type: 'raw_input'; content: string; turnId?: string; trustedController?: TrustedCaller; followUpContent?: string; followUpTurnId?: string; followUpCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; mojoLivePatch?: MojoLivePatch; turnCallerOpenId?: string }
+  | { type: 'raw_input'; content: string; turnId?: string; trustedController?: TrustedCaller; followUpContent?: string; followUpTurnId?: string; followUpCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; mojoLivePatch?: MojoLivePatch; turnCallerOpenId?: string; requireSafeComposer?: true }
   /** Rename the current CLI-native interactive session. The worker queues this
    *  administrative slash command until the TUI is idle and does not treat it
    *  as a model turn. Only adapters declaring buildSessionRenameCommand handle
@@ -2311,6 +2328,8 @@ export type WorkerToDaemon =
     canParkDiagnostic?: boolean;
     /** A Codex App thread is still owned by another app-server writer. */
     codexAppActiveWriter?: boolean;
+    /** Linux bwrap sandbox could not create this namespace on this host. */
+    sandboxNamespace?: 'pid' | 'user';
     turnId?: string;
     dispatchAttempt?: number;
   }
@@ -2367,7 +2386,7 @@ export type WorkerToDaemon =
   /** Executor-observed Codex tier, bound to this worker + rollout generation.
    * `null` explicitly clears any previous generation's snapshot. */
   | { type: 'codex_service_tier'; snapshot: CodexServiceTierSnapshot | null }
-  | { type: 'error'; message: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'error'; message: string; turnId?: string; dispatchAttempt?: number; sandboxNamespace?: 'pid' | 'user' }
   | { type: 'bridge_source_session'; bridge: 'hermes'; sourceSessionId: string }
   /** Worker observed a successful explicit `botmux send` for this turn, so
    * the daemon should treat listener-preview runs as visibly replied even

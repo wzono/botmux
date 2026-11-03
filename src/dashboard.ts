@@ -57,6 +57,7 @@ import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
 import { reconcileDaemonSessions, reconcileDaemonSnapshot } from './dashboard/daemon-reconcile.js';
 import { createSessionPresentationCoordinator } from './dashboard/session-presentation.js';
 import {
+  adoptSessionGroupFields,
   compactGroupsMatrix,
   groupsNamesMatrix,
   createGroupsMatrixSnapshot,
@@ -125,6 +126,7 @@ import { FeedbackAnalyticsService } from './services/feedback-analytics.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { buildFederatedRoster } from './services/federation-roster.js';
 import { resolveLiveBotTransport } from './services/team-roster.js';
+import { normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
 import { handleFederationSpokeApi, syncAllMemberships, autoBindOwnerIfUnambiguous, type TeamSessionRowLike } from './dashboard/federation-spoke-api.js';
 import type { TeamGroupCreateResult, TeamGroupOwnerTransferResult } from './dashboard/federated-group-core.js';
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
@@ -320,6 +322,7 @@ import {
   sanitizeSkillForDashboard,
 } from './dashboard/skill-pack-response.js';
 import { effectiveDefaultWorkingDir, getBot, getLoadedConfigPath, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
+import { findRetiredCliBots, retiredCli } from './adapters/cli/retired-cli.js';
 import {
   findQuotaFallbackCycles,
   normalizeQuotaFallbackBotConfig,
@@ -1373,6 +1376,14 @@ function refreshLocalVcMeetingAgentConfig(appId: string): void {
   } catch {
     // This dashboard process may not host the target bot daemon.
   }
+}
+
+/** Workflow run view: live registry name first, then the persisted
+ *  bots-info.json name (offline bots), read lazily once per request. */
+function v3RunBotNameResolver(): (larkAppId: string) => string | undefined {
+  let persisted: Map<string, string> | undefined;
+  return (appId) => registry.getByAppId(appId)?.botName
+    ?? (persisted ??= readPersistedBotNames()).get(appId);
 }
 
 /** Map appId → persisted Feishu-probed botName from bots-info.json (offline
@@ -3141,6 +3152,7 @@ function configuredBotAgentFields(): Map<string, ConfiguredBotAgentFields> {
 }
 
 type QuotaFallbackStartupBlock = { reason: 'quota_fallback_cycle'; cycle: string[] };
+type RetiredCliStartupBlock = { reason: 'retired_cli'; cliId: string; replacement: string };
 
 /** File-backed Bot Defaults rows keep recovery possible when a daemon was
  * deliberately skipped during startup. The dashboard itself is online, so it
@@ -3161,10 +3173,29 @@ async function configuredBotDefaultsRecoveryRows(
       }
     }
     const persistedNames = readPersistedBotNames();
-    return configs
-      .map((bot, botIndex) => ({ bot, botIndex }))
+    // The loader leaves rows on a removed CLI (gemini) out of `configs`; show
+    // them anyway so the owner sees why the Bot is down. They are parsed as
+    // the replacement CLI only to fill the row, then carry their real cliId.
+    const retiredRows: Array<{ bot: BotConfig; botIndex: number; block: RetiredCliStartupBlock }> = [];
+    for (const retired of findRetiredCliBots(raw)) {
+      const entry = raw[retired.index];
+      const replacement = retiredCli(retired.cliId)!.replacement;
+      try {
+        const [parsed] = parseBotConfigsFromText(JSON.stringify([{ ...entry, cliId: replacement }]));
+        if (!parsed) continue;
+        retiredRows.push({
+          bot: { ...parsed, cliId: retired.cliId as CliId },
+          botIndex: retired.index,
+          block: { reason: 'retired_cli', cliId: retired.cliId, replacement },
+        });
+      } catch { /* a row that is invalid besides its cliId stays hidden, as before */ }
+    }
+    return [
+      ...configs.map((bot, botIndex) => ({ bot, botIndex, block: blockByAppId.get(bot.larkAppId) as QuotaFallbackStartupBlock | RetiredCliStartupBlock | undefined })),
+      ...retiredRows,
+    ]
       .filter(({ bot }) => !onlineAppIds.has(bot.larkAppId))
-      .map(({ bot, botIndex }) => {
+      .map(({ bot, botIndex, block }) => {
         const rawEntry = rawByAppId.get(bot.larkAppId);
         const payload = botDefaultsPayload({
           larkAppId: bot.larkAppId,
@@ -3198,7 +3229,7 @@ async function configuredBotDefaultsRecoveryRows(
           ...payload,
           botIndex,
           online: false,
-          ...(blockByAppId.has(bot.larkAppId) ? { startupBlocked: blockByAppId.get(bot.larkAppId) } : {}),
+          ...(block ? { startupBlocked: block } : {}),
         };
       });
   } catch {
@@ -3471,6 +3502,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
           _firstSeenAt: null as number | null,
           observedBotNames: [] as string[],
         };
+        adoptSessionGroupFields(cur, chatBase);
         if (Array.isArray(observedBotNames) && observedBotNames.length > 0) {
           cur.observedBotNames = [...new Set([...(cur.observedBotNames ?? []), ...observedBotNames])];
         }
@@ -6625,6 +6657,7 @@ const server = createServer(async (req, res) => {
     if (await handleV3RunsApi(req, res, url, {
       runsDir: v3RunsDir(),
       proxyToDaemon,
+      botName: v3RunBotNameResolver(),
     }, authed)) {
       return;
     }
@@ -8209,14 +8242,7 @@ function readPlatformBotsInfo(): PlatformBotInfo[] {
   try {
     const fp = join(config.session.dataDir, 'bots-info.json');
     if (!existsSync(fp)) return [];
-    const entries = JSON.parse(readFileSync(fp, 'utf8')) as Array<{
-      larkAppId?: string;
-      botOpenId?: string | null;
-      botName?: string | null;
-      botAvatarUrl?: string | null;
-      cliId?: string;
-    }>;
-    if (!Array.isArray(entries)) return [];
+    const entries = normalizeBotsInfoRouteEntries(JSON.parse(readFileSync(fp, 'utf8')));
     // Merge per-bot team-visibility config (showInTeam) from bots.json by
     // larkAppId so the platform team page can hide bots. Default: showInTeam =
     // true (shown). bots.json may be unreadable from the dashboard process →
@@ -8232,13 +8258,13 @@ function readPlatformBotsInfo(): PlatformBotInfo[] {
     }
     return entries
       .map((e) => {
-        const cfg = cfgByAppId.get(e.larkAppId || '');
+        const cfg = cfgByAppId.get(e.larkAppId);
         return {
-          appId: e.larkAppId || '',
-          openId: e.botOpenId ?? null,
+          appId: e.larkAppId,
+          openId: e.botOpenId,
           name: e.botName || e.larkAppId || 'bot',
           avatar: e.botAvatarUrl || undefined,
-          cli: e.cliId,
+          cli: e.cliId ?? undefined,
           showInTeam: cfg?.showInTeam !== false, // default true
           // 自家消息回声学到的租户稳定 union_id（可能尚未学到 → undefined）。
           // 平台聚合团队 roster 用，见 bot-union-ids-store / platform-team-store。
