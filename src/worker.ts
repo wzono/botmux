@@ -14228,7 +14228,7 @@ async function handleTuiKeysDirect(
       targetBackend,
       keys,
       KEY_TO_ANSI,
-      { isCurrent: () => backend === targetBackend },
+      { isCurrent: () => backend === targetBackend && canWriteTerminalBytes() },
     );
     if (!delivered) {
       logError('handleTuiKeys write rejected or backend replaced');
@@ -14327,6 +14327,7 @@ async function flushPendingInjections(): Promise<void> {
       // workingDir; non-barrier injects are best-effort and not replayed
       // cross-process), unlike pendingMessages which killCli preserves.
       if (cliRestartInProgress) return;
+      if (!canWriteTerminalBytes()) return;
       const item = pendingInjections.shift()!;
       const cmd = item.command;
       isPromptReady = false;
@@ -14334,6 +14335,8 @@ async function flushPendingInjections(): Promise<void> {
       try {
         // Serially：与 startupCommands / raw_input / native-rename 共用同一条
         // 字面命令行写入互斥链（text → beat → Enter 窗口不被拼接）。
+        if (!canWriteTerminalBytes()) return;
+        if (!canWriteTerminalBytes()) return;
         await sendRawCommandLineWithRecoveryFence(backend, cmd);
         await awaitPtyQuiescence(STARTUP_CMD_QUIET_MS, STARTUP_CMD_CAP_MS);
         log(`Injected command: ${cmd}`);
@@ -14366,7 +14369,7 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<boolean
   const targetAdapter = cliAdapter;
   const lifetime = cliLifetimeNonce;
   if (codexCliEffortOperation) await cancelCodexCliEffort();
-  if (backend !== targetBackend || cliAdapter !== targetAdapter || cliLifetimeNonce !== lifetime) return false;
+  if (backend !== targetBackend || cliAdapter !== targetAdapter || cliLifetimeNonce !== lifetime || !canWriteTerminalBytes()) return false;
   const navKeyCount = keys[keys.length - 1] === 'Enter' ? keys.length - 1 : keys.length;
 
   log(`TUI text input: writing "${text.substring(0, 80)}" to PTY (after ${navKeyCount} nav keys)`);
@@ -14378,7 +14381,7 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<boolean
         keys,
         text,
         keyToAnsi: KEY_TO_ANSI,
-        isCurrent: () => backend === targetBackend && cliAdapter === targetAdapter,
+        isCurrent: () => backend === targetBackend && cliAdapter === targetAdapter && canWriteTerminalBytes(),
         writeInput: async (target, content) => {
           const result = await targetAdapter.writeInput(target, content);
           if (targetBackend.captureAmbiguousSubmissionFence) {
@@ -14467,7 +14470,7 @@ async function driveCocoPicker(navKeys: string[], needsReviewSubmit: boolean, co
 
   // The hook returns passthrough → CoCo renders the picker; only then send keys.
   const appeared = await waitFor(/Enter to select|Tab\/Arrow keys|Review your answers/, 30_000);
-  if (!appeared) { log('coco_drive_picker: picker not detected within 30s — aborting drive'); return; }
+  if (!appeared || !canWriteTerminalBytes()) { log('coco_drive_picker: picker not detected or workspace fence changed — aborting drive'); return; }
   if (!backend) return;
   const targetBackend = backend;
   tuiPromptBlocking = true;
@@ -14500,20 +14503,20 @@ async function driveCocoPicker(navKeys: string[], needsReviewSubmit: boolean, co
             targetBackend,
             navKeys,
             KEY_TO_ANSI,
-            { isCurrent: () => backend === targetBackend },
+            { isCurrent: () => backend === targetBackend && canWriteTerminalBytes() },
           );
           if (!navigated) {
             throw new Error('backend rejected free-text navigation');
           }
           await new Promise(r => setTimeout(r, 150));
-          if (backend !== targetBackend) {
+          if (backend !== targetBackend || !canWriteTerminalBytes()) {
             throw new Error('backend changed before free-text input');
           }
           const input = strictInputHandle(targetBackend as SessionBackend & PtyHandle);
           if (typeof input.sendText === 'function') input.sendText(comment);
           else input.write(comment);
           await new Promise(r => setTimeout(r, 200));
-          if (backend !== targetBackend) {
+          if (backend !== targetBackend || !canWriteTerminalBytes()) {
             throw new Error('backend changed before free-text submit');
           }
           if (!await handleTuiKeysDirect(targetBackend, ['Enter'], true)) {
@@ -14551,7 +14554,7 @@ async function driveCocoPicker(navKeys: string[], needsReviewSubmit: boolean, co
   if (needsReviewSubmit) {
     const review = await waitFor(/Review your answers|Submit answers/, 8_000);
     if (!review) log('coco_drive_picker: Review screen not detected — submitting anyway');
-    if (backend !== targetBackend) {
+    if (backend !== targetBackend || !canWriteTerminalBytes()) {
       reportFailure();
       return;
     }
@@ -16042,7 +16045,8 @@ function adapterInputHandle(target: SessionBackend): PtyHandle {
 }
 
 function writeBackendWorkingDirRejected(target: SessionBackend): boolean {
-  return target.validateWorkingDirBeforeBusinessInput?.() === false;
+  if (target.validateWorkingDirBeforeBusinessInput?.() === false) return true;
+  return !!lastInitConfig?.expectedWorkingDirIdentity && !target.effectiveWorkspaceProof?.();
 }
 
 function adoptComposerConflict(target: SessionBackend): string | undefined {
@@ -16269,7 +16273,7 @@ async function runAfterAmbiguousSubmissionWrites<T>(
   ambiguousSubmissionWriteTail = new Promise<void>(resolve => { release = resolve; });
   await previous;
   try {
-    if (backend !== target) {
+    if (backend !== target || !canWriteTerminalBytes()) {
       throw new Error('backend changed before queued terminal action');
     }
     return await action();
@@ -18442,8 +18446,10 @@ async function flushPending(): Promise<void> {
     // rename. Some passthroughs (/clear, /new) can rotate the native session;
     // applying the canonical title last keeps the resume-picker label aligned.
     if (rawInputReady && pendingRawInputs.length > 0 && backend) {
+      if (!canWriteTerminalBytes()) return;
       const raw = freshnessInputQueue.takeRaw();
       if (!raw) return;
+      if (!canWriteTerminalBytes()) { pendingRawInputs.unshift(raw); return; }
       await deliverRawInput(raw);
       return;
     }
@@ -25623,11 +25629,13 @@ async function spawnCli(
   // Output ownership is independent from workspace proof. Local backends with
   // no submit-time validator installed the guarded listener above; every other
   // backend (including Riff/Mojo) must always remain observable.
-  if (!cfg.expectedWorkingDirIdentity || observedBackend.validateWorkingDirBeforeBusinessInput) {
-    observedBackend.onData((data) => {
-      if (backend !== observedBackend) return;
-      onPtyData(data);
-    });
+  observedBackend.onData((data) => {
+    if (backend !== observedBackend) return;
+    onPtyData(data);
+  });
+  if (cfg.expectedWorkingDirIdentity && observedBackend.validateWorkingDirBeforeBusinessInput
+    && (!observedBackend.validateWorkingDirBeforeBusinessInput() || !observedBackend.effectiveWorkspaceProof?.())) {
+    throw new Error(`${effectiveBackendType} effective workspace proof unavailable for group-bound session`);
   }
   if (observedBackend instanceof HerdrBackend) {
     const transcriptSettle = makeBridgeTranscriptSettle(

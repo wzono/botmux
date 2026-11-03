@@ -1318,7 +1318,7 @@ export async function reconcileTurnPermitDispatches(
     const ds = sessionsById.get(permit.sessionId);
     const observed = ds?.workerGeneration ?? ds?.session.workerGeneration ?? 0;
     const aliveReserved = !!ds?.worker && !ds.worker.killed && observed === permit.reservedGeneration;
-    if (!aliveReserved) await store.recoverExpiredSpawn?.(permit, {
+    if (ds && !aliveReserved) await store.recoverExpiredSpawn?.(permit, {
       observedGeneration: observed,
       reservedGenerationRetired: observed < permit.reservedGeneration,
     });
@@ -16170,6 +16170,21 @@ function setupWorkerHandlers(
     // installed; never let those stale events mutate the replacement's cards,
     // tokens, readiness, transcript metadata, or durable turn state.
     if (ds.worker !== worker) {
+      if (msg.type === 'turn_input_committed' && msg.controlDispatchId && msg.controlReplyDigest) {
+        const retained = [...(ds.retainedControlReplyWorkers?.values() ?? [])]
+          .some(binding => binding.worker === worker && binding.generation === workerGeneration);
+        if (retained) {
+          const receipts = ds.session.controlDispatchReceipts ??= {};
+          receipts[msg.controlDispatchId] = { replyDigest: msg.controlReplyDigest,
+            committedAt: new Date().toISOString(), workerGeneration };
+          sessionStore.updateSession(ds.session);
+          void productionTurnPermitStore.acknowledgeControlReplyByDispatch({
+            controlDispatchId: msg.controlDispatchId, replyDigest: msg.controlReplyDigest, workerGeneration,
+          });
+          return;
+        }
+      }
+
       // A retiring worker's own COMMIT ACK still settles the ordinary
       // deliveries tracked against THAT worker object: suspend detaches
       // ds.worker and a replacement advances the generation BEFORE the old

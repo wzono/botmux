@@ -9739,6 +9739,11 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
   const asyncWorker = askSession?.worker;
   const asyncGeneration = askSession?.session.workerGeneration;
   const asyncOriginTurn = typeof body.originTurnId === 'string' ? body.originTurnId : undefined;
+  if (askSession && asyncInput && asyncOriginTurn && asyncGeneration && asyncWorker) {
+    (askSession.retainedControlReplyWorkers ??= new Map()).set(asyncInput.itemId, {
+      worker: asyncWorker, generation: asyncGeneration,
+    });
+  }
   const audience = asyncInput && askSession
     ? documentDelivery ? { kind: 'human' as const, answererOpenId: documentDelivery.openId }
       : asyncAskAudience(askSession, asyncOriginTurn)
@@ -9844,10 +9849,11 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
   if (res.destroyed) return;
 
   if (asyncInput && askSession && result.kind === 'answered') {
-    const isCurrent = () => !res.destroyed && findActiveBySessionId(boundAsk.sessionId) === askSession
-      && askSession.worker === asyncWorker && !!asyncWorker && !asyncWorker.killed
-      && askSession.session.workerGeneration === asyncGeneration
-      && askSession.session.cliSessionId === asyncInput.threadId;
+    const isCurrent = () => {
+      const retained = askSession.retainedControlReplyWorkers?.get(asyncInput.itemId);
+      return !res.destroyed && !!retained && retained.worker === asyncWorker
+        && retained.generation === asyncGeneration && asyncWorker.connected !== false && !asyncWorker.killed;
+    };
     const delivered = await deliverCodexAsyncAnswer(asyncInput, boundAsk.questions, result, {
       isCurrent,
       deliver: async (text, by) => {
@@ -9915,21 +9921,23 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
             expiresAt: Date.now() + 60_000,
           }),
           beginDispatch: async permit => {
-            const actual = frozenSessionWorkspace(askSession);
+            const retained = askSession.retainedControlReplyWorkers?.get(asyncInput.itemId);
+            const originalAlive = retained?.generation === frozenControl.expectedGeneration
+              && retained.worker.connected !== false && !retained.worker.killed;
             const waitState = originalControlWaitState({ sessionId: askSession.session.sessionId,
               originalTurnId: turnId, askId: asyncInput.itemId });
             const originalStillWaiting = askInput.controlWait?.state === 'needs_user'
               && asyncInput.itemId === askInput.controlWait.wait.askId
               && (waitState === 'needs_user' || originalControlWaitAcceptedAnswer({
                 sessionId: askSession.session.sessionId, originalTurnId: turnId, askId: asyncInput.itemId }));
-            const dispatch = actual && isCurrent() && originalStillWaiting
+            const dispatch = originalAlive && originalStillWaiting
               ? await centralTurnPermitStore.beginControlReplyDispatch(permit, replyDigest, {
                   sessionId: askSession.session.sessionId,
                   originalTurnId: turnId,
                   wait: { kind: 'ask', askId: asyncInput.itemId },
-                  workerGeneration: askSession.session.workerGeneration ?? 0,
-                  workspace: actual.workspace,
-                  ...(actual.groupRevision === undefined ? {} : { groupRevision: actual.groupRevision }),
+                  workerGeneration: frozenControl.expectedGeneration,
+                  workspace: frozenControl.workspace,
+                  ...(frozenControl.groupRevision === undefined ? {} : { groupRevision: frozenControl.groupRevision }),
                   originalState: frozenControl.state,
                   authorized: true,
                 })
@@ -9951,9 +9959,19 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
                 replyToName: asyncDocumentTarget.replyToName, turnId: permit.controlDispatchId,
               };
             }
-            const accepted = sendWorkerInput(askSession, input, permit.controlDispatchId, { atMostOnce: true,
-              controlDispatchId: permit.controlDispatchId, controlReplyDigest: replyDigest,
-              trustedCaller, ...(steerable ? { codexAppSteerable: true as const } : {}) });
+            const retained = askSession.retainedControlReplyWorkers?.get(asyncInput.itemId);
+            let accepted: boolean;
+            if (retained?.worker !== askSession.worker && retained?.generation === permit.expectedGeneration
+              && retained.worker.connected !== false && !retained.worker.killed) {
+              retained.worker.send({ type: 'message', content: input.content, turnId: permit.controlDispatchId,
+                atMostOnce: true, controlDispatchId: permit.controlDispatchId, controlReplyDigest: replyDigest,
+                trustedCaller, ...(input.codexAppInput ? { codexAppInput: input.codexAppInput } : {}) });
+              accepted = true;
+            } else {
+              accepted = sendWorkerInput(askSession, input, permit.controlDispatchId, { atMostOnce: true,
+                controlDispatchId: permit.controlDispatchId, controlReplyDigest: replyDigest,
+                trustedCaller, ...(steerable ? { codexAppSteerable: true as const } : {}) });
+            }
             if (!accepted && documentDelivery && asyncDocumentTarget) {
               delete askSession.session.docCommentTargets?.[permit.controlDispatchId];
             }
