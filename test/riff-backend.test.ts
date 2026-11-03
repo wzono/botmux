@@ -82,9 +82,9 @@ describe('RiffBackend', () => {
       expect(calls.filter(call => call.url.includes('/api/task-execute'))).toHaveLength(0);
       rmSync(root, { recursive: true, force: true });
       renameSync(moved, root);
-      await expect(be.writeBusinessInput('retained prompt')).resolves.toBe('submitted');
+      await expect(be.writeBusinessInput('retained prompt')).resolves.toBe('retryable_pre_dispatch_rejection');
       await flush();
-      expect(calls.filter(call => call.url.includes('/api/task-execute'))).toHaveLength(1);
+      expect(calls.filter(call => call.url.includes('/api/task-execute'))).toHaveLength(0);
     } finally {
       be.kill();
       rmSync(root, { recursive: true, force: true });

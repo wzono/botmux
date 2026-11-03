@@ -130,7 +130,7 @@ describe('group workspace resolution', () => {
       .toMatchObject({ ok: false, reason: 'changed' });
   });
 
-  it.each(['riff', 'mojo'] as const)('accepts %s worker readiness with exact validated host contract proof and no child cwd', async backendType => {
+  it.each(['riff', 'mojo'] as const)('%s worker readiness follows effective-context support', async backendType => {
     initSessionStore(`bot-${backendType}`);
     registerBot({ larkAppId: `bot-${backendType}`, larkAppSecret: 's', cliId: backendType });
     const requested = dir(`requested-${backendType}`);
@@ -161,10 +161,14 @@ describe('group workspace resolution', () => {
     worker.emit('message', {
       type: 'ready', port: 0, token: '',
       hostWorkingDirContract: { workingDir: requested, identity },
+      effectiveWorkspaceProof: backendType === 'riff'
+        ? { kind: 'riff-repository', hostPath: requested, identity, repository: { repoName: 'group/repo', repoBranch: 'main' } }
+        : { kind: 'mojo-isolation', hostPath: requested, identity,
+            repositoryPath: requested, executionPath: `${requested}-isolated` },
     });
 
-    expect(worker.kill).not.toHaveBeenCalled();
-    expect(ds.workerReady).toBe(true);
+    if (backendType === 'riff') { expect(worker.kill).not.toHaveBeenCalled(); expect(ds.workerReady).toBe(true); }
+    else { expect(worker.kill).toHaveBeenCalled(); expect(ds.workerReady).not.toBe(true); }
   });
 
   it('rejects real worker readiness when the backend-observed cwd differs', async () => {

@@ -288,7 +288,12 @@ export class AmbiguousSubmissionBlockedError extends Error {
   }
 }
 
+export type EffectiveWorkspaceProof =
+  | { kind: 'riff-repository'; hostPath: string; identity: { dev: string; ino: string }; repository: { repoName: string; repoBranch?: string } }
+  | { kind: 'mojo-isolation'; hostPath: string; identity: { dev: string; ino: string }; repositoryPath: string; executionPath: string };
+
 export interface SessionBackend {
+  effectiveWorkspaceProof?(): EffectiveWorkspaceProof | undefined;
   spawn(bin: string, args: string[], opts: SpawnOpts): void;
   /** Returns false only when the backend can prove the write was not accepted.
    * Legacy implementations may return void on success. */

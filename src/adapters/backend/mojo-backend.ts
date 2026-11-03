@@ -91,6 +91,7 @@ import type {
 import {
     cleanupMojoIsolatedWorkspace,
     ensureMojoIsolatedWorkspace,
+
 } from './mojo-isolated-workspace.js';
 import {
     buildEffectiveChildEnv,
@@ -417,6 +418,9 @@ export class MojoBackend implements SessionBackend {
     // ── SessionBackend surface ───────────────────────────────────────────────
 
     spawn(bin: string, args: string[], opts: SpawnOpts): void {
+        if (opts.expectedWorkingDirIdentity && this.config.cwd && this.config.cwd !== opts.cwd) {
+            throw new Error('[mojo] group workspace cannot be overridden by mojo.cwd');
+        }
         // No persistent process is started here — the headless CLI is invoked
         // once per turn — but the spawn contract is still where the worker hands
         // over the authoritative cwd/env, so keep them for buildEnv()/runTurn().
@@ -639,7 +643,13 @@ export class MojoBackend implements SessionBackend {
     }
 
     validateWorkingDirBeforeBusinessInput(): boolean {
-        return this.hostWorkingDirContract.matches();
+        return this.hostWorkingDirContract.matches() && (!this.hostWorkingDirContract.validatedProof() || !!this.effectiveWorkspaceProof());
+    }
+
+    effectiveWorkspaceProof() {
+        // Mojo currently has no mechanical repository mount/provider attestation.
+        // An isolated daemon cwd plus prompt guidance is not effective-context proof.
+        return undefined;
     }
 
     validatedHostWorkingDirContract() {
@@ -2274,6 +2284,8 @@ export class MojoBackend implements SessionBackend {
             botEnv: this.spawnOpts?.injectEnv,
             mojoEnv: this.config.env,
         });
+        const proof = this.effectiveWorkspaceProof();
+        if (proof) env.BOTMUX_EFFECTIVE_WORKSPACE_PROOF = JSON.stringify(proof);
         // Prefer an injected JWT so the bot never depends on an interactive
         // `mojo auth login` on the host. Verified: X_JWT_TOKEN makes
         // `mojo auth status --json` report mode=jwt / source=env.

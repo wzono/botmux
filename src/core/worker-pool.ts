@@ -16633,14 +16633,23 @@ function setupWorkerHandlers(
         const launchGuard = ds.groupWorkspaceLaunchGuard;
         const remoteHostProof = msg.hostWorkingDirContract;
         const readyBackendType = ds.initConfig?.backendType ?? ds.session.backendType;
+        const effectiveProof = msg.effectiveWorkspaceProof;
+        const exactEffectiveProof = readyBackendType === 'riff'
+          ? effectiveProof?.kind === 'riff-repository' && !!launchGuard?.identity && effectiveProof.hostPath === launchGuard.workingDir
+            && effectiveProof.identity.dev === launchGuard.identity.dev && effectiveProof.identity.ino === launchGuard.identity.ino
+            && !!effectiveProof.repository.repoName && !!effectiveProof.repository.repoBranch
+          : readyBackendType === 'mojo' ? false : true;
         const exactRemoteHostProof = (readyBackendType === 'riff' || readyBackendType === 'mojo')
           && !!launchGuard?.identity
           && remoteHostProof?.workingDir === launchGuard.workingDir
           && remoteHostProof.identity.dev === launchGuard.identity.dev
-          && remoteHostProof.identity.ino === launchGuard.identity.ino;
+          && remoteHostProof.identity.ino === launchGuard.identity.ino
+          && exactEffectiveProof;
+        const remoteProofRequired = launchGuard && (readyBackendType === 'riff' || readyBackendType === 'mojo');
         if (launchGuard
-          && !exactRemoteHostProof
-          && (!cb.confirmWorkerReadyCwd || !cb.confirmWorkerReadyCwd(ds, msg.cwd))) {
+          && ((remoteProofRequired && !exactRemoteHostProof)
+            || (!remoteProofRequired && !exactRemoteHostProof
+              && (!cb.confirmWorkerReadyCwd || !cb.confirmWorkerReadyCwd(ds, msg.cwd))))) {
           logger.error(`[${t}] Worker ready cwd mismatch: requested=${launchGuard.workingDir} actual=${msg.cwd ?? '(unavailable)'}`);
           cb.onWorkerReadyCwdMismatch?.(ds, msg.cwd);
           ds.groupWorkspaceLaunchGuard = undefined;

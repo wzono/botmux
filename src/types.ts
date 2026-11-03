@@ -2299,6 +2299,7 @@ export type WorkerToDaemon =
         workingDir: string;
         identity: { dev: string; ino: string };
       };
+      effectiveWorkspaceProof?: import('./adapters/backend/types.js').EffectiveWorkspaceProof;
     }
   | { type: 'persistent_backend_target'; target?: PersistentBackendTarget }
   /** The exact inbound turn is now durably owned by this worker generation's

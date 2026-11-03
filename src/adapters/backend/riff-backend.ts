@@ -1237,12 +1237,32 @@ export class RiffBackend implements SessionBackend {
 
   spawn(_bin: string, _args: string[], opts: SpawnOpts): void {
     this.hostWorkingDirContract.capture(opts);
+    if (opts.expectedWorkingDirIdentity) {
+      const derived = deriveRiffRepoFromWorkingDir(opts.cwd);
+      const override = this.config.repos?.[0];
+      if (!derived || !derived.repo.repoBranch || (this.config.repos && this.config.repos.length !== 1)
+        || (override && (override.repoName !== derived.repo.repoName
+        || override.repoBranch !== derived.repo.repoBranch))) {
+        this.groupWorkspaceRepoProof = undefined;
+      } else this.groupWorkspaceRepoProof = { hostPath: opts.cwd, identity: { ...opts.expectedWorkingDirIdentity }, repository: derived.repo };
+    }
     logger.info(`[riff] spawn (ignoring bin/args, using config: ${this.config.baseUrl})`);
     // No actual process to spawn. Task creation happens on first write().
   }
 
   validateWorkingDirBeforeBusinessInput(): boolean {
-    return this.hostWorkingDirContract.matches();
+    return this.hostWorkingDirContract.matches() && (!this.hostWorkingDirContract.validatedProof() || !!this.effectiveWorkspaceProof());
+  }
+
+  private groupWorkspaceRepoProof?: { hostPath: string; identity: { dev: string; ino: string }; repository: RiffRepoRef };
+
+  effectiveWorkspaceProof() {
+    const frozen = this.groupWorkspaceRepoProof;
+    if (!frozen) return undefined;
+    const actual = deriveRiffRepoFromWorkingDir(frozen.hostPath);
+    if (!actual || actual.repo.repoName !== frozen.repository.repoName
+      || actual.repo.repoBranch !== frozen.repository.repoBranch) return undefined;
+    return { kind: 'riff-repository' as const, ...frozen };
   }
 
   validatedHostWorkingDirContract() {
@@ -1264,14 +1284,16 @@ export class RiffBackend implements SessionBackend {
     const result = new Promise<'submitted' | 'retryable_pre_dispatch_rejection'>(resolve => { resolveResult = resolve; });
     this.writeChain = this.writeChain
       .then(async () => {
-        if (this.killed || this.closing || !this.hostWorkingDirContract.matches()) {
+        const proof = this.effectiveWorkspaceProof();
+        const groupBound = !!this.hostWorkingDirContract.validatedProof();
+        if (this.killed || this.closing || !this.hostWorkingDirContract.matches() || (groupBound && !proof)) {
           resolveResult('retryable_pre_dispatch_rejection');
           return;
         }
         resolveResult('submitted');
         this.taskDone = false;
-        if (!this.currentTaskId) await this.createTask(text, attachments);
-        else await this.followUp(text, attachments);
+        if (!this.currentTaskId) await this.createTask(text, attachments, proof);
+        else await this.followUp(text, attachments, proof);
       })
       .catch((err) => {
         logger.warn(`[riff] queued write failed: ${err}`);
@@ -1733,7 +1755,7 @@ export class RiffBackend implements SessionBackend {
     return parts[parts.length - 1] ?? p;
   }
 
-  private async createTask(prompt: string, attachments: RiffAttachment[]): Promise<void> {
+  private async createTask(prompt: string, attachments: RiffAttachment[], effectiveProof?: ReturnType<RiffBackend['effectiveWorkspaceProof']>): Promise<void> {
     const url = `${this.config.baseUrl}/api/task-execute`;
 
     // riff task-execute body: origin at top level, prompt inside config.userPrompt
@@ -1760,6 +1782,7 @@ export class RiffBackend implements SessionBackend {
         for (const w of this.config.repoWarnings ?? []) this.emitLine(`[riff] ⚠️ ${w}`, 'warn');
       }
     }
+    if (effectiveProof) config.effectiveWorkspaceProof = structuredClone(effectiveProof);
     // Inject env into the riff sandbox so the agent can use `botmux send` etc.
     // Merged from: per-bot env (bots.json `env`) + botmux session context vars +
     // any explicit config.env (which takes precedence).
@@ -1814,12 +1837,13 @@ export class RiffBackend implements SessionBackend {
     return cold ? this.followUpColdTimeoutMs : this.followUpHotTimeoutMs;
   }
 
-  private async followUp(prompt: string, attachments: RiffAttachment[]): Promise<void> {
+  private async followUp(prompt: string, attachments: RiffAttachment[], effectiveProof?: ReturnType<RiffBackend['effectiveWorkspaceProof']>): Promise<void> {
     const url = `${this.config.baseUrl}/api/task-follow-up`;
 
     // Capture the parent BEFORE the request: reconcile-on-timeout below needs the
     // exact parent this follow-up hung off, independent of any later mutation.
     const parentTaskId = this.currentTaskId;
+
 
     // riff task-follow-up body: parentTaskId + origin + prompt at top level
     const payload: Record<string, unknown> = {
@@ -1827,6 +1851,8 @@ export class RiffBackend implements SessionBackend {
       parentTaskId,
       prompt: this.injectSystemPrompt(prompt),
     };
+
+    if (effectiveProof) payload.effectiveWorkspaceProof = structuredClone(effectiveProof);
 
     // Send-time floor for reconcile-on-timeout: only a task created at/after this
     // instant can be THIS follow-up's child (see reconcileAfterFollowUpTimeout).
@@ -2101,6 +2127,7 @@ export class RiffBackend implements SessionBackend {
     attachments: RiffAttachment[],
     timeoutMs: number,
   ): Promise<string> {
+    const groupBound = !!this.hostWorkingDirContract.validatedProof();
     // Assemble the request body FIRST (attachment reads can be slow on large
     // files / slow disks), THEN resolve the JWT immediately before fetch. The
     // keychain selector skips tokens expiring within a safety window, but that
@@ -2141,9 +2168,19 @@ export class RiffBackend implements SessionBackend {
     // in the wrong environment). The timeout is the caller's per-endpoint budget
     // (create vs follow-up cold/hot), not a fixed constant.
     const post = (jwt: string | null): Promise<Response> => {
-      const h = { ...headers };
-      if (jwt) h['x-jwt-token'] = jwt;
-      return fetch(url, { method: 'POST', headers: h, body, signal: AbortSignal.timeout(timeoutMs) });
+      let attemptBody = body;
+      if (groupBound) {
+        const freshProof = this.effectiveWorkspaceProof();
+        if (!freshProof) throw new Error('riff effective workspace changed before HTTP dispatch');
+        if (body instanceof FormData) {
+          const form = new FormData();
+          for (const [key, value] of body.entries()) form.append(key, value);
+          form.set('payload', JSON.stringify({ ...payload, effectiveWorkspaceProof: freshProof }));
+          attemptBody = form;
+        } else attemptBody = JSON.stringify({ ...payload, effectiveWorkspaceProof: freshProof });
+      }
+      const h = { ...headers }; if (jwt) h['x-jwt-token'] = jwt;
+      return fetch(url, { method: 'POST', headers: h, body: attemptBody, signal: AbortSignal.timeout(timeoutMs) });
     };
 
     const firstJwt = await this.getJwt();
@@ -2217,6 +2254,7 @@ export class RiffBackend implements SessionBackend {
       return false;
     }
     this.currentTaskId = taskId;
+
     this.taskIdCb?.(taskId);
     if (this.killed || this.shutdownDetaching) return false;
     return true;
