@@ -4,8 +4,8 @@
 
 - **提交基线**：实现范围为 `09940cecc5ce403f694900b335d39dbd2aeffa61..HEAD`（R2 历史 blocker 修复起点 `2affe4c87a259f2115356ad1c102439853a762f2`）；本矩阵只陈述该范围内代码和测试已经证明的结果。
 - **目标**：同一宿主机内按 `chatId` 共享群工作目录；所有已迁移的离散业务 turn 在实际派发前证明冻结目录身份、群修订、worker generation 与派发许可；群目录管理操作使用可信 tenant/真人身份、提交前复验、持久 journal/receipt 与启动恢复。
-- **本轮范围**：Tasks 1–8 已提交/本次实现的基础契约、Task 7 authority/saga 收敛，以及 ordinary/trigger/listener/Dashboard/scheduler/failed-turn ingress 适配证据。
-- **本轮非目标 / 未声称完成**：Task 9 durable queue/principal/XPI/terminal/continuation 扩展、Task 10 remote provider proof、Task 11 全量 suite 与用户文档；宿主机级 migration manifest/整批 rollback。下表中的 `unknown/leftover` 是未完成审查项，不是通过。
+- **本轮范围**：Tasks 1–9 已提交/本次实现的基础契约、Task 7 authority/saga 收敛，以及 ordinary/trigger/listener/Dashboard/scheduler/failed-turn/durable queue/terminal/continuation ingress 适配证据。
+- **本轮非目标 / 未声称完成**：Task 10 remote provider proof、Task 11 全量 suite 与用户文档；宿主机级 migration manifest/整批 rollback。下表中的 `unknown/leftover` 是未完成审查项，不是通过。
 - **评审结论边界**：这是供独立实现复核的 submitter evidence，不是 GO、merge 或部署批准。当前实现**未部署、未重启 daemon、未 push**。
 - **结果审查预算**：下一轮仅做有针对性的 R2（复核下列已修基础 blocker 及直接触达边界）；随后由原始需求决策 owner 在 R3 给终态 GO/NO-GO，不开启 R4，也不由提交者自行扩大或改写验收目标。
 
@@ -123,11 +123,11 @@
 | AC-09 | `/queue` | command handler → submitQueuedMessage → central admitted driver | P1-17 | accepted only through valid permit/receipt | `admitted-turn-driver-structure`; permit failure/retry tests；通过 |
 | AC-09 | principal lane / XPI | durable driver → admitted dispatch → acquire/attempting → submit | P1-16 | lease/attempting after permit | `admitted-turn-driver-structure` production guard + `admitted-turn-dispatch` ordering；**当前 drivers 通过，Task 9 完整 durable fault matrix leftover** |
 | AC-09 | scheduler / listener / failed-turn | caller → ordinary/mutation-owned recovery → submit | P1-16 | same permit boundary；realtime/polled listener both enter `dispatchHumanMessageViaHandlers` ordinary path；mutation path does not nest shared gate | `event-dispatcher` actual listener call chain、scheduler suites、`failed-turn-recovery`；Task 8 通过 |
-| AC-09 | Ask exact-turn reply | Ask answer → control permit → worker submission → exact ACK receipt | AR-02 | resume original wait only；frozen workspace/generation/authority；single durable receipt | `turn-admission`, `admitted-turn-dispatch`, `turn-permit-startup-order`, structure guard；通过（Ask）；approval production caller 仍待 Task 9 核对 |
+| AC-09 | Ask exact-turn reply | Ask answer → control permit → worker submission → exact ACK receipt | AR-02 | resume original wait only；frozen workspace/generation/authority；single durable receipt | `turn-admission`, `admitted-turn-dispatch`, `turn-permit-startup-order`, structure guard；Ask 通过。原需求 owner 已裁决：仓库无 approval producer/emitter，新增 approval 产品入口及端到端验收从 Task 9 移除；通用 control-wait API 不计 approval 通过 |
 | AC-09 | Riff/Mojo output and effective context | worker ready/backend submit → authoritative effective-context proof；output listener independent | P1-01,P1-15 | host contract可验证；无 provider identity则 fail closed | `ef0e7f86e`; `daemon-resolution` host ready；`admitted-worker-workspace-identity` remote fail-closed；**provider-level Riff/Mojo proof unknown/leftover** |
 | AC-10 | path/store/inode failure no fallback | resolver → consume at commit/spawn/ready/backend submit | P1-11,P1-14,P1-15 | discriminated fault; exact `{path,dev,ino}` | `resolver-contract` all consume points/inode replacement；`daemon-resolution` corrupt/locked；`e2e` inaccessible；通过（host path） |
-| AC-10 | terminal WS stale group fence | terminal proxy → worker bytes gate | P1-16 | stale group session rejects bytes, not a business turn | **unknown/leftover Task 9**；classification test alone is not production proof |
-| AC-10 | output delivery exclusion | durable-send handler | — | output_delivery never enters business admission | `turn-admission` classification only；**production negative caller proof leftover** |
+| AC-10 | terminal WS stale group fence | daemon current fence → worker init/update → three WS byte gates | P1-16 | stale group session rejects bytes, not a business turn | `group-workspace-durable-ingress`, `terminal-write-frame`；worker tmux/zellij/shared handlers share exact revision+identity fence |
+| AC-10 | output delivery exclusion | durable-send handler | — | output_delivery never enters business admission | `group-workspace-durable-ingress` + `turn-admission` output-delivery classification；no business permit accepted by durable output path |
 | AC-11 | profile rewrite independent | bot profile publisher vs group store | P1-03,P1-08 | independent persistent stores | `group-workspace-e2e` profile rewrite case；通过 |
 | AC-11 | group/operation local v1→v2 | store locked migration → identity-bearing v2 | P1-05,P1-14 | retryable locked migration; future schema fail closed | `schema-v2`, `operation-v2`; `6de89f7ca`,`bf9812b0d`,`efda0ff3a`; **局部 store 通过** |
 | AC-11 | host-wide migration batch/rollback/version compatibility | migration manifest → all JSON/SQLite/admin stores → epoch barrier | AR-04,AR-05 | one fenced epoch, per-store publish points, resume/rollback/export | **deferred/leftover Task 6**；仓库无 `workspace-schema-migrator.ts`/manifest 全矩阵，不能记 pass |

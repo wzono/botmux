@@ -19,12 +19,13 @@ export type BusinessTurnSubmitOptions = {
   codexAppSteerable?: true;
   atMostOnce?: true;
   trustedCaller?: CliTurnPayload['trustedCaller'];
+  onIpcDispatchAttempted?: () => void;
 };
 
 export type AdmittedTurnWorkerBoundary = {
   reserveGeneration(ds: DaemonSession): number;
   forkBlank(ds: DaemonSession, permit: BlankBootstrapPermit, options: BusinessTurnSubmitOptions): Promise<
-    'started' | 'deferred' | 'rejected'
+    'started' | 'deferred' | 'observing' | 'rejected'
   >;
   submit(ds: DaemonSession, payload: string | CliTurnPayload, permit: BusinessSubmitPermit,
     digest: string, options: BusinessTurnSubmitOptions): Promise<boolean>;
@@ -153,12 +154,9 @@ export async function dispatchAdmittedBusinessTurn(input: {
         return result.status === 'issued' ? result.permit : undefined;
       },
       abortBlank: async (permit, phase) => {
+        if (phase === 'pre_fork') return;
         const currentGeneration = input.ds.workerGeneration ?? input.ds.session.workerGeneration ?? 0;
-        const retirement = phase === 'pre_fork'
-          ? currentGeneration < permit.reservedGeneration
-            ? { retiredGeneration: permit.reservedGeneration, workerPid: null }
-            : undefined
-          : await input.retireUnproven?.(input.ds, permit.reservedGeneration);
+        const retirement = await input.retireUnproven?.(input.ds, permit.reservedGeneration);
         await input.permitStore.abortBootstrap(permit, {
           phase,
           observedGeneration: currentGeneration,

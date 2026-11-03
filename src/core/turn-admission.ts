@@ -44,7 +44,7 @@ export type AdmittedBusinessTurnDependencies = {
   }): Promise<BusinessSubmitPermit | undefined>;
   reserveWorkerGeneration(): number;
   issueBlank(input: BlankBootstrapPermitInput): Promise<BlankBootstrapPermit>;
-  forkBlank(permit: BlankBootstrapPermit): Promise<'started' | 'deferred' | 'rejected'>;
+  forkBlank(permit: BlankBootstrapPermit): Promise<'started' | 'deferred' | 'observing' | 'rejected'>;
   awaitBlankReady(permit: BlankBootstrapPermit): Promise<{
     actualGeneration: number; cwd: WorkspaceIdentity; backend: WorkspaceIdentity;
   } | undefined>;
@@ -83,11 +83,19 @@ export async function dispatchAdmittedBusinessTurn(input: {
       ...(frozen.groupRevision === undefined ? {} : { groupRevision: frozen.groupRevision }),
       expiresAt: Date.now() + (input.permitTtlMs ?? 60_000),
     });
-    const fork = await deps.forkBlank(blank);
+    let fork: Awaited<ReturnType<AdmittedBusinessTurnDependencies['forkBlank']>>;
+    try {
+      fork = await deps.forkBlank(blank);
+    } catch {
+      await deps.abortBlank?.(blank,
+        (deps.currentWorkerGeneration() ?? 0) >= blank.reservedGeneration ? 'forked_unproven' : 'pre_fork');
+      return false;
+    }
     if (fork === 'rejected') {
       await deps.abortBlank?.(blank, 'pre_fork');
       return false;
     }
+    if (fork === 'observing') return false;
     let proof: Awaited<ReturnType<AdmittedBusinessTurnDependencies['awaitBlankReady']>>;
     try {
       proof = await deps.awaitBlankReady(blank);

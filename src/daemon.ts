@@ -978,6 +978,7 @@ import {
   listPendingAsksByAnchor,
   askAnswerActorFor,
   submitCustomReply,
+  originalControlWaitState,
 } from './core/ask-broker.js';
 import { createAskPersistStore } from './core/ask-persist-store.js';
 import {
@@ -6271,6 +6272,7 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
   ds.session.lastMessageAt = new Date(ds.lastMessageAt).toISOString();
   if (sub.workingDir && (!ds.worker || ds.worker.killed)) {
     applySessionWorkingDir(ds, { workingDir: sub.workingDir, source: 'explicit' });
+    publishTerminalWorkspaceFence(ds);
   }
 
   if (ds.worker && !ds.worker.killed) {
@@ -6286,7 +6288,10 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
     });
     rememberLastCliInput(ds, promptContent, cliInput);
     sessionStore.updateSession(ds.session);
-    if (!sendWorkerInput(ds, cliInput, turnId)) {
+    if (await followGroupWorkspaceBeforeBusinessTurn(ds) === 'stop'
+      || !await dispatchAdmittedBusinessTurn({ ds, turnId, payload: cliInput,
+        options: { resume: ds.hasHistory }, boundary: centralTurnWorkerBoundary,
+        permitStore: centralTurnPermitStore })) {
       throw new Error('doc-watch warmup worker input was not accepted');
     }
     beginNewTurn(ds, title, turnId);
@@ -6305,7 +6310,10 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
     });
     rememberLastCliInput(ds, promptContent, wrappedInput);
     sessionStore.updateSession(ds.session);
-    if (!forkWorker(ds, wrappedInput, ds.hasHistory)) {
+    if (await followGroupWorkspaceBeforeBusinessTurn(ds) === 'stop'
+      || !await dispatchAdmittedBusinessTurn({ ds, turnId, payload: wrappedInput,
+        options: { resume: ds.hasHistory }, boundary: centralTurnWorkerBoundary,
+        permitStore: centralTurnPermitStore })) {
       throw new Error('doc-watch warmup worker fork was not accepted');
     }
     beginNewTurn(ds, title, turnId);
@@ -6321,13 +6329,8 @@ async function submitQueuedMessage(
   ds: DaemonSession, message: LarkMessage, text: string,
   replyTarget?: import('./types.js').FrozenSessionReplyTarget,
 ): Promise<boolean> {
-  const worker = ds.worker;
-  const generation = ds.session.workerGeneration;
-  const nativeThread = ds.session.cliSessionId;
   const isCurrent = () => activeSessions.get(activeSessionKey(ds)) === ds
-    && ds.worker === worker && !!worker && !worker.killed
-    && ds.session.workerGeneration === generation
-    && ds.session.cliSessionId === nativeThread;
+    && !!ds.worker && !ds.worker.killed;
   if (!isCurrent()) return false;
   const senderIsBot = senderIsBotTriState(message.senderType,
     isKnownPeerBot(config.session.dataDir, ds.larkAppId, message.senderId));
@@ -6369,9 +6372,6 @@ async function submitQueuedMessage(
     participants: [{ openId: message.senderId, isBot: senderIsBot === true }],
     inThread: !!message.threadId,
   });
-  await noteTurnReceived(ds, message.messageId, text, sender, message.messageId);
-  // Identity refresh and reaction delivery both await external work.
-  if (!isCurrent()) { rollbackReplyContext(); return false; }
   const trustedCaller = await trustedCallerForInboundTurn(
     ds.larkAppId,
     message.senderId,
@@ -6379,31 +6379,68 @@ async function submitQueuedMessage(
     senderIsBot,
   );
   if (!isCurrent()) { rollbackReplyContext(); return false; }
+  await prepareTurnCliIdentity(ds, message.messageId);
+  if (!isCurrent()) { rollbackReplyContext(); return false; }
   // Intentionally omit codexAppSteerable. The omission is frozen in the ledger
   // and carried across runner recovery; user-written text cannot enable it.
+  if (await followGroupWorkspaceBeforeBusinessTurn(ds) === 'stop') { rollbackReplyContext(); return false; }
+  const followedWorker = ds.worker;
+  const followedGeneration = ds.session.workerGeneration;
+  const followedThread = ds.session.cliSessionId;
+  if (activeSessions.get(activeSessionKey(ds)) !== ds || !followedWorker || followedWorker.killed
+    || ds.session.workerGeneration !== followedGeneration || ds.session.cliSessionId !== followedThread) {
+    rollbackReplyContext(); return false;
+  }
   if (!await dispatchAdmittedBusinessTurn({
-    ds, turnId: message.messageId, payload: input,
-    options: { resume: ds.hasHistory, notifyRejection: false, trustedCaller },
-    boundary: centralTurnWorkerBoundary, permitStore: centralTurnPermitStore,
-    retireUnproven: async (current, reservedGeneration) => {
-      const generation = current.workerGeneration ?? current.session.workerGeneration ?? 0;
-      if (generation !== reservedGeneration) return undefined;
-      const workerPid = current.worker?.pid ?? current.session.pid ?? null;
-      return await retireWorkerForReplacement(current)
-        ? { retiredGeneration: generation, workerPid }
-        : undefined;
-    },
+      ds, turnId: message.messageId, payload: input,
+      options: { resume: ds.hasHistory, notifyRejection: false, trustedCaller },
+      boundary: centralTurnWorkerBoundary, permitStore: centralTurnPermitStore,
+      retireUnproven: async (current, reservedGeneration) => {
+        const currentGeneration = current.workerGeneration ?? current.session.workerGeneration ?? 0;
+        if (currentGeneration !== reservedGeneration) return undefined;
+        const workerPid = current.worker?.pid ?? current.session.pid ?? null;
+        return await retireWorkerForReplacement(current)
+          ? { retiredGeneration: currentGeneration, workerPid }
+          : undefined;
+      },
+      resource: { markAttempting: async () => {
+        await noteTurnReceived(ds, message.messageId, text, sender, message.messageId);
+        return ds.worker === followedWorker && ds.session.workerGeneration === followedGeneration
+          && ds.session.cliSessionId === followedThread;
+      } },
   })) { rollbackReplyContext(); return false; }
-  ds.session.lastCallerOpenId = message.senderId;
-  beginNewTurn(ds, text, message.messageId);
-  rememberLastCliInput(ds, text, input);
-  markSessionActivity(ds, Date.now(), { human: senderIsBot === false });
-  sessionStore.updateSession(ds.session);
+  if (ds.worker !== followedWorker || ds.session.workerGeneration !== followedGeneration
+    || ds.session.cliSessionId !== followedThread) {
+    logger.error(`[${tag(ds)}] queued turn committed on a worker binding that changed during dispatch; refusing retry`);
+    return true;
+  }
+
+  try {
+    ds.session.lastCallerOpenId = message.senderId;
+    beginNewTurn(ds, text, message.messageId);
+    rememberLastCliInput(ds, text, input);
+    markSessionActivity(ds, Date.now(), { human: senderIsBot === false });
+    sessionStore.updateSession(ds.session);
+  } catch (error) {
+    logger.error(`[${tag(ds)}] queued turn committed but lifecycle bookkeeping is ambiguous: ${error instanceof Error ? error.message : String(error)}`);
+    return true;
+  }
   return true;
 }
 
 const GROUP_WORKSPACE_FOLLOW_READY_TIMEOUT_MS = 30_000;
 const centralTurnPermitStore = new TurnPermitStore(config.session.dataDir);
+function publishTerminalWorkspaceFence(ds: DaemonSession): void {
+  if (!ds.worker?.connected) return;
+  try { ds.worker.send({
+    type: 'terminal_workspace_fence',
+    source: ds.session.workingDirSource ?? 'legacy-unknown',
+    ...(ds.session.groupWorkspaceRevision === undefined ? {} : { groupRevision: ds.session.groupWorkspaceRevision }),
+    ...(ds.session.groupWorkspaceIdentity ? { workspaceIdentity: { ...ds.session.groupWorkspaceIdentity } }
+      : ds.session.workingDirSource === 'group' ? { workspaceIdentity: { path: getSessionWorkingDir(ds), dev: '', ino: '' } } : {}),
+  } satisfies import('./types.js').DaemonToWorker); }
+  catch (error) { logger.warn(`[${tag(ds)}] terminal workspace fence publish raced worker close: ${error instanceof Error ? error.message : String(error)}`); }
+}
 const centralTurnWorkerBoundary = {
   reserveGeneration: (ds: DaemonSession) => (ds.session.workerGeneration ?? ds.workerGeneration ?? 0) + 1,
   forkBlank: (ds: DaemonSession, permit: import('./core/turn-admission.js').BlankBootstrapPermit,
@@ -6422,6 +6459,7 @@ const centralTurnWorkerBoundary = {
       ...(options.codexAppSteerable ? { codexAppSteerable: true as const } : {}),
       ...(options.atMostOnce ? { atMostOnce: true as const } : {}),
       ...(options.trustedCaller ? { trustedCaller: options.trustedCaller } : {}),
+      ...(options.onIpcDispatchAttempted ? { onIpcDispatchAttempted: options.onIpcDispatchAttempted } : {}),
     }, centralTurnPermitStore),
 };
 
@@ -6506,6 +6544,7 @@ async function followGroupWorkspaceBeforeBusinessTurn(
       if (!sessionStore.updateGroupWorkspaceFollowSession(next, input.expectedJournalRevision)) return false;
       Object.assign(ds.session, next);
       if (input.workingDir) ds.workingDir = input.workingDir;
+      publishTerminalWorkspaceFence(ds);
       return true;
     },
     retire: current => retireWorkerForReplacement(current),
@@ -6535,7 +6574,11 @@ const commandDeps: CommandHandlerDeps = {
   lastRepoScan,
   prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
   prewarmDocCommentSession,
-  submitQueuedMessage,
+  submitQueuedMessage: (ds, message, text, replyTarget) => {
+    const key = `\u0000queue-delivery:${ds.larkAppId}:${ds.session.sessionId}`;
+    return withActiveSessionKeyLock(activeSessions, key, () =>
+      withBotTurnAdmission(ds.larkAppId, () => submitQueuedMessage(ds, message, text, replyTarget)));
+  },
   repairGroupWorkspace: async (ds, sender, requestedPath) => {
     const runtime = groupWorkspaceRouteRuntimes.get(ds.larkAppId);
     if (!runtime) return 'unauthorized';
@@ -6551,7 +6594,7 @@ const commandDeps: CommandHandlerDeps = {
     const requested = requestedPath?.toLowerCase() === 'current' ? undefined : requestedPath;
     if (requested && (current.status !== 'available' || current.record?.directory.kind !== 'bound'
       || expandHome(requested) !== current.record.directory.workingDir)) return 'proof_mismatch';
-    return (await coordinateGroupWorkspaceQuarantineRepair({
+    const repaired = await coordinateGroupWorkspaceQuarantineRepair({
       sessionId: ds.session.sessionId, chatId: ds.chatId, actor: authority.actor,
       authority: { authorize: () => consumeGroupWorkspaceRepairAuthority(() => runtime.revalidateAuthority({
         chatId: ds.chatId,
@@ -6559,7 +6602,25 @@ const commandDeps: CommandHandlerDeps = {
         authorityFingerprint: authority.configFingerprint,
       })) },
       groupStore: groupWorkspaceStore,
-    })).status;
+    });
+    if (repaired.status === 'repaired') {
+      for (const current of activeSessions.values()) {
+        if (current.chatId !== ds.chatId) continue;
+        const durable = sessionStore.getOwnedSession(current.session.sessionId);
+        if (durable) syncXpiSession(current, durable);
+        if (current.session.xpiSharedCwdQuarantine?.reason === 'restore_quarantined_member'
+          && current.session.xpiSharedCwdQuarantine.detail === current.session.groupWorkspaceQuarantine?.detail) {
+          current.session.xpiSharedCwdQuarantine = undefined;
+        }
+        const head = current.session.principalLaneQueuedTurns?.[0];
+        if (head?.dispatchState === 'blocked') { head.dispatchState = 'queued'; delete head.blockedReason; delete head.nextRetryAt; }
+        sessionStore.updateSession(current.session);
+        if (head) queueMicrotask(() => { void driveNextPrincipalLaneTurn(current); });
+        const groupId = current.session.xpiSharedCwdAdmissionGroupId;
+        if (groupId) queueMicrotask(() => { void driveNextXpiSharedCwdTurn(groupId); });
+      }
+    }
+    return repaired.status;
   },
   readGroupWorkspaceShow: async ds => {
     const group = await groupWorkspaceStore.read(ds.chatId);
@@ -9723,6 +9784,19 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
     chatId: boundAsk.chatId,
     rootMessageId: boundAsk.rootMessageId,
     sessionId: boundAsk.sessionId,
+    ...(asyncInput && askSession && asyncOriginTurn && asyncGeneration
+      ? (() => {
+          const frozen = frozenSessionWorkspace(askSession);
+          return frozen ? { controlWait: {
+            originalTurnId: asyncOriginTurn,
+            expectedGeneration: asyncGeneration,
+            workspace: frozen.workspace,
+            ...(frozen.groupRevision === undefined ? {} : { groupRevision: frozen.groupRevision }),
+            wait: { kind: 'ask' as const, askId: asyncInput.itemId },
+            state: 'needs_user' as const,
+          } } : {};
+        })()
+      : {}),
     questions: boundAsk.questions,
     // Async asks outlive their originating reply card; document asks are delivered privately.
     replyCardTarget: asyncInput || documentDelivery ? undefined : replyCardAskTarget(askSession, boundAsk, body),
@@ -9822,8 +9896,9 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
         });
         const steerable = steerTarget !== undefined && input.codexAppInput !== undefined;
         if (steerable) input.codexAppInput = { ...input.codexAppInput!, steerTargetTurnId: steerTarget };
-        const frozen = frozenSessionWorkspace(askSession);
-        if (!frozen) return false;
+        const frozenControl = askInput.controlWait;
+        if (!frozenControl || frozenControl.wait.kind !== 'ask'
+          || frozenControl.wait.askId !== asyncInput.itemId) return false;
         const replyDigest = createHash('sha256').update(text).digest('hex');
         const resumed = await resumeAdmittedControlReply({
           authorizeFresh: async () => evaluateAskAnswerTalk(
@@ -9831,24 +9906,29 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
           ),
           issuePermit: () => centralTurnPermitStore.issueControlReply({
             sessionId: askSession.session.sessionId,
-            originalTurnId: turnId,
-            wait: { kind: 'ask', askId: asyncInput.itemId },
-            expectedGeneration: asyncGeneration,
-            workspace: frozen.workspace,
-            ...(frozen.groupRevision === undefined ? {} : { groupRevision: frozen.groupRevision }),
+            originalTurnId: frozenControl.originalTurnId,
+            wait: frozenControl.wait,
+            expectedGeneration: frozenControl.expectedGeneration,
+            workspace: frozenControl.workspace,
+            ...(frozenControl.groupRevision === undefined ? {} : { groupRevision: frozenControl.groupRevision }),
             expiresAt: Date.now() + 60_000,
           }),
           beginDispatch: async permit => {
-            const current = frozenSessionWorkspace(askSession);
-            const dispatch = current && isCurrent()
+            const actual = frozenSessionWorkspace(askSession);
+            const waitState = originalControlWaitState({ sessionId: askSession.session.sessionId,
+              originalTurnId: turnId, askId: asyncInput.itemId });
+            const originalStillWaiting = askInput.controlWait?.state === 'needs_user'
+              && asyncInput.itemId === askInput.controlWait.wait.askId
+              && waitState === 'needs_user';
+            const dispatch = actual && isCurrent() && originalStillWaiting
               ? await centralTurnPermitStore.beginControlReplyDispatch(permit, replyDigest, {
                   sessionId: askSession.session.sessionId,
                   originalTurnId: turnId,
                   wait: { kind: 'ask', askId: asyncInput.itemId },
                   workerGeneration: askSession.session.workerGeneration ?? 0,
-                  workspace: current.workspace,
-                  ...(current.groupRevision === undefined ? {} : { groupRevision: current.groupRevision }),
-                  originalState: 'needs_user',
+                  workspace: actual.workspace,
+                  ...(actual.groupRevision === undefined ? {} : { groupRevision: actual.groupRevision }),
+                  originalState: frozenControl.state,
                   authorized: true,
                 })
               : { status: 'rejected' as const };
@@ -21294,6 +21374,13 @@ function settlePrincipalLaneDispatchUnknown(
 const PRINCIPAL_LANE_DISPATCH_RETRY_BASE_MS = 100;
 const PRINCIPAL_LANE_DISPATCH_RETRY_MAX_MS = 5_000;
 
+type PrincipalLaneDispatchDependencies = {
+  dispatch(input: Parameters<typeof dispatchAdmittedBusinessTurn>[0]): Promise<boolean>;
+};
+const principalLaneDispatchDependencies: PrincipalLaneDispatchDependencies = {
+  dispatch: dispatchAdmittedBusinessTurn,
+};
+
 function clearPrincipalLaneDispatchRetry(ds: DaemonSession, turnId?: string): void {
   const retry = ds.principalLaneDispatchRetry;
   if (!retry || (turnId !== undefined && retry.turnId !== turnId)) return;
@@ -21305,7 +21392,10 @@ function clearPrincipalLaneDispatchRetry(ds: DaemonSession, turnId?: string): vo
  * event. The runtime/session/head checks make a stale timer a no-op after close,
  * route replacement, or queue advancement; delay growth is capped so a
  * transient quarantine can recover without creating a tight retry loop. */
-function schedulePrincipalLaneDispatchRetry(ds: DaemonSession, turnId: string): void {
+function schedulePrincipalLaneDispatchRetry(
+  ds: DaemonSession, turnId: string,
+  dependencies: PrincipalLaneDispatchDependencies = principalLaneDispatchDependencies,
+): void {
   let retry = ds.principalLaneDispatchRetry;
   if (retry?.turnId !== turnId) {
     clearPrincipalLaneDispatchRetry(ds);
@@ -21314,16 +21404,18 @@ function schedulePrincipalLaneDispatchRetry(ds: DaemonSession, turnId: string): 
   }
   if (retry.timer) return;
 
+
   const delay = Math.min(
     PRINCIPAL_LANE_DISPATCH_RETRY_MAX_MS,
     PRINCIPAL_LANE_DISPATCH_RETRY_BASE_MS * (2 ** Math.min(retry.attempt, 6)),
   );
   retry.attempt += 1;
   const timer = setTimeout(() => {
-    if (ds.principalLaneDispatchRetry !== retry || retry.timer !== timer) return;
-    retry.timer = undefined;
-    const head = ds.session.principalLaneQueuedTurns?.[0];
-    if (ds.session.status !== 'active'
+    try {
+      if (ds.principalLaneDispatchRetry !== retry || retry.timer !== timer) return;
+      retry.timer = undefined;
+      const head = ds.session.principalLaneQueuedTurns?.[0];
+      if (ds.session.status !== 'active'
         || activeSessions.get(activeSessionKey(ds)) !== ds
         || !ds.session.principalLane
         || ds.principalLaneRunningTurn
@@ -21332,21 +21424,24 @@ function schedulePrincipalLaneDispatchRetry(ds: DaemonSession, turnId: string): 
         || head.turnId !== turnId
         || head.dispatchState !== 'queued') {
       clearPrincipalLaneDispatchRetry(ds, turnId);
-      return;
-    }
-    try {
-      driveNextPrincipalLaneTurn(ds);
-    } catch (error) {
+        return;
+      }
+      void driveNextPrincipalLaneTurn(ds, dependencies).catch(error => {
       logger.error(
         `[${tag(ds)}] Principal-lane queued turn retry failed `
         + `turn=${turnId.slice(0, 12)}: ${error instanceof Error ? error.message : String(error)}`,
       );
       const currentHead = ds.session.principalLaneQueuedTurns?.[0];
       if (currentHead?.turnId === turnId && currentHead.dispatchState === 'queued') {
-        schedulePrincipalLaneDispatchRetry(ds, turnId);
+        schedulePrincipalLaneDispatchRetry(ds, turnId, dependencies);
       } else {
         clearPrincipalLaneDispatchRetry(ds, turnId);
       }
+      });
+    } catch (error) {
+      logger.error(`[${tag(ds)}] Principal-lane retry timer failed safely turn=${turnId.slice(0, 12)}: ${error instanceof Error ? error.message : String(error)}`);
+      retry.timer = undefined;
+      schedulePrincipalLaneDispatchRetry(ds, turnId, dependencies);
     }
   }, delay);
   timer.unref?.();
@@ -21356,12 +21451,36 @@ function schedulePrincipalLaneDispatchRetry(ds: DaemonSession, turnId: string): 
 /** Dispatch only the durable FIFO head.  The `attempting` write happens before
  * worker IPC, so a commit-unknown/restart can never replay a turn that may have
  * reached the CLI.  The head remains present until its exact terminal edge. */
-async function driveNextPrincipalLaneTurn(ds: DaemonSession): Promise<boolean> {
+async function driveNextPrincipalLaneTurn(
+  ds: DaemonSession,
+  dependencies: PrincipalLaneDispatchDependencies = principalLaneDispatchDependencies,
+): Promise<boolean> {
+  const initialHead = ds.session.principalLaneQueuedTurns?.[0];
+  const generation = ds.workerGeneration ?? ds.session.workerGeneration ?? 0;
+  const existingFlight = ds.principalLaneDispatchFlight;
+  if (initialHead && existingFlight?.turnId === initialHead.turnId) return existingFlight.promise;
+  const run = driveNextPrincipalLaneTurnOwned(ds, dependencies);
+  if (initialHead) {
+    const flight = { generation, turnId: initialHead.turnId, promise: run };
+    ds.principalLaneDispatchFlight = flight;
+    void run.then(() => {
+      if (ds.principalLaneDispatchFlight === flight) ds.principalLaneDispatchFlight = undefined;
+    }, () => {
+      if (ds.principalLaneDispatchFlight === flight) ds.principalLaneDispatchFlight = undefined;
+    });
+  }
+  return run;
+}
+
+async function driveNextPrincipalLaneTurnOwned(
+  ds: DaemonSession,
+  dependencies: PrincipalLaneDispatchDependencies,
+): Promise<boolean> {
   if (!ds.session.principalLane
       || ds.principalLaneRunningTurn
       || ds.activeInteractiveTurn) return false;
   const head = ds.session.principalLaneQueuedTurns?.[0];
-  if (!head || head.dispatchState === 'attempting') {
+  if (!head || head.dispatchState === 'attempting' || head.dispatchState === 'blocked') {
     clearPrincipalLaneDispatchRetry(ds);
     return false;
   }
@@ -21369,13 +21488,23 @@ async function driveNextPrincipalLaneTurn(ds: DaemonSession): Promise<boolean> {
     clearPrincipalLaneDispatchRetry(ds);
   }
 
+  if (await followGroupWorkspaceBeforeBusinessTurn(ds) === 'stop') {
+    if (ds.session.groupWorkspaceQuarantine) {
+      head.dispatchState = 'blocked';
+      head.blockedReason = ds.session.groupWorkspaceQuarantine.detail;
+      sessionStore.updateSession(ds.session);
+    } else schedulePrincipalLaneDispatchRetry(ds, head.turnId, dependencies);
+    return false;
+  }
+
   let accepted = false;
   let ipcDispatchAttempted = false;
   try {
-    accepted = await dispatchAdmittedBusinessTurn({
+    accepted = await dependencies.dispatch({
       ds, turnId: head.turnId, payload: head.cliInput,
       options: {
         resume: head.resume, atMostOnce: true, trustedCaller: head.caller,
+        onIpcDispatchAttempted: () => { ipcDispatchAttempted = true; },
         ...(head.codexAppSteerable ? { codexAppSteerable: true as const } : {}),
       },
       boundary: centralTurnWorkerBoundary,
@@ -21399,7 +21528,7 @@ async function driveNextPrincipalLaneTurn(ds: DaemonSession): Promise<boolean> {
         },
       },
     });
-    ipcDispatchAttempted = accepted;
+    ipcDispatchAttempted ||= accepted;
   } catch (error) {
     if (!ipcDispatchAttempted) {
       // Preflight, sandbox, binding, adapter and spawn-preparation failures are
@@ -21415,7 +21544,7 @@ async function driveNextPrincipalLaneTurn(ds: DaemonSession): Promise<boolean> {
         `[${tag(ds)}] Principal-lane queued turn was not dispatched; retained for retry `
         + `turn=${head.turnId.slice(0, 12)}: ${error instanceof Error ? error.message : String(error)}`,
       );
-      schedulePrincipalLaneDispatchRetry(ds, head.turnId);
+      schedulePrincipalLaneDispatchRetry(ds, head.turnId, dependencies);
       return false;
     }
     // Once the IPC boundary was crossed the outcome is unknowable. Keep the
@@ -21429,13 +21558,18 @@ async function driveNextPrincipalLaneTurn(ds: DaemonSession): Promise<boolean> {
     return false;
   }
   if (!accepted) {
+    if (ipcDispatchAttempted) {
+      clearPrincipalLaneDispatchRetry(ds, head.turnId);
+      settlePrincipalLaneDispatchUnknown(ds, head.turnId, undefined);
+      return false;
+    }
     const durableHead = ds.session.principalLaneQueuedTurns?.[0];
     if (!durableHead || durableHead.turnId !== head.turnId) {
       throw new Error('principal-lane FIFO head changed during rejected dispatch rollback');
     }
     durableHead.dispatchState = 'queued';
     sessionStore.updateSession(ds.session);
-    schedulePrincipalLaneDispatchRetry(ds, head.turnId);
+    schedulePrincipalLaneDispatchRetry(ds, head.turnId, dependencies);
     return false;
   }
 
@@ -21451,6 +21585,7 @@ async function driveNextPrincipalLaneTurn(ds: DaemonSession): Promise<boolean> {
 }
 
 export const __testOnly_driveNextPrincipalLaneTurn = driveNextPrincipalLaneTurn;
+export type { PrincipalLaneDispatchDependencies };
 
 /** Settle only the exact durable head, then synchronously hand the worker the
  * next lane-local turn before another inbound event can observe an idle gap. */
@@ -21464,13 +21599,20 @@ async function onPrincipalLaneTurnTerminal(
   if (!running
       || running.turnId !== turnId
       || running.workerGeneration !== workerGeneration) return false;
-  ds.principalLaneRunningTurn = undefined;
   const queued = ds.session.principalLaneQueuedTurns;
   if (queued?.[0]?.turnId === turnId && queued[0].dispatchState === 'attempting') {
     ds.session.principalLaneQueuedTurns = queued.length > 1 ? queued.slice(1) : undefined;
     sessionStore.updateSession(ds.session);
   }
-  return driveNextPrincipalLaneTurn(ds);
+  ds.principalLaneRunningTurn = undefined;
+  if (ds.activeInteractiveTurn?.turnId === turnId) ds.activeInteractiveTurn = undefined;
+  try { return await driveNextPrincipalLaneTurn(ds); }
+  catch (error) {
+    const next = ds.session.principalLaneQueuedTurns?.[0];
+    if (next?.dispatchState === 'queued') schedulePrincipalLaneDispatchRetry(ds, next.turnId);
+    logger.error(`[${tag(ds)}] Principal-lane next-head dispatch failed after terminal commit: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
 }
 
 export const __testOnly_onPrincipalLaneTurnTerminal = onPrincipalLaneTurnTerminal;
@@ -21830,6 +21972,39 @@ function rollbackXpiSharedCwdAdmission(
   });
 }
 
+
+function settleXpiSharedCwdDispatchUnknown(ds: DaemonSession, admission: XpiSharedCwdTurnAdmission, turnId: string,
+  crossPrincipalRecordId?: string): void {
+  if (admission.kind !== 'acquired') return;
+  const groupId = ds.session.xpiSharedCwdAdmissionGroupId;
+  if (!groupId) return;
+  const ids = ownedXpiSharedCwdGroupRows(groupId).map(row => row.sessionId);
+  let mutation: ReturnType<typeof sessionStore.mutateOwnedSessionsAtomically<void>>;
+  try { mutation = sessionStore.mutateOwnedSessionsAtomically(ids, fresh => {
+    const member = fresh.get(ds.session.sessionId);
+    const coordinator = member ? fresh.get(member.xpiSharedCwdAdmissionCoordinatorSessionId ?? '') : undefined;
+    const record = member?.xpiSharedCwdQueuedTurns?.find(row => row.turnId === turnId);
+    if (!member || !coordinator || !record) return;
+    coordinator.xpiSharedCwdAdmissionLease = undefined;
+    removeXpiSharedCwdTurn(member, record.id);
+    if (crossPrincipalRecordId) {
+      const remaining = member.crossPrincipalInterruptions?.filter(row => row.id !== crossPrincipalRecordId);
+      member.crossPrincipalInterruptions = remaining?.length ? remaining : undefined;
+    }
+    (member.xpiSharedCwdDispatchUnknownNotices ??= []).push({ version: 1, id: record.id, turnId,
+      caller: structuredClone(record.caller), detectedAt: new Date().toISOString(), noticePending: true });
+  }, { nonblocking: true }); } catch (error) {
+    if (error instanceof sessionStore.SessionStoreBusyError) {
+      scheduleXpiSessionStoreBusyRetry({ key: `dispatch-unknown:${groupId}:${ds.session.sessionId}:${turnId}`,
+        operation: 'dispatch', sessionId: ds.session.sessionId, groupId, turnId },
+      () => settleXpiSharedCwdDispatchUnknown(ds, admission, turnId, crossPrincipalRecordId));
+      return;
+    }
+    throw error;
+  }
+  syncXpiSession(ds, mutation.rows.get(ds.session.sessionId));
+}
+
 async function notifyXpiSharedCwdQuarantine(
   larkAppId: string,
   notice: XpiSharedCwdQuarantineNotice,
@@ -22050,39 +22225,6 @@ const xpiSharedCwdDriveDependencies: XpiSharedCwdDriveDependencies = {
   notifyQuarantine: notifyXpiSharedCwdQuarantine,
 };
 
-function forkXpiSharedCwdTurn(
-  ds: DaemonSession,
-  args: {
-    cliInput: CliTurnPayload;
-    resume: boolean;
-    turnId: string;
-    caller: TrustedCaller;
-    onWorkerGenerationReserved: (workerGeneration: number) => void;
-  },
-  forkAdopt: typeof forkAdoptWorker = forkAdoptWorker,
-): { accepted: boolean; marginalReclaim: boolean } {
-  if (ds.adoptedFrom) {
-    return {
-      accepted: forkAdopt(ds, {
-        prompt: args.cliInput.content,
-        turnId: args.turnId,
-        atMostOnce: true,
-        trustedCaller: args.caller,
-        onWorkerGenerationReserved: args.onWorkerGenerationReserved,
-      }) === 'accepted',
-      marginalReclaim: false,
-    };
-  }
-  const admissionOpts: ForkWorkerOptions = {};
-  const accepted = forkWorker(ds, args.cliInput, {
-    resume: args.resume,
-    turnId: args.turnId,
-    atMostOnce: true,
-    trustedCaller: args.caller,
-    onWorkerGenerationReserved: args.onWorkerGenerationReserved,
-  }, admissionOpts);
-  return { accepted, marginalReclaim: admissionOpts.marginalReclaimScheduled === true };
-}
 
 async function driveNextXpiSharedCwdTurn(
   groupId: string,
@@ -22161,6 +22303,19 @@ async function driveNextXpiSharedCwdTurn(
     return false;
   }
   if (isSessionTransferring(ds)) return false;
+  if (await followGroupWorkspaceBeforeBusinessTurn(ds) === 'stop') {
+    if (ds.session.groupWorkspaceQuarantine) {
+      ds.session.xpiSharedCwdQuarantine = { version: 1, scope: 'session', reason: 'restore_quarantined_member',
+        detail: ds.session.groupWorkspaceQuarantine.detail, detectedAt: new Date().toISOString(), noticePending: true };
+      sessionStore.updateSession(ds.session);
+      return false;
+    }
+    scheduleXpiSessionStoreBusyRetry({
+      key: `workspace-follow:${groupId}:${ds.session.sessionId}:${next.record.turnId}`,
+      operation: 'dispatch', sessionId: ds.session.sessionId, groupId, turnId: next.record.turnId,
+    }, () => driveNextXpiSharedCwdTurn(groupId, dependencies));
+    return false;
+  }
   const freeze = currentDeviceIsolationFreezeLease();
   if (freeze) {
     const retryMs = Math.max(50, Math.min(1_000, freeze.expiresAt - Date.now() + 10));
@@ -22170,14 +22325,41 @@ async function driveNextXpiSharedCwdTurn(
 
   let admission: XpiSharedCwdTurnAdmission = { kind: 'unmanaged' };
   let accepted = false;
+  let xpiIpcAttempted = false;
   try {
     accepted = await dispatchAdmittedBusinessTurn({
       ds, turnId: next.record.turnId, payload: next.record.cliInput,
       options: {
         resume: next.record.resume, atMostOnce: true, trustedCaller: next.record.caller,
+        onIpcDispatchAttempted: () => { xpiIpcAttempted = true; },
         ...(next.record.cliInput.codexAppSteerable ? { codexAppSteerable: true as const } : {}),
       },
-      boundary: centralTurnWorkerBoundary,
+      boundary: ds.adoptedFrom ? {
+        ...centralTurnWorkerBoundary,
+        forkBlank: async (current, permit, options) => {
+          const transition = await centralTurnPermitStore.beginSpawn(permit);
+          if (transition.status === 'observing') return 'observing' as const;
+          if (transition.status !== 'acquired') return 'rejected' as const;
+          try {
+            const accepted = dependencies.forkAdoptWorker(current, {
+              prompt: '', turnId: permit.turnId, atMostOnce: options.atMostOnce,
+              trustedCaller: options.trustedCaller,
+              onWorkerGenerationReserved: generation => {
+                current.workerGeneration = generation;
+                current.session.workerGeneration = generation;
+              },
+            }) === 'accepted';
+            if (!accepted) await centralTurnPermitStore.releasePreForkFailure(permit, transition.spawnAttemptId);
+            return accepted ? 'started' as const : 'rejected' as const;
+          } catch (error) {
+            const generation = current.workerGeneration ?? current.session.workerGeneration ?? 0;
+            if (generation < permit.reservedGeneration) {
+              await centralTurnPermitStore.releasePreForkFailure(permit, transition.spawnAttemptId);
+            }
+            throw error;
+          }
+        },
+      } : centralTurnWorkerBoundary,
       permitStore: centralTurnPermitStore,
       retireUnproven: async (current, reservedGeneration) => {
       const generation = current.workerGeneration ?? current.session.workerGeneration ?? 0;
@@ -22203,7 +22385,8 @@ async function driveNextXpiSharedCwdTurn(
       },
     });
     if (!accepted) {
-      rollbackXpiSharedCwdAdmission(ds, admission, next.record.turnId);
+      if (!xpiIpcAttempted) rollbackXpiSharedCwdAdmission(ds, admission, next.record.turnId);
+      else settleXpiSharedCwdDispatchUnknown(ds, admission, next.record.turnId);
       return false;
     }
     // Keep the durable queue record as the in-flight journal until the exact
@@ -22217,7 +22400,7 @@ async function driveNextXpiSharedCwdTurn(
     rememberLastCliInput(ds, next.record.userPrompt, next.record.cliInput);
     return true;
   } catch (error) {
-    if (!accepted) rollbackXpiSharedCwdAdmission(ds, admission, next.record.turnId);
+    if (!accepted && !xpiIpcAttempted) rollbackXpiSharedCwdAdmission(ds, admission, next.record.turnId);
     if (error instanceof sessionStore.SessionStoreBusyError) {
       scheduleXpiSessionStoreBusyRetry(
         {
@@ -23191,100 +23374,41 @@ async function dispatchApprovedCrossPrincipalSuggestion(
     participants: [{ openId: ownerId, isBot: ownerIsBot }],
     inThread: record.messages[0]?.inThread,
   });
-  let accepted = false;
-  let marginalReclaim = false;
   let admission: XpiSharedCwdTurnAdmission = { kind: 'unmanaged' };
-  if (ds.worker && !ds.worker.killed) {
-    admission = admitLiveXpiSharedCwdTurn({
-      ds,
-      turnId,
-      caller: record.owner,
-      userPrompt: prompt,
-      cliInput,
-      resume: ds.hasHistory,
-    });
-    if (admission.kind === 'queued') {
-      removeCrossPrincipalRecord(ds, record.id);
-      await notifyApprovedCrossPrincipalDispatch(ds, record, 'queued');
-      return true;
-    }
-    accepted = sendWorkerInput(ds, cliInput, turnId, {
-      atMostOnce: true,
-      trustedCaller: record.owner,
-    });
-  } else {
-    if (ds.session.xpiSharedCwdAdmissionGroupId && xpiSharedCwdUnavailableOrBusy(ds)) {
-      queueXpiSharedCwdTurn({
-        ds,
-        turnId,
-        caller: record.owner,
-        userPrompt: prompt,
-        cliInput,
-        resume: ds.hasHistory,
-      });
-      removeCrossPrincipalRecord(ds, record.id);
-      await notifyApprovedCrossPrincipalDispatch(ds, record, 'queued');
-      return true;
-    }
-    const forkOutcome = forkXpiSharedCwdTurn(ds, {
-      cliInput,
-      resume: ds.hasHistory,
-      turnId,
-      caller: record.owner,
-      onWorkerGenerationReserved(workerGeneration: number) {
-        if (!ds.session.xpiSharedCwdAdmissionGroupId) return;
-        admission = claimExactXpiSharedCwdAdmission({
-          ds,
-          turnId,
-          workerGeneration,
-          caller: record.owner,
-          userPrompt: prompt,
-          cliInput,
-          resume: ds.hasHistory,
-        });
-        if (admission.kind !== 'acquired') {
-          throw new Error('XPI shared-cwd admission changed at the worker reservation boundary');
-        }
-      },
-    });
-    accepted = forkOutcome.accepted;
-    marginalReclaim = forkOutcome.marginalReclaim;
-  }
-  if (!accepted) {
-    rollbackXpiSharedCwdAdmission(ds, admission, turnId);
-    await notifyApprovedCrossPrincipalDispatch(ds, record, 'retrying');
+  let approvedIpcAttempted = false;
+  if (await followGroupWorkspaceBeforeBusinessTurn(ds) === 'stop') {
     scheduleCrossPrincipalOwnerWait(ds, Date.now() + 5_000);
     return false;
   }
-  if (ds.session.xpiSharedCwdAdmissionGroupId && admission.kind !== 'acquired') {
-    if (!marginalReclaim) {
-      // A synchronous refusal other than marginal deferral (hard memory block,
-      // retirement fence, device freeze/transfer gate): no asynchronous
-      // re-entry will claim the slot, so keep the record and the owner-wait
-      // retry. Queueing here would park the turn in a journal no release event
-      // drives, and the hard-block notice already asks the owner to resend.
-      rollbackXpiSharedCwdAdmission(ds, admission, turnId);
-      await notifyApprovedCrossPrincipalDispatch(ds, record, 'retrying');
-      scheduleCrossPrincipalOwnerWait(ds, Date.now() + 5_000);
-      return false;
-    }
-    // Marginal memory admission accepted the fork synchronously but the group
-    // slot is only claimed on the asynchronous re-entry (the reclaim callback
-    // routes around this closure). Enqueue like the busy path so the leased
-    // queue performs the single dispatch; keeping the record for the owner wait
-    // would re-enter on a live worker and execute this non-om_ turn twice
-    // (worker-side turn dedupe does not cover `<recordId>:approved`).
-    queueXpiSharedCwdTurn({
-      ds,
-      turnId,
-      caller: record.owner,
-      userPrompt: prompt,
-      cliInput,
-      resume: ds.hasHistory,
-    });
+  if (ds.session.xpiSharedCwdAdmissionGroupId && xpiSharedCwdUnavailableOrBusy(ds)) {
+    queueXpiSharedCwdTurn({ ds, turnId, caller: record.owner, userPrompt: prompt,
+      cliInput, resume: ds.hasHistory });
     removeCrossPrincipalRecord(ds, record.id);
     await notifyApprovedCrossPrincipalDispatch(ds, record, 'queued');
     return true;
+  }
+  const accepted = await dispatchAdmittedBusinessTurn({
+    ds, turnId, payload: cliInput,
+    options: { resume: ds.hasHistory, atMostOnce: true, trustedCaller: record.owner,
+      onIpcDispatchAttempted: () => { approvedIpcAttempted = true; } },
+    boundary: centralTurnWorkerBoundary, permitStore: centralTurnPermitStore,
+    resource: {
+      acquire: async permit => {
+        if (!ds.session.xpiSharedCwdAdmissionGroupId) return true;
+        admission = claimExactXpiSharedCwdAdmission({ ds, turnId, workerGeneration: permit.workerGeneration,
+          caller: record.owner, userPrompt: prompt, cliInput, resume: ds.hasHistory });
+        return admission.kind === 'acquired';
+      },
+    },
+  });
+  if (!accepted) {
+    if (!approvedIpcAttempted) rollbackXpiSharedCwdAdmission(ds, admission, turnId);
+    else {
+      settleXpiSharedCwdDispatchUnknown(ds, admission, turnId, record.id);
+    }
+    await notifyApprovedCrossPrincipalDispatch(ds, record, 'retrying');
+    if (!approvedIpcAttempted) scheduleCrossPrincipalOwnerWait(ds, Date.now() + 5_000);
+    return false;
   }
   setActiveInteractiveTurn(ds, turnId, record.owner, ownerTask);
   beginNewTurn(ds, ownerTask, turnId);
@@ -24103,16 +24227,10 @@ async function confirmNextCrossPrincipalSuggestion(ds: DaemonSession): Promise<v
   };
   let accepted = false;
   try {
-    if (ds.worker && !ds.worker.killed) {
-      accepted = sendWorkerInput(ds, approvedInput, suggestion.turnId, {
-        trustedCaller: suggestion.owner,
-      });
-    } else if (!ds.adoptedFrom) {
-      accepted = forkWorker(ds, approvedInput, {
-        resume: ds.hasHistory,
-        turnId: suggestion.turnId,
-        trustedCaller: suggestion.owner,
-      });
+    if (await followGroupWorkspaceBeforeBusinessTurn(ds) === 'continue') {
+      accepted = await dispatchAdmittedBusinessTurn({ ds, turnId: suggestion.turnId, payload: approvedInput,
+        options: { resume: ds.hasHistory, trustedCaller: suggestion.owner },
+        boundary: centralTurnWorkerBoundary, permitStore: centralTurnPermitStore });
     }
   } catch (err) {
     logger.error(`[${tag(ds)}] Approved suggestion dispatch failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -30883,8 +31001,10 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
         if (ds.worker !== targetWorker || targetWorker.killed) {
           throw new Error('worker generation changed during comment:live-note');
         }
-        if (!sendWorkerInput(ds, cliInput, turnId,
-          cliInput.trustedCaller ? { trustedCaller: cliInput.trustedCaller } : {})) {
+        if (await followGroupWorkspaceBeforeBusinessTurn(ds) === 'stop'
+          || !await dispatchAdmittedBusinessTurn({ ds, turnId, payload: cliInput,
+            options: { resume: ds.hasHistory, ...(cliInput.trustedCaller ? { trustedCaller: cliInput.trustedCaller } : {}) },
+            boundary: centralTurnWorkerBoundary, permitStore: centralTurnPermitStore })) {
           throw new Error('worker became unavailable during comment:live-send');
         }
         acceptDocCommentSession(ds);
@@ -32098,6 +32218,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   });
   // Initialise worker pool with daemon callbacks
   initWorkerPool({
+    currentTerminalWorkspaceFence: ds => ({
+      type: 'terminal_workspace_fence',
+      source: ds.session.workingDirSource ?? 'legacy-unknown',
+      ...(ds.session.groupWorkspaceRevision === undefined ? {} : { groupRevision: ds.session.groupWorkspaceRevision }),
+      ...(ds.session.groupWorkspaceIdentity ? { workspaceIdentity: { ...ds.session.groupWorkspaceIdentity } }
+        : ds.session.workingDirSource === 'group' ? { workspaceIdentity: { path: getSessionWorkingDir(ds), dev: '', ino: '' } } : {}),
+    }),
     sessionReply,
     onZeroPromptFinal: reportZeroPromptFinal,
     getSessionWorkingDir,
@@ -32125,8 +32252,24 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     getActiveCount,
     prepareRawInputTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
     dispatchAdmittedBusinessTurn: async input => {
-      if (await followGroupWorkspaceBeforeBusinessTurn(input.ds) === 'stop') return false;
-      return dispatchAdmittedBusinessTurn({
+      const key = `\u0000continuation-delivery:${input.ds.larkAppId}:${input.ds.session.sessionId}`;
+      return withActiveSessionKeyLock(activeSessions, key, () => withBotTurnAdmission(input.ds.larkAppId, async () => {
+        if (input.expectedWorkspace) {
+          const beforeFollow = frozenSessionWorkspace(input.ds);
+          const expected = input.expectedWorkspace;
+          if (!beforeFollow || beforeFollow.workspace.path !== expected.workspace.path
+            || beforeFollow.workspace.dev !== expected.workspace.dev || beforeFollow.workspace.ino !== expected.workspace.ino
+            || beforeFollow.groupRevision !== expected.groupRevision) return false;
+        }
+        if (await followGroupWorkspaceBeforeBusinessTurn(input.ds) === 'stop') return false;
+        if (input.expectedWorkspace) {
+          const actual = frozenSessionWorkspace(input.ds);
+          const expected = input.expectedWorkspace;
+          if (!actual || actual.workspace.path !== expected.workspace.path
+            || actual.workspace.dev !== expected.workspace.dev || actual.workspace.ino !== expected.workspace.ino
+            || actual.groupRevision !== expected.groupRevision) return false;
+        }
+        return dispatchAdmittedBusinessTurn({
       ds: input.ds,
       turnId: input.turnId,
       payload: input.payload,
@@ -32143,6 +32286,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           : undefined;
       },
     });
+
+      }));
     },
     onTriggerTurnStarted: (ds, title, turnId) => beginNewTurn(ds, title, turnId),
     closeSession(ds: DaemonSession): Promise<boolean> {
@@ -32331,7 +32476,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // Principal lanes are parallel across runtime keys but own a durable,
       // full-turn FIFO inside each key. Release/advance only on this exact
       // terminal edge; a stale terminal cannot dequeue a newer head.
-      onPrincipalLaneTurnTerminal(ds, terminal.turnId, context.workerGeneration);
+      await onPrincipalLaneTurnTerminal(ds, terminal.turnId, context.workerGeneration);
       if (shouldAdvanceCrossPrincipal) {
         queueMicrotask(() => {
           void confirmNextCrossPrincipalSuggestion(ds);
@@ -33283,6 +33428,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           || proof.identity.ino !== input.workspaceIdentity.ino) return { status: 'unknown' };
         if (!await retireWorkerForReplacement(current)) return { status: 'unknown' };
         applySessionWorkingDir(current, { workingDir: input.targetWorkingDir, source: 'explicit' });
+        publishTerminalWorkspaceFence(current);
         const accepted = forkWorker(current, '', false);
         if (accepted === false) return { status: 'unknown' };
         const generation = current.workerGeneration ?? current.session.workerGeneration ?? input.expectedGeneration + 1;
@@ -33300,6 +33446,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           ? { workingDir: getSessionWorkingDir(current), source: 'group', groupWorkspaceRevision: input.groupRevision!,
               groupWorkspaceIdentity: input.workspaceIdentity! }
           : { workingDir: getSessionWorkingDir(current), source: 'explicit' });
+        publishTerminalWorkspaceFence(current);
         return 'converged';
       },
     });
@@ -33449,6 +33596,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                   ? { workingDir: getSessionWorkingDir(current), source: 'group', groupWorkspaceRevision: input.groupRevision!,
                       groupWorkspaceIdentity: input.workspaceIdentity! }
                   : { workingDir: getSessionWorkingDir(current), source: 'explicit' });
+                publishTerminalWorkspaceFence(current);
                 return 'converged';
               },
             });
@@ -33465,7 +33613,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             return { status: result.status === 'observing' ? 'unknown' : result.status };
           },
           executeUnbind: async request => {
-            return executeGroupWorkspaceUnbind({
+            const result = await executeGroupWorkspaceUnbind({
               sourceEventId: request.sourceEventId, chatId: request.chatId, actor: request.actor,
               authorityFingerprint: route.authorityFingerprint,
               ownerLarkAppId: cfg.larkAppId,
@@ -33490,6 +33638,28 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             executorLeaseStore: groupWorkspaceExecutorLeaseStore,
             executorOwner: groupWorkspaceExecutorOwner,
             });
+            if (result.status === 'group_committed') {
+              for (const row of sessionStore.listSessionsStrict().filter(row => row.chatId === request.chatId && row.workingDirSource === 'group')) {
+                row.groupWorkspaceRevision = result.groupRevision;
+                row.groupWorkspaceQuarantine = { kind: 'known_group_identity_unprovable', expectedIdentity: row.groupWorkspaceIdentity,
+                  expectedRevision: result.groupRevision, detail: 'group workspace unbound' };
+                sessionStore.updateSession(row);
+              }
+              for (const current of activeSessions.values()) {
+                if (current.chatId === request.chatId && current.session.workingDirSource === 'group') {
+                  current.session.groupWorkspaceRevision = result.groupRevision;
+                  current.session.groupWorkspaceQuarantine = {
+                    kind: 'known_group_identity_unprovable',
+                    expectedIdentity: current.session.groupWorkspaceIdentity,
+                    expectedRevision: result.groupRevision,
+                    detail: 'group workspace is currently unbound; terminal and business input remain fenced until the next bind',
+                  };
+                  sessionStore.updateSession(current.session);
+                  publishTerminalWorkspaceFence(current);
+                }
+              }
+            }
+            return result;
           },
         });
       },

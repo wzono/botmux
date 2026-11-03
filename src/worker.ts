@@ -2917,6 +2917,32 @@ function ensureZellijAttachConfig(): string {
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
+let currentTerminalWorkspaceFence: Extract<DaemonToWorker, { type: 'terminal_workspace_fence' }> | undefined;
+
+export function terminalWorkspaceBytesAllowed(
+  frozen: Extract<DaemonToWorker, { type: 'init' }>['terminalWorkspaceFence'],
+  current: Extract<DaemonToWorker, { type: 'terminal_workspace_fence' }> | undefined,
+): boolean {
+  if (!frozen || frozen.source !== 'group') return true;
+  const actual = current?.workspaceIdentity;
+  return current?.source === 'group' && current.groupRevision === frozen.groupRevision
+    && !!actual && actual.path === frozen.workspaceIdentity.path
+    && actual.dev === frozen.workspaceIdentity.dev && actual.ino === frozen.workspaceIdentity.ino;
+}
+
+function canWriteTerminalBytes(): boolean {
+  const frozen = lastInitConfig?.terminalWorkspaceFence;
+  if (currentTerminalWorkspaceFence?.source === 'group' && !frozen) return false;
+  if (!terminalWorkspaceBytesAllowed(frozen, currentTerminalWorkspaceFence)) return false;
+  if (!frozen || frozen.source !== 'group') return true;
+  try {
+    const real = realpathSync(lastInitConfig!.workingDir);
+    const stat = statSync(real, { bigint: true });
+    return real === frozen.workspaceIdentity.path
+      && String(stat.dev) === frozen.workspaceIdentity.dev
+      && String(stat.ino) === frozen.workspaceIdentity.ino;
+  } catch { return false; }
+}
 let traexAutoModelController: TraexAutoModelController | null = null;
 let traexAutoModelSwitching = false;
 let traexAutoModelTurnReplayForbidden = false;
@@ -26946,7 +26972,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
           });
 
           // Replay any input that arrived during the spawn window.
-          for (const data of pendingInput) cp.write(data);
+          if (canWriteTerminalBytes()) for (const data of pendingInput) cp.write(data);
           pendingInput.length = 0;
         };
 
@@ -26965,6 +26991,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
                 cp.resize(msg.cols, msg.rows);
               }
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
+              if (!canWriteTerminalBytes()) return;
               // Mouse protocols carry clicks, releases, drags and wheel input;
               // a mouse-aware TUI may bind any of them to approvals/actions.
               // A view capability therefore forwards no input bytes at all.
@@ -26973,11 +27000,13 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               const inputLifetime = cliLifetimeNonce;
               if (!await cancelDeploymentForTerminalInput()) return;
               if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || !authedClients.has(ws)) return;
+              if (!canWriteTerminalBytes()) return;
               if (codexCliEffortOperation) {
                 const target = backend;
                 const lifetime = cliLifetimeNonce;
                 await cancelCodexCliEffort();
                 if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws)) return;
+                if (!canWriteTerminalBytes()) return;
               }
               auditTerminalInput(auditUser, msg.data);
               if (cp) cp.write(msg.data);
@@ -27041,7 +27070,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
             clientPtys.delete(ws);
             if (ws.readyState === WebSocket.OPEN) ws.close();
           });
-          for (const data of pendingInput) cp.write(data);
+          if (canWriteTerminalBytes()) for (const data of pendingInput) cp.write(data);
           pendingInput.length = 0;
         };
 
@@ -27054,16 +27083,19 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               if (!cp) { clearTimeout(spawnTimer); startAttach(msg.cols, msg.rows); }
               else cp.resize(msg.cols, msg.rows);
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
+              if (!canWriteTerminalBytes()) return;
               if (!authedClients.has(ws)) return;
               const inputBackend = backend;
               const inputLifetime = cliLifetimeNonce;
               if (!await cancelDeploymentForTerminalInput()) return;
               if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || !authedClients.has(ws)) return;
+              if (!canWriteTerminalBytes()) return;
               if (codexCliEffortOperation) {
                 const target = backend;
                 const lifetime = cliLifetimeNonce;
                 await cancelCodexCliEffort();
                 if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws)) return;
+                if (!canWriteTerminalBytes()) return;
               }
               auditTerminalInput(auditUser, msg.data);
               if (cp) cp.write(msg.data);
@@ -27164,6 +27196,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
                 broadcastOwnedTmuxReadOnlyFollowerGrid();
               }
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
+              if (!canWriteTerminalBytes()) return;
               // Mouse protocols can encode approvals/actions as well as wheel input.
               // A read-only view capability must never forward bytes to the backend.
               if (!authedClients.has(ws)) return;
@@ -27171,11 +27204,13 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               const inputLifetime = cliLifetimeNonce;
               if (!await cancelDeploymentForTerminalInput()) return;
               if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || !authedClients.has(ws)) return;
+              if (!canWriteTerminalBytes()) return;
               if (codexCliEffortOperation) {
                 const target = backend;
                 const lifetime = cliLifetimeNonce;
                 await cancelCodexCliEffort();
                 if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws)) return;
+                if (!canWriteTerminalBytes()) return;
               }
               auditTerminalInput(auditUser, msg.data);
               lastWebTerminalInputAtMs = Date.now();
@@ -27186,6 +27221,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               }
               backend?.write(msg.data);
             } else if (msg.type === 'scroll' && typeof msg.data === 'string') {
+              if (!canWriteTerminalBytes()) return;
               if (!allowReadOnlyRemoteScroll || authedClients.has(ws)) return;
               const parsed = parseReadOnlyRemoteScrollPayload(msg.data);
               if (!parsed) return;
@@ -29324,6 +29360,10 @@ process.on('message', async (raw: unknown) => {
       else pending.resolve(msg.mode === 'enabled' ? 'enabled' : undefined);
       break;
     }
+    case 'terminal_workspace_fence': {
+      currentTerminalWorkspaceFence = msg;
+      break;
+    }
     case 'plugin_result_delivery_result': {
       const pending = pendingPluginResultDeliveries.get(msg.requestId);
       if (!pending) break;
@@ -29372,6 +29412,9 @@ process.on('message', async (raw: unknown) => {
         }
       }
       lastInitConfig = msg;
+      currentTerminalWorkspaceFence = msg.terminalWorkspaceFence
+        ? { type: 'terminal_workspace_fence', ...msg.terminalWorkspaceFence }
+        : undefined;
       configureTraexAutoModel(msg);
       if (isCodexAppCliId(msg.cliId) && msg.noProgressNotify?.timeoutMs !== undefined) {
         // Per-bot liveness window override (#1162). The value is normalized at
@@ -30250,6 +30293,7 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'raw_input': {
+      if (!canWriteTerminalBytes()) break;
       discardDeploymentContinuation();
       if (/^\/(?:model|new|clear)\b/i.test(msg.content.trim())) {
         // An explicit native setting/session command takes precedence until
@@ -30363,6 +30407,8 @@ process.on('message', async (raw: unknown) => {
       // （COPY 最新 <sid>.jsonl 进新 cwd 桶，已在 master）接住，上下文不丢。
       if (msg.updateWorkingDir && lastInitConfig) {
         lastInitConfig.workingDir = msg.updateWorkingDir;
+        lastInitConfig.terminalWorkspaceFence = undefined;
+        currentTerminalWorkspaceFence = undefined;
       }
       // per-bot env 热更：daemon 发 restart 时捎带 bots.json `env` 的最新值
       // （live-worker restart 不 refork，没有 init 重发这条通道），respawn 前
@@ -30586,6 +30632,7 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'tui_keys': {
+      if (!canWriteTerminalBytes()) break;
       // Stale-card guard: if this key press came from a stuck-warning card,
       // delegate to processStuckWarningTuiKeys which does a FRESH capture (not
       // the 2s-cached lastAnalyzerSnapshot) and re-verifies the current screen
@@ -30706,6 +30753,7 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'inject_command': {
+      if (!canWriteTerminalBytes()) break;
       discardDeploymentContinuation();
       // 唯一发送方是 /slash 路由的白名单 TUI 命令注入。cwd 移动不再走注入
       // （角色切换已改为 restart+updateWorkingDir 的 respawn），这里不接受
@@ -30880,6 +30928,7 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'term_action': {
+      if (!canWriteTerminalBytes()) break;
       await handleTermAction(msg.key);
       break;
     }

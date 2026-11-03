@@ -6,6 +6,7 @@ import { readTurnRegistration } from './trigger-registration.js';
 import { lookupTurnResultRequest } from './turn-result-routes.js';
 import { normalizeCalendarBinding, normalizeCalendarDayType, listWorkCalendars, previewTaskCalendar } from '../services/work-calendar.js';
 import { resolveWorkspace } from './workspace-metadata.js';
+import { frozenSessionWorkspace } from './admitted-turn-dispatch.js';
 // src/core/dashboard-ipc-server.ts
 import { canOperate } from '../im/lark/event-dispatcher.js';
 import {
@@ -4008,9 +4009,13 @@ ipcRoute('POST', '/api/sessions/:sessionId/continuation', async (req, res, param
         || proof?.workerGeneration !== generation) {
         return jsonRes(res, 409, { ok: false, error: 'continuation_rpc_required' });
       }
+      const frozenWorkspace = frozenSessionWorkspace(ds);
+      if (!frozenWorkspace) return jsonRes(res, 409, { ok: false, error: 'continuation_workspace_required' });
       state = startReadonlyTaskContinuation(ds.session, {
         turnId,
         workerGeneration: generation!,
+        workspaceIdentity: frozenWorkspace.workspace,
+        ...(frozenWorkspace.groupRevision === undefined ? {} : { groupRevision: frozenWorkspace.groupRevision }),
         authorizationMode: 'inherited',
         startMode: 'explicit',
         trustedCaller: inheritedAuthority.caller,

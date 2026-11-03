@@ -634,8 +634,11 @@ export interface DaemonSession {
   principalLaneDispatchRetry?: {
     turnId: string;
     attempt: number;
+    maxAttempts?: number;
     timer?: ReturnType<typeof setTimeout>;
   };
+  /** One exact durable head may cross admission for a worker generation. */
+  principalLaneDispatchFlight?: { generation: number; turnId: string; promise: Promise<boolean> };
   /** Host-owned classification/approval driver currently attached to disk state. */
   crossPrincipalInterruptionDriving?: boolean;
   /** Runtime wake-up for the bounded wait until the current owner turn ends. */

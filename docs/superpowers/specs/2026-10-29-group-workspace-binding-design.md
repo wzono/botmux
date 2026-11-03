@@ -106,7 +106,7 @@ async function admitTurn(request: TurnAdmissionRequest): Promise<TurnAdmissionRe
 | XPI | `driveNextXpiSharedCwdTurn` | workspace admission 先于 exact XPI lease/attempting | 失败保留 queue/lease 未取 |
 | scheduler | callback → `executeScheduledTask` | 现有 bot gate 内、session send/fork 前 admission | 目标 identity 不一致拒绝 |
 | failed-turn recovery | `recoverFailedTurn`（mutation gate） | 使用 `admitTurnUnderMutation`，不嵌套 shared gate | receipt attempting 前完成 |
-| Ask/approval reply | card/text answer → wait registry → original turn resume | 验证 exact-turn `ControlReplyPermit`；只恢复原 turn | 不得开始新 turn/follow；terminal 后按当前 group 重新准入 |
+| Ask reply | card/text answer → wait registry → original turn resume | 验证 exact-turn `ControlReplyPermit`；只恢复原 turn | 不得开始新 turn/follow；terminal 后按当前 group 重新准入。Owner-approved scope ruling：仓库无 approval 产品 emitter，新增 approval 入口及端到端验收从 Task 9 移除；通用 control-wait 注册/恢复 API 保留但不计 approval 通过 |
 | ordinary continuation | worker-pool recovery send/fork | 已 admitted logical turn仅可重放同 permit；generation 变化则重新 admission | 禁止跨 generation 沿用 permit |
 | startup saga/follow recovery | boot barrier | recovery 自身是 management；不得发送业务内容 | barrier 完成后开 ingress |
 | terminal WS | proxy → worker `cp.write` | 加 `canAcceptTerminalBytes` fence | stale group session 拒绝 |

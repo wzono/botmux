@@ -1,5 +1,6 @@
 import { canTalk } from '../im/lark/event-dispatcher.js';
 import { cancelDeploymentContinuation, deploymentContinuationClaimCurrent } from '../services/deployment-continuation.js';
+
 import { deploymentContinuationAuthority } from './deployment-continuation-authority.js';
 import { CliProgressNotifier, cliProgressNoticeCard } from '../services/cli-progress-notice.js';
 import { listPendingAsks } from './ask-broker.js';
@@ -201,6 +202,7 @@ import { TurnResultStore } from '../services/turn-result-store.js';
 import type { TurnResult, TurnDeliveryReceipt } from '../services/turn-result.js';
 import { reconcileTurnPermitDispatches as reconcilePersistedTurnPermitDispatches, type BlankBootstrapPermit, type BusinessSubmitPermit } from './turn-admission.js';
 import { TurnPermitStore } from '../services/turn-permit-store.js';
+import { frozenSessionWorkspace } from './admitted-turn-dispatch.js';
 import { turnResultEnabled, turnResultBinding, turnResultSessionEligible, observeTurnResultTerminal, observeTurnResultDelivery } from './turn-result-session.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
@@ -1056,6 +1058,7 @@ export interface WorkerSessionReplyOptions {
 }
 
 export interface WorkerPoolCallbacks {
+  currentTerminalWorkspaceFence?: (ds: DaemonSession) => Extract<DaemonToWorker, { type: 'terminal_workspace_fence' }>;
   onTurnResult?: (result: Readonly<TurnResult>) => void | Promise<void>;
   /** Host-owned return path for zero-injection sub-bots. */
   onZeroPromptFinal?: (ds: DaemonSession, input: {
@@ -1091,6 +1094,7 @@ export interface WorkerPoolCallbacks {
     payload: string | CliTurnPayload;
     options: { resume: boolean; dispatchAttempt?: number; atMostOnce?: true; codexAppSteerable?: true; trustedCaller?: TrustedCaller };
     markAttempting?: () => Promise<boolean>;
+    expectedWorkspace?: { workspace: import('./turn-admission.js').WorkspaceIdentity; groupRevision?: number };
   }) => Promise<boolean>;
   /** Connector-owned live card for a handoff whose exact input has started. */
   onTriggerTurnStarted?: (ds: DaemonSession, title: string, turnId: string) => void;
@@ -1256,6 +1260,7 @@ export function initWorkerPool(cb: WorkerPoolCallbacks): void {
 }
 
 /** Embedded IPC/test seam; production normally supplies this in initWorkerPool. */
+
 export function setWorkspaceAdmittedBusinessTurnDispatcher(
   dispatcher: WorkerPoolCallbacks['dispatchAdmittedBusinessTurn'] | undefined,
 ): () => void {
@@ -2582,9 +2587,13 @@ export function ensureAutomaticTaskContinuationLease(
   if (!ensureReadonlyTaskContinuationAttached(ds, botCfg)) return false;
 
   try {
+    const frozenWorkspace = frozenSessionWorkspace(ds);
+    if (!frozenWorkspace) return false;
     const state = startReadonlyTaskContinuation(ds.session, {
       turnId: authority.turnId,
       workerGeneration: workerGeneration!,
+      workspaceIdentity: frozenWorkspace.workspace,
+      ...(frozenWorkspace.groupRevision === undefined ? {} : { groupRevision: frozenWorkspace.groupRevision }),
       authorizationMode: 'inherited',
       startMode: 'automatic',
       trustedCaller: authority.caller,
@@ -2805,7 +2814,7 @@ export function ensureReadonlyTaskContinuationAttached(
   }
   attachReadonlyTaskContinuation(ds.session, {
     schedule: (delayMs, run) => {
-      const timer = setTimeout(run, delayMs);
+      const timer = setTimeout(() => { void run(); }, delayMs);
       timer.unref?.();
       return timer;
     },
@@ -2827,7 +2836,7 @@ export function ensureReadonlyTaskContinuationAttached(
         && ds.session.workerGeneration === workerGeneration
         && proof?.workerGeneration === workerGeneration;
     },
-    enqueue: (dispatch: ReadonlyTaskContinuationDispatch) => {
+    enqueue: async (dispatch: ReadonlyTaskContinuationDispatch) => {
       if (!readonlyTaskContinuationEligible(ds) || !ordinaryTurnRecoveryStillOwnsSession(ds)) {
         return false;
       }
@@ -2842,15 +2851,21 @@ export function ensureReadonlyTaskContinuationAttached(
         return false;
       }
       const current = ds.session.readonlyTaskContinuation;
-      if (!current || current.currentTurnId !== dispatch.turnId
+      const frozenWorkspace = frozenSessionWorkspace(ds);
+      if (!current || current.leaseId !== dispatch.leaseId || current.currentTurnId !== dispatch.turnId
         || current.currentDispatchAttempt !== dispatch.dispatchAttempt
         || current.authorizationMode !== 'inherited'
+        || !frozenWorkspace
+        || (current.workspaceIdentity && (current.workspaceIdentity.path !== frozenWorkspace.workspace.path
+          || current.workspaceIdentity.dev !== frozenWorkspace.workspace.dev
+          || current.workspaceIdentity.ino !== frozenWorkspace.workspace.ino))
+        || (!current.workspaceIdentity && ds.session.workingDirSource === 'group')
+        || current.groupRevision !== frozenWorkspace.groupRevision
         || !current.trustedCaller
         || current.trustedCaller.requestLarkAppId !== ds.larkAppId
         || (current.trustedController
           && current.trustedController.requestLarkAppId !== ds.larkAppId)) return false;
-      try {
-        ds.worker.send({
+      const payload = {
           type: 'message',
           content: dispatch.prompt,
           turnId: dispatch.turnId,
@@ -2868,7 +2883,41 @@ export function ensureReadonlyTaskContinuationAttached(
             rpcGeneration: proof.rpcGeneration,
             authorizationMode: 'inherited',
           },
-        } satisfies Extract<DaemonToWorker, { type: 'message' }>);
+        } satisfies Extract<DaemonToWorker, { type: 'message' }>;
+      try {
+        const frozen = frozenSessionWorkspace(ds);
+        if (!frozen || (!current.workspaceIdentity && ds.session.workingDirSource === 'group')) return false;
+        const accepted = await dispatchWorkspaceAdmittedBusinessTurn({
+          ds,
+          turnId: dispatch.turnId,
+          payload,
+          resume: true,
+          dispatchAttempt: dispatch.dispatchAttempt,
+          atMostOnce: true,
+          trustedCaller: current.trustedCaller,
+          ...(current.workspaceIdentity ? { expectedWorkspace: { workspace: current.workspaceIdentity,
+            ...(current.groupRevision === undefined ? {} : { groupRevision: current.groupRevision }) } } : {}),
+          markAttempting: async () => {
+            const live = ds.session.readonlyTaskContinuation;
+            return live?.leaseId === dispatch.leaseId && live.status === 'dispatching'
+              && live.currentTurnId === dispatch.turnId && live.currentDispatchAttempt === dispatch.dispatchAttempt;
+          },
+        });
+        if (!accepted) return false;
+        const afterAdmission = frozenSessionWorkspace(ds);
+        if (!afterAdmission || (ds.session.workingDirSource === 'group' && (!current.workspaceIdentity
+          || current.workspaceIdentity.path !== afterAdmission.workspace.path
+          || current.workspaceIdentity.dev !== afterAdmission.workspace.dev
+          || current.workspaceIdentity.ino !== afterAdmission.workspace.ino
+          || current.groupRevision !== afterAdmission.groupRevision))) {
+          const ambiguous = ds.session.readonlyTaskContinuation;
+          if (ambiguous?.leaseId === dispatch.leaseId) {
+            ds.session.readonlyTaskContinuation = { ...ambiguous, status: 'failed', nextAttemptAt: undefined,
+              lastErrorCode: 'readonly_continuation_workspace_ambiguous_after_submit' };
+            sessionStore.updateSession(ds.session);
+          }
+          return ds.workerGeneration ?? ds.session.workerGeneration ?? false;
+        }
         ds.activeInteractiveTurn = {
           turnId: dispatch.turnId,
           caller: { ...current.trustedCaller },
@@ -2880,7 +2929,7 @@ export function ensureReadonlyTaskContinuationAttached(
           beginRecovery: false,
           dispatchAttempt: dispatch.dispatchAttempt,
         });
-        return workerGeneration!;
+        return ds.workerGeneration ?? ds.session.workerGeneration ?? false;
       } catch (err) {
         logger.error(
           `[${tag(ds)}] Failed to enqueue task continuation `
@@ -11352,6 +11401,7 @@ function withTurnCaller(ds: DaemonSession, message: TransferBufferedInput): Tran
 export function sendWorkerSessionInput(
   ds: DaemonSession,
   message: TransferBufferedInput,
+  onIpcDispatchAttempted?: () => void,
 ): boolean {
   // Evaluate the cheap message-shape guards FIRST: getBot() THROWS for an
   // unregistered app (IPC tests / in-flight teardown), and every other input
@@ -11372,7 +11422,7 @@ export function sendWorkerSessionInput(
   if (bufferTransferInput(ds, annotated)) return true;
   const worker = ds.worker;
   if (!worker || worker.killed) return false;
-  return afterWorkerIpcBootstrap(worker, () => worker.send(annotated));
+  return afterWorkerIpcBootstrap(worker, () => { onIpcDispatchAttempted?.(); worker.send(annotated); });
 }
 
 /** Prompt-cache keep-alive delivery. Deliberately NOT routed through the
@@ -13110,6 +13160,7 @@ export async function dispatchWorkspaceAdmittedBusinessTurn(input: {
   atMostOnce?: true;
   trustedCaller?: TrustedCaller;
   markAttempting(): Promise<boolean>;
+  expectedWorkspace?: { workspace: import('./turn-admission.js').WorkspaceIdentity; groupRevision?: number };
 }): Promise<boolean> {
   const dispatcher = callbacks?.dispatchAdmittedBusinessTurn
     ?? embeddedWorkspaceDispatchers.at(-1)?.dispatcher;
@@ -13124,6 +13175,7 @@ export async function dispatchWorkspaceAdmittedBusinessTurn(input: {
       ...(input.atMostOnce ? { atMostOnce: true as const } : {}),
       ...(input.trustedCaller ? { trustedCaller: input.trustedCaller } : {}) },
     markAttempting: input.markAttempting,
+    ...(input.expectedWorkspace ? { expectedWorkspace: input.expectedWorkspace } : {}),
   });
 }
 
@@ -13155,6 +13207,7 @@ export function sendWorkerInput(
      *  --resume, and this turn is delivered only after the fresh CLI is ready. */
     purgeUndersizedImages?: true;
     trustedCaller?: TrustedCaller;
+    onIpcDispatchAttempted?: () => void;
   } = {},
 ): boolean {
   cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
@@ -13330,6 +13383,7 @@ export function sendWorkerInput(
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(trustedController ? { trustedController } : {}),
     ...(normalized.rerouteEnvelope ? { rerouteEnvelope: normalized.rerouteEnvelope } : {}),
+    ...(typeof payload !== 'string' && payload.taskContinuation ? { taskContinuation: payload.taskContinuation } : {}),
     ...(opts.dispatchAttempt === undefined
       && (opts.trustedCaller?.source === 'schedule_creator'
         || isSerialGroupInput(ds, opts.trustedCaller))
@@ -13350,7 +13404,7 @@ export function sendWorkerInput(
     if (!transferGate && shouldTrackOrdinaryImDelivery(ds, message)) {
       return sendOrdinaryImDeliveryTracked(ds, message);
     }
-    return sendWorkerSessionInput(ds, message);
+    return sendWorkerSessionInput(ds, message, opts.onIpcDispatchAttempted);
   };
   try {
     if (!performSend()) {
@@ -15130,6 +15184,15 @@ export function forkWorker(
     ...(ds.groupWorkspaceLaunchGuard?.identity
       ? { expectedWorkingDirIdentity: { ...ds.groupWorkspaceLaunchGuard.identity } }
       : {}),
+    ...(ds.session.workingDirSource === 'group'
+      ? { terminalWorkspaceFence: {
+          source: 'group' as const,
+          ...(ds.session.groupWorkspaceRevision === undefined ? {} : { groupRevision: ds.session.groupWorkspaceRevision }),
+          workspaceIdentity: ds.session.groupWorkspaceIdentity
+            ? { ...ds.session.groupWorkspaceIdentity }
+            : { path: cwd, dev: '', ino: '' },
+        } }
+      : {}),
     cliId: agentCfg.cliId,
     cliRuntime: agentCfg.cliRuntime,
     cliPathOverride: agentCfg.cliPathOverride,
@@ -15559,23 +15622,34 @@ export async function forkWorkerBlank(
   ds: DaemonSession,
   permit: BlankBootstrapPermit,
   options: Exclude<ForkResumeOrTurnId, boolean | string> = {},
-  permitStore: Pick<TurnPermitStore, 'beginSpawn'> = productionTurnPermitStore,
-): Promise<'started' | 'deferred' | 'rejected'> {
+  permitStore: Pick<TurnPermitStore, 'beginSpawn' | 'releasePreForkFailure'> = productionTurnPermitStore,
+): Promise<'started' | 'deferred' | 'observing' | 'rejected'> {
   if (permit.sessionId !== ds.session.sessionId) return 'rejected';
   const transition = await permitStore.beginSpawn(permit);
+  if (transition.status === 'observing') return 'observing';
   if (transition.status !== 'acquired') return 'rejected';
-  if (ds.adoptedFrom) {
-    return forkAdoptWorker(ds, {
+  try {
+    if (ds.adoptedFrom) {
+      const accepted = forkAdoptWorker(ds, {
       prompt: '', turnId: permit.turnId, atMostOnce: options.atMostOnce,
       trustedCaller: options.trustedCaller,
       onWorkerGenerationReserved: options.onWorkerGenerationReserved,
       onIpcDispatchAttempted: options.onIpcDispatchAttempted,
-    }) === 'accepted' ? 'started' : 'rejected';
+      }) === 'accepted';
+      if (!accepted) await permitStore.releasePreForkFailure(permit, transition.spawnAttemptId);
+      return accepted ? 'started' : 'rejected';
+    }
+    const before = ds.worker;
+    const accepted = forkWorker(ds, '', { ...options, turnId: permit.turnId });
+    if (!accepted) await permitStore.releasePreForkFailure(permit, transition.spawnAttemptId);
+    return accepted && ds.worker && ds.worker !== before ? 'started' : accepted ? 'deferred' : 'rejected';
+  } catch (error) {
+    const generation = ds.workerGeneration ?? ds.session.workerGeneration ?? 0;
+    if (generation < permit.reservedGeneration) {
+      await permitStore.releasePreForkFailure(permit, transition.spawnAttemptId);
+    }
+    throw error;
   }
-  const before = ds.worker;
-  const accepted = forkWorker(ds, '', { ...options, turnId: permit.turnId });
-  if (!accepted) return 'rejected';
-  return ds.worker && ds.worker !== before ? 'started' : 'deferred';
 }
 
 export type PermitAwareSubmitOptions = Parameters<typeof sendWorkerInput>[3];
@@ -15596,7 +15670,10 @@ export async function submitBusinessInput(
   if (dispatch.status !== 'acquired') return false;
   const key = businessPermitAckKey(permit.sessionId, permit.turnId, permit.workerGeneration);
   activeBusinessPermitStores.set(key, permitStore);
-  const accepted = sendWorkerInput(ds, payload, permit.turnId, options);
+  const accepted = sendWorkerInput(ds, payload, permit.turnId, {
+    ...options,
+    onIpcDispatchAttempted: options.onIpcDispatchAttempted,
+  });
   if (!accepted) activeBusinessPermitStores.delete(key);
   return accepted;
 }
@@ -16203,6 +16280,9 @@ function setupWorkerHandlers(
         break;
       }
       case 'worker_ipc_ready':
+        if (worker.connected && callbacks?.currentTerminalWorkspaceFence) {
+          worker.send(callbacks.currentTerminalWorkspaceFence(ds));
+        }
         // Consumed by the standalone bootstrap listener installed at spawn.
         break;
       case 'cron_task_anchors_sync': {
@@ -22379,6 +22459,13 @@ export function forkAdoptWorker(
     rootMessageId: sessionAnchorId(ds),
     terminalCardEpoch: ds.session.terminalCardEpoch,
     workingDir: adopted.cwd,
+    ...(ds.session.workingDirSource === 'group' ? { terminalWorkspaceFence: {
+      source: 'group' as const,
+      ...(ds.session.groupWorkspaceRevision === undefined ? {} : { groupRevision: ds.session.groupWorkspaceRevision }),
+      workspaceIdentity: ds.session.groupWorkspaceIdentity
+        ? { ...ds.session.groupWorkspaceIdentity }
+        : { path: adopted.cwd, dev: '', ino: '' },
+    } } : {}),
     cliId: adoptedCliId,
     codexProfile: agentCfg.codexProfile,
     codexProfileHome: agentCfg.codexProfileHome,

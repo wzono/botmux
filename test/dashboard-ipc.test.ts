@@ -4810,6 +4810,7 @@ describe('POST /api/sessions/:sessionId/durable-send', () => {
       chatType: 'group',
     } as any;
     const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(active);
+    const admissionSpy = vi.spyOn(workerPool, 'dispatchWorkspaceAdmittedBusinessTurn');
     const deliver = vi.fn(async () => ({ kind: 'delivered' as const, messageId: 'om_outbox' }));
     setDurableSessionSendHandler(deliver);
     setIpcAuthSecret(TEST_IPC_SECRET);
@@ -4843,7 +4844,9 @@ describe('POST /api/sessions/:sessionId/durable-send', () => {
         daemonSession: active,
         ...payload,
       });
+      expect(admissionSpy).not.toHaveBeenCalled();
     } finally {
+      admissionSpy.mockRestore();
       findSpy.mockRestore();
     }
   });
@@ -4991,6 +4994,7 @@ describe('POST /api/sessions/:sessionId/board queued activation', () => {
         getSessionWorkingDir: () => { throw new Error('forced pre-init failure'); },
         getActiveCount: () => 1,
         closeSession: vi.fn(),
+        dispatchAdmittedBusinessTurn: async () => { throw new Error('forced pre-init failure'); },
       });
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
 
