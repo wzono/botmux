@@ -31,6 +31,7 @@ import { installDaemonRejectionGuard } from './utils/daemon-rejection-guard.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readPeerCrossRef } from './services/peer-cross-ref-store.js';
 import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from './utils/bot-routing.js';
+import { normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
 import { parseBotSteerDirective } from './core/bot-steer-directive.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { join, dirname, basename, isAbsolute, relative } from 'node:path';
@@ -462,6 +463,7 @@ import {
   getDaemonBootId,
   getDaemonStreamingCardUsageSnapshot,
   getDaemonSessionUsageSnapshot,
+  sessionSupportsIdleAutoCompact,
   postTurnStartingCard,
   reconcileBotStreamingCardPins,
   reconcileRestoredStreamingCardPins,
@@ -488,7 +490,8 @@ import {
   identityDecisionTurnIsLive,
   collectSessionTurnGarbage,
 } from './core/worker-pool.js';
-import { resetPromptCacheKeepalive, runPromptCacheKeepaliveSweep } from './core/prompt-cache-keepalive.js';
+import { resetPromptCacheKeepalive, runPromptCacheKeepaliveSweep, statuslineContextTokens } from './core/prompt-cache-keepalive.js';
+import { noteIdleAutoCompactTurnStarted, runIdleAutoCompactSweep, type IdleAutoCompactNotice } from './core/idle-auto-compact.js';
 import { ensureServerThenReapOrphanTmuxServers, orphanTmuxReaperEnabled, reaperCandidateSocketNames } from './core/orphan-tmux-reaper.js';
 import { buildClosedSessionCard } from './core/closed-session-card.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
@@ -586,6 +589,7 @@ import {
 } from './core/session-manager.js';
 import { publishTurnCliIdentity, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
 import { clearSingleIdentityArtifacts, forgetProvenIdentityContent } from './core/cli-identity.js';
+import { BYTEDCLI_RENEWAL_SWEEP_MS, renewExpiringBytedcliIdentities } from './core/bytedcli-identity-renewal.js';
 import type { IdentityStorageModel } from './core/lark-tool-binding.js';
 import { noteInboundSenderUnionId, noteSenderUnionId } from './core/platform-credential-source.js';
 import { validateRoleLibraryPath } from './core/role-library.js';
@@ -3906,6 +3910,7 @@ function scheduleDeferredScheduleSettlement(
       closeSession: (id: string) => closeSessionForBackgroundCleanup(
         id,
         'deferred-schedule settlement',
+        { backgroundExecutionCleanup: true },
       ),
     }).then((result) => {
       if (result.action === 'materialized') {
@@ -6620,6 +6625,66 @@ function observeAutoCompact(ds: DaemonSession, status: string): void {
   });
 }
 
+/** Context size for the idle auto-compact threshold: Claude statusline first,
+ *  then the transcript usage snapshot; undefined = unknown (threshold skipped). */
+function idleAutoCompactContextTokens(ds: DaemonSession): number | undefined {
+  const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+  if (effectiveCliId === 'claude-code') {
+    try {
+      const tokens = statuslineContextTokens(config.session.dataDir, ds.session.sessionId, Date.now());
+      if (tokens !== undefined) return tokens;
+    } catch { /* fall through to the transcript */ }
+  }
+  const used = getDaemonSessionUsageSnapshot(ds, effectiveCliId, { fresh: true }).context?.usedTokens;
+  return typeof used === 'number' && Number.isFinite(used) && used > 0 ? used : undefined;
+}
+
+function idleAutoCompactNoticeText(ds: DaemonSession, notice: IdleAutoCompactNotice): string {
+  const loc = localeForBot(ds.larkAppId);
+  const k = (tokens: number) => String(Math.round(tokens / 1000));
+  if (notice.kind === 'skipped_small') {
+    return tr('idle_compact.notice.skipped_small', { minutes: notice.idleMinutes, tokens: k(notice.tokens), min: k(notice.minTokens) }, loc);
+  }
+  if (notice.kind === 'refused') return tr('idle_compact.notice.refused', { minutes: notice.idleMinutes }, loc);
+  if (notice.kind === 'interrupted') return tr('idle_compact.notice.interrupted', { minutes: notice.idleMinutes }, loc);
+  return notice.tokens !== undefined
+    ? tr('idle_compact.notice.compacted', { minutes: notice.idleMinutes, tokens: k(notice.tokens) }, loc)
+    : tr('idle_compact.notice.compacted_unknown', { minutes: notice.idleMinutes }, loc);
+}
+
+/** Per-session opt-in idle auto-compact (core/idle-auto-compact.ts), run from
+ *  the 60s idle sweep. The compact itself goes through the same passthrough
+ *  path as the card 「🗜️ 压缩」 button, gated like the threshold auto-compact. */
+function runIdleAutoCompact(): void {
+  runIdleAutoCompactSweep(activeSessions.values(), {
+    supported: sessionSupportsIdleAutoCompact,
+    eligible: autoCompactEligible,
+    contextTokens: idleAutoCompactContextTokens,
+    persist: ds => sessionStore.updateSession(ds.session),
+    compact: (ds, turnId) => {
+      if (!autoCompactEligible(ds)) return false;
+      const anchor = sessionAnchorId(ds);
+      let delivered = false;
+      deliverPassthroughToExistingSession(ds, '/compact', '/compact', anchor, ds.larkAppId, {
+        messageId: anchor,
+        replyRootId: anchor,
+        senderIsBot: true,
+        substitute: false,
+        inThread: ds.scope === 'thread',
+        turnId,
+        requireSafeComposer: true,
+        onDelivered: () => { delivered = true; },
+      });
+      return delivered;
+    },
+    notify: (ds, notice) => {
+      void sessionReply(sessionAnchorId(ds), idleAutoCompactNoticeText(ds, notice), 'text', ds.larkAppId)
+        .catch(err => logger.warn(`[${tag(ds)}] idle auto-compact notice failed: ${err instanceof Error ? err.message : String(err)}`));
+    },
+    log: message => logger.info(message),
+  });
+}
+
 /**
  * Freeze the previous turn's streaming card at "idle" and mark a new turn so the
  * next screen_update from the worker POSTs a fresh streaming card instead of
@@ -6631,6 +6696,8 @@ function observeAutoCompact(ds: DaemonSession, status: string): void {
 function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
   // A real turn ends the idle stretch a prompt-cache keep-alive was extending.
   resetPromptCacheKeepalive(ds);
+  // Any turn other than an in-flight idle auto-compact opens a fresh stretch.
+  noteIdleAutoCompactTurnStarted(ds, turnId);
   // docCommentTargets 改为 per-turn map（按 turnId 索引），不再需要每轮清空：
   // 非文档轮的 BOTMUX_TURN_ID 不会命中 map，天然不会误投；旧 entry 由
   // deliverFinalOutput / botmux send 成功路径清理。
@@ -13264,7 +13331,7 @@ function resolveVcMeetingListenerBotLabel(larkAppId: string): { label: string; c
   try {
     const infoPath = join(config.session.dataDir, 'bots-info.json');
     if (existsSync(infoPath)) {
-      const entries: Array<{ larkAppId?: unknown; botName?: unknown }> = JSON.parse(readFileSync(infoPath, 'utf-8'));
+      const entries = normalizeBotsInfoRouteEntries(JSON.parse(readFileSync(infoPath, 'utf-8')));
       const hit = entries.find(entry => entry.larkAppId === larkAppId);
       if (typeof hit?.botName === 'string' && hit.botName.trim()) {
         return { label: hit.botName.trim(), canMentionByName: true };
@@ -21005,6 +21072,7 @@ function startAutoWorktreePending(ds: DaemonSession, args: {
     worktreePath: args.worktreePath, branch: args.branch, reuseExisting: args.reuseExisting,
     targetSubdir: args.targetSubdir,
     activeSessions,
+    prepareTurn: prepareTurnCliIdentity,
     notify: (m) => sessionReply(args.anchor, m, 'text', ds.larkAppId),
   });
   logger.info(`[${tag(ds)}] auto-worktree → pending, building worktree off ${args.baseDir}`);
@@ -24667,8 +24735,13 @@ function deliverPassthroughToExistingSession(
       logger.warn(`[${anchor.substring(0, 12)}] Passthrough ${cmd} was not accepted by the worker`);
       return;
     }
-    beginNewTurn(ds, commandContent, turnId);
+    // The worker has the turn from here on: report delivery before the
+    // bookkeeping below, so a throw in beginNewTurn (e.g. a transient session
+    // store error while persisting card state) cannot make the caller believe
+    // the input never landed — the idle auto-compact sweep would otherwise
+    // release its claim and compact the same idle stretch again.
     turn.onDelivered?.();
+    beginNewTurn(ds, commandContent, turnId);
     markSessionActivity(ds);
     logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
     return;
@@ -26068,6 +26141,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     // (quoteTargetId === marker.turnId) holds on session-group first turns.
     // Outside a birth replyAnchorId === messageId, so plain paths are unchanged.
     pendingTurnId: replyAnchorId,
+    pendingTrustedCaller: trustedCaller,
     pendingCodexAppText: codexAppVisibleText,
     pendingCodexAppApplicationContext: codexAppApplicationContext || undefined,
     pendingCodexAppMessageContext: codexAppMessageContext,
@@ -27404,9 +27478,9 @@ function lookupForeignBotName(senderOpenId: string, larkAppId: string, senderUni
   try {
     const infoPath = join(config.session.dataDir, 'bots-info.json');
     if (existsSync(infoPath)) {
-      const entries: Array<{ larkAppId: string; botOpenId: string | null; botName: string | null; cliId: string }> = JSON.parse(readFileSync(infoPath, 'utf-8'));
+      const entries = normalizeBotsInfoRouteEntries(JSON.parse(readFileSync(infoPath, 'utf-8')));
       const hit = entries.find(e => e.botOpenId === senderOpenId);
-      if (hit) return hit.botName ?? getCliDisplayName(hit.cliId as CliId);
+      if (hit) return hit.botName ?? (hit.cliId ? getCliDisplayName(hit.cliId as CliId) : 'Bot');
     }
   } catch { /* */ }
   return 'Bot';
@@ -28705,6 +28779,7 @@ async function handleThreadReplyAdmitted(
         // durable opening instead of an impossible successor to an empty ACK.
         ds.pendingPrompt = promptContent;
         ds.pendingTurnId = parsed.messageId;
+        ds.pendingTrustedCaller = threadTrustedCaller;
         ds.pendingCodexAppText = parsed.content;
         ds.pendingCodexAppApplicationContext = codexAppApplicationContext;
         ds.pendingCodexAppMessageContext = codexAppMessageContext;
@@ -28959,6 +29034,10 @@ async function handleThreadReplyAdmitted(
       pendingSubstituteTrigger: substituteTrigger,
       pendingSubstituteControlCard: shouldSendSubstituteControlCard,
       pendingSender: autoCreateSender,
+      // The auto-worktree / repo-picker deferred fork can only read caller
+      // state off this ds literal; the pinned twin below passes
+      // threadTrustedCaller explicitly to forkReservedInitialSession.
+      pendingTrustedCaller: threadTrustedCaller,
       // R5-B1-1: freeze the plain-human steer authorization into the new-topic
       // opening metadata. buildReservedInitialInput COPIES this onto the built
       // opening payload; forkReservedInitialSession never infers it (that shared
@@ -34066,6 +34145,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     } catch (error) {
       logger.warn(`[prompt-cache] keep-alive sweep failed: ${error instanceof Error ? error.message : String(error)}`);
     }
+    // Per-session idle auto-compact: a no-op unless a session opted in.
+    try {
+      runIdleAutoCompact();
+    } catch (error) {
+      logger.warn(`[idle-compact] sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }, 60_000);
   idleWorkerSweepTimer.unref?.();
 
@@ -34151,6 +34236,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   const sessionRuntimeSweepTimer = setInterval(() => { void sweepSessionRuntimeDirs(); }, 30 * 60_000);
   sessionRuntimeSweepTimer.unref?.();
   void sweepSessionRuntimeDirs();
+  // A turn mints its bytedcli identity once, but ByteCloud JWTs live ~2h; keep
+  // long-running turns (nightly jobs, backfills) on fresh tokens of the same person.
+  const bytedcliRenewalTimer = setInterval(() => {
+    void renewExpiringBytedcliIdentities().catch(err =>
+      logger.warn(`[bytedcli-renewal] sweep failed: ${err?.message ?? err}`));
+  }, BYTEDCLI_RENEWAL_SWEEP_MS);
+  bytedcliRenewalTimer.unref?.();
 
   // v3 humanGate cold-attach: re-post pending gate cards + resume healed gates
   // for runs OWNED BY THIS BOT (codex blocker #1 — owner filter, mirrors
@@ -34715,6 +34807,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);
     clearInterval(grantExpirySweepTimer);
+    clearInterval(bytedcliRenewalTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     // Keep the occupancy lease for the whole teardown: workers still settle
     // rows into this cache and persist them below. Extend it once here (the
@@ -34983,6 +35076,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(idleWorkerSweepTimer);
     clearInterval(sessionOwnerReminderTimer);
     clearInterval(grantExpirySweepTimer);
+    clearInterval(bytedcliRenewalTimer);
     clearInterval(docCommentPollTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     setDurableBridgeFinalOutputHandler(undefined);
