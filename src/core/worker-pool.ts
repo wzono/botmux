@@ -1310,9 +1310,19 @@ export function setActiveSessionsRegistry(m: Map<string, DaemonSession> | undefi
 
 export async function reconcileTurnPermitDispatches(
   sessions: Iterable<DaemonSession>,
-  store: Pick<TurnPermitStore, 'listDispatching' | 'reconcileBusinessDispatch' | 'listDispatchingControls' | 'reconcileControlReplyDispatch'> = productionTurnPermitStore,
+  store: Pick<TurnPermitStore, 'listDispatching' | 'reconcileBusinessDispatch' | 'listDispatchingControls' | 'reconcileControlReplyDispatch' | 'listExpiredSpawns' | 'recoverExpiredSpawn'> = productionTurnPermitStore,
 ): Promise<void> {
   const restored = [...sessions];
+  const sessionsById = new Map(restored.map(ds => [ds.session.sessionId, ds]));
+  for (const permit of await store.listExpiredSpawns?.() ?? []) {
+    const ds = sessionsById.get(permit.sessionId);
+    const observed = ds?.workerGeneration ?? ds?.session.workerGeneration ?? 0;
+    const aliveReserved = !!ds?.worker && !ds.worker.killed && observed === permit.reservedGeneration;
+    if (!aliveReserved) await store.recoverExpiredSpawn?.(permit, {
+      observedGeneration: observed,
+      reservedGenerationRetired: observed < permit.reservedGeneration,
+    });
+  }
   await reconcilePersistedTurnPermitDispatches({
     pending: await store.listDispatching(),
     sessions: restored.map(ds => ({
@@ -1323,7 +1333,6 @@ export async function reconcileTurnPermitDispatches(
     })),
     reconcile: (permit, evidence) => store.reconcileBusinessDispatch(permit, evidence),
   });
-  const sessionsById = new Map(restored.map(ds => [ds.session.sessionId, ds]));
   for (const pending of await store.listDispatchingControls()) {
     const ds = sessionsById.get(pending.permit.sessionId);
     const receipt = ds?.session.controlDispatchReceipts?.[pending.permit.controlDispatchId];

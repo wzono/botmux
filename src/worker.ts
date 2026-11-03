@@ -30764,6 +30764,7 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'tui_text_input': {
+      if (!canWriteTerminalBytes()) break;
       discardDeploymentContinuation();
       const wroteText = await handleTuiTextInput(msg.keys, msg.text);
       if (msg.cardMessageId) {
@@ -30793,6 +30794,7 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'coco_drive_picker': {
+      if (!canWriteTerminalBytes()) break;
       void driveCocoPicker(msg.navKeys, msg.needsReviewSubmit, msg.comment);
       break;
     }

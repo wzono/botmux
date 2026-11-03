@@ -979,6 +979,7 @@ import {
   askAnswerActorFor,
   submitCustomReply,
   originalControlWaitState,
+  originalControlWaitAcceptedAnswer,
 } from './core/ask-broker.js';
 import { createAskPersistStore } from './core/ask-persist-store.js';
 import {
@@ -9919,7 +9920,8 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
               originalTurnId: turnId, askId: asyncInput.itemId });
             const originalStillWaiting = askInput.controlWait?.state === 'needs_user'
               && asyncInput.itemId === askInput.controlWait.wait.askId
-              && waitState === 'needs_user';
+              && (waitState === 'needs_user' || originalControlWaitAcceptedAnswer({
+                sessionId: askSession.session.sessionId, originalTurnId: turnId, askId: asyncInput.itemId }));
             const dispatch = actual && isCurrent() && originalStillWaiting
               ? await centralTurnPermitStore.beginControlReplyDispatch(permit, replyDigest, {
                   sessionId: askSession.session.sessionId,
@@ -21539,6 +21541,12 @@ async function driveNextPrincipalLaneTurnOwned(
         throw new Error('principal-lane FIFO head changed during pre-IPC rollback');
       }
       durableHead.dispatchState = 'queued';
+      const attempts = (ds.principalLaneDispatchRejectedCount ??= {});
+      attempts[head.turnId] = (attempts[head.turnId] ?? 0) + 1;
+      if (attempts[head.turnId] >= (ds.principalLaneDispatchRetry?.maxAttempts ?? 7)) {
+        durableHead.dispatchState = 'blocked'; durableHead.blockedReason = 'pre_ipc_rejected_retry_exhausted';
+        sessionStore.updateSession(ds.session); clearPrincipalLaneDispatchRetry(ds, head.turnId); return false;
+      }
       sessionStore.updateSession(ds.session);
       logger.warn(
         `[${tag(ds)}] Principal-lane queued turn was not dispatched; retained for retry `
@@ -21568,6 +21576,12 @@ async function driveNextPrincipalLaneTurnOwned(
       throw new Error('principal-lane FIFO head changed during rejected dispatch rollback');
     }
     durableHead.dispatchState = 'queued';
+    const attempts = (ds.principalLaneDispatchRejectedCount ??= {});
+    attempts[head.turnId] = (attempts[head.turnId] ?? 0) + 1;
+    if (attempts[head.turnId] >= (ds.principalLaneDispatchRetry?.maxAttempts ?? 7)) {
+      durableHead.dispatchState = 'blocked'; durableHead.blockedReason = 'pre_ipc_rejected_retry_exhausted';
+      sessionStore.updateSession(ds.session); clearPrincipalLaneDispatchRetry(ds, head.turnId); return false;
+    }
     sessionStore.updateSession(ds.session);
     schedulePrincipalLaneDispatchRetry(ds, head.turnId, dependencies);
     return false;

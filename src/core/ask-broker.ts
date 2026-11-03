@@ -1397,6 +1397,18 @@ export function originalControlWaitState(input: {
 }
 
 
+export function originalControlWaitAcceptedAnswer(input: {
+  sessionId: string; originalTurnId: string; askId: string;
+}): boolean {
+  for (const ask of pending.values()) {
+    const wait = ask.controlWait;
+    if (ask.sessionId === input.sessionId && wait?.originalTurnId === input.originalTurnId
+      && wait.wait.askId === input.askId) return ask.settled && ask.terminalResult?.kind === 'answered';
+  }
+  return false;
+}
+
+
 /** 返回当前 pending map 中所有 askId 列表（含 settled 但仍在 retention 内的条目）。
  *  仅供测试使用。 */
 export function _allAskIds(): string[] {
