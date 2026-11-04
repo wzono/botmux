@@ -67,7 +67,9 @@ describe('capacity fleet rollout policy', () => {
 
     const snapshot = createCapacityRolloutStore(root).snapshot();
     for (let index = 0; index < children.length; index++) {
-      expect(snapshot.disabled).toHaveProperty(JSON.stringify([`app-${index}`, 'codex']));
+      // Bun parses JSON-looking strings as a property path in toHaveProperty;
+      // index directly so both runners assert the literal serialized map key.
+      expect(snapshot.disabled[JSON.stringify([`app-${index}`, 'codex'])]).toBeDefined();
     }
   });
 });

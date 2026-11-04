@@ -220,7 +220,8 @@ describe('correlated async answer adversarial production probes', () => {
     try {
       const pending = delivery(scope)('answer', 'ou_owner');
       // Drain only microtasks: real publication has begun its controlled provider wait.
-      await vi.advanceTimersByTimeAsync(0);
+      for (let i = 0; i < 8 && vi.getTimerCount() === 0; i++) await Promise.resolve();
+      expect(vi.getTimerCount()).toBeGreaterThan(0);
       expect(scope.sendWorkerInput).not.toHaveBeenCalled();
       beginReplyTargetTurn(scope.askSession, 'om_root', 'om_intervening', undefined, {
         senderOpenId: 'ou_other', participants: [{ openId: 'ou_other', isBot: false }],
@@ -291,11 +292,12 @@ describe('correlated async answer adversarial production probes', () => {
         senderType: 'user', requestLarkAppId: 'app', requestUserOpenId: 'ou_owner',
       });
       const pending = delivery(scope)('answer', 'ou_owner');
-      // Drain microtasks first: the extracted delivery closure registers its
-      // 20ms abort timer only after one/two internal awaits. Bun's fake-timer
-      // shim advances time BEFORE flushing microtasks, so advancing without
-      // this drain races the timer registration under `bun test` only.
-      await vi.advanceTimersByTimeAsync(0);
+      // The extracted delivery closure reaches this boundary through several
+      // promise continuations before registering the 20ms timer. Drain those
+      // continuations explicitly; polling with fake timers would advance time
+      // before registration and tests the shim rather than the abort boundary.
+      for (let i = 0; i < 8 && vi.getTimerCount() === 0; i++) await Promise.resolve();
+      expect(vi.getTimerCount()).toBeGreaterThan(0);
       await vi.advanceTimersByTimeAsync(20);
       expect(res.destroyed).toBe(true);
       expect(await pending).toBe(false);
