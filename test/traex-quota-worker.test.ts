@@ -152,7 +152,8 @@ describe('quota recovery worker boundary', () => {
       isCriticalInterruptKey: () => true,
       runAfterAmbiguousSubmissionWrites: async (_backend: unknown, action: () => unknown) => action(),
       sendCriticalControlKey: async (_key: string, action: () => unknown) => action(),
-      sendTermActionOnce: vi.fn(() => true), log: vi.fn(), scheduleOneShotAfterAction: vi.fn(),
+      sendTermActionOnce: vi.fn(() => true), canWriteTerminalBytes: () => true,
+      log: vi.fn(), scheduleOneShotAfterAction: vi.fn(),
     });
     expect(f.recover(f.turn)).toBe(true);
     await loadWorkerFunction<(key: string) => Promise<void>>('handleTermAction', f.scope)('ctrlc');

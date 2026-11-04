@@ -62,6 +62,7 @@ export function workerSubmitHarness() {
     runAmbiguousSubmissionTransaction: async (_backend: unknown, write: () => Promise<unknown>,
       _accepted: unknown, prepare: () => void) => { prepare(); return { result: await write() }; },
     adapterInputHandle: (backend: unknown) => backend,
+    writeBackendWorkingDirRejected: () => false,
     settleVerifiableSubmissionForJournal: vi.fn(),
     armInputDeliveryQuarantine: vi.fn(() => null),
     redriveRejectedStructuredReady: vi.fn(), observeQueuedActivationReceipt: vi.fn(),

@@ -219,7 +219,16 @@ const restartCoordinator = new RestartCoordinator();
 const hostPressureWarningsLogged = new Set<string>();
 const lifecycleRetiringWorkers = new WeakMap<DaemonSession, Set<ChildProcess>>();
 const transferRetiringWorkers = new WeakSet<ChildProcess>();
-const productionTurnPermitStore = new TurnPermitStore(config.session.dataDir);
+let productionTurnPermitStore: TurnPermitStore | undefined;
+let productionTurnPermitStoreDataDir: string | undefined;
+function getProductionTurnPermitStore(): TurnPermitStore {
+  const dataDir = config.session.dataDir;
+  if (!productionTurnPermitStore || productionTurnPermitStoreDataDir !== dataDir) {
+    productionTurnPermitStore = new TurnPermitStore(dataDir);
+    productionTurnPermitStoreDataDir = dataDir;
+  }
+  return productionTurnPermitStore;
+}
 const activeBusinessPermitStores = new Map<string, Pick<TurnPermitStore, 'acknowledgeBusinessDelivery'>>();
 const businessPermitAckKey = (sessionId: string, turnId: string, workerGeneration: number) =>
   JSON.stringify([sessionId, turnId, workerGeneration]);
@@ -1342,7 +1351,7 @@ export function setActiveSessionsRegistry(m: Map<string, DaemonSession> | undefi
 
 export async function reconcileTurnPermitDispatches(
   sessions: Iterable<DaemonSession>,
-  store: Pick<TurnPermitStore, 'listDispatching' | 'reconcileBusinessDispatch' | 'listDispatchingControls' | 'reconcileControlReplyDispatch' | 'listExpiredSpawns' | 'recoverExpiredSpawn'> = productionTurnPermitStore,
+  store: Pick<TurnPermitStore, 'listDispatching' | 'reconcileBusinessDispatch' | 'listDispatchingControls' | 'reconcileControlReplyDispatch' | 'listExpiredSpawns' | 'recoverExpiredSpawn'> = getProductionTurnPermitStore(),
 ): Promise<void> {
   const restored = [...sessions];
   const sessionsById = new Map(restored.map(ds => [ds.session.sessionId, ds]));
@@ -15739,7 +15748,7 @@ export async function forkWorkerBlank(
   ds: DaemonSession,
   permit: BlankBootstrapPermit,
   options: Exclude<ForkResumeOrTurnId, boolean | string> = {},
-  permitStore: Pick<TurnPermitStore, 'beginSpawn' | 'releasePreForkFailure'> = productionTurnPermitStore,
+  permitStore: Pick<TurnPermitStore, 'beginSpawn' | 'releasePreForkFailure'> = getProductionTurnPermitStore(),
 ): Promise<'started' | 'deferred' | 'observing' | 'rejected'> {
   if (permit.sessionId !== ds.session.sessionId) return 'rejected';
   const transition = await permitStore.beginSpawn(permit);
@@ -15778,7 +15787,7 @@ export async function submitBusinessInput(
   permit: BusinessSubmitPermit,
   payloadDigest: string,
   options: PermitAwareSubmitOptions = {},
-  permitStore: Pick<TurnPermitStore, 'consumeBusiness' | 'acknowledgeBusinessDelivery'> = productionTurnPermitStore,
+  permitStore: Pick<TurnPermitStore, 'consumeBusiness' | 'acknowledgeBusinessDelivery'> = getProductionTurnPermitStore(),
 ): Promise<boolean> {
   if (permit.sessionId !== ds.session.sessionId
     || permit.workerGeneration !== (ds.session.workerGeneration ?? 0)) return false;
@@ -16288,7 +16297,7 @@ function setupWorkerHandlers(
           receipts[msg.controlDispatchId] = { replyDigest: msg.controlReplyDigest,
             committedAt: new Date().toISOString(), workerGeneration };
           sessionStore.updateSession(ds.session);
-          void productionTurnPermitStore.acknowledgeControlReplyByDispatch({
+          void getProductionTurnPermitStore().acknowledgeControlReplyByDispatch({
             controlDispatchId: msg.controlDispatchId, replyDigest: msg.controlReplyDigest, workerGeneration,
           }).then(result => {
             if (result.status !== 'delivered') return;
@@ -16614,7 +16623,7 @@ function setupWorkerHandlers(
           };
           if (Object.keys(receipts).length > 128) delete receipts[Object.keys(receipts)[0]!];
           sessionStore.updateSession(ds.session);
-          void productionTurnPermitStore.acknowledgeControlReplyByDispatch({
+          void getProductionTurnPermitStore().acknowledgeControlReplyByDispatch({
             controlDispatchId: msg.controlDispatchId,
             replyDigest: msg.controlReplyDigest,
             workerGeneration,
@@ -16627,7 +16636,7 @@ function setupWorkerHandlers(
           }
         }
         const permitAckKey = businessPermitAckKey(ds.session.sessionId, msg.turnId, workerGeneration);
-        const permitStore = activeBusinessPermitStores.get(permitAckKey) ?? productionTurnPermitStore;
+        const permitStore = activeBusinessPermitStores.get(permitAckKey) ?? getProductionTurnPermitStore();
         void permitStore.acknowledgeBusinessDelivery({
           sessionId: ds.session.sessionId,
           turnId: msg.turnId,

@@ -371,6 +371,7 @@ function aliveWorker(): { killed: boolean } {
 beforeEach(() => {
   vi.clearAllMocks();
   sendWorkerInput.mockReturnValue(true);
+  forkWorker.mockReturnValue(true);
 });
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

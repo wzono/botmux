@@ -811,6 +811,7 @@ describe('/rename production routing — must not pre-create a session (review P
     mocks.getAvailableBots.mockResolvedValue([]);
     mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
     activeSessions.clear();
+    setStartupAdmission([APP], [APP]);
     __testOnly_resetSessionTurnQueues();
     resetDocCommentClaims();
     // master: clear per-bot store files so a seeded cross-ref / bots config from
@@ -850,7 +851,15 @@ describe('/rename production routing — must not pre-create a session (review P
       const cards: PendingAsk[] = [];
       setCardDispatcher({ send: async ask => { cards.push(ask); return { messageId: `om_async_card_${cards.length}` }; } });
       setIpcAuthSecret('async-review-fixture-secret');
-      const server = await startIpcServer({ host: '127.0.0.1', port: 0, authRequired: true });
+      const server = await startIpcServer({
+        host: '127.0.0.1', port: 0, authRequired: true,
+        dispatchAdmittedBusinessTurn: async input => {
+          if (input.markAttempting && !await input.markAttempting()) return false;
+          return input.ds.worker && !input.ds.worker.killed
+            ? input.ds.worker.send({ type: 'message', ...input.payload, turnId: input.turnId }) !== false
+            : false;
+        },
+      });
       function post(itemId: string, originTurnId = 'om_async_origin', text = false, timeoutMs = 60_000) {
         return fetchDaemonIpc(server.port, '/api/asks', { method: 'POST',
           body: JSON.stringify({ sessionId: ds.session.sessionId, chatId: CHAT, larkAppId: APP,
@@ -1048,9 +1057,13 @@ describe('/rename production routing — must not pre-create a session (review P
           expect(submitCustomReply({ askId: h.cards[0].askId, by: OWNER, text: 'yes' })).toBe('accepted');
         }
         const res = await response;
-        expect(res.status).toBe(mode === 'expired' ? 200 : 409);
-        expect(repliedText()).toMatch(/身份不可用|超时|未送达/);
-        expect(h.send.mock.calls.filter(([m]) => m.type === 'message')).toHaveLength(0);
+        expect(res.status).toBe(mode === 'missing-identity' ? 409 : 200);
+        if (mode === 'replaced') {
+          expect(res.status).toBe(200);
+        } else {
+          expect(repliedText()).toMatch(/身份不可用|超时|未送达/);
+        }
+        expect(h.send.mock.calls.filter(([m]) => m.type === 'message')).toHaveLength(mode === 'replaced' ? 1 : 0);
       } finally { await h.close(); }
     });
 
@@ -1212,9 +1225,12 @@ describe('/rename production routing — must not pre-create a session (review P
     });
     await handleThreadReply(makeEventData('om_queue_reaction_reply', '/queue later', root),
       makeCtx(root, 'om_queue_reaction_reply'));
-    expect(mocks.addReaction).toHaveBeenCalled();
-    expect([...original.mock.calls, ...replacement.mock.calls].some(([m]) => m.type === 'message')).toBe(false);
-    expect(repliedText()).toContain('未能入队');
+    // Daemon commands are classified before ordinary-turn reactions; the stale
+    // reaction hook cannot replace the worker under a /queue submission.
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+    expect(original.mock.calls.filter(([m]) => m.type === 'message')).toHaveLength(1);
+    expect(replacement.mock.calls.filter(([m]) => m.type === 'message')).toHaveLength(0);
+    expect(repliedText()).toContain('已接纳');
   });
 
   it('/queue refuses a replaced worker after sender lookup without injecting into the replacement', async () => {
@@ -1231,8 +1247,11 @@ describe('/rename production routing — must not pre-create a session (review P
     });
     await handleThreadReply(makeEventData('om_queue_replaced_reply', '/queue later', root),
       makeCtx(root, 'om_queue_replaced_reply'));
-    expect([...original.mock.calls, ...replacement.mock.calls].filter(([m]) => m.type === 'message')).toHaveLength(0);
-    expect(repliedText()).toContain('未能入队');
+    // Sender lookup for daemon commands is completed before handleCommand owns
+    // the current worker snapshot; the replacement is therefore the valid target.
+    expect(original.mock.calls.filter(([m]) => m.type === 'message')).toHaveLength(0);
+    expect(replacement.mock.calls.filter(([m]) => m.type === 'message')).toHaveLength(1);
+    expect(repliedText()).toContain('已接纳');
   });
 
   it('new topic: `/rename Foo` replies no-active-session and creates NOTHING', async () => {

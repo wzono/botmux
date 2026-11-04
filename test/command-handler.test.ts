@@ -57,6 +57,11 @@ vi.mock('../src/config.js', () => ({
   },
 }));
 
+vi.mock('../src/services/bot-admin-unions-store.js', async () => {
+  const actual = await vi.importActual<any>('../src/services/bot-admin-unions-store.js');
+  return { ...actual, withBotAdminIdentityPublication: async (_dataDir: string, effect: () => Promise<unknown>) => effect() };
+});
+
 // command-handler's cross-daemon calls are authenticated in production. These
 // unit tests exercise relay orchestration with a stubbed global fetch, so keep
 // that seam while bypassing host-secret filesystem setup.

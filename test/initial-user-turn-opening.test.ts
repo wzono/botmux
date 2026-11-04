@@ -109,6 +109,23 @@ vi.mock('../src/core/worker-pool.js', async () => {
   };
 });
 
+vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/admitted-turn-dispatch.js');
+  return {
+    ...actual,
+    // This route fixture deliberately uses synthetic live workers without a
+    // filesystem identity / ready handshake. Stop the central workspace
+    // admission adapter at its worker boundary; permit semantics are covered by
+    // their own suites, while this file keeps asserting the exact opening bytes.
+    dispatchAdmittedBusinessTurn: vi.fn(async (input: any) => {
+      if (input.ds.worker && !input.ds.worker.killed) {
+        return mocks.sendWorkerInput(input.ds, input.payload, input.turnId, input.options);
+      }
+      return mocks.forkWorker(input.ds, input.payload, { ...input.options, turnId: input.turnId });
+    }),
+  };
+});
+
 // hook 注入的 preflight：默认 false（不影响现有 codex 测试），特定用例置 true。
 const preflightMock = vi.fn(() => false);
 vi.mock('../src/adapters/hook-installer.js', () => ({

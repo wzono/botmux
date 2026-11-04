@@ -154,8 +154,16 @@ vi.mock('../src/services/session-store.js', async () => {
 vi.mock('../src/core/worker-pool.js', async () => {
   const actual = await vi.importActual<any>('../src/core/worker-pool.js');
   return { ...actual, forkWorker: mocks.forkWorker,
-    sendWorkerInput: (...args: any[]) => String(args[2] ?? '').startsWith('om_effort')
-      ? mocks.sendWorkerInput(...args) : actual.sendWorkerInput(...args),
+    submitBusinessInput: async (...args: any[]) => {
+      const [ds, payload, permit, digest, options, store] = args;
+      if (!String(permit?.turnId ?? '').startsWith('om_effort')) {
+        return actual.submitBusinessInput(...args);
+      }
+      const dispatch = await store.consumeBusiness(permit, digest);
+      if (dispatch.status === 'duplicate') return true;
+      if (dispatch.status !== 'acquired') return false;
+      return mocks.sendWorkerInput(ds, payload, permit.turnId, options);
+    },
     updateCodexCliEffort: mocks.updateCodexCliEffort };
 });
 
@@ -275,8 +283,12 @@ function seedThreadSession(anchor: string, title: string): DaemonSession {
     lastMessageAt: Date.now(),
     hasHistory: false,
     ownerOpenId: OWNER,
+    workingDir: process.cwd(),
+    lastWorkerReadyCwd: process.cwd(),
+    workerReady: true,
     session: {
       sessionId: 'sess-seeded-' + Math.random().toString(36).slice(2),
+      workingDir: process.cwd(),
       chatId: CHAT,
       rootMessageId: anchor,
       title,

@@ -80,6 +80,21 @@ vi.mock('../src/core/worker-pool.js', async () => {
   return { ...actual, forkWorker: (...args: any[]) => mocks.forkWorker(...args) };
 });
 
+vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/admitted-turn-dispatch.js');
+  return {
+    ...actual,
+    dispatchAdmittedBusinessTurn: vi.fn(async ({ ds, payload }: any) => {
+      if (ds.worker && !ds.worker.killed) {
+        ds.worker.send({ type: 'message', payload });
+      } else {
+        mocks.forkWorker(ds, payload);
+      }
+      return true;
+    }),
+  };
+});
+
 vi.mock('../src/im/lark/audio-transcribe.js', async () => {
   const actual = await vi.importActual<any>('../src/im/lark/audio-transcribe.js');
   return { ...actual, resolveInboundAudio: (...args: any[]) => mocks.resolveInboundAudio(...args) };

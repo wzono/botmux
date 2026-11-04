@@ -584,7 +584,11 @@ export class FleetSupervisor {
       if (existing) {
         existing.pid = child.pid ?? 0;
         existing.generation += 1;
-        existing.status = 'online';
+        // spawn() may return a ChildProcess before exec fails with ENOENT/EACCES.
+        // A pid-less generation is not online evidence; persist it as launching so
+        // the fail-closed state parser remains readable until the error path
+        // records the terminal result.
+        existing.status = child.pid ? 'online' : 'launching';
         existing.startedAt = now;
         existing.lastExitCode = null;
         // A crash-driven respawn (isRestart) must PRESERVE restarts — that's the
@@ -601,7 +605,9 @@ export class FleetSupervisor {
         else delete existing.configHash;
         if (child.pid) existing.processStart = readDurableProcessIdentity(child.pid);
       } else {
-        cur.procs.push({ ...freshProc(spec.name, spec.appId, child.pid ?? 0, now, spec.external?.configHash) });
+        const fresh = freshProc(spec.name, spec.appId, child.pid ?? 0, now, spec.external?.configHash);
+        if (!child.pid) fresh.status = 'launching';
+        cur.procs.push(fresh);
         if (child.pid) cur.procs[cur.procs.length - 1].processStart = readDurableProcessIdentity(child.pid);
       }
       return cur;

@@ -104,7 +104,7 @@ describe('workspace ownership discovery', () => {
     symlinkSync(f.root, alias, 'dir');
     const raw = join(alias, 'work', 'repo');
     f.add('aliased', 'app-a', raw);
-    expect(canonicalWorkspacePath(raw)).toBe(join(f.workspace, 'repo'));
+    expect(canonicalWorkspacePath(raw)).toBe(canonicalWorkspacePath(join(f.workspace, 'repo')));
     expect((await f.recycler.prepare('op-alias', f.workspace)).ok).toBe(true);
     rmSync(f.workspace, { recursive: true });
     expect((await f.recycler.finish('op-alias', success)).status).toBe('closed');
@@ -130,7 +130,7 @@ describe('workspace ownership discovery', () => {
     const db = new DatabaseSync(join(dir, 'sessions.db'));
     db.exec('CREATE TABLE sessions (session_id TEXT PRIMARY KEY, row TEXT NOT NULL)');
     db.prepare('INSERT INTO sessions VALUES (?, ?)').run(session.sessionId, JSON.stringify(session)); db.close();
-    expect(loadAllSessionsStrict(f.dataDir)).toEqual([session]);
+    expect(loadAllSessionsStrict(f.dataDir)).toEqual([{ ...session, workingDirSource: 'legacy-unknown' }]);
     expect(readFileSync(join(f.dataDir, 'sessions-app-a.json'), 'utf8')).toBe('{stale snapshot');
   });
 
@@ -309,7 +309,9 @@ describe('recycle lifecycle and recovery', () => {
     f.sessions.get('one')!.status = 'closed'; f.live.delete('one');
     rmSync(f.workspace, { recursive: true });
     expect((await f.recycler.finish('op', success)).status).toBe('closed');
-    expect(f.sessions.get('one')?.workspaceRetirement).toMatchObject({ operationId: 'op', workspacePath: f.workspace });
+    expect(f.sessions.get('one')?.workspaceRetirement).toMatchObject({
+      operationId: 'op', workspacePath: canonicalWorkspacePath(f.workspace),
+    });
     expect(f.closed).toEqual([]);
   });
 

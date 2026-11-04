@@ -101,6 +101,47 @@ vi.mock('../src/im/lark/identity-cache.js', async () => {
   return { ...actual, resolveSender: (...args: any[]) => mocks.resolveSender(...args) };
 });
 
+vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/admitted-turn-dispatch.js');
+  return {
+    ...actual,
+    // This suite exercises topic-header routing, not central workspace permits.
+    // Keep its historical worker seam while preserving the admitted dispatcher contract.
+    dispatchAdmittedBusinessTurn: async (input: any) => {
+      if (!input.ds.worker || input.ds.worker.killed) {
+        let terminal: 'accepted' | 'rejected' | 'deferred' | undefined;
+        let release!: () => void;
+        const settled = new Promise<void>(resolve => { release = resolve; });
+        const options = {
+          ...input.options,
+          onAdmission: (state: 'accepted' | 'rejected' | 'deferred') => {
+            terminal = state;
+            if (state !== 'deferred') release();
+          },
+          onAdmissionBlocked: (notice: any) => input.options.onAdmissionBlocked?.(notice),
+        };
+        const forked = mocks.forkWorker(input.ds, input.payload, input.turnId, options);
+        if (forked === false) return false;
+        if (!terminal) { terminal = 'accepted'; release(); }
+        if (terminal === 'deferred') await settled;
+        return terminal === 'accepted';
+      }
+      const permit = {
+        permitId: `fixture-${input.turnId}`,
+        bootstrapPermitId: 'fixture-bootstrap',
+        sessionId: input.ds.session.sessionId,
+        turnId: input.turnId,
+        workerGeneration: input.ds.session.workerGeneration ?? input.ds.workerGeneration ?? 0,
+        workspace: actual.frozenSessionWorkspace(input.ds)?.workspace,
+        expiresAt: Date.now() + 60_000,
+      };
+      if (input.resource?.acquire && !await input.resource.acquire(permit)) return false;
+      if (input.resource?.markAttempting && !await input.resource.markAttempting(permit)) return false;
+      return mocks.sendWorkerInput(input.ds, input.payload, input.turnId, input.options);
+    },
+  };
+});
+
 vi.mock('../src/core/worker-pool.js', async () => {
   const actual = await vi.importActual<any>('../src/core/worker-pool.js');
   return {

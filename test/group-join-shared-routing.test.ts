@@ -11,6 +11,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 
 const mocks = vi.hoisted(() => ({
   forkWorker: vi.fn(),
+  dispatchAdmittedBusinessTurn: vi.fn(),
   registerHostAsk: vi.fn(),
   getAvailableBots: vi.fn(async () => []),
   getChatContext: vi.fn(async (_appId: string, chatId: string) => ({
@@ -85,6 +86,11 @@ vi.mock('../src/core/worker-pool.js', async () => {
   return { ...actual, forkWorker: mocks.forkWorker };
 });
 
+vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/admitted-turn-dispatch.js');
+  return { ...actual, dispatchAdmittedBusinessTurn: mocks.dispatchAdmittedBusinessTurn };
+});
+
 let tempRoot = '';
 let modules: Awaited<ReturnType<typeof loadModules>>;
 
@@ -121,6 +127,12 @@ beforeEach(() => {
   modules.daemon.__testOnly_setAutoStartJoinReadyMaxWaitMs();
   vi.clearAllMocks();
   mocks.forkWorker.mockReset();
+  mocks.dispatchAdmittedBusinessTurn.mockImplementation(async (input: any) => {
+    const { ds, payload, turnId, options } = input;
+    if (!ds.worker || ds.worker.killed) mocks.forkWorker(ds, payload, { turnId, trustedCaller: options.trustedCaller }, {});
+    else ds.worker.send({ type: 'message', ...payload, turnId, ...(options.trustedCaller ? { trustedCaller: options.trustedCaller } : {}), ...(ds.activeInteractiveTurn ? { queueAfterActiveTurn: true } : {}) });
+    return true;
+  });
   mocks.getChatContext.mockImplementation(async (_appId: string, chatId: string) => ({
     chatId,
     name: '【Pippit】【BUG】测试群',
