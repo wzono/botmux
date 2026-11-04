@@ -264,9 +264,10 @@ describe('daemon XPI shared-cwd lifecycle callbacks', () => {
     }));
     expect(onTurnTerminal(adoptedDs, { turnId: 'turn-adopted-first' }, { workerGeneration: 11 }))
       .toBe(true);
-
-    expect(await driveNextTurn('xpi-admission:adopt-progress', dependencies)).toBe(true);
-    expect(followerSend).toHaveBeenCalledTimes(1);
+    // Terminal settlement queues the next coordinator drive itself. Observe that
+    // production callback instead of racing it with a second manual drive; Bun
+    // reaches the explicit call before the queued microtask more often than Node.
+    await vi.waitFor(() => expect(followerSend).toHaveBeenCalledTimes(1));
     expect(followerSend.mock.calls[0]?.[0]).toEqual(expect.objectContaining({
       type: 'message',
       turnId: 'turn-follower-second',
