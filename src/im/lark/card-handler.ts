@@ -153,6 +153,8 @@ export interface CardHandlerDeps {
   v3LoopGrantDeps?: V3LoopGrantCardHandlerDeps;
   /** v3 回溯预算准许卡点击处理（同一个 runner 的 driveRun）. */
   v3RevisitGrantDeps?: V3RevisitGrantCardHandlerDeps;
+  /** v3 运行中「流程修改确认」卡的同意 / 拒绝（只有发起人能点）。 */
+  v3RevisionDeps?: import('./v3-revision-card-handler.js').V3RevisionCardHandlerDeps;
   /** v3 成功终态卡的「保存复用」动作。 */
   v3RunSaveDeps?: V3RunSaveCardHandlerDeps;
   /** v3 参数蒸馏提案的接受/拒绝动作。 */
@@ -4745,6 +4747,9 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       if (!ds) {
         return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, locDs) } };
       }
+      if (ds.session.pendingForkSession && sessionCliId(ds) === 'antigravity') {
+        return { toast: { type: 'warning', content: t('cmd.stop.fork_pending', undefined, locDs) } };
+      }
       if (isSessionTransferring(ds)) {
         return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, locDs) } };
       }
@@ -5006,6 +5011,9 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
 
     // Quick-action keys (Esc, ^C, Tab, Space, Enter, ←↑↓→, ½ page) — forward to worker.
     if (actionType === 'term_action' && ds) {
+      if (ds.session.pendingForkSession && sessionCliId(ds) === 'antigravity') {
+        return { toast: { type: 'warning', content: t('cmd.stop.fork_pending', undefined, localeForBot(ds.larkAppId)) } };
+      }
       if (isSessionTransferring(ds)) {
         return {
           toast: {
