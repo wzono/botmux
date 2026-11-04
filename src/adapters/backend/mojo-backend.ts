@@ -643,7 +643,8 @@ export class MojoBackend implements SessionBackend {
     }
 
     validateWorkingDirBeforeBusinessInput(): boolean {
-        return this.hostWorkingDirContract.matches() && (!this.hostWorkingDirContract.validatedProof() || !!this.effectiveWorkspaceProof());
+        return this.hostWorkingDirContract.identityMatches()
+            && (!this.hostWorkingDirContract.hasExpectedIdentity() || !!this.effectiveWorkspaceProof());
     }
 
     effectiveWorkspaceProof() {
@@ -674,7 +675,7 @@ export class MojoBackend implements SessionBackend {
         const result = new Promise<'submitted' | 'retryable_pre_dispatch_rejection'>(resolve => { resolveResult = resolve; });
         this.writeChain = this.writeChain
             .then(() => {
-                if (this.killed || this.closing || !this.hostWorkingDirContract.matches()) {
+                if (this.killed || this.closing || !this.hostWorkingDirContract.identityMatches()) {
                     resolveResult('retryable_pre_dispatch_rejection');
                     return undefined;
                 }
