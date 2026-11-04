@@ -49,7 +49,7 @@ function daemonScope(): Record<string, any> {
     createHash: () => ({ update: () => ({ digest: () => 'digest' }) }),
     askAnswerActorFor: () => scope.actor,
     isKnownPeerBot: () => false, config: { session: { dataDir: '/unused' } },
-    askSession: { larkAppId: 'app', chatId: 'oc_chat', session: { backendType: 'pty' } },
+    askSession: { larkAppId: 'app', chatId: 'oc_chat', session: { backendType: 'pty', status: 'active' } },
     resolveSender: async () => ({ name: 'User' }),
     isCurrent: () => scope.current, current: true, asyncCaller: 'ou_owner',
     randomUUID: () => 'probe', getBot: () => ({ config: {}, botName: 'Bot', botOpenId: 'ou_bot' }),
@@ -60,7 +60,8 @@ function daemonScope(): Record<string, any> {
       workspace: { path: '/repo', dev: '1', ino: '2' }, groupRevision: 1,
       wait: { kind: 'ask', askId: 'call' }, state: 'needs_user' } },
     originalControlWaitState: () => 'needs_user', originalControlWaitAcceptedAnswer: () => true,
-    centralTurnPermitStore: { issueControlReply: vi.fn(), beginControlReplyDispatch: vi.fn(async () => ({ status: 'acquired' })),
+    evaluateAskAnswerTalk: vi.fn(async () => true),
+    centralTurnPermitStore: { issueControlReply: vi.fn(async () => ({ controlDispatchId: 'control', expectedGeneration: 7, expiresAt: Date.now() + 1000 })), beginControlReplyDispatch: vi.fn(async () => ({ status: 'acquired' })),
       abortControlReplyDispatch: vi.fn(async () => ({ status: 'retry' })) },
     resumeAdmittedControlReply: async (input: any) => { const permit = { controlDispatchId: 'control', expectedGeneration: 7 }; const status = await input.beginDispatch(permit); return status === 'acquired' ? input.resume(permit) : undefined; },
     boundAsk: { sessionId: 'session', larkAppId: 'app', chatId: 'oc_chat', rootMessageId: 'om_root' },
@@ -73,6 +74,7 @@ function daemonScope(): Record<string, any> {
     codexAsyncAnswerSteerTarget, larkTransportEnabled: () => true,
     codexAppCleanInputAcceptedForSession: () => scope.clean, clean: true,
     sendWorkerInput: vi.fn(() => true), beginNewTurn: vi.fn(), rememberLastCliInput: vi.fn(),
+    findActiveBySessionId: () => scope.askSession,
     markSessionActivity: vi.fn(), sessionStore: { updateSession: vi.fn() }, logger: { info: vi.fn() },
   };
   scope.askSession.worker = scope.asyncWorker;
@@ -295,6 +297,84 @@ describe('correlated async answer adversarial production probes', () => {
       expect(await pending).toBe(false);
       expect(scope.sendWorkerInput).not.toHaveBeenCalled();
     });
+  it.each(['removed-session', 'changed-native-thread'] as const)(
+    'rejects async Ask delivery after %s', async mode => {
+      const scope = daemonScope();
+      const res = new ServerResponse(new IncomingMessage(new Socket()));
+      const worker = scope.asyncWorker;
+      Object.assign(scope.askSession, { worker });
+      Object.assign(scope.askSession.session, { workerGeneration: 7, cliSessionId: 'thread', status: 'active' });
+      Object.assign(scope, { res, findActiveBySessionId: () => mode === 'removed-session' ? undefined : scope.askSession });
+      if (mode === 'changed-native-thread') scope.askSession.session.cliSessionId = 'replacement-thread';
+      scope.isCurrent = deliveryIsCurrent(scope);
+      expect(await delivery(scope)('answer', 'ou_owner')).toBe(false);
+      expect(scope.sendWorkerInput).not.toHaveBeenCalled();
+      res.destroy();
+    },
+  );
+
+  it('aborts an acquired control dispatch when post-acquisition preparation fails', async () => {
+    const scope = daemonScope();
+    const res = new ServerResponse(new IncomingMessage(new Socket()));
+    Object.assign(scope, { res, findActiveBySessionId: () => scope.askSession,
+      resolveSender: async () => { throw new Error('sender lookup failed'); } });
+    scope.isCurrent = deliveryIsCurrent(scope);
+    await expect(delivery(scope)('answer', 'ou_owner')).rejects.toThrow('sender lookup failed');
+    expect(scope.centralTurnPermitStore.abortControlReplyDispatch).toHaveBeenCalledWith(
+      expect.objectContaining({ controlDispatchId: 'control' }), 'digest',
+    );
+    res.destroy();
+  });
+
+  it('does not rearm an acquired dispatch after worker acceptance when lifecycle persistence fails', async () => {
+    const scope = daemonScope();
+    const res = new ServerResponse(new IncomingMessage(new Socket()));
+    Object.assign(scope, { res, findActiveBySessionId: () => scope.askSession,
+      beginNewTurn: vi.fn(() => { throw new Error('lifecycle write failed'); }) });
+    scope.isCurrent = deliveryIsCurrent(scope);
+    await expect(delivery(scope)('answer', 'ou_owner')).rejects.toThrow('lifecycle write failed');
+    expect(scope.sendWorkerInput).toHaveBeenCalledOnce();
+    expect(scope.centralTurnPermitStore.abortControlReplyDispatch).not.toHaveBeenCalled();
+    res.destroy();
+  });
+
+  it('treats a delivered duplicate as success without replaying lifecycle side effects', async () => {
+    const scope = daemonScope();
+    const res = new ServerResponse(new IncomingMessage(new Socket()));
+    Object.assign(scope, { res, findActiveBySessionId: () => scope.askSession });
+    scope.centralTurnPermitStore.beginControlReplyDispatch = vi.fn(async () => ({ status: 'delivered' }));
+    scope.evaluateAskAnswerTalk = vi.fn(async () => true);
+    scope.resumeAdmittedControlReply = productionFunction('src/core/turn-admission.ts', 'resumeAdmittedControlReply', scope);
+    scope.isCurrent = deliveryIsCurrent(scope);
+    expect(await delivery(scope)('answer', 'ou_owner')).toBe(true);
+    expect(scope.beginReplyTargetTurn).not.toHaveBeenCalled();
+    expect(scope.noteTurnReceived).not.toHaveBeenCalled();
+    expect(scope.trustedCallerForInboundTurn).not.toHaveBeenCalled();
+    expect(scope.sendWorkerInput).not.toHaveBeenCalled();
+    expect(scope.beginNewTurn).not.toHaveBeenCalled();
+    res.destroy();
+  });
+
+  it('allows the frozen original worker after workspace rebind in the same active native thread', async () => {
+    const scope = daemonScope();
+    const res = new ServerResponse(new IncomingMessage(new Socket()));
+    const original = scope.asyncWorker;
+    const replacement = { killed: false, connected: true, send: vi.fn(() => true) };
+    Object.assign(scope.askSession, { worker: replacement,
+      retainedControlReplyWorkers: new Map([['call', { worker: original, generation: 7,
+        controlDispatchId: 'control', controlReplyDigest: 'digest', expiresAt: Date.now() + 1000 }]]) });
+    Object.assign(scope.askSession.session, { workerGeneration: 8, cliSessionId: 'thread', status: 'active' });
+    Object.assign(scope, { res, findActiveBySessionId: () => scope.askSession });
+    scope.isCurrent = deliveryIsCurrent(scope);
+    expect(await delivery(scope)('answer', 'ou_owner')).toBe(true);
+    expect(original.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message', codexAppSteerable: true,
+      codexAppInput: expect.objectContaining({ steerTargetTurnId: 'native-original' }),
+    }));
+    expect(scope.sendWorkerInput).not.toHaveBeenCalled();
+    res.destroy();
+  });
+
   it('allows an answer after natural native completion with an intact question response', async () => {
     const scope = daemonScope();
     const res = new ServerResponse(new IncomingMessage(new Socket()));

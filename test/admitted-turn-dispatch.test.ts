@@ -101,6 +101,18 @@ describe('central admitted turn dispatch', () => {
     expect(trace).toEqual(['auth', 'permit', 'dispatching', 'resume:original']);
   });
 
+  it('returns idempotent success for an already-delivered control permit without resending', async () => {
+    const resume = vi.fn(async () => true);
+    expect(await resumeAdmittedControlReply({
+      authorizeFresh: async () => true,
+      issuePermit: async () => ({ permitId: 'c', sessionId: 's', originalTurnId: 'original', wait: { kind: 'ask', askId: 'a' }, expectedGeneration: 4, workspace, expiresAt: Date.now() + 1000 } as never),
+      beginDispatch: async () => 'delivered',
+      resume,
+      abort: async () => {},
+    })).toEqual({ status: 'already_delivered' });
+    expect(resume).not.toHaveBeenCalled();
+  });
+
   it('never dispatches a control permit when fresh authorization fails', async () => {
     const beginDispatch = vi.fn();
     expect(await resumeAdmittedControlReply({

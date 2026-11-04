@@ -13934,7 +13934,7 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   const targetBackend = backend;
   const lifetime = cliLifetimeNonce;
   if (codexCliEffortOperation) await cancelCodexCliEffort();
-  if (backend !== targetBackend || cliLifetimeNonce !== lifetime) return;
+  if (backend !== targetBackend || cliLifetimeNonce !== lifetime || !canWriteTerminalBytes()) return;
   const isHalfPage = key === 'half_page_up' || key === 'half_page_down';
 
   // Tmux copy-mode scroll (works around alternate-buffer scrollback limitation)
@@ -13965,15 +13965,23 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
 
   const criticalInterrupt = isCriticalInterruptKey(key);
+  let retryCancelledByFence = false;
   let delivered = false;
   try {
     delivered = await runAfterAmbiguousSubmissionWrites(
       targetBackend,
       async () => {
+        if (backend !== targetBackend || cliLifetimeNonce !== lifetime || !canWriteTerminalBytes()) {
+          retryCancelledByFence = true;
+          return true;
+        }
         if (criticalInterrupt) {
           return sendCriticalControlKey(key, () => {
             // Never retry an old interrupt into a replacement CLI generation.
-            if (backend !== targetBackend) return true;
+            if (backend !== targetBackend || cliLifetimeNonce !== lifetime || !canWriteTerminalBytes()) {
+              retryCancelledByFence = true;
+              return true;
+            }
             return sendTermActionOnce(targetBackend, key);
           });
         }
@@ -13985,7 +13993,7 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
       log(`Term action ${key} failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
-  if (backend !== targetBackend) return;
+  if (backend !== targetBackend || retryCancelledByFence) return;
   if (!delivered) {
     log(`Term action ${key} was not delivered${criticalInterrupt ? ' after retry' : ''}`);
     if (criticalInterrupt) {
@@ -30292,6 +30300,7 @@ process.on('message', async (raw: unknown) => {
       // One short, atomic frame; never splice into a chunked business input or
       // rotate currentBotmuxTurnId, readiness, the dispatch ledger, or the card.
       if (!isCodexAppCliId(lastInitConfig?.cliId) || !backend || !codexAppControlProven
+        || !canWriteTerminalBytes()
         || isFlushing || commandLineWritesPending > 0 || cliRestartInProgress
         || shouldHoldCodexRunnerInput(codexRunnerFreshness) || lastInitConfig.adoptMode) {
         send({ type: 'codex_app_effort_result', requestId: msg.requestId, status: 'unavailable' });

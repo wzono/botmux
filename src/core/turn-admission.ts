@@ -150,12 +150,12 @@ export async function resumeAdmittedControlReply<T>(input: {
   beginDispatch(permit: ControlReplyPermit): Promise<'acquired' | 'observing' | 'delivered' | 'rejected'>;
   resume(permit: ControlReplyPermit): Promise<T>;
   abort(permit: ControlReplyPermit): Promise<void>;
-}): Promise<T | undefined> {
+}): Promise<T | { status: 'already_delivered' } | undefined> {
   if (!await input.authorizeFresh()) return undefined;
   const permit = await input.issuePermit();
   if (!permit) return undefined;
   const dispatch = await input.beginDispatch(permit);
-  if (dispatch === 'delivered') return undefined;
+  if (dispatch === 'delivered') return { status: 'already_delivered' };
   if (dispatch !== 'acquired') return undefined;
   const result = await resumeOriginalTurnReply(permit, () => input.resume(permit));
   if (result === false) await input.abort(permit);

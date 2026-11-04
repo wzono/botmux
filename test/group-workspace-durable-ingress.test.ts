@@ -100,7 +100,7 @@ describe('group workspace durable ingress', () => {
         abort: async p => { await store.abortControlReplyDispatch(p, 'digest'); },
       });
       expect(await run()).toBe(true);
-      expect(await run()).toBeUndefined();
+      expect(await run()).toEqual({ status: 'already_delivered' });
       expect(sends).toBe(1);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });

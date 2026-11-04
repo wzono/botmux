@@ -265,7 +265,6 @@ import {
 import { hasProtectedSessionMutationOwnership } from './core/session-mutation-guard.js';
 import { dispatchAdmittedBusinessTurn, frozenSessionWorkspace } from './core/admitted-turn-dispatch.js';
 import { createWorkspaceBusinessDispatcher } from './core/workspace-business-dispatcher.js';
-import { resumeAdmittedControlReply } from './core/turn-admission.js';
 import { TurnPermitStore } from './services/turn-permit-store.js';
 import { delay } from './utils/timing.js';
 import { BoundedMap } from './utils/bounded-map.js';
@@ -9874,7 +9873,10 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
   if (asyncInput && askSession && result.kind === 'answered') {
     const isCurrent = () => {
       const retained = askSession.retainedControlReplyWorkers?.get(asyncInput.itemId);
-      return !res.destroyed && !!asyncWorker && asyncWorker.connected !== false && !asyncWorker.killed
+      const active = findActiveBySessionId(askSession.session.sessionId);
+      return !res.destroyed && active === askSession && askSession.session.status === 'active'
+        && askSession.session.cliSessionId === asyncInput.threadId
+        && !!asyncWorker && asyncWorker.connected !== false && !asyncWorker.killed
         && ((!retained && asyncGeneration === askInput.controlWait?.expectedGeneration)
           || (!!retained && retained.worker === asyncWorker && retained.generation === asyncGeneration));
     };
@@ -9884,12 +9886,55 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
         const actor = askAnswerActorFor(result);
         const byIsBot = actor?.botSender === true || isKnownPeerBot(config.session.dataDir, askSession.larkAppId, by);
         const byType = byIsBot ? true : actor ? (actor.senderType === 'user' ? false : undefined) : false;
+        const frozenControl = askInput.controlWait;
+        if (!frozenControl || frozenControl.wait.kind !== 'ask'
+          || frozenControl.wait.askId !== asyncInput.itemId) return false;
+        if (!await evaluateAskAnswerTalk(askSession.larkAppId, askSession.chatId, by, askSession.chatType, actor)) return false;
+        const replyDigest = createHash('sha256').update(text).digest('hex');
+        const permit = await centralTurnPermitStore.issueControlReply({
+          sessionId: askSession.session.sessionId,
+          originalTurnId: frozenControl.originalTurnId,
+          wait: frozenControl.wait,
+          expectedGeneration: frozenControl.expectedGeneration,
+          workspace: frozenControl.workspace,
+          ...(frozenControl.groupRevision === undefined ? {} : { groupRevision: frozenControl.groupRevision }),
+          expiresAt: Date.now() + 60_000,
+        });
+        const originalAlive = !!asyncWorker && asyncGeneration === frozenControl.expectedGeneration
+          && asyncWorker.connected !== false && !asyncWorker.killed;
+        const waitState = originalControlWaitState({ sessionId: askSession.session.sessionId,
+          originalTurnId: asyncOriginTurn!, askId: asyncInput.itemId });
+        const originalStillWaiting = frozenControl.state === 'needs_user'
+          && (waitState === 'needs_user' || originalControlWaitAcceptedAnswer({
+            sessionId: askSession.session.sessionId, originalTurnId: asyncOriginTurn!, askId: asyncInput.itemId }));
+        const controlDispatch = originalAlive && originalStillWaiting
+          ? await centralTurnPermitStore.beginControlReplyDispatch(permit, replyDigest, {
+              sessionId: askSession.session.sessionId, originalTurnId: frozenControl.originalTurnId,
+              wait: frozenControl.wait, workerGeneration: frozenControl.expectedGeneration,
+              workspace: frozenControl.workspace,
+              ...(frozenControl.groupRevision === undefined ? {} : { groupRevision: frozenControl.groupRevision }),
+              originalState: frozenControl.state, authorized: true,
+            })
+          : { status: 'rejected' as const };
+        if (controlDispatch.status === 'delivered') return true;
+        if (controlDispatch.status !== 'acquired') return false;
+        (askSession.retainedControlReplyWorkers ??= new Map()).set(asyncInput.itemId, {
+          worker: asyncWorker!, generation: asyncGeneration!, controlDispatchId: permit.controlDispatchId,
+          controlReplyDigest: replyDigest, expiresAt: permit.expiresAt,
+        });
+        const abortAcquired = async () => {
+          askSession.retainedControlReplyWorkers?.delete(asyncInput.itemId);
+          await centralTurnPermitStore.abortControlReplyDispatch(permit, replyDigest);
+          return false;
+        };
+        let ipcAccepted = false;
+        try {
         const sender = await resolveSender(askSession.larkAppId, by, byIsBot ? 'bot' : 'user');
         // Never send an old card's answer into a replacement runner, another
         // native thread or another principal's active session after this await.
-        if (!isCurrent() || (asyncCaller && by !== asyncCaller)) return false;
+        if (!isCurrent() || (asyncCaller && by !== asyncCaller)) return abortAcquired();
         const turnId = asyncOriginTurn;
-        if (!turnId || !asyncGeneration) return false;
+        if (!turnId || !asyncGeneration) return abortAcquired();
         const bot = getBot(askSession.larkAppId);
         askSession.session.quoteTargetId = asyncOriginMessageId;
         askSession.session.quoteTargetSenderOpenId = by;
@@ -9908,14 +9953,14 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
         // A correlated ordinary human answer may enter its original active
         // native turn; completed/different targets retain the serial fallback.
         await noteTurnReceived(askSession, turnId, text, sender, turnId);
-        if (!isCurrent()) return false;
+        if (!isCurrent()) return abortAcquired();
         const trustedCaller = await trustedCallerForInboundTurn(
           boundAsk.larkAppId,
           by,
           actor?.memberUnionId,
           byType,
         );
-        if (!isCurrent() || (asyncCaller && by !== asyncCaller)) return false;
+        if (!isCurrent() || (asyncCaller && by !== asyncCaller)) return abortAcquired();
         const steerTarget = codexAsyncAnswerSteerTarget(asyncInput, {
           answerer: by, originalAnswerer: asyncCaller,
           human: byType === false && trustedCaller?.senderType === 'user'
@@ -9927,106 +9972,57 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
         });
         const steerable = steerTarget !== undefined && input.codexAppInput !== undefined;
         if (steerable) input.codexAppInput = { ...input.codexAppInput!, steerTargetTurnId: steerTarget };
-        const frozenControl = askInput.controlWait;
-        if (!frozenControl || frozenControl.wait.kind !== 'ask'
-          || frozenControl.wait.askId !== asyncInput.itemId) return false;
-        const replyDigest = createHash('sha256').update(text).digest('hex');
-        const resumed = await resumeAdmittedControlReply({
-          authorizeFresh: async () => evaluateAskAnswerTalk(
-            askSession.larkAppId, askSession.chatId, by, askSession.chatType, actor,
-          ),
-          issuePermit: () => centralTurnPermitStore.issueControlReply({
-            sessionId: askSession.session.sessionId,
-            originalTurnId: frozenControl.originalTurnId,
-            wait: frozenControl.wait,
-            expectedGeneration: frozenControl.expectedGeneration,
-            workspace: frozenControl.workspace,
-            ...(frozenControl.groupRevision === undefined ? {} : { groupRevision: frozenControl.groupRevision }),
-            expiresAt: Date.now() + 60_000,
-          }),
-          beginDispatch: async permit => {
-            const originalAlive = !!asyncWorker && asyncGeneration === frozenControl.expectedGeneration
-              && asyncWorker.connected !== false && !asyncWorker.killed;
-            const waitState = originalControlWaitState({ sessionId: askSession.session.sessionId,
-              originalTurnId: turnId, askId: asyncInput.itemId });
-            const originalStillWaiting = askInput.controlWait?.state === 'needs_user'
-              && asyncInput.itemId === askInput.controlWait.wait.askId
-              && (waitState === 'needs_user' || originalControlWaitAcceptedAnswer({
-                sessionId: askSession.session.sessionId, originalTurnId: turnId, askId: asyncInput.itemId }));
-            const dispatch = originalAlive && originalStillWaiting
-              ? await centralTurnPermitStore.beginControlReplyDispatch(permit, replyDigest, {
-                  sessionId: askSession.session.sessionId,
-                  originalTurnId: turnId,
-                  wait: { kind: 'ask', askId: asyncInput.itemId },
-                  workerGeneration: frozenControl.expectedGeneration,
-                  workspace: frozenControl.workspace,
-                  ...(frozenControl.groupRevision === undefined ? {} : { groupRevision: frozenControl.groupRevision }),
-                  originalState: frozenControl.state,
-                  authorized: true,
-                })
-              : { status: 'rejected' as const };
-            if (dispatch.status === 'acquired') {
-              (askSession.retainedControlReplyWorkers ??= new Map()).set(asyncInput.itemId, {
-                worker: asyncWorker!, generation: asyncGeneration!, controlDispatchId: permit.controlDispatchId,
-                controlReplyDigest: replyDigest, expiresAt: permit.expiresAt,
-              });
+        // The original turn remains the authorization authority, while the
+        // control delivery gets its own worker dedupe key.
+        if (documentDelivery && asyncDocumentTarget) {
+          (askSession.session.docCommentTargets ??= {})[permit.controlDispatchId] = {
+            fileToken: asyncDocumentTarget.fileToken, fileType: asyncDocumentTarget.fileType,
+            commentId: asyncDocumentTarget.commentId, replyToOpenId: documentDelivery.openId,
+            replyToName: asyncDocumentTarget.replyToName, turnId: permit.controlDispatchId,
+          };
+        }
+        const retained = askSession.retainedControlReplyWorkers?.get(asyncInput.itemId);
+        if (retained) {
+          retained.timer = setTimeout(() => {
+            if (askSession.retainedControlReplyWorkers?.get(asyncInput.itemId) === retained) {
+              askSession.retainedControlReplyWorkers.delete(asyncInput.itemId);
             }
-            return dispatch.status === 'acquired' || dispatch.status === 'observing' || dispatch.status === 'delivered'
-              ? dispatch.status : 'rejected';
-          },
-          // The original turn remains the authorization authority, while the
-          // control delivery gets its own worker dedupe key. Reusing turnId here
-          // lets an ordinary-turn receipt suppress the later async answer.
-          resume: async permit => {
-            if (documentDelivery && asyncDocumentTarget) {
-              // The control dispatch gets its own worker dedupe key. Preserve the
-              // originating document route under that exact key before IPC so a
-              // synchronous worker ACK/final output can resolve it immediately.
-              (askSession.session.docCommentTargets ??= {})[permit.controlDispatchId] = {
-                fileToken: asyncDocumentTarget.fileToken, fileType: asyncDocumentTarget.fileType,
-                commentId: asyncDocumentTarget.commentId, replyToOpenId: documentDelivery.openId,
-                replyToName: asyncDocumentTarget.replyToName, turnId: permit.controlDispatchId,
-              };
-            }
-            const retained = askSession.retainedControlReplyWorkers?.get(asyncInput.itemId);
-            if (retained) {
-              retained.timer = setTimeout(() => {
-                if (askSession.retainedControlReplyWorkers?.get(asyncInput.itemId) === retained) {
-                  askSession.retainedControlReplyWorkers.delete(asyncInput.itemId);
-                }
-              }, Math.max(1, retained.expiresAt - Date.now()));
-              retained.timer.unref?.();
-            }
-            let accepted: boolean;
-            if (retained?.worker !== askSession.worker && retained?.generation === permit.expectedGeneration
-              && retained.worker.connected !== false && !retained.worker.killed) {
-              try {
-                accepted = retained.worker.send({ type: 'message', content: input.content, turnId: permit.controlDispatchId,
-                  atMostOnce: true, controlDispatchId: permit.controlDispatchId, controlReplyDigest: replyDigest,
-                  trustedCaller, ...(input.codexAppInput ? { codexAppInput: input.codexAppInput } : {}) });
-              } catch { accepted = false; }
-            } else {
-              accepted = sendWorkerInput(askSession, input, permit.controlDispatchId, { atMostOnce: true,
-                controlDispatchId: permit.controlDispatchId, controlReplyDigest: replyDigest,
-                trustedCaller, ...(steerable ? { codexAppSteerable: true as const } : {}) });
-            }
-            if (!accepted && documentDelivery && asyncDocumentTarget) {
-              delete askSession.session.docCommentTargets?.[permit.controlDispatchId];
-            }
-            if (!accepted) askSession.retainedControlReplyWorkers?.delete(asyncInput.itemId);
-            return accepted;
-          },
-          abort: async permit => {
-            await centralTurnPermitStore.abortControlReplyDispatch(permit, replyDigest);
-          },
-        });
-        if (resumed !== true) return false;
+          }, Math.max(1, retained.expiresAt - Date.now()));
+          retained.timer.unref?.();
+        }
+        let accepted: boolean;
+        if (retained?.worker !== askSession.worker && retained?.generation === permit.expectedGeneration
+          && retained.worker.connected !== false && !retained.worker.killed) {
+          try {
+            accepted = retained.worker.send({ type: 'message', content: input.content, turnId: permit.controlDispatchId,
+              atMostOnce: true, controlDispatchId: permit.controlDispatchId, controlReplyDigest: replyDigest,
+              trustedCaller, ...(input.codexAppInput ? { codexAppInput: input.codexAppInput } : {}),
+              ...(steerable ? { codexAppSteerable: true as const } : {}) });
+          } catch { accepted = false; }
+        } else {
+          accepted = sendWorkerInput(askSession, input, permit.controlDispatchId, { atMostOnce: true,
+            controlDispatchId: permit.controlDispatchId, controlReplyDigest: replyDigest,
+            trustedCaller, ...(steerable ? { codexAppSteerable: true as const } : {}) });
+        }
+        if (!accepted && documentDelivery && asyncDocumentTarget) {
+          delete askSession.session.docCommentTargets?.[permit.controlDispatchId];
+        }
+        if (!accepted) {
+          askSession.retainedControlReplyWorkers?.delete(asyncInput.itemId);
+          await centralTurnPermitStore.abortControlReplyDispatch(permit, replyDigest);
+          return false;
+        }
+        ipcAccepted = true;
         beginNewTurn(askSession, '异步提问答复', turnId);
         rememberLastCliInput(askSession, text, input);
         markSessionActivity(askSession);
         sessionStore.updateSession(askSession.session);
         logger.info(`[${boundAsk.sessionId.slice(0, 8)}] async question ${asyncInput.itemId} answer admitted as ${turnId}`);
         return true;
+        } catch (error) {
+          if (!ipcAccepted) await abortAcquired();
+          throw error;
+        }
       },
     });
     if (!delivered) {

@@ -16455,7 +16455,9 @@ function setupWorkerHandlers(
             .find(([, binding]) => binding.worker === worker && binding.generation === workerGeneration
               && binding.controlDispatchId === msg.controlDispatchId
               && binding.controlReplyDigest === msg.controlReplyDigest);
-          if (ds.retainedControlReplyWorkers?.size && !retainedEntry) break;
+          const retainedForDispatch = [...(ds.retainedControlReplyWorkers?.values() ?? [])]
+            .some(binding => binding.controlDispatchId === msg.controlDispatchId);
+          if (retainedForDispatch && !retainedEntry) break;
           const receipts = ds.session.controlDispatchReceipts ??= {};
           receipts[msg.controlDispatchId] = {
             replyDigest: msg.controlReplyDigest,

@@ -45,18 +45,18 @@ export async function writeRawCommandLine(
       return opts.isCurrent?.() !== false && sendSpecialKeys('Enter') !== false;
     }
     if (opts.pasteLine && backend.supportsRawCommandPasteLine && pasteText) {
-      if (pasteText(content) === false) return false;
+      if (opts.isCurrent?.() === false || pasteText(content) === false) return false;
       await delay(opts.pasteSettleMs ?? beatMs);
       return opts.isCurrent?.() !== false && sendSpecialKeys('Enter') !== false;
     }
     if (sendText) {
-      if (sendText(content) === false) return false;
+      if (opts.isCurrent?.() === false || sendText(content) === false) return false;
       await delay(beatMs);
       return opts.isCurrent?.() !== false && sendSpecialKeys('Enter') !== false;
     }
   }
 
-  if (backend.write(content) === false) return false;
+  if (opts.isCurrent?.() === false || backend.write(content) === false) return false;
   await delay(beatMs);
   return opts.isCurrent?.() !== false && backend.write('\r') !== false;
 }

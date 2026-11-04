@@ -50,7 +50,7 @@ describe('central admitted business driver structure', () => {
 
   // 源码结构护栏(K3)：异步 Ask 生产回复只能恢复原 turn，不能重新派生业务 turn。
   it('async Ask answer resumes the exact original turn through a control permit', () => {
-    expect(daemon).toContain('resumeAdmittedControlReply');
+    expect(daemon).toContain("if (controlDispatch.status === 'delivered') return true;");
     expect(daemon).toContain('issueControlReply');
     expect(daemon).toContain('beginControlReplyDispatch');
     expect(daemon).toContain('controlDispatchId: permit.controlDispatchId');
