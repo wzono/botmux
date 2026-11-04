@@ -564,6 +564,11 @@ describe('target daemon consumes signed message authority', () => {
       scheduleAuthorityStore: undefined as any,
       // noteTurnReceived's reaction bookkeeping: a card-on session stops there.
       streamingCardDisabledFor: () => false,
+      silentTurnReactionsFor: () => false,
+      resolveVcMeetingImTurnOrigin: () => undefined,
+      isSilentScheduledTurn: () => false,
+      sessionStore: { ownsSessionForMutation: () => false },
+      turnFeedbackReconciler: { reconcile: vi.fn(async () => undefined) },
     };
     const handlers = new Function('scope', 'with (scope) { ' + code
       + '; return { refreshTurnCliIdentity, prepareTurnCliIdentity, handleIdentityDecisionFlip, noteTurnReceived }; }')(scopeValues);

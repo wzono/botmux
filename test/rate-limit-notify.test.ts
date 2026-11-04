@@ -4,14 +4,13 @@
  * 背景：限流检测本身完备（Claude 结构化 error:"rate_limit"、Codex
  * codex_rate_limited、屏幕扫描三路都发 status:'limited' 的 screen_update），
  * 缺口在通知侧——limited 只走卡片 PATCH（无未读/无 @ 提醒），card-off 会话更是
- * 直接 break 零信号；working→limited 边沿还误调 finishTurnReactions 把 ✋ 翻成
- * ✅，让用户以为任务完成。本测试钉住修复约定：
+ * 直接 break 零信号；屏幕状态边沿也不能结算回合表情。本测试钉住修复约定：
  *   - working/其它→limited 边沿主动发一条新消息到原话题（scopedReply），
  *     正文 <at owner> + 限流原因 + 重试引导；owner 为空时不 @
  *   - 同一次限流（usageLimitStateKey 相同）只发一次；clearUsageLimitState
  *     复位后下一次限流会再发
  *   - card-off 会话也发（PATCH 无未读，新消息才有）
- *   - working→limited 不再误翻 ✋→✅（working→idle 正常完成仍翻，见 turn-reactions）
+ *   - working→limited/idle 都不结算回合表情；只认 exact turn_terminal
  *
  * Run: pnpm vitest run test/rate-limit-notify.test.ts
  */
@@ -362,7 +361,6 @@ describe('rate-limit proactive notification', () => {
     const ds = makeDs({
       worker,
       workerPort: 9999,
-      pendingAckReactions: [{ messageId: 'om_a', reactionId: 'rid_om_a' }],
     });
     __testOnly_setupWorkerHandlers(ds, worker);
     await noteTurnReceived(ds, 'om_a');
@@ -381,17 +379,17 @@ describe('rate-limit proactive notification', () => {
 
     expect(mocks.removeReaction).not.toHaveBeenCalled();
     expect(mocks.addReaction).not.toHaveBeenCalledWith(APP_CARD_OFF, 'om_a', 'DONE');
-    expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_a']);
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a?.phase)
+      .toBe('processing');
   });
 
-  it('回归：working→idle 正常完成仍翻 ✋→✅（limited 修复不影响 idle 路径）', async () => {
+  it('回归：working→idle 只表示终端空闲，不再翻 ✋→✅', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     setupPool(sessionReply);
     const worker = makeFakeWorker();
     const ds = makeDs({
       worker,
       workerPort: 9999,
-      pendingAckReactions: [{ messageId: 'om_a', reactionId: 'rid_om_a' }],
     });
     __testOnly_setupWorkerHandlers(ds, worker);
     await noteTurnReceived(ds, 'om_a');
@@ -403,9 +401,10 @@ describe('rate-limit proactive notification', () => {
     worker.emit('message', { type: 'screen_update', content: 'done', status: 'idle' });
     await flush();
 
-    expect(mocks.removeReaction).toHaveBeenCalledWith(APP_CARD_OFF, 'om_a', 'rid_om_a');
-    expect(mocks.addReaction).toHaveBeenCalledWith(APP_CARD_OFF, 'om_a', 'DONE');
-    expect(ds.pendingAckReactions).toEqual([]);
+    expect(mocks.removeReaction).not.toHaveBeenCalled();
+    expect(mocks.addReaction).not.toHaveBeenCalledWith(APP_CARD_OFF, 'om_a', 'DONE');
+    expect(sessionStore.getSessionFresh(ds.session.sessionId)?.turnFeedback?.om_a?.phase)
+      .toBe('processing');
   });
 
   it('回归：重启静默窗口内的「假边沿」不发限流通知、不写 latch（CLI 在 daemon 宕机期间被限流）', async () => {

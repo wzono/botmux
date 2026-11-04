@@ -10,6 +10,7 @@ import { normalizeCodexInstancePool, registerCodexInstanceBot, clearCodexInstanc
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { underReadIsolation } from './adapters/cli/read-isolation.js';
+import { retiredCli, retiredCliNotice } from './adapters/cli/retired-cli.js';
 import {
   normalizeSandboxMode,
   normalizeScratchStorage,
@@ -1635,6 +1636,10 @@ export interface BotConfig {
   /** Opt-in Codex model-capacity continuation. Missing/false is off. Each
    * admitted task may inject up to two recovery inputs into native history. */
   codexCapacityRecovery?: boolean;
+  /** Capacity wait work-card reminder threshold for interactive turns. Default 2 minutes. */
+  capacityInteractiveReminderMinutes?: number;
+  /** Capacity wait work-card reminder threshold for scheduled/headless turns. Default 10 minutes. */
+  capacityBackgroundReminderMinutes?: number;
   /** Experimental, off by default. When true, a structured-bridge failure
    * notice is not posted if this exact turn/attempt already delivered an
    * acknowledged explicit final. It trusts that final and does not compare it
@@ -1781,7 +1786,8 @@ export interface BotConfig {
    *     docs/design/2026-09-21-sandbox-scratch-mode.md.
    *   false/"off"/missing — no local file isolation.
    * Env BOTMUX_SANDBOX=1 forces oncall, BOTMUX_SANDBOX=scratch forces scratch
-   * (testing/global).
+   * (testing/global); unset/0/false means no force and never turns this off
+   * (see resolveSandboxMode).
    */
   sandbox?: boolean | 'oncall' | 'scratch' | 'off';
   /**
@@ -1942,7 +1948,7 @@ export interface BotConfig {
   /** UI language for this bot: 'zh' or 'en'. Falls back to BOTMUX_LANG / LANG env when unset. */
   lang?: Locale;
   /** How this bot's built-in botmux bridge skills reach its CLI (only meaningful
-   *  for CLIs with a global `skillsDir` — codex/gemini/opencode/…):
+   *  for CLIs with a global `skillsDir` — codex/opencode/…):
    *   - `global`: install into the CLI's shared global skills dir (leaks into the
    *     user's own standalone CLI). For users who never run the CLI by hand.
    *   - `prompt`: inject a session-scoped skill catalog into the prompt +
@@ -2241,6 +2247,8 @@ export interface BotConfig {
   cotEnabled?: boolean;
   /** Legacy tool-output preference; false still suppresses result bodies. */
   thinkingCardToolResult?: boolean;
+  /** Show tool-call nodes in unified reply cards. Default on; false keeps thinking text. */
+  replyCardShowTools?: boolean;
   /** chat_id list: chats where the CoT (thinking process) message is suppressed
    *  even when {@link cotEnabled} is on. Written by `/cot off|on`. */
   noCotChats?: string[];
@@ -3420,6 +3428,14 @@ function resolveBotConfigPath(): string {
   );
 }
 
+const warnedRetiredCliApps = new Set<string>();
+/** Once per process and Bot: the loader runs on every bots.json read. */
+function warnRetiredCliOnce(cliId: string, appId: string): void {
+  if (warnedRetiredCliApps.has(appId)) return;
+  warnedRetiredCliApps.add(appId);
+  logger.warn(`[bot-registry] ${retiredCliNotice(cliId, appId)}`);
+}
+
 /** Warn once per relevant cycle and identify only the Bot rows whose handoff must be disabled. */
 function warnAndCollectCyclicQuotaFallbackIds(
   entries: any[],
@@ -3466,6 +3482,10 @@ export function loadBotConfigAtIndex(index: number): BotConfig {
   }
   const selectedAppId = String((entry as Record<string, unknown>).larkAppId ?? '');
   const cyclicQuotaFallbackIds = warnAndCollectCyclicQuotaFallbackIds(parsed, selectedAppId);
+  const entryCliId = (entry as Record<string, unknown>).cliId;
+  if (retiredCli(entryCliId)) {
+    throw new Error(`Bot config [${index}]: ${retiredCliNotice(entryCliId as string, selectedAppId)} (file: ${filePath})`);
+  }
   if ((entry as Record<string, unknown>).activationPending === true) {
     throw new Error(`Bot config [${index}] activation pending (file: ${filePath})`);
   }
@@ -3675,6 +3695,14 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       || entry.activationStarting !== undefined
       || entry.activationCommitted !== undefined
     ) {
+      continue;
+    }
+    // A removed CLI (gemini): the row stays in bots.json for the owner to fix,
+    // but the Bot is not loaded, so nothing builds an adapter for it. The
+    // fleet skips it the same way (fleet-runtime) and start/restart/Dashboard
+    // show the notice.
+    if (retiredCli(entry.cliId)) {
+      warnRetiredCliOnce(entry.cliId, entry.larkAppId);
       continue;
     }
 
@@ -4292,6 +4320,18 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         && Number.isInteger(entry.idleSuspendMinutes) && entry.idleSuspendMinutes > 0
         ? entry.idleSuspendMinutes
         : undefined,
+      capacityInteractiveReminderMinutes: typeof entry.capacityInteractiveReminderMinutes === 'number'
+        && Number.isInteger(entry.capacityInteractiveReminderMinutes)
+        && entry.capacityInteractiveReminderMinutes >= 1
+        && entry.capacityInteractiveReminderMinutes <= 60
+        ? entry.capacityInteractiveReminderMinutes
+        : undefined,
+      capacityBackgroundReminderMinutes: typeof entry.capacityBackgroundReminderMinutes === 'number'
+        && Number.isInteger(entry.capacityBackgroundReminderMinutes)
+        && entry.capacityBackgroundReminderMinutes >= 1
+        && entry.capacityBackgroundReminderMinutes <= 240
+        ? entry.capacityBackgroundReminderMinutes
+        : undefined,
       sessionOwnerReminder: normalizeSessionOwnerReminderConfig(entry.sessionOwnerReminder),
       quotaFallbackBot: normalizedQuotaFallback.config,
       // Only explicit true persisted (undefined = off), same as restrictGrantCommands.
@@ -4379,6 +4419,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       disableStreamingCard: entry.disableStreamingCard === true || entry.replyCardMode === 'final-only' || undefined,
       replyCardMode: entry.replyCardMode === 'unified' || entry.replyCardMode === 'final-only' ? 'unified' : undefined,
       thinkingCardToolResult: entry.thinkingCardToolResult === false ? false : undefined,
+      replyCardShowTools: entry.replyCardShowTools === false ? false : undefined,
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons),
       pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
