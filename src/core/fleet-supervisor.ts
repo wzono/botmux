@@ -23,7 +23,6 @@ import { join } from 'node:path';
 import { openRotatedAppendLog } from '../utils/log-rotate.js';
 import { isStandaloneBinary, resolveEntrySpawn, type BotmuxEntry } from './self-spawn.js';
 import { scrubExternalMemberEnv } from '../utils/child-env.js';
-import { readDurableProcessIdentity } from '../utils/process-identity.js';
 import {
   builtinFleetEntryMatches,
   inspectFleetProcess,
@@ -577,6 +576,9 @@ export class FleetSupervisor {
     if (outFd !== undefined) { try { closeSync(outFd); } catch { /* */ } }
     if (errFd !== undefined) { try { closeSync(errFd); } catch { /* */ } }
     const now = new Date().toISOString();
+    const childProcessStart = child.pid
+      ? (this.opts.processIdentityRuntime ?? fleetProcessIdentityRuntime).readIdentity(child.pid)
+      : undefined;
 
     // Persist the new generation + pid atomically, bumping generation on restart.
     const generation = mutateFleetState(this.opts.statePath, (cur) => {
@@ -585,10 +587,10 @@ export class FleetSupervisor {
         existing.pid = child.pid ?? 0;
         existing.generation += 1;
         // spawn() may return a ChildProcess before exec fails with ENOENT/EACCES.
-        // A pid-less generation is not online evidence; persist it as launching so
-        // the fail-closed state parser remains readable until the error path
-        // records the terminal result.
-        existing.status = child.pid ? 'online' : 'launching';
+        // Neither a pid-less generation nor a PID whose durable birth identity
+        // disappeared before /proc could be sampled is online evidence. Keep the
+        // row parseable as launching until the child exit/error path records it.
+        existing.status = child.pid && childProcessStart ? 'online' : 'launching';
         existing.startedAt = now;
         existing.lastExitCode = null;
         // A crash-driven respawn (isRestart) must PRESERVE restarts — that's the
@@ -603,12 +605,13 @@ export class FleetSupervisor {
         // "running and current". Only external members have one.
         if (spec.external?.configHash !== undefined) existing.configHash = spec.external.configHash;
         else delete existing.configHash;
-        if (child.pid) existing.processStart = readDurableProcessIdentity(child.pid);
+        if (childProcessStart) existing.processStart = childProcessStart;
+        else delete existing.processStart;
       } else {
         const fresh = freshProc(spec.name, spec.appId, child.pid ?? 0, now, spec.external?.configHash);
-        if (!child.pid) fresh.status = 'launching';
+        if (!child.pid || !childProcessStart) fresh.status = 'launching';
+        if (childProcessStart) fresh.processStart = childProcessStart;
         cur.procs.push(fresh);
-        if (child.pid) cur.procs[cur.procs.length - 1].processStart = readDurableProcessIdentity(child.pid);
       }
       return cur;
     }).procs.find((p) => p.name === spec.name)!.generation;

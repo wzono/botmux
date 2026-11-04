@@ -142,20 +142,6 @@ vi.mock('../src/core/worker-pool.js', async () => {
   };
 });
 
-// Central ingress admission now probes the selected workspace before creating a
-// session. Keep this recovery test's deliberately missing path admissible so the
-// real forkWorker remains the component that refuses it and publishes the card.
-vi.mock('../src/core/path-usability.js', async () => {
-  const { existsSync } = await import('node:fs');
-  const actual = await vi.importActual<any>('../src/core/path-usability.js');
-  return {
-    ...actual,
-    probePathUsability: (path: string, options?: unknown) => existsSync(path)
-      ? actual.probePathUsability(path, options)
-      : { ok: true, normalizedPath: path, identity: { dev: 'missing-test', ino: 'missing-test' } },
-  };
-});
-
 vi.mock('../src/core/session-cwd.js', async () => {
   const actual = await vi.importActual<any>('../src/core/session-cwd.js');
   return {

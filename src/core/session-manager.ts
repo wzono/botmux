@@ -4978,6 +4978,17 @@ export async function executeScheduledTask(
         if (activeSessions.get(key) !== existing || existing.session.status !== 'active') {
           throw new Error(`scheduled continuation lost active session ${existing.session.sessionId}`);
         }
+        const { missingStartDir, MissingWorkingDirError, publishWorkingDirRecovery } = await import('./working-dir-recovery.js');
+        const missingContinuationDir = missingStartDir(existing);
+        if (missingContinuationDir) {
+          await publishWorkingDirRecovery(existing, missingContinuationDir, {
+            sessionReply: (_rootId, content, msgType = 'text') => existing.scope === 'thread'
+              ? replyMessage(existing.larkAppId, sessionAnchorId(existing), content, msgType, true)
+              : sendMessage(existing.larkAppId, existing.chatId, content, msgType),
+            lastRepoScan: new Map(),
+          });
+          throw new MissingWorkingDirError(missingContinuationDir);
+        }
         markSessionActivity(existing);
         ensureSessionWhiteboard(existing);
         if (existing.session.deferredScheduleRun
@@ -5076,17 +5087,38 @@ export async function executeScheduledTask(
       };
     }
     session.lastMessageAt = new Date(now).toISOString();
+    const scheduleBotDefault = effectiveDefaultWorkingDir(bot.config);
     const scheduleWorkspace = await resolveIngressWorkspace({
       larkAppId, chatId: task.chatId, chatType: task.chatType === 'p2p' ? 'p2p' : 'group',
       dataDir: config.session.dataDir, explicitWorkingDir: task.workingDir,
       oncall: findOncallChat(larkAppId, task.chatId),
-      botDefaultWorkingDir: effectiveDefaultWorkingDir(bot.config),
+      botDefaultWorkingDir: scheduleBotDefault,
     });
-    if (scheduleWorkspace.status !== 'resolved') {
+    let missingScheduleWorkingDir: string | undefined;
+    if (scheduleWorkspace.status === 'invalid_dir'
+      || (scheduleWorkspace.status === 'unbound' && scheduleBotDefault && !existsSync(scheduleBotDefault))) {
+      // A retained scheduled task whose explicit directory was deleted remains a
+      // recoverable conversation: register it under the original anchor and show
+      // the repo picker, but never cross the worker boundary. Other resolver
+      // failures (store outage, inaccessible path, identity drift) stay fail-closed.
+      const missingPath = scheduleWorkspace.status === 'invalid_dir'
+        ? scheduleWorkspace.detail
+        : scheduleBotDefault!;
+      missingScheduleWorkingDir = missingPath;
+      setSessionWorkingDirMetadata(session, {
+        workingDir: missingPath,
+        source: 'explicit',
+      });
+      // This registered recovery placeholder is the scheduled conversation to
+      // resume after /repo or /cd repairs the path; do not let the next fire
+      // classify it as disposable command scaffolding and create a second row.
+      session.suspendedColdResume = true;
+    } else if (scheduleWorkspace.status === 'resolved') {
+      setSessionWorkingDirMetadata(session, scheduleWorkspace.mutation);
+    } else {
       sessionStore.closeSession(session.sessionId);
       throw new Error(`scheduled task ${task.id} workspace_${scheduleWorkspace.status}`);
     }
-    setSessionWorkingDirMetadata(session, scheduleWorkspace.mutation);
     // Effort is persisted with the session (mirroring trigger-session): unlike
     // the model it is not re-resolved from the bot on every spawn, so a later
     // resume of this scheduled session must find it here.
@@ -5150,6 +5182,18 @@ export async function executeScheduledTask(
         `scheduled task ${task.id} lost active-session registration for ${anchor}` +
         (winner ? ` to ${winner.session.sessionId}` : ''),
       );
+    }
+    if (missingScheduleWorkingDir) {
+      const { MissingWorkingDirError, publishWorkingDirRecovery } = await import('./working-dir-recovery.js');
+      await publishWorkingDirRecovery(ds, missingScheduleWorkingDir, {
+        sessionReply: (_rootId, content, msgType = 'text') => ds.scope === 'thread'
+          ? replyMessage(ds.larkAppId, anchor, content, msgType, true)
+          : sendMessage(ds.larkAppId, ds.chatId, content, msgType),
+        lastRepoScan: new Map(),
+      });
+      ds.initialStartPending = false;
+      ds.pendingPrompt = undefined;
+      throw new MissingWorkingDirError(missingScheduleWorkingDir);
     }
     rememberLastCliInput(ds, task.prompt, prompt);
     if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
