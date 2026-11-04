@@ -1,3 +1,4 @@
+import { proxySessionStopControl } from './dashboard/session-stop-control.js';
 // src/dashboard.ts
 import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
@@ -15,6 +16,7 @@ import { createConfigApi } from './core/plugins/runtime.js';
 import { createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
+import { handleXtermVendorHttp } from './core/xterm-vendor-serve.js';
 import { currentUpdateStrategy, replaceStandaloneBinary, applyStandaloneUpdate, releaseAssetName, type BinaryUpdatePhase } from './core/binary-self-update.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
@@ -130,7 +132,8 @@ import {
 } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
 import { handleFeedbackAnalyticsApi } from './dashboard/feedback-analytics-api.js';
-import { FeedbackAnalyticsService } from './services/feedback-analytics.js';
+import { handleFeedbackStorageApi } from './dashboard/feedback-storage-api.js';
+import { getFeedbackStorage, closeFeedbackStorage } from './services/feedback-storage.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { buildFederatedRoster } from './services/federation-roster.js';
 import { resolveLiveBotTransport } from './services/team-roster.js';
@@ -1247,8 +1250,10 @@ interface ResolvedDashboardSettings {
   /** Machine-wide v3 Workflow feature switch. Default ON; set false to disable
    *  the `/workflow` grill, Saved-Workflow run/save, the botmux-workflow skill
    *  family, and the CLI authoring/run subcommands host-wide. `nodeExecutor`
-   *  is the experimental executor frozen into newly authorized runs. */
-  workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot' };
+   *  is the experimental executor frozen into newly authorized runs;
+   *  `handoffIdentity` whether those runs hand their initiator's identity to
+   *  the node bots. */
+  workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot'; handoffIdentity: boolean };
   /** Machine-wide Claude Code prompt-cache default; null = not configured. */
   promptCache: import('./services/prompt-cache-policy.js').PromptCacheConfig | null;
   /** 定时自动清理空闲会话。默认关闭。olderThanHours/intervalMinutes 反映当前
@@ -1259,8 +1264,9 @@ interface ResolvedDashboardSettings {
     olderThanHours: SessionCleanupHours;
     intervalMinutes: number;
   };
-  /** Machine-wide multi-topic orchestration switch. Default ON. */
-  multiTopic: { enabled: boolean };
+  /** Machine-wide multi-topic orchestration switch. Default ON; the nested
+   *  dispatch task-tree card switch is default OFF. */
+  multiTopic: { enabled: boolean; taskTreeCard: boolean };
   /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
    *  of local host:port. Off by default; only meaningful when bound. */
   remoteAccess: boolean;
@@ -1893,6 +1899,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     workflow: {
       enabled: global.workflow?.enabled === true, // default OFF
       nodeExecutor: global.workflow?.nodeExecutor === 'bot' ? 'bot' : 'ephemeral', // default ephemeral
+      handoffIdentity: global.workflow?.handoffIdentity === true, // default OFF
     },
     sessionCleanup: {
       archiveCodex: global.sessionCleanup?.archiveCodex === true,
@@ -1901,7 +1908,10 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
       intervalMinutes: resolveCleanupIntervalMs(global.sessionCleanup) / 60_000,
     },
     promptCache: global.promptCache ?? null,
-    multiTopic: { enabled: global.multiTopic?.enabled !== false }, // default ON
+    multiTopic: {
+      enabled: global.multiTopic?.enabled !== false, // default ON
+      taskTreeCard: global.multiTopic?.taskTreeCard === true, // default OFF
+    },
     remoteAccess: global.remoteAccess === true,
     oauthRedirectBase: global.oauthRedirectBase ?? null,
     httpProxy: global.httpProxy ?? null,
@@ -4042,10 +4052,6 @@ const dashboardSummaryEndpoint = createDashboardSummaryEndpoint({
     logger.warn(`[dashboard-summary] live snapshot unavailable: ${error instanceof Error ? error.message : String(error)}`);
   },
 });
-let feedbackAnalyticsService: FeedbackAnalyticsService | undefined;
-function analyticsService(): FeedbackAnalyticsService {
-  return feedbackAnalyticsService ??= new FeedbackAnalyticsService(config.session.dataDir);
-}
 
 const companionApi = (() => {
   try {
@@ -4143,6 +4149,14 @@ const server = createServer(async (req, res) => {
     if (url.pathname === '/__health') {
       return jsonRes(res, 200, { ok: true });
     }
+
+    // Pinned xterm 5.5.0 browser bundle (the #1940 set) for pages rendered at
+    // the Dashboard root — the v3 terminal replay iframe — instead of a public
+    // CDN. Public library files, so no auth (same as the worker's copy under
+    // `/s/<id>/`, which still reaches the worker through the front proxy).
+    if (handleXtermVendorHttp(req, res, url.pathname, 'root', (err) => {
+      logger.warn(`[dashboard] xterm vendor asset failed: ${err instanceof Error ? err.message : String(err)}`);
+    })) return;
 
     // Desktop shell compatibility probe (read-only, no token required). Keep it
     // outside the browser auth gate so packaged desktop apps can decide whether
@@ -4609,7 +4623,13 @@ const server = createServer(async (req, res) => {
     }
 
     if (url.pathname.startsWith('/api/feedback/analytics/')) {
-      await handleFeedbackAnalyticsApi(req, res, url, { service: analyticsService() });
+      await handleFeedbackAnalyticsApi(req, res, url, { service: (await getFeedbackStorage(config.session.dataDir)).analytics });
+      return;
+    }
+    if (url.pathname.startsWith('/api/feedback/storage')) {
+      if (!legacyAuthed || requestIdentity?.kind !== 'legacy-dashboard') return jsonRes(res, 403, { error: 'feedback_storage_admin_required' });
+      if (req.method !== 'GET' && !enforceControlCsrf(req, res, requestIdentity)) return;
+      await handleFeedbackStorageApi(req, res, url, { dataDir: config.session.dataDir, isHostAdmin: true, csrfValid: true });
       return;
     }
 
@@ -6492,6 +6512,16 @@ const server = createServer(async (req, res) => {
       try { body = JSON.parse(raw); }
       catch { return jsonRes(res, 502, { ok: false, error: 'invalid_daemon_response' }); }
       return jsonRes(res, upstream.status, projectSessionDetailForBrowser(body));
+    }
+
+    // Owner authentication above applies; never fall back to a broad interrupt.
+    const sessionStop = await proxySessionStopControl(req.method, url.pathname, {
+      ownerOf: sid => aggregator.ownerOf(sid), proxyToDaemon,
+    });
+    if (sessionStop) {
+      res.writeHead(sessionStop.status, { 'content-type': 'application/json' });
+      res.end(await sessionStop.text());
+      return;
     }
 
     // 异步 trigger 结果轮询（asyncReturnSessionId 模式的权威查询端点）。
@@ -8436,7 +8466,7 @@ function handlePlatformTeamSync(payload: PlatformTeamSyncMessage): void {
 }
 
 // Graceful shutdown
-function shutdown(): void {
+async function shutdown(): Promise<void> {
   codexNotifierAbort.abort();
   stopAutoCleanup();
   for (const sub of subs.values()) sub.off();
@@ -8445,7 +8475,7 @@ function shutdown(): void {
   resourceMonitor.stop();
   platformTunnel?.stop();
   hostTerminalManager.shutdown();
-  feedbackAnalyticsService?.close();
+  await closeFeedbackStorage(config.session.dataDir);
   setDurableConfigCoordinator(undefined);
   if (oauthCallbackServer.listening) oauthCallbackServer.close();
   server.close(() => {

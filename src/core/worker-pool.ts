@@ -822,6 +822,7 @@ import {
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { decideAutoRestart } from './restart-policy.js';
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
+import { acceptSessionGroupTitle } from '../services/session-group-title.js';
 import { freezePrincipalLaneTurnBinding, readPrincipalLaneTurnBinding } from './principal-lane-turn.js';
 import { settlePrincipalLaneOutboundProvenance } from './principal-lane-outbound-provenance.js';
 import { hasPendingSessionTurns } from './session-turn-queue.js';
@@ -11629,7 +11630,7 @@ export function sendPromptCacheKeepalive(ds: DaemonSession, text: string): boole
 
 export type ExactTurnInterruptResult =
   | { ok: true }
-  | { ok: false; reason: 'no_worker' | 'stale_turn' | 'unsupported' | 'delivery_failed' | 'timeout' };
+  | { ok: false; reason: 'no_worker' | 'stale_turn' | 'unsupported' | 'delivery_failed' | 'timeout' | 'fork_pending' };
 
 /** Native settings use their own receipt, without rotating business-turn state. */
 const pendingCodexCliEffort = new WeakSet<DaemonSession>();
@@ -12430,15 +12431,15 @@ export async function transferSession(
   }
 }
 
-/** Backends whose conversation state is a local, copyable transcript file and
- *  whose CLI exposes a native "fork/branch this session" primitive that botmux
- *  can drive at cold spawn (Claude family / Grok: `--fork-session`; Codex/TraeX
+/** CLIs whose native fork primitive creates an independent conversation.
+ *  Antigravity runs its interactive /fork before the first ready/input edge;
+ *  the others can drive it at cold spawn (Claude family / Grok: `--fork-session`; Codex/TraeX
  *  terminal: `<cli> fork <id>`). App-server backends (codex-app, or a Codex-family CLI running in
  *  Hybrid RPC mode) keep state in a live app-server process + SQLite and have no
  *  byte-level fork we can reproduce — they are refused. Riff / other pure-remote
  *  backends have no local rollout to fork either. */
 const FORK_CAPABLE_CLI_IDS: ReadonlySet<CliId> = new Set<CliId>([
-  'claude-code', 'seed', 'relay', 'codex', 'traex', 'grok',
+  'claude-code', 'seed', 'relay', 'codex', 'traex', 'grok', 'antigravity',
 ]);
 
 /** True when this session can be byte-level forked via a CLI-native primitive.
@@ -12449,6 +12450,7 @@ export function isForkCapableSession(ds: DaemonSession): boolean {
   const botCfg = getBot(ds.larkAppId).config;
   const cliId = sessionCliId(ds, botCfg);
   if (!FORK_CAPABLE_CLI_IDS.has(cliId)) return false;
+  if (cliId === 'antigravity' && isRemoteBackendSession(ds)) return false;
   // An external App Server thread is not a local rollout. `codex fork` would
   // resolve against the terminal client's own CODEX_HOME and could fork an
   // unrelated/empty local session, so refuse rather than claiming a copy was
@@ -13361,9 +13363,13 @@ export function sendWorkerInput(
      * The dormant-fork path rides `atMostOnce` on the fork init instead. */
     atMostOnce?: true;
     trustedCaller?: TrustedCaller;
+    /** Queue behind a running turn instead of folding into it (type-ahead):
+     *  the input must start as a turn of its own. */
+    queueAfterActiveTurn?: true;
   } = {},
 ): boolean {
   cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
+  if (feedbackMaintenanceActive(config.session.dataDir)) return false;
   const remoteRetirementPhase = remoteRetirementAdmissionPhase(ds);
   if (remoteRetirementPhase) {
     const remoteBackend = (ds.initConfig?.backendType ?? ds.session.backendType) === 'mojo'
@@ -13533,9 +13539,9 @@ export function sendWorkerInput(
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(trustedController ? { trustedController } : {}),
     ...(normalized.rerouteEnvelope ? { rerouteEnvelope: normalized.rerouteEnvelope } : {}),
-    ...(opts.dispatchAttempt === undefined
+    ...(opts.queueAfterActiveTurn || (opts.dispatchAttempt === undefined
       && (opts.trustedCaller?.source === 'schedule_creator'
-        || isSerialGroupInput(ds, opts.trustedCaller))
+        || isSerialGroupInput(ds, opts.trustedCaller)))
       ? { queueAfterActiveTurn: true as const } : {}),
     ...(vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin }
@@ -14347,6 +14353,10 @@ export function forkWorker(
   resumeOrTurnId: ForkResumeOrTurnId = false,
   opts: ForkWorkerOptions = {},
 ): boolean {
+  if (feedbackMaintenanceActive(config.session.dataDir)) {
+    opts.onAdmission?.('rejected');
+    return false;
+  }
   let admissionReported = false;
   const reportAdmission = (admission: WorkerForkAdmission): void => {
     if (admissionReported) return;
@@ -17315,6 +17325,9 @@ function setupWorkerHandlers(
       }
 
       case 'cli_session_id': {
+        // Interactive fork launches briefly hold the parent's id. Such an
+        // observation is not a completed fork and must leave the intent intact.
+        if (ds.session.pendingForkSession && msg.cliSessionId === ds.session.cliSessionId) break;
         const wasLocalCliOpenReady = isLocalCliOpenReady(ds, { cliId: effectiveCliId });
         ds.session.cliSessionId = msg.cliSessionId;
         ds.session.codexCleanupTarget = ['codex', 'codex-app'].includes(effectiveCliId)
@@ -17354,6 +17367,9 @@ function setupWorkerHandlers(
           ds.initConfig.nativeSessionTitlePrompt = undefined;
         }
         sessionStore.updateSession(ds.session);
+        if (ds.scope === 'chat' && ds.chatType === 'group') {
+          acceptSessionGroupTitle(ds.larkAppId, ds.session, title);
+        }
         break;
       }
 
@@ -21191,8 +21207,8 @@ async function persistFinalOutputDelivery(
   try {
     const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
     const feedbackStore = await getSkillFeedbackStore(config.session.dataDir);
-    if (feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, messageId)) return;
-    feedbackStore.recordTurnDelivery({
+    if (await feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, messageId)) return;
+    await feedbackStore.recordTurnDelivery({
       botAppId: ds.larkAppId,
       sessionId: ds.session.sessionId,
       turnId: msg.turnId,
@@ -23410,3 +23426,4 @@ export function setCurrentCliVersion(v: string, runtimeKey?: string): void {
 export function getCurrentCliVersion(runtimeKey?: string): string {
   return runtimeKey ? currentCliVersions.get(runtimeKey) ?? 'unknown' : currentCliVersion;
 }
+import { feedbackMaintenanceActive } from '../services/feedback-maintenance.js';
