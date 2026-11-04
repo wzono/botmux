@@ -16,13 +16,15 @@ import { readPersistedSessionRows, seedPersistedSessionRows } from './helpers/se
 
 const supported = ['x64', 'arm64', 'ia32', 'arm'].includes(process.arch);
 const linux = process.platform === 'linux';
-const canRunBwrap = linux && spawnSync('bwrap', [
-  '--ro-bind', '/', '/', '--unshare-user', '--unshare-pid', '--proc', '/proc',
-  '--', '/bin/true',
-], { stdio: 'ignore', timeout: 5_000 }).status === 0;
-const repoRoot = realpathSync(fileURLToPath(new URL('..', import.meta.url)));
 const bwrapArgs = ['--ro-bind', '/', '/', '--unshare-user', '--unshare-pid',
   '--unshare-net', '--proc', '/proc', '--dev', '/dev', '--'];
+// The kernel probes include nested user/PID/mount namespaces. A shallow
+// `bwrap /bin/true` can succeed on a runner whose AppArmor policy rejects that
+// nested shape, so gate on the strongest baseline every case below requires.
+const canRunBwrap = linux && spawnSync('bwrap', [
+  ...bwrapArgs, 'bwrap', ...bwrapArgs, '/bin/true',
+], { stdio: 'ignore', timeout: 5_000 }).status === 0;
+const repoRoot = realpathSync(fileURLToPath(new URL('..', import.meta.url)));
 
 type Launch = ReturnType<typeof linuxIsolationLaunch>;
 
