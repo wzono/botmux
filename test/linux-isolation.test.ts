@@ -219,7 +219,7 @@ describe('Linux isolation kernel probe', () => {
     ]))).toMatchObject({ isolated: true, offline: true });
   });
 
-  it.each([0, 3, 38])('does not trust an overlaid seccomp errno %s', errno => {
+  it.skipIf(!canRunBwrap || !supported).each([0, 3, 38])('does not trust an overlaid seccomp errno %s', errno => {
     const inner = linuxIsolationLaunch('bwrap', [...bwrapArgs, ...cleanCli]);
     const bytes = filterBytes(inner);
     let replaced = 0;
