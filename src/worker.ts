@@ -16045,9 +16045,15 @@ function adapterInputHandle(target: SessionBackend): PtyHandle {
     : target;
 }
 
+function backendRequiresEffectiveWorkspaceProof(backendType: BackendType | undefined): boolean {
+  return backendType === 'riff' || backendType === 'mojo' || backendType === 'remote-runner';
+}
+
 function writeBackendWorkingDirRejected(target: SessionBackend): boolean {
   if (target.validateWorkingDirBeforeBusinessInput?.() === false) return true;
-  return !!lastInitConfig?.expectedWorkingDirIdentity && !target.effectiveWorkspaceProof?.();
+  return !!lastInitConfig?.expectedWorkingDirIdentity
+    && backendRequiresEffectiveWorkspaceProof(lastInitConfig.backendType)
+    && !target.effectiveWorkspaceProof?.();
 }
 
 function adoptComposerConflict(target: SessionBackend): string | undefined {
@@ -25635,7 +25641,8 @@ async function spawnCli(
     onPtyData(data);
   });
   if (cfg.expectedWorkingDirIdentity && observedBackend.validateWorkingDirBeforeBusinessInput
-    && (!observedBackend.validateWorkingDirBeforeBusinessInput() || !observedBackend.effectiveWorkspaceProof?.())) {
+    && (!observedBackend.validateWorkingDirBeforeBusinessInput()
+      || (backendRequiresEffectiveWorkspaceProof(effectiveBackendType) && !observedBackend.effectiveWorkspaceProof?.()))) {
     throw new Error(`${effectiveBackendType} effective workspace proof unavailable for group-bound session`);
   }
   if (observedBackend instanceof HerdrBackend) {

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -183,11 +184,13 @@ describe('host-wide workspace schema migration', () => {
     await migrator.migrateOrRecover();
     const original = readFileSync(join(root, 'group-workspaces.json'), 'utf8');
     const manifest = readFileSync(join(root, 'workspace-migration-manifest.json'), 'utf8');
+    const sessionBefore = createHash('sha256').update(readFileSync(dbPath)).digest('hex');
     const output = join(root, 'downgrade-export');
     const exported = migrator.exportCompatibilityCopies(output);
     expect(exported.some(path => path.endsWith('group-workspaces.json'))).toBe(true);
     expect(exported.some(path => path.endsWith('sessions.db'))).toBe(true);
     expect(readFileSync(join(root, 'group-workspaces.json'), 'utf8')).toBe(original);
     expect(readFileSync(join(root, 'workspace-migration-manifest.json'), 'utf8')).toBe(manifest);
+    expect(createHash('sha256').update(readFileSync(dbPath)).digest('hex')).toBe(sessionBefore);
   });
 });

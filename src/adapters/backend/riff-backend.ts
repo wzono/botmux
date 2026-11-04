@@ -1251,16 +1251,21 @@ export class RiffBackend implements SessionBackend {
   }
 
   validateWorkingDirBeforeBusinessInput(): boolean {
-    return this.hostWorkingDirContract.matches() && (!this.hostWorkingDirContract.validatedProof() || !!this.effectiveWorkspaceProof());
+    return this.hostWorkingDirContract.identityMatches()
+      && (!this.hostWorkingDirContract.hasExpectedIdentity() || !!this.effectiveWorkspaceProof());
   }
 
   private groupWorkspaceRepoProof?: { hostPath: string; identity: { dev: string; ino: string }; repository: RiffRepoRef };
 
   effectiveWorkspaceProof() {
     const frozen = this.groupWorkspaceRepoProof;
-    if (!frozen) return undefined;
+    if (!frozen || !this.hostWorkingDirContract.identityMatches()) return undefined;
     const actual = deriveRiffRepoFromWorkingDir(frozen.hostPath);
-    if (!actual || actual.repo.repoName !== frozen.repository.repoName
+    // Git derivation spawns multiple reads. Re-probe the exact admitted inode
+    // afterwards so a path swap during derivation cannot pair the old identity
+    // with repository metadata observed from its replacement.
+    if (!actual || !this.hostWorkingDirContract.identityMatches()
+      || actual.repo.repoName !== frozen.repository.repoName
       || actual.repo.repoBranch !== frozen.repository.repoBranch) return undefined;
     return { kind: 'riff-repository' as const, ...frozen };
   }
@@ -1285,15 +1290,25 @@ export class RiffBackend implements SessionBackend {
     this.writeChain = this.writeChain
       .then(async () => {
         const proof = this.effectiveWorkspaceProof();
-        const groupBound = !!this.hostWorkingDirContract.validatedProof();
-        if (this.killed || this.closing || !this.hostWorkingDirContract.matches() || (groupBound && !proof)) {
+        const groupBound = this.hostWorkingDirContract.hasExpectedIdentity();
+        if (this.killed || this.closing || !this.hostWorkingDirContract.identityMatches() || (groupBound && !proof)) {
           resolveResult('retryable_pre_dispatch_rejection');
           return;
         }
-        resolveResult('submitted');
         this.taskDone = false;
-        if (!this.currentTaskId) await this.createTask(text, attachments, proof);
-        else await this.followUp(text, attachments, proof);
+        let dispatched = false;
+        const onDispatched = () => {
+          if (dispatched) return;
+          dispatched = true;
+          resolveResult('submitted');
+        };
+        try {
+          if (!this.currentTaskId) await this.createTask(text, attachments, proof, onDispatched);
+          else await this.followUp(text, attachments, proof, onDispatched);
+        } catch (err) {
+          if (!dispatched) resolveResult('retryable_pre_dispatch_rejection');
+          throw err;
+        }
       })
       .catch((err) => {
         logger.warn(`[riff] queued write failed: ${err}`);
@@ -1755,7 +1770,7 @@ export class RiffBackend implements SessionBackend {
     return parts[parts.length - 1] ?? p;
   }
 
-  private async createTask(prompt: string, attachments: RiffAttachment[], effectiveProof?: ReturnType<RiffBackend['effectiveWorkspaceProof']>): Promise<void> {
+  private async createTask(prompt: string, attachments: RiffAttachment[], effectiveProof?: ReturnType<RiffBackend['effectiveWorkspaceProof']>, onDispatched?: () => void): Promise<void> {
     const url = `${this.config.baseUrl}/api/task-execute`;
 
     // riff task-execute body: origin at top level, prompt inside config.userPrompt
@@ -1807,13 +1822,14 @@ export class RiffBackend implements SessionBackend {
     if (this.config.templateId) payload.templateId = this.config.templateId;
 
     try {
-      const taskId = await this.uploadAndCreate(url, payload, attachments, this.createTimeoutMs);
+      const taskId = await this.uploadAndCreate(url, payload, attachments, this.createTimeoutMs, onDispatched);
       if (!(await this.adoptLateTask(taskId))) return;
       this.markActivity();
       this.reconnectAttempts = 0; // per-task budget (see streamTask)
       this.streamTask(taskId);
     } catch (err) {
       this.emitError(`创建 riff 任务失败: ${err}`);
+      throw err;
     }
   }
 
@@ -1837,7 +1853,7 @@ export class RiffBackend implements SessionBackend {
     return cold ? this.followUpColdTimeoutMs : this.followUpHotTimeoutMs;
   }
 
-  private async followUp(prompt: string, attachments: RiffAttachment[], effectiveProof?: ReturnType<RiffBackend['effectiveWorkspaceProof']>): Promise<void> {
+  private async followUp(prompt: string, attachments: RiffAttachment[], effectiveProof?: ReturnType<RiffBackend['effectiveWorkspaceProof']>, onDispatched?: () => void): Promise<void> {
     const url = `${this.config.baseUrl}/api/task-follow-up`;
 
     // Capture the parent BEFORE the request: reconcile-on-timeout below needs the
@@ -1861,7 +1877,7 @@ export class RiffBackend implements SessionBackend {
     const sentAtMs = Date.now();
 
     try {
-      const taskId = await this.uploadAndCreate(url, payload, attachments, this.followUpTimeoutMs());
+      const taskId = await this.uploadAndCreate(url, payload, attachments, this.followUpTimeoutMs(), onDispatched);
       if (!(await this.adoptLateTask(taskId))) return;
       this.markActivity();
       this.reconnectAttempts = 0; // per-task budget (see streamTask)
@@ -1896,6 +1912,7 @@ export class RiffBackend implements SessionBackend {
       this.currentTaskId = null;
       this.taskIdCb?.(null);
       this.emitError(`riff follow-up 失败: ${err}（下一条消息将新建任务）`);
+      throw err;
     }
   }
 
@@ -2126,8 +2143,9 @@ export class RiffBackend implements SessionBackend {
     payload: Record<string, unknown>,
     attachments: RiffAttachment[],
     timeoutMs: number,
+    onDispatched?: () => void,
   ): Promise<string> {
-    const groupBound = !!this.hostWorkingDirContract.validatedProof();
+    const groupBound = this.hostWorkingDirContract.hasExpectedIdentity();
     // Assemble the request body FIRST (attachment reads can be slow on large
     // files / slow disks), THEN resolve the JWT immediately before fetch. The
     // keychain selector skips tokens expiring within a safety window, but that
@@ -2180,7 +2198,9 @@ export class RiffBackend implements SessionBackend {
         } else attemptBody = JSON.stringify({ ...payload, effectiveWorkspaceProof: freshProof });
       }
       const h = { ...headers }; if (jwt) h['x-jwt-token'] = jwt;
-      return fetch(url, { method: 'POST', headers: h, body: attemptBody, signal: AbortSignal.timeout(timeoutMs) });
+      const request = fetch(url, { method: 'POST', headers: h, body: attemptBody, signal: AbortSignal.timeout(timeoutMs) });
+      onDispatched?.();
+      return request;
     };
 
     const firstJwt = await this.getJwt();

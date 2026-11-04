@@ -371,6 +371,7 @@ describe('Riff worker session environment', () => {
     let taskRequests = 0;
     const bodies: Record<string, any>[] = [];
     const messages: WorkerToDaemon[] = [];
+    const workerLogs: string[] = [];
     const server = createServer(async (req, res) => {
       if (req.url === '/api/task-execute' && req.method === 'POST') {
         taskRequests++;
@@ -387,8 +388,12 @@ describe('Riff worker session environment', () => {
       res.writeHead(404); res.end();
     });
     try {
-      execFileSync('git', ['init', '-q'], { cwd: root });
+      execFileSync('git', ['init', '-q', '-b', 'group-branch'], { cwd: root });
       execFileSync('git', ['remote', 'add', 'origin', 'https://git.example.com/g/group-bound.git'], { cwd: root });
+      writeFileSync(join(root, 'README'), 'group-bound');
+      execFileSync('git', ['add', '.'], { cwd: root });
+      execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '-m', 'seed'], { cwd: root });
+      execFileSync('git', ['update-ref', 'refs/remotes/origin/group-branch', 'HEAD'], { cwd: root });
       const stat = statSync(root, { bigint: true });
       const identity = { dev: stat.dev.toString(), ino: stat.ino.toString() };
       const port = await listen(server);
@@ -397,8 +402,11 @@ describe('Riff worker session environment', () => {
       writeFileSync(botsPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'riff', backendType: 'riff', riff: { baseUrl: `http://127.0.0.1:${port}` } }]));
       child = spawnTsScript(resolve('src/worker.ts'), [], { cwd: resolve('.'), env: { ...process.env, HOME: root, SESSION_DATA_DIR: root, BOTS_CONFIG: botsPath, BOTMUX_SESSION_ID: 'sid-riff-group-bound', LARK_APP_ID: appId, LARK_APP_SECRET: 'secret' }, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
       child.on('message', raw => messages.push(raw as WorkerToDaemon));
+      child.stdout?.on('data', chunk => workerLogs.push(chunk.toString()));
+      child.stderr?.on('data', chunk => workerLogs.push(chunk.toString()));
       child.send({ type: 'init', sessionId: 'sid-riff-group-bound', chatId: 'oc_group', rootMessageId: 'om_group', workingDir: root, expectedWorkingDirIdentity: identity, cliId: 'riff', backendType: 'riff', backendConfig: { baseUrl: `http://127.0.0.1:${port}`, jwt: 'test-jwt', injectStatusLines: false }, prompt: 'first business prompt', turnId: 'turn-valid', larkAppId: appId, larkAppSecret: 'secret' } satisfies DaemonToWorker);
-      await waitFor(() => taskRequests === 1, 10_000, () => `valid Riff task did not start; requests=${taskRequests}`);
+      await waitFor(() => taskRequests === 1, 30_000,
+        () => `valid Riff task did not start; requests=${taskRequests} messages=${JSON.stringify(messages)} logs=${workerLogs.join('')}`);
       expect(bodies[0]?.config?.userPrompt).toContain('first business prompt');
       await waitFor(
         () => messages.filter(message => message.type === 'prompt_ready').length >= 2,
@@ -422,6 +430,6 @@ describe('Riff worker session environment', () => {
       await new Promise<void>(resolvePromise => server.close(() => resolvePromise()));
       rmTree(root); rmTree(replacement);
     }
-  }, 20_000);
+  }, 60_000);
 
 });

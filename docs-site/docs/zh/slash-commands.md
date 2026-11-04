@@ -65,6 +65,9 @@
 - 每条顶层 `/repo` 用原始飞书消息建立持久收据。跨 Bot 重投、重启恢复或不同 delivery attempt 会返回同一结果，不会重复切会话或增加 revision；同一原始消息被改成不同选仓意图会拒绝。
 - 话题内 `/repo` 仅影响该话题；`/repo wt` 创建的 worktree 与 `/repo here` 都不会改群绑定。群绑定目录失效、不可进入或启动前发生替换时会 fail closed，不回退到默认目录；用新的顶层 `/repo` 修复或 `/repo unbind` 解除。
 - 只有来源仍为 `group` 的普通群本地 PTY 会话会在下一条业务消息的安全空闲边界跟随新 revision：先停止并确认旧 worker 退出，再在新目录启动且校验 ready cwd。繁忙、等待输入、远程/adopt、显式 `/cd`、oncall、worktree 与历史未知来源不会被强切。
+- 普通消息、`/th`、trigger、Dashboard 启动、listener、定时任务、`/queue`、principal lane 与 XPI 在业务输入进入 worker 前都经过同一套目录/ready 准入。存储不可读、revision 或目录身份过期、配置权限撤销、迁移未完成时会拒绝或延后，不会静默换到其他目录。
+- 工作目录 schema v2 按宿主机整体迁移并支持重启恢复：分阶段暂存、校验全部存储时会围栏普通写入；首个发布点之后只向前恢复；原文件与校验和保留用于回滚/导出。遇到未来 schema 会原样 fail closed；降级只生成独立副本，不改在线 v2 状态。
+- 远程群会话必须提供机械可验证的有效目录证明。Riff 在 ready 和每次提交时都要重新证明精确 Git 仓库及远端分支；Mojo/云端 provider 若不能证明宿主目录到执行目录的映射则标记为不支持，仅在 prompt 里要求远端 agent 使用某目录不算证明。
 
 指令头的几条指令：
 

@@ -264,6 +264,7 @@ import {
 } from './utils/codex-app-dispatch-ledger.js';
 import { hasProtectedSessionMutationOwnership } from './core/session-mutation-guard.js';
 import { dispatchAdmittedBusinessTurn, frozenSessionWorkspace } from './core/admitted-turn-dispatch.js';
+import { createWorkspaceBusinessDispatcher } from './core/workspace-business-dispatcher.js';
 import { resumeAdmittedControlReply } from './core/turn-admission.js';
 import { TurnPermitStore } from './services/turn-permit-store.js';
 import { delay } from './utils/timing.js';
@@ -6463,6 +6464,32 @@ const centralTurnWorkerBoundary = {
       ...(options.onIpcDispatchAttempted ? { onIpcDispatchAttempted: options.onIpcDispatchAttempted } : {}),
     }, centralTurnPermitStore),
 };
+
+const workspaceBusinessDispatcher = createWorkspaceBusinessDispatcher({
+  runExclusive: (input, run) => {
+    const key = `\u0000continuation-delivery:${input.ds.larkAppId}:${input.ds.session.sessionId}`;
+    return withActiveSessionKeyLock(activeSessions, key, () => withBotTurnAdmission(input.ds.larkAppId, run));
+  },
+  freeze: frozenSessionWorkspace,
+  follow: followGroupWorkspaceBeforeBusinessTurn,
+  dispatch: input => dispatchAdmittedBusinessTurn({
+    ds: input.ds,
+    turnId: input.turnId,
+    payload: input.payload,
+    options: input.options,
+    boundary: centralTurnWorkerBoundary,
+    permitStore: centralTurnPermitStore,
+    ...(input.markAttempting ? { resource: { markAttempting: input.markAttempting } } : {}),
+    retireUnproven: async (current, reservedGeneration) => {
+      const generation = current.workerGeneration ?? current.session.workerGeneration ?? 0;
+      if (generation !== reservedGeneration) return undefined;
+      const workerPid = current.worker?.pid ?? current.session.pid ?? null;
+      return await retireWorkerForReplacement(current)
+        ? { retiredGeneration: generation, workerPid }
+        : undefined;
+    },
+  }),
+});
 
 type FollowPersistedSession = Session;
 
@@ -32295,44 +32322,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     getActiveCount,
     prepareRawInputTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
-    dispatchAdmittedBusinessTurn: async input => {
-      const key = `\u0000continuation-delivery:${input.ds.larkAppId}:${input.ds.session.sessionId}`;
-      return withActiveSessionKeyLock(activeSessions, key, () => withBotTurnAdmission(input.ds.larkAppId, async () => {
-        if (input.expectedWorkspace) {
-          const beforeFollow = frozenSessionWorkspace(input.ds);
-          const expected = input.expectedWorkspace;
-          if (!beforeFollow || beforeFollow.workspace.path !== expected.workspace.path
-            || beforeFollow.workspace.dev !== expected.workspace.dev || beforeFollow.workspace.ino !== expected.workspace.ino
-            || beforeFollow.groupRevision !== expected.groupRevision) return false;
-        }
-        if (await followGroupWorkspaceBeforeBusinessTurn(input.ds) === 'stop') return false;
-        if (input.expectedWorkspace) {
-          const actual = frozenSessionWorkspace(input.ds);
-          const expected = input.expectedWorkspace;
-          if (!actual || actual.workspace.path !== expected.workspace.path
-            || actual.workspace.dev !== expected.workspace.dev || actual.workspace.ino !== expected.workspace.ino
-            || actual.groupRevision !== expected.groupRevision) return false;
-        }
-        return dispatchAdmittedBusinessTurn({
-      ds: input.ds,
-      turnId: input.turnId,
-      payload: input.payload,
-      options: input.options,
-      boundary: centralTurnWorkerBoundary,
-      permitStore: centralTurnPermitStore,
-      ...(input.markAttempting ? { resource: { markAttempting: async () => input.markAttempting!() } } : {}),
-      retireUnproven: async (current, reservedGeneration) => {
-        const generation = current.workerGeneration ?? current.session.workerGeneration ?? 0;
-        if (generation !== reservedGeneration) return undefined;
-        const workerPid = current.worker?.pid ?? current.session.pid ?? null;
-        return await retireWorkerForReplacement(current)
-          ? { retiredGeneration: generation, workerPid }
-          : undefined;
-      },
-    });
-
-      }));
-    },
+    dispatchAdmittedBusinessTurn: workspaceBusinessDispatcher,
     onTriggerTurnStarted: (ds, title, turnId) => beginNewTurn(ds, title, turnId),
     closeSession(ds: DaemonSession): Promise<boolean> {
       // Route through the dashboard-aware helper so session.exited / session.update

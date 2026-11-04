@@ -1,3 +1,4 @@
+import { realpathSync, statSync } from 'node:fs';
 import { probePathUsability, type PathIdentity } from '../../core/path-usability.js';
 import type { SpawnOpts } from './types.js';
 
@@ -12,10 +13,28 @@ export class HostWorkingDirContract {
       : null;
   }
 
+  hasExpectedIdentity(): boolean {
+    return this.expected !== null;
+  }
+
   matches(): boolean {
     const expected = this.expected;
     return expected === null
       || probePathUsability(expected.path, { expectedIdentity: expected.identity }).ok;
+  }
+
+  /** Cheap send-edge identity fence. Launch/ready still use matches() for the
+   * child-chdir usability proof; serialized submits need an exact no-subprocess
+   * dev/ino check before and after provider-context derivation. */
+  identityMatches(): boolean {
+    const expected = this.expected;
+    if (expected === null) return true;
+    try {
+      const path = realpathSync(expected.path);
+      const stat = statSync(path, { bigint: true });
+      return String(stat.dev) === expected.identity.dev
+        && String(stat.ino) === expected.identity.ino;
+    } catch { return false; }
   }
 
   validatedProof(): { workingDir: string; identity: PathIdentity } | undefined {

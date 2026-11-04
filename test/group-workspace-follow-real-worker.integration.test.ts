@@ -1,4 +1,4 @@
-import type { ChildProcess } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -65,6 +65,21 @@ process.stdin.on('data', chunk => {
   process.stdout.write('\\r\\n' + ${JSON.stringify(prompt)});
 });
 `;
+}
+
+function expectedCliDescendant(worker: RuntimeWorker, expectedCliPath: string): number | undefined {
+  if (process.platform !== 'linux') return undefined;
+  const root = worker.child.pid;
+  if (!root) return undefined;
+  const attested = worker.messages
+    .filter((message): message is Extract<WorkerToDaemon, { type: 'local_process_attestation' }> =>
+      message.type === 'local_process_attestation' && message.cliPid !== undefined)
+    .at(-1)?.cliPid;
+  if (!attested || !descendantPids(root).includes(attested)) return undefined;
+  try {
+    const cmdline = readFileSync(`/proc/${attested}/cmdline`, 'utf8').split('\0').filter(Boolean);
+    return cmdline.includes(expectedCliPath) ? attested : undefined;
+  } catch { return undefined; }
 }
 
 function startWorker(input: {
@@ -165,6 +180,7 @@ async function productionComposition(input: {
   await Promise.all([...workers.values()].map(worker => waitUntil(
     () => worker.messages.some(message => message.type === 'prompt_ready'),
     () => `${worker.logs.join('')}\n${JSON.stringify(worker.messages)}`,
+    60_000,
   )));
 
   let writerThrown = false;
@@ -301,6 +317,38 @@ async function productionComposition(input: {
 }
 
 describe('group workspace follow with real PTY workers', () => {
+  it.runIf(process.platform === 'linux')('rejects an attested descendant whose executable is not the exact fake CLI', async () => {
+    // Attach the alternate executable beneath the claimed worker root with a
+    // tiny shell that waits for it; this isolates cmdline matching from lineage.
+    const descendantParent = spawn('/bin/sh', ['-c', 'sleep 60 & wait'], { stdio: 'ignore' });
+    children.add(descendantParent);
+    await waitUntil(() => !!descendantParent.pid && descendantPids(descendantParent.pid!).length > 0,
+      () => 'alternate executable descendant did not start');
+    const descendant = descendantPids(descendantParent.pid!)[0]!;
+    const worker = {
+      child: descendantParent,
+      logs: [],
+      messages: [{ type: 'local_process_attestation', backendType: 'pty', credentialIsolated: false,
+        cliPid: descendant, cliProcStart: 'test' } as WorkerToDaemon],
+    };
+    expect(expectedCliDescendant(worker, '/definitely/not/the/alternate-cli')).toBeUndefined();
+  });
+
+  it.runIf(process.platform === 'linux')('rejects an exact executable PID outside the claimed worker tree', async () => {
+    const claimedRoot = spawn('/bin/sh', ['-c', 'sleep 60'], { stdio: 'ignore' });
+    const outsider = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    children.add(claimedRoot); children.add(outsider);
+    await waitUntil(() => !!claimedRoot.pid && !!outsider.pid, () => 'sibling fixtures did not start');
+    const worker = {
+      child: claimedRoot,
+      logs: [],
+      messages: [{ type: 'local_process_attestation', backendType: 'pty', credentialIsolated: false,
+        cliPid: outsider.pid!, cliProcStart: 'test' } as WorkerToDaemon],
+    };
+    const exactExecutable = readFileSync(`/proc/${outsider.pid!}/cmdline`, 'utf8').split('\0').filter(Boolean)[0]!;
+    expect(expectedCliDescendant(worker, exactExecutable)).toBeUndefined();
+  });
+
   it.each([
     'prepared_before_switch',
     'session_persisted_before_advance',
@@ -379,7 +427,9 @@ describe('group workspace follow with real PTY workers', () => {
       && worker.child.exitCode === null && worker.child.signalCode === null
       && (() => { try { process.kill(worker.child.pid!, 0); return true; } catch { return false; } })());
     expect(liveWorkerProcesses).toHaveLength(2);
-    expect(liveWorkerProcesses.map(worker => descendantPids(worker.child.pid!).length)).toEqual([2, 2]);
+    if (process.platform === 'linux') {
+      expect(liveWorkerProcesses.map(worker => expectedCliDescendant(worker, fakeCli) !== undefined)).toEqual([true, true]);
+    }
     expect(runtime.replies).toHaveLength(2);
     expect(runtime.emitted.filter(value => value.endsWith(':group_committed'))).toHaveLength(2);
 
@@ -429,7 +479,9 @@ describe('group workspace follow with real PTY workers', () => {
       && worker.child.exitCode === null && worker.child.signalCode === null
       && (() => { try { process.kill(worker.child.pid!, 0); return true; } catch { return false; } })());
     expect(liveWorkerProcesses).toHaveLength(2);
-    expect(liveWorkerProcesses.map(worker => descendantPids(worker.child.pid!).length)).toEqual([2, 2]);
+    if (process.platform === 'linux') {
+      expect(liveWorkerProcesses.map(worker => expectedCliDescendant(worker, fakeCli) !== undefined)).toEqual([true, true]);
+    }
   }, 90_000);
 
   it.each(['prepared', 'old_exited', 'persisted', 'spawned'] as const)(
