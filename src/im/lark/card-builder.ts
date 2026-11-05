@@ -1138,7 +1138,6 @@ export function buildStreamingCard(
   const elements: any[] = [];
 
   // ── Output body (shared with the private snapshot card) ──────────────────
-  pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale, usage, screenshotUnavailable });
   const capacityWait = capacityWaitLabel(silentIdle);
   if (capacityWait) {
     const waitedMinutes = capacityWait.ageMs !== undefined && capacityWait.ageMs >= 60_000
