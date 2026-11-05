@@ -528,6 +528,7 @@ import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { getIdentity, resolveVerifiedUserIdentity } from '../im/lark/identity-cache.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { recallProvenIdentityContent, refreshSessionIdentity, sessionIdentityMaterialPresent } from './cli-identity.js';
+import { larkToolBindingPath, readLarkToolBinding, larkToolIdentityEnabled } from './lark-tool-binding.js';
 import {
   resolveRegisteredBackgroundContext,
   backgroundContextStillValid,
@@ -537,7 +538,6 @@ import {
   resolveDetachedScheduledExecutionIdentity,
 } from './detached-scheduled-identity.js';
 import { noteSenderUnionId } from './platform-credential-source.js';
-import { larkToolBindingPath, readLarkToolBinding } from './lark-tool-binding.js';
 import { sessionAuthRequests } from './session-auth-requests.js';
 import { resolveUserToken } from '../utils/user-token.js';
 import { currentLarkToolDelegation, getLarkToolDelegation } from './lark-tool-delegation.js';
@@ -3335,6 +3335,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   try { botConfig = targetLarkAppId ? getBot(targetLarkAppId).config : undefined; } catch { /* bot missing */ }
   if ((!ds && !detachedScheduled)
     || (ds && ds.session.status !== 'active')
+    || !botConfig
+    || !larkToolIdentityEnabled({ chatId: targetChatId ?? '', apiOnly: botConfig?.apiOnly, headless: ds?.session.headless })
     || (isHeadlessSessionChatId(targetChatId) && !validHeadlessSession)
     || botConfig?.apiOnly === true
     || (targetChatId !== undefined && !validHeadlessSession
@@ -3366,7 +3368,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     }
     const stillValidSession = ds
       ? (findActiveBySessionId(params.sessionId) === ds && ds.session.status === 'active'
-        && !sessionTransportDisabled(ds) && ds.larkAppId === bot.larkAppId)
+        && larkToolIdentityEnabled({ chatId: ds.chatId ?? '', apiOnly: bot.apiOnly, headless: ds.session.headless })
+        && ds.larkAppId === bot.larkAppId)
       : (!!backgroundInput && !!detachedScheduled && backgroundContextStillValid(backgroundInput, detachedScheduled)
         && !sessionTransportDisabled({ chatId: targetChatId, larkAppId: bot.larkAppId }));
     if (!stillValidSession || !boundLarkToolRequest(req, params.sessionId, bot.larkAppId)) {
@@ -3375,6 +3378,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     return jsonRes(res, 200, {
       ok: true, appId: bot.larkAppId, mode: 'bot', credentialType: 'tenant_access_token', credential: token,
     });
+  }
+  if (ds?.session.headless) {
+    return jsonRes(res, 403, { ok: false, error: 'lark_tool_user_transport_required' });
   }
   const executionInput = (ds && peer?.ok)
     ? { sessionId: params.sessionId, peer: peer.peer, findSession: findActiveBySessionId } : undefined;

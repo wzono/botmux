@@ -375,6 +375,9 @@ describe('empty-started session — first real business turn must use the new-to
 
     const followUp = liveInputs()[0]!.content;
     expect(followUp).toContain('<botmux_reminder>');
+    expect(followUp).toContain('短进度优先纯文本');
+    expect(followUp).toContain('强调仅包短词或无中文标点的短语');
+    expect(followUp).toContain('标点和后文放在 `**` 外');
     expect(followUp).toContain(t('ai.followup.feishu_safe_emphasis', undefined, 'zh'));
   });
 
@@ -406,6 +409,9 @@ describe('empty-started session — first real business turn must use the new-to
       fingerprintPromptText(followUp),
       prefixOf(followUp),
     );
+    expect(envelope).toContain('短进度优先纯文本');
+    expect(envelope).toContain('强调仅包短词或无中文标点的短语');
+    expect(envelope).toContain('标点和后文放在 `**` 外');
     expect(envelope).toContain(t('ai.followup.feishu_safe_emphasis', undefined, 'zh'));
   });
 
@@ -439,6 +445,7 @@ describe('empty-started session — first real business turn must use the new-to
       prefixOf(followUp),
     );
     expect(envelope).toContain('<botmux_formatting>');
+    expect(envelope).toContain('短进度优先纯文本');
     expect(envelope).toContain(t('ai.followup.feishu_safe_emphasis', undefined, 'zh'));
     expect(envelope).not.toContain('botmux send');
     expect(envelope).not.toContain('BOTMUX_NOTHING_TO_SEND');
