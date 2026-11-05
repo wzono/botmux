@@ -491,7 +491,6 @@ export interface MessageProvenance {
   updatedAt: string;
 }
 
-<<<<<<< HEAD
 /** Durable ownership and projection state for one exact admitted turn. */
 export interface PersistedTurnFeedback {
   version: 1;
