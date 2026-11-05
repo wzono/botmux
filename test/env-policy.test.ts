@@ -51,11 +51,14 @@ describe('per-bot environment policy', () => {
   it('preserves host worker controls and the workflow kill switch without widening CLI inheritance', () => {
     const base = { BOTMUX_WORKFLOW_ENABLED: 'false', BOTMUX_REQUIRE_MENTION_DECISION: 'true',
       WEB_HOST: '127.0.0.1', STUCK_DETECTOR_TIMEOUT_MS: '45000', TMUX_TMPDIR: '/run/botmux-tmux',
-      UNKNOWN_CREDENTIAL: 'secret-sentinel' };
+      BOTMUX_TEST_FORCE_TMUX_NEW_SESSION_FAIL: '1', UNKNOWN_CREDENTIAL: 'secret-sentinel' };
     const worker = buildBotWorkerEnv(base, { mode: 'strict' });
     for (const key of Object.keys(base).filter(key => key !== 'UNKNOWN_CREDENTIAL')) expect(worker[key]).toBe(base[key as keyof typeof base]);
     const child = buildSessionChildEnv(worker, { mode: 'strict' });
     expect(child.TMUX_TMPDIR).toBe(base.TMUX_TMPDIR);
+    // The fault seam is worker-only: strict worker construction must preserve
+    // it, while the CLI business environment must not inherit it.
+    expect(worker.BOTMUX_TEST_FORCE_TMUX_NEW_SESSION_FAIL).toBe('1');
     for (const key of Object.keys(base).filter(key => key !== 'TMUX_TMPDIR')) expect(key in child, key).toBe(false);
   });
   it('preserves per-session homes and workflows after trusted injection', () => {
