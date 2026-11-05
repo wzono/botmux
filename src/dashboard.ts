@@ -1,3 +1,4 @@
+import { proxySessionStopControl } from './dashboard/session-stop-control.js';
 // src/dashboard.ts
 import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
@@ -15,6 +16,7 @@ import { createConfigApi } from './core/plugins/runtime.js';
 import { createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
+import { handleXtermVendorHttp } from './core/xterm-vendor-serve.js';
 import { currentUpdateStrategy, replaceStandaloneBinary, applyStandaloneUpdate, releaseAssetName, type BinaryUpdatePhase } from './core/binary-self-update.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { config, isWildcardBindHost } from './config.js';
@@ -94,6 +96,14 @@ import { buildTeamGroupCreatePayload, planGroupCreator } from './dashboard/team-
 import { jsonRes } from './dashboard/http.js';
 import { handleCustomizationApi } from './dashboard/customization-api.js';
 import { handleV3RunsApi } from './dashboard/v3-runs-api.js';
+import { handleWorkflowSidebar } from './dashboard/workflow-sidebar-api.js';
+import { publishDashboardH5Presence } from './core/dashboard-h5-presence.js';
+import {
+  WORKFLOW_SIDEBAR_MEMBERSHIP_ROUTE,
+  WorkflowSidebarMembershipCache,
+  type WorkflowSidebarMembershipRequest,
+  type WorkflowViewerMembership,
+} from './core/workflow-sidebar-membership.js';
 import {
   defaultRunsDir as v3RunsDir,
   liveV3TerminalPortForSession,
@@ -122,10 +132,12 @@ import {
 } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
 import { handleFeedbackAnalyticsApi } from './dashboard/feedback-analytics-api.js';
-import { FeedbackAnalyticsService } from './services/feedback-analytics.js';
+import { handleFeedbackStorageApi } from './dashboard/feedback-storage-api.js';
+import { getFeedbackStorage, closeFeedbackStorage } from './services/feedback-storage.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { buildFederatedRoster } from './services/federation-roster.js';
 import { resolveLiveBotTransport } from './services/team-roster.js';
+import { normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
 import { handleFederationSpokeApi, syncAllMemberships, autoBindOwnerIfUnambiguous, type TeamSessionRowLike } from './dashboard/federation-spoke-api.js';
 import type { TeamGroupCreateResult, TeamGroupOwnerTransferResult } from './dashboard/federated-group-core.js';
 import { BotOnboardingManager } from './dashboard/bot-onboarding.js';
@@ -134,6 +146,7 @@ import {
   createDashboardH5AuthController,
   DashboardSessionStore,
   resolveDashboardH5AuthConfig,
+  dashboardH5LoginUsable,
 } from './dashboard/h5-auth.js';
 import { PluginResultArtifactStore } from './core/plugins/mcp/result-artifact-store.js';
 import { listLatestDiagnosticFiles } from './core/plugins/mcp/diagnostics-files.js';
@@ -185,7 +198,7 @@ import { cliAvailabilityResponse } from './dashboard/cli-availability-request.js
 import { modelCatalogProbeContext } from './dashboard/model-catalog-request.js';
 import { checkCliAvailability, preliminaryCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
-import { applyGlobalSessionEnvOps, globalConfigPath, ignoredScheduleBotGrantCount, invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type ScheduleBotGrant, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
+import { applyGlobalSessionEnvOps, isWorkflowFeatureEnabled, workflowNodeExecutorMode, globalConfigPath, ignoredScheduleBotGrantCount, invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type ScheduleBotGrant, type WhiteboardConfig, type SessionCleanupHours } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import {
   buildDashboardUrls,
@@ -197,6 +210,11 @@ import { WORKBENCH_DOCK_IMMERSIVE_HASH, WORKBENCH_IMMERSIVE_HASH } from './core/
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { coordinationModeIsPrimary, initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
 import { createDurableConfigCoordinator } from './services/durable-config-coordinator.js';
+import {
+  createDurableTerminalRoutePublisher,
+  createDurableTerminalRouteRegistry,
+  durableTerminalRoutePort,
+} from './services/durable-terminal-route.js';
 import {
   runDurableConfigMutation,
   setDurableConfigCoordinator,
@@ -261,6 +279,7 @@ import { withFileLock, FileLockTimeoutError } from './utils/file-lock.js';
 // in their own module because every one of them must run on a REDACTED env —
 // see dashboard/managed-spawn.ts.
 import { runGlobalInstall, runLocalDevStep, spawnStartBotLive, spawnStopBotLive, installDshProfileDeps } from './dashboard/managed-spawn.js';
+import { LocalDevForceUpdates } from './utils/local-dev-force-update.js';
 import {
   applySettingsWrite,
   defaultSettingsWriteApplierDeps,
@@ -363,6 +382,8 @@ import type { SafeInsightOverview } from './services/insight/types.js';
 import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncMessage } from './platform/tunnel-client.js';
 import { dashboardScheduleWriteHeaders } from './core/dashboard-schedule-creator.js';
+import { handleWorkflowInitiatorApi, workflowInitiatorPreGateDenial } from './dashboard/workflow-initiator-api.js';
+import { handleWorkflowDraftsApi } from './dashboard/workflow-drafts-api.js';
 import { applyPlatformTeamSync, getPlatformTeamSyncRev } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { getBotSpecialties } from './services/bot-profile-store.js';
@@ -486,6 +507,31 @@ const dashboardH5Auth = createDashboardH5AuthController({
   audit: dashboardControlAudit,
 });
 const pluginResultArtifacts = new PluginResultArtifactStore({ dataDir: resolveBotmuxDataDir() });
+const workflowSidebarMembership = new WorkflowSidebarMembershipCache();
+const WORKFLOW_SIDEBAR_MEMBERSHIP_ASK_TIMEOUT_MS = 10_000;
+
+/** Ask the run's main bot daemon (its own app) whether the viewer is in the
+ *  run's chat. Offline daemon / any error → unavailable (the sidebar denies). */
+async function askWorkflowSidebarMembership(
+  mainLarkAppId: string,
+  request: WorkflowSidebarMembershipRequest,
+): Promise<WorkflowViewerMembership> {
+  try {
+    const response = await proxyToDaemon(mainLarkAppId, WORKFLOW_SIDEBAR_MEMBERSHIP_ROUTE, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chatId: request.chatId, ...request.principal }),
+      // The daemon makes up to one contact call plus the chat's member pages.
+      signal: AbortSignal.timeout(WORKFLOW_SIDEBAR_MEMBERSHIP_ASK_TIMEOUT_MS),
+    });
+    if (!response.ok) return 'unavailable';
+    const body = await response.json().catch(() => null) as { ok?: unknown; member?: unknown } | null;
+    if (body?.ok !== true || typeof body.member !== 'boolean') return 'unavailable';
+    return body.member ? 'member' : 'not_member';
+  } catch {
+    return 'unavailable';
+  }
+}
 try {
   pluginResultArtifacts.sweepExpired();
 } catch (error) {
@@ -876,10 +922,39 @@ const previewGuardPage = createPreviewGuardPage({
   // 没权限」。这只是不渲染一个必然失败的入口，服务端门禁一分未松。
   canInteract: req => projectWorkbenchOperationCapabilities(dashboardRequestIdentity(req)).canInteract,
 });
+// Primary replicas need one shared route registry for Pod-local worker
+// terminals. Initialize it before the `/s/*` front proxy so a request landing
+// on a non-owner backend can resolve the current owner Dashboard NodePort.
+const dashboardCoordinationRuntime = coordinationModeIsPrimary()
+  ? await initializeDurableCoordinationRuntime({
+      ...process.env,
+      // Daemon providers own the Pod health snapshot/metrics. The dashboard's
+      // narrow config/route provider must not race those reporters on one path.
+      BOTMUX_COORDINATION_HEALTH_FILE: '',
+    }, { allowPrimary: true })
+  : undefined;
+const terminalRouteInstanceId = (process.env.MY_POD_NAME || process.env.HOSTNAME || `dashboard-${process.pid}`).trim();
+const terminalRouteRegistry = dashboardCoordinationRuntime?.mode === 'primary'
+  ? createDurableTerminalRouteRegistry({
+      store: dashboardCoordinationRuntime.store,
+      ownerId: `terminal-route-dashboard:${terminalRouteInstanceId}:${process.pid}`,
+    })
+  : undefined;
 const terminalFrontProxy = createTerminalFrontProxy({
   resolvePort: sessionId => (
     aggregator.terminalProxyPortOf(sessionId) ?? liveV3TerminalPortForSession(v3RunsDir(), sessionId)
   ),
+  // #2062: cross-replica routing exists only when primary coordination is on.
+  // Single-replica Dashboards install neither hook and keep the local-only path.
+  ...(terminalRouteRegistry
+    ? {
+        resolveRemoteTarget: async (sessionId: string) => {
+          const route = await terminalRouteRegistry.resolveSession(sessionId, terminalRouteInstanceId);
+          return route ? { host: route.host, port: route.port } : undefined;
+        },
+        isLocalTerminalLive: (sessionId: string) => aggregator.hasLiveTerminalWorker(sessionId),
+      }
+    : {}),
   resolveActor: dashboardRequestIdentity,
   control: terminalControl,
   // P1-5: bound `?viewToken=` capabilities are refused once the auth session
@@ -896,6 +971,40 @@ const terminalFrontProxy = createTerminalFrontProxy({
   // #2004: lets the daemon proxy wake a suspended session for a signed-in viewer.
   wakeProof: sessionId => signTerminalWakeProof(SECRET, sessionId),
 });
+
+// #2062: advertise this replica's live terminals so a request landing on a
+// peer Dashboard can be forwarded here. Primary-only; a single-replica
+// Dashboard installs no listener and no timer.
+const terminalRouteHost = process.env.BOTMUX_TERMINAL_ROUTE_HOST?.trim();
+const terminalRoutePort = durableTerminalRoutePort(process.env);
+if (terminalRouteRegistry && terminalRouteHost && terminalRoutePort !== undefined) {
+  const terminalRoutePublisher = createDurableTerminalRoutePublisher({
+    registry: terminalRouteRegistry,
+    listRows: () => aggregator.getSessions(),
+    ownerInstanceId: terminalRouteInstanceId,
+    host: terminalRouteHost,
+    port: terminalRoutePort,
+    onWarn: message => logger.warn(`[terminal-route] ${message}`),
+  });
+  let terminalRoutePublishInFlight: Promise<void> | undefined;
+  const scheduleTerminalRoutePublish = (): void => {
+    if (terminalRoutePublishInFlight) return;
+    terminalRoutePublishInFlight = terminalRoutePublisher.publishDue()
+      .catch(error => logger.warn(`[terminal-route] publish failed: ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => { terminalRoutePublishInFlight = undefined; });
+  };
+  aggregator.on(ev => {
+    if (ev.type === 'session.spawned' || ev.type === 'session.update') {
+      scheduleTerminalRoutePublish();
+    }
+  });
+  const terminalRouteHeartbeat = setInterval(scheduleTerminalRoutePublish, 10_000);
+  terminalRouteHeartbeat.unref?.();
+} else if (terminalRouteRegistry) {
+  logger.warn('[terminal-route] primary coordination is on but BOTMUX_TERMINAL_ROUTE_HOST / '
+    + 'BOTMUX_TERMINAL_ROUTE_PORT (or BOTMUX_DASHBOARD_PORT) is unset or invalid; '
+    + 'terminals on this replica are not reachable from peer replicas');
+}
 const sessionPresentation = createSessionPresentationCoordinator(aggregator, async () => null,
   async (appId, row, options) => {
     const daemon = registry.getByAppId(appId);
@@ -1212,8 +1321,11 @@ interface ResolvedDashboardSettings {
   whiteboard: WhiteboardConfig;
   /** Machine-wide v3 Workflow feature switch. Default ON; set false to disable
    *  the `/workflow` grill, Saved-Workflow run/save, the botmux-workflow skill
-   *  family, and the CLI authoring/run subcommands host-wide. */
-  workflow: { enabled: boolean };
+   *  family, and the CLI authoring/run subcommands host-wide. `nodeExecutor`
+   *  is the experimental executor frozen into newly authorized runs;
+   *  `handoffIdentity` whether those runs hand their initiator's identity to
+   *  the node bots. */
+  workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot'; handoffIdentity: boolean };
   /** Machine-wide Claude Code prompt-cache default; null = not configured. */
   promptCache: import('./services/prompt-cache-policy.js').PromptCacheConfig | null;
   /** 定时自动清理空闲会话。默认关闭。olderThanHours/intervalMinutes 反映当前
@@ -1224,8 +1336,9 @@ interface ResolvedDashboardSettings {
     olderThanHours: SessionCleanupHours;
     intervalMinutes: number;
   };
-  /** Machine-wide multi-topic orchestration switch. Default ON. */
-  multiTopic: { enabled: boolean };
+  /** Machine-wide multi-topic orchestration switch. Default ON; the nested
+   *  dispatch task-tree card switch is default OFF. */
+  multiTopic: { enabled: boolean; taskTreeCard: boolean };
   /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
    *  of local host:port. Off by default; only meaningful when bound. */
   remoteAccess: boolean;
@@ -1377,6 +1490,14 @@ function refreshLocalVcMeetingAgentConfig(appId: string): void {
   } catch {
     // This dashboard process may not host the target bot daemon.
   }
+}
+
+/** Workflow run view: live registry name first, then the persisted
+ *  bots-info.json name (offline bots), read lazily once per request. */
+function v3RunBotNameResolver(): (larkAppId: string) => string | undefined {
+  let persisted: Map<string, string> | undefined;
+  return (appId) => registry.getByAppId(appId)?.botName
+    ?? (persisted ??= readPersistedBotNames()).get(appId);
 }
 
 /** Map appId → persisted Feishu-probed botName from bots-info.json (offline
@@ -1847,7 +1968,11 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     // false for every compiled binary, because its package root is "/".
     autoUpdateSupported: lastSuccessfulUpdatePlan !== undefined || isAutoUpdateSupportedInstall(),
     whiteboard: { enabled: global.whiteboard?.enabled === true },
-    workflow: { enabled: global.workflow?.enabled === true }, // default OFF
+    workflow: {
+      enabled: global.workflow?.enabled === true, // default OFF
+      nodeExecutor: global.workflow?.nodeExecutor === 'bot' ? 'bot' : 'ephemeral', // default ephemeral
+      handoffIdentity: global.workflow?.handoffIdentity === true, // default OFF
+    },
     sessionCleanup: {
       archiveCodex: global.sessionCleanup?.archiveCodex === true,
       enabled: global.sessionCleanup?.enabled === true, // default OFF
@@ -1855,7 +1980,10 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
       intervalMinutes: resolveCleanupIntervalMs(global.sessionCleanup) / 60_000,
     },
     promptCache: global.promptCache ?? null,
-    multiTopic: { enabled: global.multiTopic?.enabled !== false }, // default ON
+    multiTopic: {
+      enabled: global.multiTopic?.enabled !== false, // default ON
+      taskTreeCard: global.multiTopic?.taskTreeCard === true, // default OFF
+    },
     remoteAccess: global.remoteAccess === true,
     oauthRedirectBase: global.oauthRedirectBase ?? null,
     httpProxy: global.httpProxy ?? null,
@@ -1868,14 +1996,6 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
 // Single shared deps object for `applySettingsWrite` — both the browser
 // `PUT /api/settings` route and (PR2 C6) the HMAC-gated `PUT /__daemon/settings-write`
 // route call through this so error codes / merge semantics stay identical.
-const dashboardCoordinationRuntime = coordinationModeIsPrimary()
-  ? await initializeDurableCoordinationRuntime({
-      ...process.env,
-      // Daemon providers own the Pod health snapshot/metrics. The dashboard's
-      // narrow config-CAS provider must not race those reporters on one path.
-      BOTMUX_COORDINATION_HEALTH_FILE: '',
-    }, { allowPrimary: true })
-  : undefined;
 const dashboardConfigCoordinator = dashboardCoordinationRuntime?.mode === 'primary'
   ? createDurableConfigCoordinator({
       store: dashboardCoordinationRuntime.store,
@@ -2206,7 +2326,9 @@ function currentInstalledVersion(): string {
  * the caller signals independently of `changed`. Rejects with a stable `code`
  * on the recoverable, UI-actionable failures.
  */
-async function runLocalDevUpdate(): Promise<{ dir: string; changed: boolean; oldVersion: string; newVersion: string; head: string }> {
+const localDevForceUpdates = new LocalDevForceUpdates();
+
+async function runLocalDevUpdate(forceToken?: string): Promise<{ dir: string; changed: boolean; oldVersion: string; newVersion: string; head: string; backupRef?: string }> {
   const dir = resolveLocalDevCheckoutDir();
   if (!isGitWorktree(dir)) {
     throw Object.assign(new Error(`${dir} is not a git worktree`), { code: 'not_a_worktree', dir });
@@ -2217,19 +2339,29 @@ async function runLocalDevUpdate(): Promise<{ dir: string; changed: boolean; old
   } catch (e) {
     throw Object.assign(new Error(e instanceof Error ? e.message : String(e)), { code: 'git_status_failed', dir });
   }
-  if (status) {
+  if (status && !forceToken) {
     throw Object.assign(new Error('working tree has uncommitted changes'), {
       code: 'dirty_worktree', dir, status,
     });
   }
   const before = gitHeadSha(dir);
   const oldVersion = resolveCurrentVersionAt(dir);
-  for (const { command, args } of localDevUpdateSteps()) {
-    await runLocalDevStep(dir, command, args);
+  let backupRef: string | undefined;
+  try {
+    if (forceToken) {
+      ({ backupRef } = await localDevForceUpdates.apply(dir, forceToken));
+      await runLocalDevStep(dir, 'bun', ['install', '--frozen-lockfile']);
+      await runLocalDevStep(dir, 'bun', ['run', 'build']);
+    } else {
+      for (const { command, args } of localDevUpdateSteps()) await runLocalDevStep(dir, command, args);
+    }
+  } catch (e) {
+    if (backupRef && e instanceof Error) Object.assign(e, { backupRef });
+    throw e;
   }
   const after = gitHeadSha(dir);
   const newVersion = resolveCurrentVersionAt(dir);
-  return { dir, changed: before === '' || after === '' ? true : before !== after, oldVersion, newVersion, head: after };
+  return { dir, changed: before === '' || after === '' ? true : before !== after, oldVersion, newVersion, head: after, backupRef };
 }
 
 /**
@@ -3995,10 +4127,6 @@ const dashboardSummaryEndpoint = createDashboardSummaryEndpoint({
     logger.warn(`[dashboard-summary] live snapshot unavailable: ${error instanceof Error ? error.message : String(error)}`);
   },
 });
-let feedbackAnalyticsService: FeedbackAnalyticsService | undefined;
-function analyticsService(): FeedbackAnalyticsService {
-  return feedbackAnalyticsService ??= new FeedbackAnalyticsService(config.session.dataDir);
-}
 
 const companionApi = (() => {
   try {
@@ -4097,6 +4225,14 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, { ok: true });
     }
 
+    // Pinned xterm 5.5.0 browser bundle (the #1940 set) for pages rendered at
+    // the Dashboard root — the v3 terminal replay iframe — instead of a public
+    // CDN. Public library files, so no auth (same as the worker's copy under
+    // `/s/<id>/`, which still reaches the worker through the front proxy).
+    if (handleXtermVendorHttp(req, res, url.pathname, 'root', (err) => {
+      logger.warn(`[dashboard] xterm vendor asset failed: ${err instanceof Error ? err.message : String(err)}`);
+    })) return;
+
     // Desktop shell compatibility probe (read-only, no token required). Keep it
     // outside the browser auth gate so packaged desktop apps can decide whether
     // this runtime speaks their dashboard protocol before loading the SPA.
@@ -4139,6 +4275,23 @@ const server = createServer(async (req, res) => {
         if (!dashboardH5AuthConfig.enabled) return undefined;
         return `${dashboardH5AuthConfig.entryPath}?returnTo=${encodeURIComponent(returnTo)}`;
       },
+    })) return;
+
+    // Workflow sidebar (design 2026-11-03 §11): the `/workflow/<app>/<run>`
+    // entry and its read-only data route own their D6 gate — admins see the
+    // full run, current chat members a server-trimmed view, everyone else 403.
+    // Mounted before the ordinary gate because the H5 session it accepts for
+    // non-allowlisted members is invisible to every other route.
+    if (await handleWorkflowSidebar(req, res, url, {
+      runsDir: v3RunsDir(),
+      identity: () => dashboardRequestIdentity(req),
+      h5: () => dashboardH5Auth.resolve(req),
+      h5Config: dashboardH5AuthConfig,
+      platformLoginUrl: returnTo => buildPlatformDashboardLoginUrl(returnTo),
+      membership: workflowSidebarMembership,
+      askMembership: askWorkflowSidebarMembership,
+      brand: appId => normalizeBrand(configuredBrands().get(appId)),
+      botName: v3RunBotNameResolver(),
     })) return;
 
     // Session Web preview is an authenticated, same-origin reverse proxy to an
@@ -4380,6 +4533,10 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Workflow orchestration refuses Feishu H5 免登 with its own code (design
+    // 2026-11-03 workflow-dashboard-orchestration I5) instead of the generic 401.
+    if (workflowInitiatorPreGateDenial(res, url.pathname, requestIdentity, canManageHost)) return;
+
     if (decision.kind === 'deny401') {
       const loginUrl = buildPlatformDashboardLoginUrl();
       res.writeHead(401, {
@@ -4545,7 +4702,13 @@ const server = createServer(async (req, res) => {
     }
 
     if (url.pathname.startsWith('/api/feedback/analytics/')) {
-      await handleFeedbackAnalyticsApi(req, res, url, { service: analyticsService() });
+      await handleFeedbackAnalyticsApi(req, res, url, { service: (await getFeedbackStorage(config.session.dataDir)).analytics });
+      return;
+    }
+    if (url.pathname.startsWith('/api/feedback/storage')) {
+      if (!legacyAuthed || requestIdentity?.kind !== 'legacy-dashboard') return jsonRes(res, 403, { error: 'feedback_storage_admin_required' });
+      if (req.method !== 'GET' && !enforceControlCsrf(req, res, requestIdentity)) return;
+      await handleFeedbackStorageApi(req, res, url, { dataDir: config.session.dataDir, isHostAdmin: true, csrfValid: true });
       return;
     }
 
@@ -5065,11 +5228,40 @@ const server = createServer(async (req, res) => {
       });
     }
 
+    if (req.method === 'POST' && url.pathname === '/api/update/local-dev/preview') {
+      if (!legacyAuthed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      if (!isLocalDevInstall()) return jsonRes(res, 400, { ok: false, error: 'not_a_worktree' });
+      if (updateInFlight || hasActiveRestartLease()) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
+      updateInFlight = true;
+      try {
+        const preview = await withFileLock(globalInstallUpdateLockTarget(), async () => {
+          if (hasActiveRestartLease()) throw Object.assign(new Error('restart_in_flight'), { code: 'restart_in_flight' });
+          return localDevForceUpdates.preview(resolveLocalDevCheckoutDir());
+        }, { maxWaitMs: 2_000 });
+        return jsonRes(res, 200, { ok: true, ...preview });
+      } catch (e) {
+        const error = e instanceof FileLockTimeoutError ? 'update_in_flight' : (e as { code?: string }).code ?? 'install_failed';
+        return jsonRes(res, 409, { ok: false, error, detail: e instanceof Error ? e.message : String(e) });
+      } finally { updateInFlight = false; }
+    }
+
     if (req.method === 'POST' && url.pathname === '/api/update/run') {
       // owner-only：这条会 git pull + 重建，等于改机器上实际运行的代码。协管者的
       // `dashboard:manage` 只覆盖「运营配置」（settings/schedules/groups/autostart），
       // 不含「改代码并重启」——那属于 debug shell 同一档的整机控制权。
       if (!legacyAuthed) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+      let forceToken: string | undefined;
+      if (req.headers['content-type']?.includes('application/json')) {
+        try {
+          const body = await readJsonBody(req, 4096) as { forceLocal?: unknown; previewToken?: unknown } | null;
+          if (body?.forceLocal !== undefined) {
+            if (body.forceLocal !== true || typeof body.previewToken !== 'string' || !body.previewToken || !isLocalDevInstall()) {
+              return jsonRes(res, 400, { ok: false, error: 'invalid_force_update' });
+            }
+            forceToken = body.previewToken;
+          }
+        } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+      }
       // 本地 checkout：走 git pull --ff-only + bun run build（与 CLI cmdUpgradeLocalDev
       // 共用 local-dev-update 逻辑），而不是全局包管理器安装。重启仍走下方
       // /api/update/restart 的 lease/intent 路径。
@@ -5080,16 +5272,22 @@ const server = createServer(async (req, res) => {
         updateInFlight = true;
         let acquired = false;
         let blockedByRestart = false;
-        let result: { dir: string; changed: boolean; oldVersion: string; newVersion: string; head: string } | undefined;
+        let result: Awaited<ReturnType<typeof runLocalDevUpdate>> | undefined;
         try {
           await withFileLock(globalInstallUpdateLockTarget(), async () => {
             acquired = true;
             if (hasActiveRestartLease()) { blockedByRestart = true; return; }
-            result = await runLocalDevUpdate();
+            pendingLocalDevRestart = undefined;
+            result = await runLocalDevUpdate(forceToken);
           }, { maxWaitMs: 2_000 });
         } catch (e) {
           if (!acquired && e instanceof FileLockTimeoutError) return jsonRes(res, 409, { ok: false, error: 'update_in_flight' });
           const code = (e as { code?: string }).code;
+          const backupRef = (e as { backupRef?: string }).backupRef;
+          const backupStash = (e as { backupStash?: string }).backupStash;
+          if (typeof code === 'string' && code.startsWith('local_update_')) {
+            return jsonRes(res, 409, { ok: false, error: code, backupRef });
+          }
           if (code === 'dirty_worktree') {
             return jsonRes(res, 409, {
               ok: false, error: 'dirty_worktree',
@@ -5100,7 +5298,7 @@ const server = createServer(async (req, res) => {
           if (code === 'not_a_worktree') {
             return jsonRes(res, 400, { ok: false, error: 'not_a_worktree', dir: (e as { dir?: string }).dir ?? '' });
           }
-          return jsonRes(res, 500, { ok: false, error: 'install_failed', detail: e instanceof Error ? e.message : String(e) });
+          return jsonRes(res, 500, { ok: false, error: 'install_failed', detail: e instanceof Error ? e.message : String(e), backupRef, backupStash });
         } finally {
           updateInFlight = false;
         }
@@ -5122,6 +5320,7 @@ const server = createServer(async (req, res) => {
           // have been pulled already and only needed a build).
           restartRequired: true,
           localDev: true,
+          backupRef: result?.backupRef,
         });
       }
       // 编译版独立二进制（install.sh 形态）：没有包管理器拥有这个文件，改为下载
@@ -6394,6 +6593,16 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, upstream.status, projectSessionDetailForBrowser(body));
     }
 
+    // Owner authentication above applies; never fall back to a broad interrupt.
+    const sessionStop = await proxySessionStopControl(req.method, url.pathname, {
+      ownerOf: sid => aggregator.ownerOf(sid), proxyToDaemon,
+    });
+    if (sessionStop) {
+      res.writeHead(sessionStop.status, { 'content-type': 'application/json' });
+      res.end(await sessionStop.text());
+      return;
+    }
+
     // 异步 trigger 结果轮询（asyncReturnSessionId 模式的权威查询端点）。
     // 四态 running/completed/failed/not_found，daemon 重启后从持久化结果兜底
     // 重建 completed。owner-only（写权限 cookie），代理到 owner daemon 同名 IPC。
@@ -6655,12 +6864,40 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Workflow initiator (design 2026-11-03 workflow-dashboard-orchestration
+    // §7.1): classify the login here, resolve the person and gate on the
+    // orchestrating bot's own daemon.
+    if (await handleWorkflowInitiatorApi(req, res, url, {
+      identity: requestIdentity,
+      canManageHost: authed,
+      platformBound: !!readPlatformBinding(),
+      featureEnabled: () => isWorkflowFeatureEnabled() && workflowNodeExecutorMode() === 'bot',
+      proxyToDaemon,
+    })) {
+      return;
+    }
+
+    // Workflow drafts (design 2026-11-03 workflow-dashboard-orchestration D2):
+    // the list reads disk; everything else goes to the draft's orchestrating
+    // bot's daemon, which checks the initiator on every write.
+    if (await handleWorkflowDraftsApi(req, res, url, {
+      identity: requestIdentity,
+      canManageHost: authed,
+      platformBound: !!readPlatformBinding(),
+      featureEnabled: () => isWorkflowFeatureEnabled() && workflowNodeExecutorMode() === 'bot',
+      runsDir: v3RunsDir(),
+      proxyToDaemon,
+    })) {
+      return;
+    }
+
     // v3 workflow runs. Reads project directly from disk; cancel resolves the
     // immutable run owner and proxies to that daemon (the dashboard never
     // writes the v3 journal itself).
     if (await handleV3RunsApi(req, res, url, {
       runsDir: v3RunsDir(),
       proxyToDaemon,
+      botName: v3RunBotNameResolver(),
     }, authed)) {
       return;
     }
@@ -8144,7 +8381,20 @@ listenWithProbe({
   try { atomicWriteFileSync(PORT_PATH, String(port)); } catch (e) {
     logger.warn(`[dashboard] Failed to persist port to ${PORT_PATH}: ${(e as Error).message}`);
   }
+  // Card builders (daemons / CLIs never see the H5 config) read this to pick
+  // the「工作流 ›」link: the Feishu sidebar only when H5 login can work there.
+  try { publishDashboardH5Presence(dashboardH5LoginUsable(dashboardH5AuthConfig)); } catch (e) {
+    logger.warn(`[dashboard] Failed to record H5 login availability: ${(e as Error).message}`);
+  }
   logger.info(`[dashboard] listening on ${config.dashboard.host}:${port}`);
+  // #2062 F5: the advertised route port defaults to BOTMUX_DASHBOARD_PORT, but
+  // the listener may have probed past a busy port. An explicit
+  // BOTMUX_TERMINAL_ROUTE_PORT (e.g. a NodePort mapping) is trusted as-is.
+  if (terminalRouteRegistry && !process.env.BOTMUX_TERMINAL_ROUTE_PORT?.trim()
+      && terminalRoutePort !== undefined && terminalRoutePort !== port) {
+    logger.warn(`[terminal-route] advertised port ${terminalRoutePort} differs from the listening port ${port}; `
+      + 'peer replicas will fail to reach terminals here — set BOTMUX_TERMINAL_ROUTE_PORT explicitly');
+  }
   // Reclaim any `.trash-*` skill trees left by an interrupted background unlink
   // (crash/restart mid-delete). Best-effort and fire-and-forget.
   sweepStoreTrash();
@@ -8245,14 +8495,7 @@ function readPlatformBotsInfo(): PlatformBotInfo[] {
   try {
     const fp = join(config.session.dataDir, 'bots-info.json');
     if (!existsSync(fp)) return [];
-    const entries = JSON.parse(readFileSync(fp, 'utf8')) as Array<{
-      larkAppId?: string;
-      botOpenId?: string | null;
-      botName?: string | null;
-      botAvatarUrl?: string | null;
-      cliId?: string;
-    }>;
-    if (!Array.isArray(entries)) return [];
+    const entries = normalizeBotsInfoRouteEntries(JSON.parse(readFileSync(fp, 'utf8')));
     // Merge per-bot team-visibility config (showInTeam) from bots.json by
     // larkAppId so the platform team page can hide bots. Default: showInTeam =
     // true (shown). bots.json may be unreadable from the dashboard process →
@@ -8268,13 +8511,13 @@ function readPlatformBotsInfo(): PlatformBotInfo[] {
     }
     return entries
       .map((e) => {
-        const cfg = cfgByAppId.get(e.larkAppId || '');
+        const cfg = cfgByAppId.get(e.larkAppId);
         return {
-          appId: e.larkAppId || '',
-          openId: e.botOpenId ?? null,
+          appId: e.larkAppId,
+          openId: e.botOpenId,
           name: e.botName || e.larkAppId || 'bot',
           avatar: e.botAvatarUrl || undefined,
-          cli: e.cliId,
+          cli: e.cliId ?? undefined,
           showInTeam: cfg?.showInTeam !== false, // default true
           // 自家消息回声学到的租户稳定 union_id（可能尚未学到 → undefined）。
           // 平台聚合团队 roster 用，见 bot-union-ids-store / platform-team-store。
@@ -8337,7 +8580,7 @@ function handlePlatformTeamSync(payload: PlatformTeamSyncMessage): void {
 }
 
 // Graceful shutdown
-function shutdown(): void {
+async function shutdown(): Promise<void> {
   codexNotifierAbort.abort();
   stopAutoCleanup();
   for (const sub of subs.values()) sub.off();
@@ -8346,7 +8589,7 @@ function shutdown(): void {
   resourceMonitor.stop();
   platformTunnel?.stop();
   hostTerminalManager.shutdown();
-  feedbackAnalyticsService?.close();
+  await closeFeedbackStorage(config.session.dataDir);
   setDurableConfigCoordinator(undefined);
   if (oauthCallbackServer.listening) oauthCallbackServer.close();
   server.close(() => {

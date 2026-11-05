@@ -32,9 +32,20 @@ const BOTS_INFO = [
 
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
+  const { dirname, resolve, sep } = await import('node:path');
   return {
     ...actual,
-    existsSync: vi.fn(() => true),
+    existsSync: vi.fn((path) => {
+      // /botconfig uses real temporary bots.json fixtures. Keep existence checks
+      // in that directory real too: claiming every optional sidecar exists makes
+      // the real persistence path try to lstat/read files the fixture never made.
+      const botsFile = process.env.BOTS_CONFIG;
+      if (botsFile && typeof path === 'string'
+          && resolve(path).startsWith(dirname(resolve(botsFile)) + sep)) {
+        return actual.existsSync(path);
+      }
+      return true;
+    }),
     statSync: vi.fn(() => ({ isDirectory: () => true })),
     mkdirSync: vi.fn(),
     readFileSync: vi.fn((p: any, ...rest: any[]) => {
@@ -4557,6 +4568,16 @@ describe('handleCommand', () => {
   // ─── /stop ──────────────────────────────────────────────────────────────
 
   describe('/stop', () => {
+    it('does not claim a stop was sent while an Antigravity fork is pending', async () => {
+      const ds = makeDaemonSession({ worker: { killed: false, send: vi.fn() } as any });
+      ds.session.cliId = 'antigravity';
+      ds.session.pendingForkSession = true;
+      const deps = makeDeps(ds);
+      await handleCommand('/stop', ROOT_ID, makeLarkMessage('/stop'), deps, LARK_APP_ID);
+      expect(sendWorkerSessionInput).not.toHaveBeenCalled();
+      expect(closeSession).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID, expect.stringContaining('/close'), undefined, LARK_APP_ID, 'msg_001');
+    });
     it('sends ctrl-c through the session input channel and keeps the session alive', async () => {
       const ds = makeDaemonSession({
         worker: { killed: false, send: vi.fn() } as any,
@@ -10066,6 +10087,12 @@ describe('/card — operator / canOperate gate', () => {
 
   it.each([
     { frozen: 'grok', stale: 'opencode', mode: 'unified', managed: true },
+    { frozen: 'traex', stale: 'opencode', mode: 'unified', managed: true },
+    { frozen: 'pi', stale: 'opencode', mode: 'unified', managed: true },
+    { frozen: 'opencode', stale: 'traex', mode: 'unified', managed: false },
+    { frozen: 'opencode', stale: 'pi', mode: 'unified', managed: false },
+    { frozen: undefined, stale: 'traex', mode: 'unified', managed: true },
+    { frozen: undefined, stale: 'pi', mode: 'unified', managed: true },
     { frozen: 'opencode', stale: 'grok', mode: 'unified', managed: false },
     { frozen: undefined, stale: 'grok', mode: 'unified', managed: true },
     { frozen: undefined, stale: undefined, mode: 'unified', managed: true },

@@ -11,7 +11,7 @@ import { describe, it, expect } from 'vitest';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync, mkdirSync, rmSync, statSync, chmodSync, utimesSync } from 'node:fs';
- import { buildCredentialOnlySandboxArgs, buildRelayHostArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, sandboxTarOptions, attachSandboxOutbox, sandboxTreeSurvivesWorkerExit, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
+import { buildCredentialOnlySandboxArgs, buildRelayHostArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, sandboxTarOptions, attachSandboxOutbox, sandboxTreeSurvivesWorkerExit, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 
@@ -768,6 +768,17 @@ describe('validateRelayRequest', () => {
     expect(validateRelayRequest({ contentFile: 'c.content', videoCovers: ['../cover.png'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'a/b' }).ok).toBe(false);
     expect(validateRelayRequest({ /* missing contentFile */ flags: [] }).ok).toBe(false);
+  });
+
+  it('rejects cards and every media field on a dispatch relay (send-only payloads)', () => {
+    const dispatchBase = { command: 'dispatch' as const, contentFile: 'c.brief', flags: [] };
+    expect(validateRelayRequest({ ...dispatchBase, images: ['preview.png'] }).ok).toBe(false);
+    expect(validateRelayRequest({ ...dispatchBase, attachments: ['report.pdf'] }).ok).toBe(false);
+    expect(validateRelayRequest({ ...dispatchBase, videos: ['replay.mp4'] }).ok).toBe(false);
+    expect(validateRelayRequest({ ...dispatchBase, videoCovers: ['cover.png'] }).ok).toBe(false);
+    expect(validateRelayRequest({ ...dispatchBase, preparedContentFile: 'c.card-content' }).ok).toBe(false);
+    expect(validateRelayRequest({ ...dispatchBase, cardFile: 'c.card.json' }).ok).toBe(false);
+    expect(validateRelayRequest({ ...dispatchBase, completionProposalFile: 'c.proposal.json' }).ok).toBe(false);
   });
 });
 

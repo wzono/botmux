@@ -133,9 +133,13 @@ export interface TranscriptEvent {
    *  Background launches are read from here — see {@link backgroundTaskLaunches}. */
   toolUseResult?: unknown;
   /** `type:"queue-operation"` lines: `enqueue` / `dequeue` / `remove` on Claude
-   *  Code's input queue, with the queued text in the top-level `content`. */
+   *  Code's input queue, with the queued text in the top-level `content`.
+   *  `remove` records additionally carry the queued item's `commandUuid`
+   *  (and often its `deliveryId`); `enqueue` / `dequeue` carry neither. */
   operation?: string;
   content?: unknown;
+  commandUuid?: string;
+  deliveryId?: string;
 }
 
 /**
@@ -1837,7 +1841,9 @@ export interface JsonlFingerprintSearchOptions {
   /** Drop events whose `timestamp` field is older than this (millis since
    *  epoch). Defends against short fingerprints ("hello", "test") matching
    *  old user lines in unrelated sibling jsonls — file mtime alone isn't
-   *  enough since a sibling Claude pane could be actively writing. */
+   *  enough since a sibling Claude pane could be actively writing. Events
+   *  with no parseable timestamp are dropped as well (see
+   *  {@link eventAtOrAfter}). */
   minEventTimestampMs?: number;
   /** Also match Claude Code type-ahead enqueue events, whose content is not role:user. */
   includeQueueOperations?: boolean;
@@ -1861,6 +1867,18 @@ export interface JsonlFingerprintSearchOptions {
    *  leave this off: a subagent jsonl must never replace the session jsonl as
    *  the watched transcript. */
   includeSubagentTranscripts?: boolean;
+}
+
+/** True when the event carries a parseable timestamp at or after `floorMs`.
+ *  An event without one cannot be placed after the floor: Claude Code writes
+ *  `api-request-blob` records (a copy of a request's user content, no
+ *  timestamp) next to the original prompt, so letting them through matched a
+ *  new Lark turn against an hours-old identical prompt in another session's
+ *  file. */
+function eventAtOrAfter(ev: { timestamp?: unknown }, floorMs: number): boolean {
+  if (typeof ev.timestamp !== 'string') return false;
+  const evMs = Date.parse(ev.timestamp);
+  return Number.isFinite(evMs) && evMs >= floorMs;
 }
 
 /** Scan a single jsonl file's tail for a Lark message fingerprint. Same
@@ -1908,10 +1926,7 @@ export function jsonlContainsFingerprint(
     // mtime can be recent if a sibling Claude pane is actively writing
     // its own turns). We compare against `event.timestamp` rather than
     // file mtime to be precise.
-    if (minEventTimestampMs !== undefined && typeof ev.timestamp === 'string') {
-      const evMs = Date.parse(ev.timestamp);
-      if (Number.isFinite(evMs) && evMs < minEventTimestampMs) continue;
-    }
+    if (minEventTimestampMs !== undefined && !eventAtOrAfter(ev, minEventTimestampMs)) continue;
     const role = ev.message?.role ?? ev.type;
     let lineText = '';
     if (role === 'user') {
@@ -1953,6 +1968,7 @@ function jsonlTailMatchFingerprint(
   path: string,
   fingerprint: string,
   opts: JsonlFingerprintSearchOptions,
+  requireForwardedSubagentMessage = false,
 ): 'match' | 'veto' | 'none' {
   let hit = false;
   try {
@@ -1986,13 +2002,17 @@ function jsonlTailMatchFingerprint(
         // the full rationale. Required to keep short fingerprints
         // ("hello", "test") from matching old user lines in unrelated
         // sibling jsonls.
-        if (opts.minEventTimestampMs !== undefined && typeof ev.timestamp === 'string') {
-          const evMs = Date.parse(ev.timestamp);
-          if (Number.isFinite(evMs) && evMs < opts.minEventTimestampMs) continue;
-        }
+        if (opts.minEventTimestampMs !== undefined && !eventAtOrAfter(ev, opts.minEventTimestampMs)) continue;
         const role = ev.message?.role ?? ev.type;
         let text = '';
         if (role === 'user') {
+          // A subagent transcript starts with its task instruction as a normal
+          // user event. That instruction was not delivered by this submission,
+          // so it must not confirm the submit merely because it contains the
+          // same fingerprint. Claude marks messages forwarded to an already
+          // running subagent as meta user events; require that boundary rather
+          // than matching arbitrary subagent input.
+          if (requireForwardedSubagentMessage && ev.isMeta !== true) continue;
           // Skip pure tool_result events — see jsonlContainsFingerprint
           // for the full rationale; in short, tool_result content is
           // log output, not user input, and would false-match short
@@ -2041,11 +2061,11 @@ export function findJsonlContainingFingerprint(
   // Walk newest-first so a recently-rotated jsonl is found before older
   // ones; if two files contain the fingerprint (rare, e.g. user pasted
   // the same message into two panes) we prefer the more recent.
-  const candidates: Array<{ path: string; mtime: number }> = [];
-  const addCandidateFile = (full: string, mtimeMs: number): void => {
+  const candidates: Array<{ path: string; mtime: number; subagent: boolean }> = [];
+  const addCandidateFile = (full: string, mtimeMs: number, subagent = false): void => {
     if (opts.excludePath && full === opts.excludePath) return;
     if (opts.minMtimeMs !== undefined && mtimeMs < opts.minMtimeMs) return;
-    candidates.push({ path: full, mtime: mtimeMs });
+    candidates.push({ path: full, mtime: mtimeMs, subagent });
   };
   for (const name of entries) {
     const full = join(dir, name);
@@ -2073,16 +2093,16 @@ export function findJsonlContainingFingerprint(
         const subFull = join(subDir, subName);
         try {
           const subSt = statSync(subFull);
-          if (subSt.isFile()) addCandidateFile(subFull, subSt.mtimeMs);
+          if (subSt.isFile()) addCandidateFile(subFull, subSt.mtimeMs, true);
         } catch { /* ignore */ }
       }
     } catch { /* ignore */ }
   }
   candidates.sort((a, b) => b.mtime - a.mtime);
-  for (const { path } of candidates) {
+  for (const { path, subagent } of candidates) {
     // A veto moves on to the next-older candidate instead of returning null
     // after the first fingerprint hit (sibling-pane hijack guard).
-    if (jsonlTailMatchFingerprint(path, fingerprint, opts) === 'match') return path;
+    if (jsonlTailMatchFingerprint(path, fingerprint, opts, subagent) === 'match') return path;
   }
   return null;
 }
@@ -2157,10 +2177,7 @@ export function findJsonlsContainingExactContent(
           let ev: any;
           try { ev = JSON.parse(line); } catch { continue; }
           if (!ev || typeof ev !== 'object') continue;
-          if (opts.minEventTimestampMs !== undefined && typeof ev.timestamp === 'string') {
-            const evMs = Date.parse(ev.timestamp);
-            if (Number.isFinite(evMs) && evMs < opts.minEventTimestampMs) continue;
-          }
+          if (opts.minEventTimestampMs !== undefined && !eventAtOrAfter(ev, opts.minEventTimestampMs)) continue;
           const role = ev.message?.role ?? ev.type;
           let raw = '';
           if (role === 'user') {

@@ -10,6 +10,12 @@ Every conversation turn produces a live-updating Lark card, your primary window 
 - **A fresh card per turn**: the previous card freezes as an archive, keeping conversation history clear and traceable; after a session is moved to another group with [`/relay`](/en/relay), the original card also automatically freezes as an archive (buttons removed).
 - **A "recoverable" card on close**: it carries a "▶️ Resume session" button to click back in anytime; **if the CLI supports native resume** (the adapter implements `buildResumeCommand` and a native session id exists), it also includes the native command (e.g. `claude --resume <id>`) for manual recovery; when unsupported, only botmux's resume button plus a short note is shown.
 
+## Dynamic single reply cards
+
+Set `/botconfig set replyCardMode unified` to update public progress, tool activity and the final answer in one card per turn; the next turn creates a new card. This supports ordinary Claude Code / Codex / Grok / TraeX / Pi Feishu conversations without a file sandbox, including group and topic sessions. Changes take effect from the next turn. `/botconfig set replyCardMode legacy` restores separate messages. The terminal status card remains independently controlled by `disableStreamingCard` and `/card off`.
+
+TraeX and Pi reuse their structured transcript bridges for turn attribution. A retriable Pi error keeps the card working until a native settlement marker or the existing error timeout resolves it. A custom tool that returns `terminate:true` without persisting a terminal record can leave the card working until a later input supersedes it. Sandboxed sessions and other unsupported entry points retain their existing delivery behavior.
+
 ## The four display layers of a turn
 
 botmux's "presence" in Lark has four independently switched layers:
@@ -65,6 +71,16 @@ To stop or correct it mid-turn, **don't wait for it to finish**: in screenshot m
 The card body is a **live screenshot (image)** of the terminal, not text rendering. Messages the CLI proactively sends (via `botmux send`) are separate rich-text / image-and-text messages that can carry images, files, and @mentions; for fully custom display, `--card-file` / `--card-json` can send raw interactive card JSON.
 
 > ⚠️ Raw cards allow **display-only elements + open_url buttons only**: any callback-firing control — callback buttons (with a `value`), dropdown / person selects, date-time pickers, inputs, form submits — is rejected. This prevents custom cards from forging interactive callbacks.
+
+## Automatic-recovery failure card
+
+When an ordinary Claude message hits a transient model failure (model API unreachable, DNS outage, dropped connection, ...), Botmux continues it automatically, at most twice. If automatic recovery finally fails, one failure card is posted in the original chat (or topic). It is the only notice for that message:
+
+- It @-mentions the original sender, then states the cause in one sentence (classified from the error code; no raw error text), an excerpt of the message, the time, and how many automatic continuations ran.
+- **🔁 Retry** delivers the original message again, running as the original sender; the answer still goes to the original chat or topic. Only the original sender (while they may still talk to the bot) or a bot admin can press it. A card can be retried successfully once; afterwards it shows who retried. The re-delivered message carries one line asking the AI to check the current state first and to try to avoid repeating work that already completed.
+- A continuation whose result never arrives (the terminal has been idle for about a minute) also counts as failed and gets the card, instead of staying "in progress" forever.
+- If the Feishu API is also unreachable when the card is due, it keeps retrying (up to 24 hours) and lands exactly once; a daemon restart does not re-send a delivered card.
+- Scheduled-task runs get the card too, without a retry button; run the task again manually if needed.
 
 ## Custom card usage segments
 

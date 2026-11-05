@@ -725,6 +725,7 @@ describe('findJsonlContainingFingerprint', () => {
     const subagent = join(subDir, 'agent-aaaaaaaa.jsonl');
     const ev = {
       type: 'user',
+      isMeta: true,
       timestamp: '2026-09-17T03:39:54.000Z',
       message: {
         role: 'user',
@@ -740,13 +741,50 @@ describe('findJsonlContainingFingerprint', () => {
     })).toBe(subagent);
   });
 
-  it('respects minMtimeMs for subagent transcripts', () => {
+  it('does not treat the initial subagent task instruction as forwarded delivery', () => {
     const sid = '11111111-2222-3333-4444-555555555555';
     const subDir = join(projectDir, sid, 'subagents');
     mkdirSync(subDir, { recursive: true });
     const subagent = join(subDir, 'agent-aaaaaaaa.jsonl');
-    writeFileSync(subagent, '{"type":"user","message":{"role":"user","content":"repeatable short prompt"}}\n');
+    const submittedFingerprint = 'review the exact submission marker';
+    writeFileSync(subagent, [
+      JSON.stringify({
+        type: 'user',
+        isSidechain: true,
+        timestamp: '2026-09-17T03:39:54.000Z',
+        message: { role: 'user', content: `Initial agent task: ${submittedFingerprint}` },
+      }),
+      JSON.stringify({
+        type: 'user',
+        isSidechain: true,
+        isMeta: true,
+        timestamp: '2026-09-17T03:39:55.000Z',
+        message: { role: 'user', content: 'The user sent a new message while you were working: unrelated follow-up' },
+      }),
+    ].join('\n') + '\n');
+    utimesSync(subagent, 2_000_000, 2_000_000);
+
+    expect(findJsonlContainingFingerprint(projectDir, submittedFingerprint, {
+      includeSubagentTranscripts: true,
+    })).toBeNull();
+  });
+
+  it('respects minMtimeMs for otherwise eligible forwarded subagent messages', () => {
+    const sid = '11111111-2222-3333-4444-555555555555';
+    const subDir = join(projectDir, sid, 'subagents');
+    mkdirSync(subDir, { recursive: true });
+    const subagent = join(subDir, 'agent-aaaaaaaa.jsonl');
+    writeFileSync(subagent, JSON.stringify({
+      type: 'user',
+      isMeta: true,
+      message: { role: 'user', content: 'repeatable short prompt' },
+    }) + '\n');
     utimesSync(subagent, 1_000_000, 1_000_000);
+
+    // Positive control: without the mtime floor, this forwarded event matches.
+    expect(findJsonlContainingFingerprint(projectDir, 'repeatable short prompt', {
+      includeSubagentTranscripts: true,
+    })).toBe(subagent);
     expect(findJsonlContainingFingerprint(projectDir, 'repeatable short prompt', {
       includeSubagentTranscripts: true,
       minMtimeMs: 1_500_000_000,
@@ -754,11 +792,29 @@ describe('findJsonlContainingFingerprint', () => {
   });
 
   it('does not descend into non-session-named subdirectories', () => {
+    const forwardedEvent = (content: string) => JSON.stringify({
+      type: 'user',
+      isMeta: true,
+      message: { role: 'user', content },
+    }) + '\n';
     const rogue = join(projectDir, 'some-other-folder', 'subagents');
     mkdirSync(rogue, { recursive: true });
     const rogueFile = join(rogue, 'agent-x.jsonl');
-    writeFileSync(rogueFile, '{"type":"user","message":{"role":"user","content":"fingerprint-in-nested-folder"}}\n');
+    writeFileSync(rogueFile, forwardedEvent('fingerprint-in-nested-folder'));
     utimesSync(rogueFile, 2_000_000, 2_000_000);
+
+    const sid = '11111111-2222-3333-4444-555555555555';
+    const validSubDir = join(projectDir, sid, 'subagents');
+    mkdirSync(validSubDir, { recursive: true });
+    const validFile = join(validSubDir, 'agent-control.jsonl');
+    writeFileSync(validFile, forwardedEvent('valid-session-folder-control'));
+    utimesSync(validFile, 2_000_000, 2_000_000);
+
+    // Positive control: the same forwarded-event shape is eligible under a
+    // UUID-named session directory.
+    expect(findJsonlContainingFingerprint(projectDir, 'valid-session-folder-control', {
+      includeSubagentTranscripts: true,
+    })).toBe(validFile);
     expect(findJsonlContainingFingerprint(projectDir, 'fingerprint-in-nested-folder', {
       includeSubagentTranscripts: true,
     })).toBeNull();
@@ -1142,6 +1198,66 @@ describe('fingerprint fallback: /clear rotation + short fingerprint guard', () =
     expect(jsonlContainsFingerprint(path, 'hello world', {
       minEventTimestampMs: Date.parse('2026-04-29T06:00:00.000Z'),
     })).toBe(false);
+  });
+});
+
+describe('time floor: records without a timestamp cannot pass it', () => {
+  const floorMs = Date.parse('2026-10-29T10:35:00.000Z');
+  // Shape Claude Code writes next to a prompt: role:user content, no timestamp, no uuid.
+  const blob = (text: string) => JSON.stringify({
+    type: 'api-request-blob',
+    hash: 'abc',
+    message: { role: 'user', content: [{ type: 'text', text }] },
+  }) + '\n';
+  const stalePrompt = (text: string) => JSON.stringify({
+    type: 'user',
+    timestamp: '2026-10-29T10:08:04.933Z',
+    message: { role: 'user', content: text },
+  }) + '\n';
+
+  it('a stale prompt and its blob copy in another session do not match a new turn', () => {
+    const closed = join(dir, 'closed-session.jsonl');
+    appendFileSync(closed, stalePrompt('run the daily report') + blob('run the daily report'), 'utf8');
+    const options = { minEventTimestampMs: floorMs, includeQueueOperations: true };
+    expect(findJsonlsContainingExactContent(dir, 'run the daily report', options)).toEqual([]);
+    expect(findJsonlContainingFingerprint(dir, 'run the daily', options)).toBeNull();
+    expect(jsonlContainsFingerprint(closed, 'run the daily', options)).toBe(false);
+  });
+
+  it('a record with an unparseable timestamp does not pass either', () => {
+    const path = join(dir, 'bad-ts.jsonl');
+    appendFileSync(path, JSON.stringify({
+      type: 'user',
+      timestamp: 'not-a-date',
+      message: { role: 'user', content: 'run the daily report' },
+    }) + '\n', 'utf8');
+    expect(jsonlContainsFingerprint(path, 'run the daily', { minEventTimestampMs: floorMs })).toBe(false);
+  });
+
+  it('a fresh prompt still matches when the file also holds blob copies', () => {
+    const live = join(dir, 'live-session.jsonl');
+    appendFileSync(live, blob('run the daily report') + JSON.stringify({
+      type: 'user',
+      timestamp: '2026-10-29T10:35:43.733Z',
+      message: { role: 'user', content: 'run the daily report' },
+    }) + '\n', 'utf8');
+    expect(findJsonlsContainingExactContent(dir, 'run the daily report', { minEventTimestampMs: floorMs })).toEqual([live]);
+  });
+
+  it('a record exactly at the floor passes (the floor is inclusive)', () => {
+    const path = join(dir, 'at-floor.jsonl');
+    appendFileSync(path, JSON.stringify({
+      type: 'user',
+      timestamp: new Date(floorMs).toISOString(),
+      message: { role: 'user', content: 'run the daily report' },
+    }) + '\n', 'utf8');
+    expect(jsonlContainsFingerprint(path, 'run the daily', { minEventTimestampMs: floorMs })).toBe(true);
+  });
+
+  it('without a floor, the blob copy still counts (behaviour unchanged)', () => {
+    const path = join(dir, 'no-floor.jsonl');
+    appendFileSync(path, blob('run the daily report'), 'utf8');
+    expect(jsonlContainsFingerprint(path, 'run the daily')).toBe(true);
   });
 });
 

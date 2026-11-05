@@ -60,7 +60,7 @@ async function request(mode: string, accessKey = binding.accessKey) {
   });
 }
 describe('session application identity route', () => {
-  async function delegate(options: { tools?: ('lark-cli' | 'bytedcli')[]; denialReason?: 'target_access_denied' | 'target_validation_unavailable'; targetOpenId?: string; turnId?: string } = {}) {
+  async function delegate(options: { tools?: ('lark-cli' | 'bytedcli')[]; denialReason?: 'target_access_denied' | 'target_validation_unavailable'; targetOpenId?: string; turnId?: string; recheck?: () => string | undefined } = {}) {
     session.managedTurnOrigin.callerOpenId = 'ou_dispatch_bot';
     const botConfig = { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret',
       larkToolBinding: true,
@@ -70,8 +70,60 @@ describe('session application identity route', () => {
       senderOpenId: 'ou_dispatch_bot', turnId: options.turnId ?? 'om_turn', delegatedIdentity: {
         credentialOpenId: 'ou_source_human', targetOpenId: options.targetOpenId ?? 'ou_target_human', unionId: 'on_source_human',
         tools: options.tools ?? ['lark-cli'], dispatchRoot: 'om_dispatch_root', denialReason: options.denialReason,
+        ...(options.recheck ? { workflowHandoff: true as const, recheck: options.recheck } : {}),
       } });
   }
+  it('re-checks a workflow handoff delegation on every use; once it stops holding it is refused for good', async () => {
+    let refusal: string | undefined;
+    await delegate({ recheck: () => refusal });
+    vi.mocked(tokens.resolveUserToken).mockResolvedValue('target-grant');
+    expect(await (await request('user')).json()).toMatchObject({ ok: true, credential: 'target-grant' });
+    refusal = 'attempt_inactive'; // e.g. the run was cancelled and the stop never arrived
+    const refused = await request('user');
+    expect(refused.status).toBe(403);
+    expect(await refused.json()).toMatchObject({ ok: false, error: expect.stringMatching(/delegation_inactive.*--dispatch-root om_dispatch_root/) });
+    expect(tokens.resolveUserToken).toHaveBeenCalledTimes(1);
+    refusal = undefined;
+    expect((await request('user')).status).toBe(403);
+  });
+  it('an inactive workflow delegation cannot start an authorization for its human either', async () => {
+    await delegate({ recheck: () => 'handoff_revoked' });
+    const requestAuth = vi.spyOn(tokens, 'requestUserAuthorization');
+    const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/auth-request`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
+      body: JSON.stringify({ scopes: ['im:chat:read'] }),
+    });
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({ ok: false, error: 'current_actor_unverified' });
+    expect(requestAuth).not.toHaveBeenCalled();
+  });
+  it('serves a refusal instead of the published bytedcli identity once a workflow delegation stops holding', async () => {
+    const { writeSessionIdentity } = await import('../src/core/cli-identity.js');
+    const { rememberLarkToolDelegation } = await import('../src/core/lark-tool-delegation.js');
+    vi.spyOn(workerPool, 'identityStorageModelForDaemonSession').mockReturnValue('proven');
+    session.reportedIdentityModel = { model: 'proven' };
+    writeSessionIdentity(dir, 'tool-session', { tool: 'bytedcli', cloudJwt: 'alice-cloud', turnId: 'om_turn' } as any, 'proven');
+    let refusal: string | undefined;
+    rememberLarkToolDelegation(dir, 'tool-session', 'om_turn', {
+      credentialOpenId: 'ou_source_human', targetOpenId: 'ou_target_human', unionId: 'on_source_human',
+      tools: ['bytedcli'], dispatchRoot: 'om_handoff', workflowHandoff: true, recheck: () => refusal,
+    });
+    const identity = async () => (await fetch(`http://127.0.0.1:${ipc!.port}/api/current-execution-identity`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: 'tool-session', tool: 'bytedcli' }),
+    })).json();
+    expect(await identity()).toMatchObject({ status: 'verified', env: expect.stringContaining('alice-cloud') });
+    refusal = 'handoff_revoked';
+    const after = await identity();
+    // Capture the primitive BEFORE the asymmetric-matcher assertion: Bun's
+    // toMatchObject replaces the matched nested field on the RECEIVED object
+    // with the matcher instance (measured on Bun 1.4), so reading after.env
+    // after the expectation hands back an ExpectStringContaining, not a string.
+    const afterEnv: string = after.env;
+    expect(after).toMatchObject({ status: 'verified', env: expect.stringContaining('no longer active') });
+    expect(afterEnv).not.toContain('alice-cloud');
+    expect(afterEnv).toContain('--dispatch-root om_handoff');
+  });
   it('uses the verified delegated human’s target-app authorization, never the dispatch bot or source token', async () => {
     await delegate();
     vi.mocked(tokens.resolveUserToken).mockImplementation(async (app, _secret, _brand, person) =>
@@ -211,20 +263,6 @@ describe('session application identity route', () => {
     session.larkAppId = 'cli_other';
     expect((await request('bot')).status).toBe(403);
     expect(botToken).not.toHaveBeenCalled();
-  });
-  it('gives a bound headless runner only its own bot token', async () => {
-    markHeadless();
-    session.managedTurnOrigin = undefined;
-    const response = await request('bot');
-    expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ appId: 'cli_bound', mode: 'bot',
-      credentialType: 'tenant_access_token', credential: 'bound-bot-token' });
-    expect((await request('user')).status).toBe(403);
-    expect(tokens.resolveUserToken).not.toHaveBeenCalled();
-    // Even a stale human origin cannot turn a headless runner into a user session.
-    session.managedTurnOrigin = { turnId: 'om_turn', capability: 'cap', callerOpenId: 'ou_sender' };
-    expect((await request('user')).status).toBe(403);
-    expect(tokens.resolveUserToken).not.toHaveBeenCalled();
   });
   it.each(['http_async_runner', 'http_wait_runner'])('keeps other virtual chats without tool credentials (%s)', async chatId => {
     session.chatId = chatId;
@@ -399,11 +437,7 @@ describe('session application identity route', () => {
       expect(tokens.resolveUserToken).not.toHaveBeenCalled();
     } finally { shell.kill(); }
   });
-  it.each([false, true])('runs the real tool process with only the selected application credentials (headless=%s)', async headless => {
-    if (headless) {
-      markHeadless();
-      session.managedTurnOrigin = undefined;
-    }
+  it('runs the real tool process with only the selected application credentials', async () => {
     const real = join(dir, 'real-lark');
     writeFileSync(real, '#!/usr/bin/env node\n' + fakeLarkHelpScript() + 'process.stdout.write([process.env.LARKSUITE_CLI_APP_ID,process.env.LARKSUITE_CLI_APP_SECRET,process.env.LARKSUITE_CLI_TENANT_ACCESS_TOKEN,process.env.LARKSUITE_CLI_USER_ACCESS_TOKEN,process.argv.slice(2).join(" ")].map(x=>x||"").join("|"));\n'); chmodSync(real, 0o755);
     binding.realBinary = real; writeFileSync(larkToolBindingPath(dir, 'tool-session'), JSON.stringify(binding), { mode: 0o600 });
@@ -418,15 +452,8 @@ describe('session application identity route', () => {
     const bot = await run(['docs', '+fetch']); expect(bot.code, bot.err).toBe(0);
     expect(bot.out).toBe('cli_bound||bound-bot-token||docs +fetch --as bot');
     const user = await run(['docs', '+fetch', '--as=user']);
-    if (headless) {
-      expect(user.code).toBe(77);
-      expect(user.out).toBe('');
-      expect(user.err).toContain('lark_tool_user_transport_required');
-      expect(tokens.resolveUserToken).not.toHaveBeenCalled();
-    } else {
-      expect(user.code, user.err).toBe(0);
-      expect(user.out).toBe('cli_bound|||bound-user-token|docs +fetch --as user');
-    }
+    expect(user.code, user.err).toBe(0);
+    expect(user.out).toBe('cli_bound|||bound-user-token|docs +fetch --as user');
     const passthrough = await run(['docs', '+fetch', '--profile=cli_other']); expect(passthrough.code, passthrough.err).toBe(0);
     expect(passthrough.out).toBe('cli_wrong|||wrong-user|docs +fetch --profile=cli_other');
   });

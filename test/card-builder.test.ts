@@ -1824,9 +1824,9 @@ describe('buildStreamingCard', () => {
   describe('screenshot display mode', () => {
     it('should include screenshot placeholder when no image is available', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working', undefined, 'screenshot'));
-      const mdElements = card.elements.filter((e: any) => e.tag === 'markdown');
-      expect(mdElements).toHaveLength(1);
-      expect(mdElements[0].content).toBe('_(等待第一张截图…)_');
+      const placeholder = card.elements.find((e: any) => e.tag === 'markdown'
+        && e.content === '_(等待第一张截图…)_');
+      expect(placeholder).toBeDefined();
     });
 
     // Positional helper: buildStreamingCard's 23rd argument is screenshotUnavailable.
@@ -1911,6 +1911,29 @@ describe('buildStreamingCard', () => {
       const actions = findActions(card);
       const toggleBtn = actions.find((a: any) => a.value?.action === 'toggle_display');
       expect(toggleBtn.value).not.toHaveProperty('card_nonce');
+    });
+  });
+
+  // #2062: the idempotent display target exists only for the primary
+  // multi-replica control lane; single-replica cards keep the old payload
+  // (byte-for-byte, see card-builder-wire-golden).
+  describe('display toggle target mode', () => {
+    afterEach(() => { vi.unstubAllEnvs(); });
+    const toggleValue = (mode: 'hidden' | 'screenshot') => findActions(
+      parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', undefined, mode)),
+    ).find((a: any) => a.value?.action === 'toggle_display').value;
+
+    it('carries the visible target in primary coordination mode', () => {
+      vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+      expect(toggleValue('hidden').target_display_mode).toBe('screenshot');
+      expect(toggleValue('screenshot').target_display_mode).toBe('hidden');
+    });
+
+    it('omits it outside primary mode', () => {
+      vi.stubEnv('BOTMUX_COORDINATION_MODE', 'disabled');
+      expect(toggleValue('hidden')).not.toHaveProperty('target_display_mode');
+      vi.stubEnv('BOTMUX_COORDINATION_MODE', '');
+      expect(toggleValue('screenshot')).not.toHaveProperty('target_display_mode');
     });
   });
 

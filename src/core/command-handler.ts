@@ -1,3 +1,4 @@
+import { showDefaultModelPicker, showSessionModelPicker } from '../im/lark/session-model-picker.js';
 import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgents, resolveGroupDecorations, type GroupCreationArgs } from '../services/group-creation-options.js';
 /**
  * Command handler — processes /slash commands from users.
@@ -47,11 +48,12 @@ import { prepareForkTopic } from '../im/lark/fork-topic.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
-import { botsInfoObjectEntries, isBotsInfoNameEntry } from '../services/bots-info-shape.js';
+import { botsInfoObjectEntries, isBotsInfoNameEntry, normalizeBotsInfoRouteEntries } from '../services/bots-info-shape.js';
 import { replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
+import { supportsUnifiedReplyCardCli } from '../services/turn-reply-card.js';
 import { publicReplyCardActivity, publicReplyCardTools } from '../im/lark/turn-reply-card.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, isResumeRecoveryPlaceholder, forkClosedSession, requestSessionRestart, isSessionTransferring, updateCodexAppEffort, updateCodexCliEffort, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
+import { scheduleActiveRuntimePatch, sessionSupportsIdleAutoCompact, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, isResumeRecoveryPlaceholder, forkClosedSession, requestSessionRestart, isSessionTransferring, updateCodexAppEffort, updateCodexCliEffort, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -105,6 +107,7 @@ import { setChatStreamingCardPin } from '../services/pin-streaming-card-mode-sto
 import { setCotMode } from '../services/cot-mode-store.js';
 import { handleCotThinkingUpdate } from '../im/lark/cot-message.js';
 import { canOperate, isKnownPeerBot } from '../im/lark/event-dispatcher.js';
+import { IDLE_AUTO_COMPACT_MIN_CONTEXT_TOKENS, applyIdleAutoCompactSetting, idleAutoCompactMinutes, isIdleAutoCompactEnabled, parseIdleAutoCompactCommand } from './idle-auto-compact.js';
 import { buildSafeInsightReport } from '../services/insight/report.js';
 import type { SafeInsightReport } from '../services/insight/types.js';
 import { invalidWorkingDirs } from '../utils/working-dir.js';
@@ -549,7 +552,7 @@ function botDisplayName(larkAppId: string): string {
     try {
       const p = join(config.session.dataDir, 'bots-info.json');
       if (existsSync(p)) {
-        const entries: Array<{ larkAppId?: string; botName?: string | null; cliId?: string | null }> = JSON.parse(readFileSync(p, 'utf-8'));
+        const entries = normalizeBotsInfoRouteEntries(JSON.parse(readFileSync(p, 'utf-8')));
         const found = entries.find(e => e.larkAppId === larkAppId);
         return found?.botName || found?.cliId || larkAppId;
       }
@@ -598,6 +601,8 @@ function invalidConfiguredWorkingDirs(ds: DaemonSession | undefined, larkAppId: 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 export interface CommandHandlerDeps {
+  /** Source entry, independent of a shared session or newly created topic. */
+  invocationContext?: 'new-topic' | 'thread';
   activeSessions: Map<string, DaemonSession>;
   sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string, opts?: WorkerSessionReplyOptions) => Promise<string>;
   getActiveCount: () => number;
@@ -1511,7 +1516,7 @@ export async function handleCardCommand(
   const sub = content.replace(/^\/card\s*/i, '').trim().toLowerCase();
   const botConfig = getBot(larkAppId).config;
   const managedReplyMode = botConfig.replyCardMode && botConfig.replyCardMode !== 'legacy'
-    && ['claude-code', 'codex', 'grok'].includes(ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? botConfig.cliId);
+    && supportsUnifiedReplyCardCli(ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? botConfig.cliId);
 
   if (sub === 'pin off') {
     const r = await setChatStreamingCardPin(larkAppId, chatId, false);
@@ -1869,6 +1874,20 @@ export async function handleCommand(
 
   try {
     switch (cmd) {
+      case '/models': {
+        const atTopLevel = deps.invocationContext === 'new-topic' || (!deps.invocationContext && !ds);
+        if (atTopLevel && larkAppId) {
+          await showDefaultModelPicker(larkAppId, rootId, message.senderId, sessionReply, loc);
+          break;
+        }
+        if (!ds) {
+          await replyNoSession(replyHere, loc);
+          break;
+        }
+        await showSessionModelPicker(ds, rootId, message.senderId, message.senderUnionId, sessionReply, loc);
+        break;
+      }
+
       case '/queue': {
         if (!ds) {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
@@ -2927,6 +2946,10 @@ export async function handleCommand(
           break;
         }
         const effectiveCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+        if (ds.session.pendingForkSession && effectiveCliId === 'antigravity') {
+          await sessionReply(rootId, t('cmd.stop.fork_pending', undefined, loc));
+          break;
+        }
         if (ds.initConfig?.codexRpcInput === true || effectiveCliId === 'codex-app' || isRemoteCliId(effectiveCliId) || isRemoteBackendSession(ds)) {
           await sessionReply(rootId, t('cmd.stop.unsupported', undefined, loc));
           break;
@@ -3735,6 +3758,55 @@ export async function handleCommand(
         sessionStore.updateSession(ds.session);
         logger.info(`[${logTag}] /retry re-injected turn ${failedTurn.turnId.slice(0, 8)} (attempt #${ds.session.lastFailedTurn?.retryCount ?? 1})`);
         await sessionReply(rootId, t('cmd.retry.success', { errorCode: failedTurn.errorCode ?? 'unknown' }, loc));
+        break;
+      }
+
+      case '/idlecompact': {
+        if (!ds) {
+          await replyNoSession(replyHere, loc);
+          break;
+        }
+        if (!canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId)) {
+          await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd }, loc));
+          break;
+        }
+        if (!sessionSupportsIdleAutoCompact(ds)) {
+          await sessionReply(rootId, t('card.idle_compact.unsupported', undefined, loc));
+          break;
+        }
+        const parsed = parseIdleAutoCompactCommand(message.content.trim().replace(/^\/idlecompact\b/i, ''));
+        const minK = String(Math.round(IDLE_AUTO_COMPACT_MIN_CONTEXT_TOKENS / 1000));
+        if (parsed.kind === 'invalid') {
+          await sessionReply(rootId, t('cmd.idlecompact.usage', undefined, loc));
+          break;
+        }
+        if (parsed.kind === 'status') {
+          const setting = ds.session.idleAutoCompact;
+          await sessionReply(rootId, t(
+            isIdleAutoCompactEnabled(ds.session) ? 'cmd.idlecompact.status_on' : 'cmd.idlecompact.status_off',
+            { minutes: idleAutoCompactMinutes(setting), min: minK },
+            loc,
+          ));
+          break;
+        }
+        const previous = ds.session.idleAutoCompact ? { ...ds.session.idleAutoCompact } : undefined;
+        const setting = applyIdleAutoCompactSetting(ds.session, parsed.kind === 'on'
+          ? { enabled: true, ...(parsed.minutes !== undefined ? { minutes: parsed.minutes } : {}) }
+          : { enabled: false });
+        try {
+          sessionStore.updateSession(ds.session);
+        } catch (err) {
+          if (previous) ds.session.idleAutoCompact = previous;
+          else delete ds.session.idleAutoCompact;
+          logger.warn(`[${logTag}] /idlecompact save failed: ${err instanceof Error ? err.message : String(err)}`);
+          await sessionReply(rootId, t('card.idle_compact.save_failed', undefined, loc));
+          break;
+        }
+        // Refresh the live card's toggle label; best-effort.
+        try { scheduleActiveRuntimePatch(ds); } catch { /* card refresh is cosmetic */ }
+        await sessionReply(rootId, setting.enabled
+          ? t('card.idle_compact.enabled', { minutes: idleAutoCompactMinutes(setting) }, loc)
+          : t('card.idle_compact.disabled', undefined, loc));
         break;
       }
 
@@ -5564,7 +5636,7 @@ export async function handleCommand(
             let bots: Parameters<typeof resolveGroupCreationAgents>[2] = [];
             try {
               const cached: unknown = existsSync(p) ? JSON.parse(readFileSync(p, 'utf-8')) : [];
-              if (Array.isArray(cached)) bots = cached.filter(b => b && typeof b === 'object');
+              bots = normalizeBotsInfoRouteEntries(cached);
             } catch { /* Names can be unavailable; app IDs still resolve against config. */ }
             configuredAgentIds = resolveGroupCreationAgents(groupArgs.agents, configs, bots);
           }
@@ -6731,8 +6803,10 @@ export async function handleCommand(
           t('help.rename', undefined, loc),
           t('help.status', undefined, loc),
           t('help.capacity', undefined, loc),
+          t('help.models', undefined, loc),
           t('help.retry', undefined, loc),
           t('help.rewind', undefined, loc),
+          t('help.idlecompact', undefined, loc),
           t('help.queue', undefined, loc),
           t('help.card', undefined, loc),
           t('help.cot', undefined, loc),
