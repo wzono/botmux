@@ -17679,7 +17679,6 @@ function setupWorkerHandlers(
           if (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited') {
             recordUsageForDaemonSession(ds);
             if (ds.lastScreenStatus === 'idle' && (prevStatus === 'working' || prevStatus === 'analyzing')) {
-              void finishTurnReactions(ds);
               if (ds.session.workflowNode && !ds.session.workflowNode.submittedAt) {
                 cb.onWorkflowNodeTurnSettled?.(ds, { ...(msg.turnId ? { turnId: msg.turnId } : {}), at: Date.now() });
               }

@@ -571,7 +571,7 @@ function renderAskCardWithCap(
       schema: '2.0', config: { width_mode: 'fill' },
       header: { template: 'blue', title: { tag: 'plain_text', content: t('card.ask.title', undefined, locale) } },
       body: { elements: [
-        { tag: 'markdown', content: metaDiv.fields.map(f => f.text.content).join('\n') },
+        { tag: 'markdown', content: metaDiv.fields.map(f => String((f.text as { content?: unknown }).content ?? '')).join('\n') },
         ...(ask.deliveryTarget ? [{ tag: 'markdown', content: t('card.ask.document_origin', {
           document: ask.deliveryTarget.fileToken, comment: ask.deliveryTarget.commentId,
         }, locale) }] : []),
