@@ -28,6 +28,7 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { getBotUnionId } from './bot-union-ids-store.js';
 import { replaceTeamGroupsByPrefix } from './team-groups-store.js';
 
 /** teamId prefix used when mirroring platform team groups into team-groups.json. */
@@ -159,14 +160,23 @@ export function isPlatformHallChat(dataDir: string, chatId: string | undefined):
 }
 
 /** Is `unionId` a bot in ANY platform team this machine belongs to? The auth
- *  gate's platform-mode predicate — membership-driven, no expiry. */
+ *  gate's platform-mode predicate — membership-driven, no expiry.
+ *
+ *  The platform roster can temporarily know only a local bot's appId: union_id
+ *  is learned asynchronously from Lark events and reaches the next heartbeat
+ *  after team-sync. For bots on this machine, join that authoritative team appId
+ *  with the locally learned self union_id. Team removal still revokes trust
+ *  immediately because an appId absent from the current roster is never read. */
 export function isPlatformTeamBot(dataDir: string, unionId: string | undefined): boolean {
   const id = (unionId ?? '').trim();
   if (!id) return false;
   const data = readFile(dataDir);
   if (!data) return false;
   for (const t of data.teams) {
-    for (const b of t.bots) if (b.unionId === id) return true;
+    for (const b of t.bots) {
+      if (b.unionId === id) return true;
+      if (!b.unionId && getBotUnionId(dataDir, b.appId) === id) return true;
+    }
   }
   return false;
 }
