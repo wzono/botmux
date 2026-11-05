@@ -1430,6 +1430,9 @@ function buildNewTopicBlocks(
       key: 'userMessage',
       text: buildServiceUserPrompt(
         [opts?.sharedGroupContext, userMessage, ...(followUps ?? [])].filter(Boolean).join('\n\n'),
+        sessionIsNoTransport(opts?.larkAppId, opts?.chatId) || cliId === 'mira'
+          ? undefined
+          : t('ai.followup.feishu_safe_emphasis', undefined, locale),
         locale,
         sessionIsNoTransport(opts?.larkAppId, opts?.chatId),
       ),
