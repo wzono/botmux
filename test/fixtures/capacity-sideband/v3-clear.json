@@ -1,0 +1,13 @@
+{
+  "schema_version": "capacity-wait.v3",
+  "adapter": "codex",
+  "owner_app_id": "cli_fixture",
+  "signer_key_id": "fixture",
+  "signer_epoch": 1,
+  "native_turn_id": "turn-clear",
+  "request_id": "request-clear",
+  "state": "clear",
+  "observed_at": "2026-10-28T09:00:01.000Z",
+  "sequence": 2,
+  "signature": "fixture"
+}

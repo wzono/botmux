@@ -12,6 +12,7 @@ import { ServerResponse, IncomingMessage } from 'node:http';
 import { Socket } from 'node:net';
 import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
 import { managedOriginCapabilityPath, replaceManagedOriginCapabilityFile } from '../src/core/managed-origin-capability.js';
+import { isSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -60,10 +61,14 @@ function daemonScope(): Record<string, any> {
     noteTurnReceived: vi.fn(async () => undefined),
     trustedCallerForInboundTurn: vi.fn(async () => ({ senderType: 'user', requestLarkAppId: 'app', requestUserOpenId: 'ou_owner' })),
     asyncInput: { threadId: 'thread', itemId: 'call', nativeTurnId: 'native-original' },
+    codexAsyncAnswerSteerTarget, larkTransportEnabled: () => true,
+    isSilentScheduledTurn,
     codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable, larkTransportEnabled: () => true,
     codexAppCleanInputAcceptedForSession: () => scope.clean, clean: true,
     sendWorkerInput: vi.fn(() => true), beginNewTurn: vi.fn(), rememberLastCliInput: vi.fn(),
-    markSessionActivity: vi.fn(), sessionStore: { updateSession: vi.fn() }, logger: { info: vi.fn() },
+    markSessionActivity: vi.fn(), sessionStore: {
+      ownsSessionForMutation: () => false, updateSession: vi.fn(),
+    }, logger: { info: vi.fn() },
   };
   scope.codexAsyncAnswerSteerable = productionFunction('src/services/codex-async-user-input.ts', 'codexAsyncAnswerSteerable', scope);
   scope.codexAsyncAnswerSteerTarget = productionFunction('src/services/codex-async-user-input.ts', 'codexAsyncAnswerSteerTarget', scope);
