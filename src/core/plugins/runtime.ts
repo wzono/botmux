@@ -138,7 +138,10 @@ function orderedPluginRecords(pluginIds?: readonly string[]): InstalledPluginRec
   return out;
 }
 
-export async function loadPluginServiceDefinition(record: InstalledPluginRecord): Promise<PluginServiceDefinition | undefined> {
+export async function loadPluginServiceDefinition(
+  record: InstalledPluginRecord,
+  options: { readOnlyConfig?: boolean } = {},
+): Promise<PluginServiceDefinition | undefined> {
   if (!record.manifest.service) return undefined;
   const pluginDir = pluginRuntimeDir(record.id);
   const entrypoint = record.contributions?.service?.entry;
@@ -147,8 +150,17 @@ export async function loadPluginServiceDefinition(record: InstalledPluginRecord)
   if (!existsSync(entry)) throw new Error(`plugin_service_entry_not_found:${record.id}:${entrypoint}`);
   const mod = await import(pathToFileURL(entry).href);
   const exported = mod.default ?? mod;
+  const api = baseApi(record, 'service');
+  if (options.readOnlyConfig) {
+    const config = api.config as PluginConfigApi;
+    api.config = {
+      ...config,
+      set: () => { throw new Error(`plugin_repair_config_write_forbidden:${record.id}`); },
+      replace: () => { throw new Error(`plugin_repair_config_write_forbidden:${record.id}`); },
+    } satisfies PluginConfigApi;
+  }
   const definition = typeof exported === 'function'
-    ? await exported(baseApi(record, 'service'), baseContext(record, 'service'))
+    ? await exported(api, baseContext(record, 'service'))
     : exported;
   if (!definition || typeof definition !== 'object') throw new Error(`plugin_service_definition_not_found:${record.id}`);
   const service = definition as PluginServiceDefinition;
