@@ -214,6 +214,48 @@ describe('role injection mode', () => {
   });
 });
 
+describe('global adaptive response contract', () => {
+  it('injects the contract into a representative opening turn without a custom role', async () => {
+    await fresh();
+    const { buildNewTopicPrompt } = await import('../src/core/session-manager.js');
+    const prompt = buildNewTopicPrompt(
+      'hello', 'sess-style-opening', 'claude-code', undefined,
+      undefined, undefined, undefined, undefined, undefined, 'zh', undefined,
+      { larkAppId: 'app1', chatId: 'oc_style' },
+    );
+
+    const { t } = await import('../src/i18n/index.js');
+    expect(prompt).toContain(`<botmux_response_style>${t('ai.response_style.contract', undefined, 'zh')}</botmux_response_style>`);
+  });
+
+  it('keeps the contract visible on representative follow-up turns', async () => {
+    await fresh();
+    const { buildFollowUpContent } = await import('../src/core/session-manager.js');
+    const prompt = buildFollowUpContent('continue', 'sess-style-followup', {
+      cliId: 'claude-code',
+      locale: 'zh',
+      larkAppId: 'app1',
+      chatId: 'oc_style',
+    });
+
+    const { t } = await import('../src/i18n/index.js');
+    expect(prompt).toContain(`<botmux_response_style>${t('ai.response_style.contract', undefined, 'zh')}</botmux_response_style>`);
+  });
+
+  it('renders the English contract through the same opening seam', async () => {
+    await fresh();
+    const { buildNewTopicPrompt } = await import('../src/core/session-manager.js');
+    const prompt = buildNewTopicPrompt(
+      'hello', 'sess-style-en', 'claude-code', undefined,
+      undefined, undefined, undefined, undefined, undefined, 'en', undefined,
+      { larkAppId: 'app1', chatId: 'oc_style' },
+    );
+
+    const { t } = await import('../src/i18n/index.js');
+    expect(prompt).toContain(`<botmux_response_style>${t('ai.response_style.contract', undefined, 'en')}</botmux_response_style>`);
+  });
+});
+
 describe('buildNewTopicPrompt role injection', () => {
   it('injects a <role> block when { larkAppId, chatId } resolves a role', async () => {
     await fresh();
