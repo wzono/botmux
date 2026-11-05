@@ -7,8 +7,8 @@
  * an ordinary pane, a credential-only pane and a full (oncall) file sandbox.
  *
  * Fully hermetic: HOME, SESSION_DATA_DIR and bots.json live in a temp dir (the
- * worker resolves the enrollment marker from `homedir()`), and `tmux` on PATH
- * is a shim pinned to a private socket.
+ * worker resolves the enrollment marker from `homedir()`), and managed tmux
+ * uses the test fence's private TMUX_TMPDIR.
  */
 import { describe, it, expect, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
@@ -23,6 +23,7 @@ import {
   isolationPaneMarkerPath,
 } from '../src/adapters/cli/read-isolation.js';
 import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-capability.js';
+import { DEFAULT_MANAGED_TMUX_SOCKET } from '../src/adapters/backend/tmux-socket.js';
 import { readJsonLines } from './helpers/read-json-lines.js';
 
 let realTmux: string | undefined;
@@ -52,7 +53,6 @@ function createLab(opts: LabOptions) {
   const sessionId = randomUUID();
   // Short path: tmux socket paths are length-limited.
   const dir = mkdtempSync('/tmp/credonly-life-');
-  const socket = join(dir, 'socket');
   const dataDir = join(dir, '.botmux', 'data');
   // The CLI's own files live in the working dir: the one place every flavour
   // (including the oncall allow-list) lets it read and write.
@@ -89,12 +89,8 @@ process.stdin.on('data', (chunk) => {
 });
 console.log('Ready >'); process.stdout.write('❯ '); setInterval(() => {}, 1 << 30);
 `, { mode: 0o700 });
-  const bin = join(dir, 'bin');
-  mkdirSync(bin);
-  writeFileSync(join(bin, 'tmux'), `#!/bin/sh\nexec '${realTmux}' -S '${socket}' "$@"\n`, { mode: 0o700 });
   const env: NodeJS.ProcessEnv = {
     ...process.env,
-    PATH: `${bin}:${process.env.PATH}`,
     HOME: dir,
     // Pane launch goes through the user's shell; pin a plain one so the test
     // does not depend on the runner's login shell (nologin for service
@@ -138,12 +134,14 @@ console.log('Ready >'); process.stdout.write('❯ '); setInterval(() => {}, 1 <<
     sessionId, dataDir, sessionRoot, outbox, capabilityLeaf,
     reports: (): Array<{ relay: string | null }> => readJsonLines(report),
     typed: (): string => { try { return readFileSync(typed, 'utf8'); } catch { return ''; } },
-    paneAlive: (): boolean => spawnSync(realTmux!, ['-S', socket, 'has-session', '-t', paneTarget]).status === 0,
+    paneAlive: (): boolean => spawnSync(realTmux!, [
+      '-L', DEFAULT_MANAGED_TMUX_SOCKET, 'has-session', '-t', paneTarget,
+    ], { env }).status === 0,
     // HOST pid of the pane's process. (The fake CLI's own process.pid is
     // namespace-local under bwrap --unshare-pid and means nothing out here.)
     panePid: (): number => Number(spawnSync(realTmux!, [
-      '-S', socket, 'display-message', '-p', '-t', paneTarget, '#{pane_pid}',
-    ], { encoding: 'utf8' }).stdout.trim()),
+      '-L', DEFAULT_MANAGED_TMUX_SOCKET, 'display-message', '-p', '-t', paneTarget, '#{pane_pid}',
+    ], { encoding: 'utf8', env }).stdout.trim()),
     hostProcessAlive: (pid: number): boolean => {
       try { process.kill(pid, 0); return true; } catch { return false; }
     },
@@ -192,7 +190,11 @@ console.log('Ready >'); process.stdout.write('❯ '); setInterval(() => {}, 1 <<
     },
     async dispose(): Promise<void> {
       for (const worker of [...workers]) await lab.stop(worker, 'close').catch(() => undefined);
-      try { execFileSync(realTmux!, ['-S', socket, 'kill-server'], { stdio: 'ignore' }); } catch { /* gone */ }
+      try {
+        execFileSync(realTmux!, ['-L', DEFAULT_MANAGED_TMUX_SOCKET, 'kill-session', '-t', `=${paneTarget}`], {
+          stdio: 'ignore', env,
+        });
+      } catch { /* gone */ }
       rmSync(dir, { recursive: true, force: true });
     },
   };
