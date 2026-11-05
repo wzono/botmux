@@ -1160,6 +1160,7 @@ describe('replyDelivery=transcript envelope', () => {
     const out = buildFollowUpContent('继续', 'sess-t1', { ...base, cliId: 'claude-code', attachments, mentions });
     expect(out).not.toContain('<botmux_reminder>');
     expect(out).toContain('<botmux_formatting>');
+    expect(out).toContain('短进度优先纯文本');
     expect(out).toContain(t('ai.followup.feishu_safe_emphasis', undefined, 'zh'));
     expect(out).not.toMatch(/<botmux_formatting>[^<]*botmux send/);
     expect(out).not.toMatch(/<botmux_formatting>[^<]*BOTMUX_NOTHING_TO_SEND/);

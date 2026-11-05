@@ -23820,7 +23820,7 @@ async function spawnCli(
     Object.assign(perBotInjectEnv, await prepareZcodeSessionModel({
       sessionId: cfg.sessionId, dataDir: config.session.dataDir,
       env: { ...buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset), ...perBotInjectEnv },
-      model: cfg.model, reasoningEffort: cfg.reasoningEffort, resume: effectiveResume,
+      model: cfg.model, reasoningEffort: cfg.reasoningEffort, resume: cfg.resume ?? false,
     }));
   }
   const cliExtraArgs = resolveCliExtraArgs();
@@ -23872,7 +23872,7 @@ async function spawnCli(
       identityShellEnv.PATH = [dir, ...effectivePath.split(':').filter(path => path !== dir)].join(':');
     }
   }
-  if (cfg.cliId === 'traex' && !cfg.adoptMode && cfg.resume && effectiveCliSessionId) {
+  if (cfg.cliId === 'traex' && !cfg.adoptMode && (cfg.resume ?? false) && effectiveCliSessionId) {
     noteTraexResumeTargetLeftInDefaultHome(effectiveCliSessionId);
   }
   const args = cliAdapter.buildArgs({

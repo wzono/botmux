@@ -68,6 +68,15 @@ describe('built-in botmux-send skill', () => {
     expect(skill!.content).toContain('不要在普通回复里画不能点击的按钮');
     expect(skill!.content).not.toContain('纯文本走普通消息');
   });
+
+  it('teaches Feishu-safe emphasis without adding runtime validation', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-send');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('强调只包住短词或不含中文标点的短语');
+    expect(skill!.content).toContain('中文标点和后续正文放在 `**` 外');
+    expect(skill!.content).toContain('短进度优先直接写纯文本');
+    expect(skill!.content).toContain('**范围已锁定**：只处理 watcher 的静默问题。下一步先止血。');
+  });
 });
 
 describe('built-in botmux-session-rename skill', () => {
