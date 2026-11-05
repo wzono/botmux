@@ -1696,6 +1696,20 @@ export class TmuxPipeBackend implements SessionBackend {
     let createdIdentity: string | null = null;
     for (let attempt = 0; ; attempt++) {
       try {
+        // Test seam: a pre-pane failure cannot be injected through a PATH shim
+        // once a file sandbox has canonicalised its launcher PATH (the trusted
+        // runtime directories intentionally precede the bot PATH). Keep this at
+        // the exact new-session boundary so lifecycle tests exercise the real
+        // worker rollback without replacing tmux or creating a pane first.
+        if (process.env.BOTMUX_TEST_FORCE_TMUX_NEW_SESSION_FAIL === '1') {
+          const injected = new Error('new-session refused by test') as Error & {
+            status: number;
+            stderr: Buffer;
+          };
+          injected.status = 1;
+          injected.stderr = Buffer.from('new-session refused by test');
+          throw injected;
+        }
         const printed = execFileSync('tmux', [...this.tmuxArgs, ...argv], {
           cwd: opts.cwd,
           stdio: ['ignore', 'pipe', 'pipe'],
