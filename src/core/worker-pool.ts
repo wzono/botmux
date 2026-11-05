@@ -69,6 +69,7 @@ import {
   resolveSessionLaunchModel,
   resolveSessionLaunchModelChoice,
   resolveSessionGroupSettings,
+  resolveTopicReasoningEffort,
 } from './session-model.js';
 import {
   initialNativeRenameStartupCommand,
@@ -203,6 +204,8 @@ import { removeSessionMcpGatewayDir } from './plugins/mcp/socket-dir.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
 import { materializeFeedbackPolicyForDelivery } from '../services/feedback-reviewer-delivery.js';
 import { attachOncallGroupButton, recordOncallGroupDelivery } from '../im/lark/oncall-group.js';
+import { attachWorkflowSidebarEntry, workflowNodeSessionEntry } from '../im/lark/workflow-sidebar-entry.js';
+import { resolveWorkflowEntryLink } from './workflow-entry-link.js';
 import { beginFinalOutputDelivery, waitForTurnFinalOutputDeliveryDrain } from './final-output-delivery-drain.js';
 import { createTurnResultRuntime, setTurnResultRuntime } from './turn-result-runtime.js';
 import { TurnResultStore } from '../services/turn-result-store.js';
@@ -214,6 +217,7 @@ import { turnResultEnabled, turnResultBinding, turnResultSessionEligible, observ
  *  distinguishable from a pane surviving a daemon restart (different id). */
 const DAEMON_BOOT_ID = randomBytes(32).toString('base64url');
 const restartCoordinator = new RestartCoordinator();
+const topicEffortRestartReadiness = new Map<string, { attemptId: string; worker: DaemonSession['worker']; workerGeneration?: number; workerReady: boolean; cliReady: boolean; requested: import('../utils/traex-session-effort.js').TraexTopicEffortRestart }>();
 const hostPressureWarningsLogged = new Set<string>();
 const lifecycleRetiringWorkers = new WeakMap<DaemonSession, Set<ChildProcess>>();
 const transferRetiringWorkers = new WeakSet<ChildProcess>();
@@ -818,6 +822,7 @@ import {
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { decideAutoRestart } from './restart-policy.js';
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
+import { acceptSessionGroupTitle } from '../services/session-group-title.js';
 import { freezePrincipalLaneTurnBinding, readPrincipalLaneTurnBinding } from './principal-lane-turn.js';
 import { settlePrincipalLaneOutboundProvenance } from './principal-lane-outbound-provenance.js';
 import { hasPendingSessionTurns } from './session-turn-queue.js';
@@ -1211,6 +1216,14 @@ export interface WorkerPoolCallbacks {
     ds: DaemonSession,
     context: { turnId: string; source: 'terminal' | 'idle'; errorCode?: string },
   ) => void | Promise<void>;
+  /** Workflow node session (design 2026-11-03 §6.3): a turn was committed to
+   *  the CLI input queue — the handoff's own turn is the acceptance, a later
+   *  one means the bot works again. Only fired for sessions carrying a
+   *  verified `workflowNode` marker. */
+  onWorkflowNodeInputCommitted?: (ds: DaemonSession, context: { turnId: string; committedAt: number }) => void;
+  /** Workflow node session (§8): a turn went from working to idle while the
+   *  node's handoff has no accepted submission — shown as "Bot 已停下，未提交". */
+  onWorkflowNodeTurnSettled?: (ds: DaemonSession, context: { turnId?: string; at: number }) => void;
   /** The worker reported its identity storage decision for the current spawn.
    *  `flipped` means the daemon's last actual publication used the other model
    *  (cold start / restart window): the daemon must discard the wrong-model
@@ -3254,7 +3267,7 @@ function sessionAgentConfig(
     // A per-session `/cli` selection launches the stock CLI: like bot env (rejected
     // above), the bot's config profile belongs to the bot's own CLI, not the
     // selected one. ds.session.cliConfigDir stays unset for these sessions.
-    return { cliId: selected.cliId, cliRuntime: runtime, cliPathOverride: legacyPath, wrapperCli, cliLaunchMode, model, traexAutoModel: modelChoice.traexAutoModel, modelBackendVariant, reasoningEffort, serviceTier: sessionServiceTier(ds, selected.cliId), launchShell, startupCommands };
+    return { cliId: selected.cliId, cliRuntime: runtime, cliPathOverride: legacyPath, wrapperCli, cliLaunchMode, model, traexAutoModel: modelChoice.traexAutoModel, modelBackendVariant, reasoningEffort: resolveTopicReasoningEffort(ds.session, selected.cliId, model, reasoningEffort), serviceTier: sessionServiceTier(ds, selected.cliId), launchShell, startupCommands };
   }
   if (groupEffort && !ds.session.reasoningEffort) {
     ds.session.reasoningEffort = groupEffort;
@@ -3377,7 +3390,7 @@ function sessionAgentConfig(
     model,
     traexAutoModel: modelChoice.traexAutoModel,
     modelBackendVariant: ds.session.modelBackendVariant,
-    reasoningEffort: ds.session.reasoningEffort,
+    reasoningEffort: resolveTopicReasoningEffort(ds.session, ds.session.cliId ?? botCfg.cliId, model, ds.session.reasoningEffort),
     serviceTier: sessionServiceTier(ds, ds.session.cliId ?? botCfg.cliId),
     launchShell: botCfg.launchShell,
     startupCommands: botCfg.startupCommands,
@@ -7327,6 +7340,7 @@ export function latestLarkToolBindingForRespawn(ds: DaemonSession): boolean | nu
 }
 
 export interface SessionRestartOptions {
+  topicEffort?: import('../utils/traex-session-effort.js').TraexTopicEffortRestart;
   /**
    * Role-switch cwd move: the worker converges `lastInitConfig.workingDir` to
    * this path before respawning (`restart.updateWorkingDir`). The caller must
@@ -7390,19 +7404,33 @@ export function requestSessionRestart(
     logger.warn(`[${tag(ds)}] Restart refused while routing transfer is in progress`);
     return undefined;
   }
+  if (opts.topicEffort && (isSessionRestartInFlight(ds) || !ds.worker || ds.worker.killed)) return undefined;
   const start: { failure?: { error: unknown } } = {};
   const cwdMove = opts.updateWorkingDir ? { updateWorkingDir: opts.updateWorkingDir } : {};
-  const result = restartCoordinator.request(ds.session.sessionId, observer, attemptId => {
+  let settingAttempt: string | undefined;
+  const restartObserver: RestartObserver = opts.topicEffort ? {
+    source: observer.source,
+    notify: async status => {
+      if (status !== 'in_progress' && topicEffortRestartReadiness.get(ds.session.sessionId)?.attemptId === settingAttempt) {
+        topicEffortRestartReadiness.delete(ds.session.sessionId);
+      }
+      await observer.notify(status);
+    },
+  } : observer;
+  const result = restartCoordinator.request(ds.session.sessionId, restartObserver, attemptId => {
+    settingAttempt = attemptId;
     try {
       if (ds.worker && !ds.worker.killed) {
+        if (opts.topicEffort) topicEffortRestartReadiness.set(ds.session.sessionId, { attemptId, worker: ds.worker, workerGeneration: ds.workerGeneration, workerReady: !!ds.workerReady, cliReady: !!ds.cliReady, requested: opts.topicEffort });
         ds.workerReady = false;
         // In-worker respawn: the next prompt belongs to a NEW CLI generation.
         ds.cliReady = false;
         ds.worker.send({ type: 'restart', attemptId, ...restartIpcReason(observer.source), ...cwdMove,
-          ...restartSessionEnvFields(ds), model: latestModelForRespawn(ds),
-          traexAutoModel: latestTraexAutoModelForRespawn(ds),
-          codexRpcInput: latestCodexRpcInputForRespawn(ds),
-          larkToolBinding: latestLarkToolBindingForRespawn(ds) } as DaemonToWorker);
+          ...(opts.topicEffort ? {} : restartSessionEnvFields(ds)), model: opts.topicEffort?.model ?? latestModelForRespawn(ds),
+          ...(opts.topicEffort ? { topicEffort: opts.topicEffort } : {}),
+          traexAutoModel: opts.topicEffort ? null : latestTraexAutoModelForRespawn(ds),
+          ...(opts.topicEffort ? {} : { codexRpcInput: latestCodexRpcInputForRespawn(ds),
+            larkToolBinding: latestLarkToolBindingForRespawn(ds) }) } as DaemonToWorker);
         return;
       }
       // No live worker but the persistent pane may still be alive (e.g. after a
@@ -7416,6 +7444,14 @@ export function requestSessionRestart(
       });
     } catch (error) {
       start.failure = { error };
+      const before = topicEffortRestartReadiness.get(ds.session.sessionId);
+      if (opts.topicEffort && before?.attemptId === attemptId && before.worker === ds.worker
+        && before.workerGeneration === ds.workerGeneration) {
+        ds.workerReady = before.workerReady;
+        ds.cliReady = before.cliReady;
+        topicEffortRestartReadiness.delete(ds.session.sessionId);
+      }
+
       // Rethrow: the coordinator settles this fresh attempt as `failed`.
       throw error;
     }
@@ -7424,6 +7460,7 @@ export function requestSessionRestart(
 }
 
 export function __testOnly_resetRestartCoordinator(): void {
+  topicEffortRestartReadiness.clear();
   restartCoordinator.reset();
 }
 
@@ -9223,6 +9260,39 @@ export function sessionReasoningControl(ds: DaemonSession): CardUsageSnapshot['r
     pending: !!ds.session.reasoningEffort && (!!ds.session.suspendedColdResume
       || ds.session.reasoningEffort !== (ds.activeReasoningEffort ?? ds.initConfig?.reasoningEffort)),
   };
+}
+
+/** Topic settings for a managed local TraeX runtime. Native /model persists shared defaults. */
+export function topicReasoningControl(ds: DaemonSession): { model: string; choices: readonly string[]; selected?: string; active?: string; pending: boolean } | undefined {
+  const cfg = ds.initConfig ?? ds.session;
+  if ((ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? cfg.cliId) !== 'traex'
+    || !['pty', 'tmux'].includes(cfg.backendType ?? '') || cfg.wrapperCli || ds.initConfig?.traexAutoModel?.enabled
+    || ds.initConfig?.workflowNodeSession || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode
+    || sandboxBoolValue(cfg.sandbox) || sandboxEnabled() || ds.initConfig?.readIsolation) return;
+  const model = ds.activeModel?.trim() || cfg.model?.trim();
+  if (!model) return;
+  const choices = reasoningEffortsForCliModel('traex', model);
+  const saved = resolveTopicReasoningEffort(ds.session, 'traex', model, undefined);
+  const active = ds.activeReasoningEffort ?? ds.initConfig?.reasoningEffort;
+  return { model, choices, selected: saved ?? active, active, pending: !!saved && saved !== active };
+}
+
+/** Save only the model-bound topic preference; physical application is an explicit restart. */
+export function setTopicReasoningEffort(ds: DaemonSession, effort: unknown): 'saved' | 'busy' | 'unsupported' | 'invalid' {
+  const control = topicReasoningControl(ds);
+  if (!control) return 'unsupported';
+  const selected = control.choices.find(value => value === effort);
+  if (!selected) return 'invalid';
+  if (!sessionAcceptsDirectCommand(ds) || isSessionRestartInFlight(ds)) return 'busy';
+  const previous = Object.getOwnPropertyDescriptor(ds.session, 'topicReasoningEffort');
+  ds.session.topicReasoningEffort = { model: control.model, effort: selected as NonNullable<Session['reasoningEffort']> };
+  try { sessionStore.updateSession(ds.session); }
+  catch (error) {
+    if (previous) Object.defineProperty(ds.session, 'topicReasoningEffort', previous);
+    else Reflect.deleteProperty(ds.session, 'topicReasoningEffort');
+    throw error;
+  }
+  return 'saved';
 }
 
 /** Whether accepted ordinary IM input still awaits worker admission. */
@@ -11592,7 +11662,7 @@ export function sendPromptCacheKeepalive(ds: DaemonSession, text: string): boole
 
 export type ExactTurnInterruptResult =
   | { ok: true }
-  | { ok: false; reason: 'no_worker' | 'stale_turn' | 'unsupported' | 'delivery_failed' | 'timeout' };
+  | { ok: false; reason: 'no_worker' | 'stale_turn' | 'unsupported' | 'delivery_failed' | 'timeout' | 'fork_pending' };
 
 /** Native settings use their own receipt, without rotating business-turn state. */
 const pendingCodexCliEffort = new WeakSet<DaemonSession>();
@@ -12393,15 +12463,15 @@ export async function transferSession(
   }
 }
 
-/** Backends whose conversation state is a local, copyable transcript file and
- *  whose CLI exposes a native "fork/branch this session" primitive that botmux
- *  can drive at cold spawn (Claude family / Grok: `--fork-session`; Codex/TraeX
+/** CLIs whose native fork primitive creates an independent conversation.
+ *  Antigravity runs its interactive /fork before the first ready/input edge;
+ *  the others can drive it at cold spawn (Claude family / Grok: `--fork-session`; Codex/TraeX
  *  terminal: `<cli> fork <id>`). App-server backends (codex-app, or a Codex-family CLI running in
  *  Hybrid RPC mode) keep state in a live app-server process + SQLite and have no
  *  byte-level fork we can reproduce — they are refused. Riff / other pure-remote
  *  backends have no local rollout to fork either. */
 const FORK_CAPABLE_CLI_IDS: ReadonlySet<CliId> = new Set<CliId>([
-  'claude-code', 'seed', 'relay', 'codex', 'traex', 'grok',
+  'claude-code', 'seed', 'relay', 'codex', 'traex', 'grok', 'antigravity',
 ]);
 
 /** True when this session can be byte-level forked via a CLI-native primitive.
@@ -12412,6 +12482,7 @@ export function isForkCapableSession(ds: DaemonSession): boolean {
   const botCfg = getBot(ds.larkAppId).config;
   const cliId = sessionCliId(ds, botCfg);
   if (!FORK_CAPABLE_CLI_IDS.has(cliId)) return false;
+  if (cliId === 'antigravity' && isRemoteBackendSession(ds)) return false;
   // An external App Server thread is not a local rollout. `codex fork` would
   // resolve against the terminal client's own CODEX_HOME and could fork an
   // unrelated/empty local session, so refuse rather than claiming a copy was
@@ -13328,9 +13399,13 @@ export function sendWorkerInput(
      *  --resume, and this turn is delivered only after the fresh CLI is ready. */
     purgeUndersizedImages?: true;
     trustedCaller?: TrustedCaller;
+    /** Queue behind a running turn instead of folding into it (type-ahead):
+     *  the input must start as a turn of its own. */
+    queueAfterActiveTurn?: true;
   } = {},
 ): boolean {
   cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
+  if (feedbackMaintenanceActive(config.session.dataDir)) return false;
   const remoteRetirementPhase = remoteRetirementAdmissionPhase(ds);
   if (remoteRetirementPhase) {
     const remoteBackend = (ds.initConfig?.backendType ?? ds.session.backendType) === 'mojo'
@@ -13501,9 +13576,9 @@ export function sendWorkerInput(
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(trustedController ? { trustedController } : {}),
     ...(normalized.rerouteEnvelope ? { rerouteEnvelope: normalized.rerouteEnvelope } : {}),
-    ...(opts.dispatchAttempt === undefined
+    ...(opts.queueAfterActiveTurn || (opts.dispatchAttempt === undefined
       && (opts.trustedCaller?.source === 'schedule_creator'
-        || isSerialGroupInput(ds, opts.trustedCaller))
+        || isSerialGroupInput(ds, opts.trustedCaller)))
       ? { queueAfterActiveTurn: true as const } : {}),
     ...(vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin }
@@ -14315,6 +14390,10 @@ export function forkWorker(
   resumeOrTurnId: ForkResumeOrTurnId = false,
   opts: ForkWorkerOptions = {},
 ): boolean {
+  if (feedbackMaintenanceActive(config.session.dataDir)) {
+    opts.onAdmission?.('rejected');
+    return false;
+  }
   let admissionReported = false;
   const reportAdmission = (admission: WorkerForkAdmission): void => {
     if (admissionReported) return;
@@ -15504,6 +15583,9 @@ export function forkWorker(
       return ttl ? { promptCacheTtl: ttl } : {};
     })(),
     solo: ds.soloSession === true,
+    // Workflow node session (design 2026-11-03 §4.2): the worker exports the
+    // marker so its CLI system prompt and `botmux skill show` skip workflow.
+    ...(ds.session.workflowNode ? { workflowNodeSession: true as const } : {}),
     feedback: feedbackPolicy,
     terminalCardEpoch: ds.session.terminalCardEpoch,
     // Freeze the ACTUAL loaded bots-config path (getLoadedConfigPath) so a
@@ -16559,6 +16641,9 @@ function setupWorkerHandlers(
           if (msg.turnId.startsWith('mlrp_turn_')) {
             markMessageListenerRunPreviewRunning(msg.turnId);
           }
+          if (ds.session.workflowNode) {
+            cb.onWorkflowNodeInputCommitted?.(ds, { turnId: msg.turnId, committedAt: Date.now() });
+          }
         } else {
           logger[unboundInputCommitLogLevel(msg.turnId)](`[${t}] Ignored unbound input commit turn=${msg.turnId.slice(0, 16)}`);
         }
@@ -17279,10 +17364,16 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored restart_result from stale worker generation`);
           break;
         }
+        const savedReadiness = topicEffortRestartReadiness.get(ds.session.sessionId);
+        const currentSettingsAttempt = savedReadiness?.attemptId === msg.attemptId && savedReadiness.worker === worker
+          && savedReadiness.workerGeneration === ds.workerGeneration;
+        const validSettingReceipt = !currentSettingsAttempt || msg.status !== 'succeeded'
+          || (!!msg.topicEffort && msg.topicEffort.model === savedReadiness.requested.model
+            && msg.topicEffort.effort === savedReadiness.requested.effort);
         const restartSettled = restartCoordinator.resolve(
           ds.session.sessionId,
           msg.attemptId,
-          msg.status,
+          validSettingReceipt ? msg.status : 'failed',
         );
         // requestSessionRestart() fences the live generation by clearing
         // workerReady before asking the worker to respawn its CLI in place. An
@@ -17291,13 +17382,34 @@ function setupWorkerHandlers(
         // that must release that fence. Without this assignment the terminal
         // can be prompt-ready/idle while relay and fork remain permanently
         // blocked as `worker_busy`.
-        if (restartSettled && msg.status === 'succeeded') {
+        if (restartSettled && validSettingReceipt && msg.status === 'succeeded') {
           ds.workerReady = true;
         }
+        if (restartSettled && currentSettingsAttempt) {
+          if (msg.untouched) {
+            ds.workerReady = savedReadiness.workerReady;
+            ds.cliReady = savedReadiness.cliReady;
+          }
+          if (validSettingReceipt && msg.status === 'succeeded' && msg.topicEffort) {
+            ds.activeModel = msg.topicEffort.model;
+            ds.activeReasoningEffort = msg.topicEffort.effort;
+            ds.activeModelBackendVariant = msg.topicEffort.variant;
+            if (ds.initConfig) {
+              ds.initConfig.model = msg.topicEffort.model;
+              ds.initConfig.reasoningEffort = msg.topicEffort.effort;
+              ds.initConfig.modelBackendVariant = msg.topicEffort.variant;
+            }
+          }
+          topicEffortRestartReadiness.delete(ds.session.sessionId);
+        }
+
         break;
       }
 
       case 'cli_session_id': {
+        // Interactive fork launches briefly hold the parent's id. Such an
+        // observation is not a completed fork and must leave the intent intact.
+        if (ds.session.pendingForkSession && msg.cliSessionId === ds.session.cliSessionId) break;
         const wasLocalCliOpenReady = isLocalCliOpenReady(ds, { cliId: effectiveCliId });
         ds.session.cliSessionId = msg.cliSessionId;
         ds.session.codexCleanupTarget = ['codex', 'codex-app'].includes(effectiveCliId)
@@ -17337,6 +17449,9 @@ function setupWorkerHandlers(
           ds.initConfig.nativeSessionTitlePrompt = undefined;
         }
         sessionStore.updateSession(ds.session);
+        if (ds.scope === 'chat' && ds.chatType === 'group') {
+          acceptSessionGroupTitle(ds.larkAppId, ds.session, title);
+        }
         break;
       }
 
@@ -17563,6 +17678,12 @@ function setupWorkerHandlers(
           // settle exclusively from the validated turn_terminal path below.
           if (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited') {
             recordUsageForDaemonSession(ds);
+            if (ds.lastScreenStatus === 'idle' && (prevStatus === 'working' || prevStatus === 'analyzing')) {
+              void finishTurnReactions(ds);
+              if (ds.session.workflowNode && !ds.session.workflowNode.submittedAt) {
+                cb.onWorkflowNodeTurnSettled?.(ds, { ...(msg.turnId ? { turnId: msg.turnId } : {}), at: Date.now() });
+              }
+            }
           }
           if (
             ds.lastScreenStatus === 'idle'
@@ -21131,8 +21252,8 @@ async function persistFinalOutputDelivery(
   try {
     const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
     const feedbackStore = await getSkillFeedbackStore(config.session.dataDir);
-    if (feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, messageId)) return;
-    feedbackStore.recordTurnDelivery({
+    if (await feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, messageId)) return;
+    await feedbackStore.recordTurnDelivery({
       botAppId: ds.larkAppId,
       sessionId: ds.session.sessionId,
       turnId: msg.turnId,
@@ -21794,6 +21915,17 @@ function deliverFinalOutput(
       if (!managedReceiver) {
         cardJson = attachOncallGroupButton(cardJson, getBot(ds.larkAppId).config.oncallGroup, ds.chatId, ds.chatType);
       }
+      // §11 / §5.5: a node session's replies carry the run's「工作流 ›」entry
+      // at the signature row's right end (after the on-call button).
+      cardJson = attachWorkflowSidebarEntry(cardJson, workflowNodeSessionEntry(
+        ds.session.workflowNode,
+        (mainLarkAppId, runId) => resolveWorkflowEntryLink({
+          mainLarkAppId,
+          runId,
+          brand: getBotBrand(ds.larkAppId),
+          locale: localeForBot(ds.larkAppId),
+        }),
+      ));
       const baseFeedbackCard = feedback ? JSON.parse(cardJson) as Record<string, unknown> : undefined;
 
       const proposedOutput = {
@@ -23339,3 +23471,4 @@ export function setCurrentCliVersion(v: string, runtimeKey?: string): void {
 export function getCurrentCliVersion(runtimeKey?: string): string {
   return runtimeKey ? currentCliVersions.get(runtimeKey) ?? 'unknown' : currentCliVersion;
 }
+import { feedbackMaintenanceActive } from '../services/feedback-maintenance.js';
