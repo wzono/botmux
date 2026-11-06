@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import { parseAskBody } from '../src/core/ask-api.js';
 import { codexAsyncAnswerText, codexAsyncAnswerSteerTarget, codexAsyncSteerTargetMatches, deliverCodexAsyncAnswer, parseCodexAsyncQuestions, parseCodexAsyncUserInput } from '../src/services/codex-async-user-input.js';
 import type { AskResult } from '../src/core/ask-types.js';
@@ -27,7 +28,7 @@ describe('Codex async user input', () => {
       { human: false }, { managedLark: false }, { cleanInputAccepted: false }]) {
       expect(codexAsyncAnswerSteerTarget(input, { ...facts, ...patch })).toBeUndefined();
     }
-    expect(codexAsyncAnswerSteerTarget(identity, facts)).toBeUndefined();
+    expect(codexAsyncAnswerSteerTarget(identity, facts)).toBeNull();
   });
   it('keeps late answers and stripped sidecars out of a different active native task', () => {
     const answerId = 'codex-async-answer-test';
@@ -37,6 +38,49 @@ describe('Codex async user input', () => {
     expect(codexAsyncSteerTargetMatches(answerId, input, undefined)).toBe(false);
     expect(codexAsyncSteerTargetMatches(answerId, undefined, 'native-original')).toBe(false);
     expect(codexAsyncSteerTargetMatches('om_ordinary', undefined, 'native-later')).toBe(true);
+  });
+  it('preserves daemon construction and validation over real JSON IPC', async () => {
+    const child = spawnTsEvalWithRepoImports(`
+      import { isCodexAppTurnInput } from './src/adapters/cli/codex-app-turn.js';
+      import { codexAsyncAnswerSteerTarget, codexAsyncSteerTargetMatches, withCodexAsyncAnswerSteerTarget } from './src/services/codex-async-user-input.js';
+      process.on('message', ({ identity, facts }) => {
+        const target = codexAsyncAnswerSteerTarget(identity, facts);
+        const answer = withCodexAsyncAnswerSteerTarget({ text: 'answer' }, target ?? null);
+        const supplement = { text: 'supplement' };
+        process.send?.({
+          answer,
+          answerValid: isCodexAppTurnInput(answer),
+          answerSteerable: codexAsyncSteerTargetMatches('control', answer, 'native-active'),
+          supplementValid: isCodexAppTurnInput(supplement),
+          supplementSteerable: codexAsyncSteerTargetMatches('om_supplement', supplement, 'native-active'),
+        });
+      });
+    `, { cwd: process.cwd(), stdio: ['ignore', 'ignore', 'inherit', 'ipc'], serialization: 'json' });
+    const outcome = new Promise<any>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('JSON IPC probe timed out')), 5_000);
+      timer.unref?.();
+      child.once('message', message => { clearTimeout(timer); resolve(message); });
+      child.once('error', error => { clearTimeout(timer); reject(error); });
+      child.once('exit', (code, signal) => {
+        clearTimeout(timer);
+        reject(new Error(`JSON IPC probe exited before reply: code=${code} signal=${signal}`));
+      });
+    });
+    try {
+      child.send({ identity, facts: {
+        answerer: 'ou_owner', originalAnswerer: 'ou_owner', human: true,
+        managedLark: true, cleanInputAccepted: true,
+      } });
+      await expect(outcome).resolves.toEqual({
+        answer: { text: 'answer', steerTargetTurnId: null },
+        answerValid: true,
+        answerSteerable: false,
+        supplementValid: true,
+        supplementSteerable: true,
+      });
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+    }
   });
   it('preserves titles/options and requires submission instead of assuming the first option', () => {
     const questions = parseCodexAsyncQuestions(item);

@@ -4331,7 +4331,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
       }
       markRetryAttempt(ds.session);
-      rememberLastCliInput(ds, failedTurn.userPrompt, { content: submittedContent });
+      rememberLastCliInput(ds, failedTurn.userPrompt, { content: submittedContent },
+        ds.pendingTurnId ?? failedTurn.turnId);
       sessionStore.updateSession(ds.session);
       ds.lastScreenStatus = 'working';
       ds.streamCardPending = true;

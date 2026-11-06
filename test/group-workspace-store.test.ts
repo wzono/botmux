@@ -223,6 +223,53 @@ describe('GroupWorkspaceStore', () => {
     expect(await createStore(dir).read(CHAT)).toEqual({ status: 'store_unavailable' });
   });
 
+  it.each([
+    ['unbind marker', { kind: 'unbind', historicalIdentity: 'legacy_unprovable' }],
+    ['noncommitted marker', { outcome: 'conflict', historicalIdentity: 'legacy_unprovable' }],
+    ['marker plus identity', { historicalIdentity: 'legacy_unprovable', workspaceIdentity: { path: '/tmp/one', dev: '1', ino: '2' } }],
+    ['invalid marker', { historicalIdentity: 'other' }],
+  ])('rejects historical identity outside migrated committed set shape: %s', async (_name, patch) => {
+    const dir = dataDir(); const path = join(dir, 'group-workspaces.json');
+    await createStore(dir).mutate(setInput({ sourceEventId: textSource('om_historical_shape'), workingDir: '/tmp/one', expectedRevision: 0 }));
+    const registry = JSON.parse(readFileSync(path, 'utf8'));
+    let receipt = Object.values(registry.receipts)[0] as any;
+    if (patch.kind === 'unbind' || patch.outcome === 'conflict') {
+      const sourceEventId = textSource(`om_historical_${patch.kind ?? patch.outcome}`);
+      const kind = patch.kind ?? 'set';
+      const key = groupWorkspaceOperationKey(sourceEventId, kind);
+      receipt = { ...receipt, operationKey: key, sourceEventId, kind, outcome: 'conflict', expectedRevision: 1,
+        historicalIdentity: 'legacy_unprovable' };
+      delete receipt.resultingRevision; delete receipt.resultingDirectory; delete receipt.workspaceIdentity;
+      if (kind === 'unbind') {
+        delete receipt.canonicalTargetWorkingDir;
+        delete receipt.expectedSessionGeneration;
+        receipt.payloadDigest = canonicalGroupOperationPayloadDigest({
+          kind: 'unbind', chatId: CHAT, sourceEventId, expectedRevision: 1,
+          actor: U, authorized: true, now: receipt.completedAt,
+        });
+      } else {
+        receipt.payloadDigest = canonicalGroupOperationPayloadDigest(setInput({
+          sourceEventId, workingDir: '/tmp/one', expectedRevision: 1,
+        }));
+      }
+      registry.receipts[key] = receipt;
+    } else {
+      Object.assign(receipt, patch);
+    }
+    writeFileSync(path, JSON.stringify(registry));
+    expect(await createStore(dir).read(CHAT)).toEqual({ status: 'store_unavailable' });
+  });
+
+  it('rejects a historical sentinel on the latest committed set receipt', async () => {
+    const dir = dataDir(); const path = join(dir, 'group-workspaces.json');
+    await createStore(dir).mutate(setInput({ sourceEventId: textSource('om_latest_sentinel'), workingDir: '/tmp/one', expectedRevision: 0 }));
+    const registry = JSON.parse(readFileSync(path, 'utf8'));
+    const receipt = Object.values(registry.receipts)[0] as any;
+    delete receipt.workspaceIdentity; receipt.historicalIdentity = 'legacy_unprovable';
+    writeFileSync(path, JSON.stringify(registry));
+    expect(await createStore(dir).read(CHAT)).toEqual({ status: 'store_unavailable' });
+  });
+
   it('accepts noncommitted receipts alongside an exact committed revision history', async () => {
     const dir = dataDir();
     const store = createStore(dir);

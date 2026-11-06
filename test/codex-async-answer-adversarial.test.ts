@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable, codexAsyncSteerTargetMatches } from '../src/services/codex-async-user-input.js';
+import { codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable, codexAsyncSteerTargetMatches, withCodexAsyncAnswerSteerTarget } from '../src/services/codex-async-user-input.js';
 import { buildCodexAppTurnStartParams, supportsClientUserMessageId } from '../src/adapters/cli/codex-app-turn.js';
 import { productionFunction, productionClass, delivery, deliveryIsCurrent } from './helpers/codex-async-answer-function-harness.js';
 import { beginReplyTargetTurn, pickTurnReplyTarget } from '../src/core/reply-target.js';
@@ -74,7 +74,8 @@ function daemonScope(): Record<string, any> {
     asyncInput: { threadId: 'thread', itemId: 'call', nativeTurnId: 'native-original' },
     codexAsyncAnswerSteerTarget, larkTransportEnabled: () => true,
     isSilentScheduledTurn,
-    codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable, larkTransportEnabled: () => true,
+    codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable, withCodexAsyncAnswerSteerTarget,
+    larkTransportEnabled: () => true,
     codexAppCleanInputAcceptedForSession: () => scope.clean, clean: true,
     sendWorkerInput: vi.fn(() => true), beginNewTurn: vi.fn(), rememberLastCliInput: vi.fn(),
     findActiveBySessionId: () => scope.askSession,

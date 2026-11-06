@@ -2024,8 +2024,9 @@ export interface CodexAppAdditionalContextEntry {
 export interface CodexAppTurnInput {
   text: string;
   /** Host routing constraint for a correlated async answer; never forwarded
-   * as a native request parameter or used to grant steer authority. */
-  steerTargetTurnId?: string;
+   * as a native request parameter or used to grant steer authority. `null`
+   * marks a proven async answer that has no native target and must stay serial. */
+  steerTargetTurnId?: string | null;
   additionalContext?: Record<string, CodexAppAdditionalContextEntry>;
   localImages?: Array<{
     path: string;

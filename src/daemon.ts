@@ -17,7 +17,7 @@ import {
 } from './services/group-workspace-operation-store.js';
 import {
   readWorkspaceMigrationManifest,
-  workspaceMigrationIngressReady,
+  ensureWorkspaceMigrationReadyForStartup,
 } from './services/workspace-schema-migrator.js';
 import { coordinateGroupWorkspaceQuarantineRepair } from './services/group-workspace-repair.js';
 import { OperationExecutorLeaseStore } from './services/operation-executor-lease-store.js';
@@ -1084,7 +1084,7 @@ import { runCompletionProposalContinuation } from './core/completion-proposal-co
 import { renderCompletionProposalCard } from './im/lark/completion-proposal-card.js';
 import { parseAskBody, registerAskForResponse } from './core/ask-api.js';
 import { resolveAskRootTarget } from './core/ask-into-target.js';
-import { CODEX_ASYNC_ASK_ORIGIN, deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable } from './services/codex-async-user-input.js';
+import { CODEX_ASYNC_ASK_ORIGIN, deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable, withCodexAsyncAnswerSteerTarget } from './services/codex-async-user-input.js';
 import { resolveDocumentAskDelivery } from './core/doc-comment-ask.js';
 import { isHumanOpenId } from './im/lark/client.js';
 import { submitDocumentAskReply } from './core/ask-broker.js';
@@ -7241,6 +7241,7 @@ const centralTurnWorkerBoundary = {
       ...(options.durablePrimaryInbox ? { durablePrimaryInbox: true as const } : {}),
       ...(options.notifyRejection === false ? { notifyRejection: false as const } : {}),
       ...(options.codexAppSteerable ? { codexAppSteerable: true as const } : {}),
+      ...(options.queueAfterActiveTurn ? { queueAfterActiveTurn: true as const } : {}),
       ...(options.atMostOnce ? { atMostOnce: true as const } : {}),
       ...(options.queueAfterActiveTurn ? { queueAfterActiveTurn: true as const } : {}),
       ...(options.trustedCaller ? { trustedCaller: options.trustedCaller } : {}),
@@ -11629,7 +11630,10 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
         };
         const steerTarget = codexAsyncAnswerSteerTarget(asyncInput, steerFacts);
         const steerable = codexAsyncAnswerSteerable(steerFacts) && input.codexAppInput !== undefined;
-        if (steerable && steerTarget !== undefined) input.codexAppInput = { ...input.codexAppInput!, steerTargetTurnId: steerTarget };
+        if (steerable) input.codexAppInput = withCodexAsyncAnswerSteerTarget(
+          input.codexAppInput!,
+          steerTarget ?? null,
+        );
         // The original turn remains the authorization authority, while the
         // control delivery gets its own worker dedupe key.
         if (documentDelivery && asyncDocumentTarget) {
@@ -32921,25 +32925,9 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
 
       // Worker 挂起 / 已退出 —— resume 重 fork（与 handleThreadReply 同路）。
       logger.info(`[${tag(ds)}] Worker not running for doc-comment, re-forking...`);
-      if (ds.usageLimitRetryTimer) { clearTimeout(ds.usageLimitRetryTimer); ds.usageLimitRetryTimer = undefined; }
-      ds.usageLimit = undefined;
-      ds.quotaFallbackAttemptToken = undefined;
-      ds.currentTurnTitle = text.substring(0, 50);
-      parkStreamCard(ds);
-      ds.streamCardId = undefined;
-      ds.streamCardNonce = undefined;
-      ds.streamCardPending = true;
-      ds.streamCardPendingTurnId = turnId;
-      ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
-      // Same new-turn bookkeeping as beginNewTurn (this branch bypasses it) —
-      // see the Lark-message re-fork branch above.
-      ds.messageListenerCompletedTurnId = undefined;
-      ds.silentIdleTurnId = undefined;
-      ds.completedIdleTurnId = undefined;
-      ds.failedIdleTurnId = undefined;
-      ds.currentTurnId = turnId;
-      ds.currentImageKey = undefined;
-      persistStreamCardState(ds);
+      // Keep presentation/current-turn state unchanged until the provider-owned
+      // comment is accepted. A rejected permit remains retryable and must not
+      // replace the visible turn or park its card.
       // Skip whiteboard ensure for adopted (bridge) sessions on re-fork — mirrors
       // the live-worker branch above (if (!isBridge) ensure…).
       if (!ds.adoptedFrom) ensureSessionWhiteboard(ds);
@@ -32954,46 +32942,50 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
         turnId,
       });
       (ds.session.docCommentTargets ??= {})[turnId] = docTarget; // per-turn map，不覆盖其他并发轮
-      rememberLastCliInput(ds, promptContent, wrappedInput, turnId);
       await noteTurnReceived(ds, commentId, text, sender, turnId);
       ensureCurrentRoutingGeneration(generation, 'comment:refork-note');
       sub = currentDocSubscriptionForDelivery(larkAppId, sub);
-      if (ds.worker && !ds.worker.killed) {
-        // A sibling reply in the same newly-created comment thread may finish
-        // the one canonical fork while this turn was awaiting admission-side
-        // feedback/identity work. That worker is the expected successor, not a
-        // foreign generation: deliver this exact frozen input to it instead of
-        // attempting a second fork or rejecting the provider event.
-        if (!sendWorkerInput(ds, wrappedInput, turnId,
-          wrappedInput.trustedCaller ? { trustedCaller: wrappedInput.trustedCaller } : {})) {
-          throw new Error('worker became unavailable during comment:refork-handoff');
-        }
-        acceptDocCommentSession(ds);
-        markDocCommentActivityAfterAdmission(ds, turnId);
-        return;
-      }
       sessionStore.updateSession(ds.session);
-      if (ds.adoptedFrom) {
-        if (forkAdoptWorker(ds, { payload: wrappedInput, turnId }) !== 'accepted') {
-          throw new Error('adopt worker fork did not accept document comment input');
-        }
-        acceptDocCommentSession(ds);
-      } else {
-        let forkAdmission: WorkerForkAdmission | undefined;
-        const forked = forkWorker(
+      // Admission-side awaits above may have produced a sibling worker, while a
+      // group workspace may also have advanced since this dormant session last
+      // ran. Route both cases through the same follow + blank-bootstrap + typed
+      // business-permit boundary as every other business turn. In particular,
+      // never attach the document payload to the bootstrap fork: a provider
+      // retry remains unaccepted until the exact worker generation proves ready
+      // and accepts the one-shot business permit.
+      if (await followGroupWorkspaceBeforeBusinessTurn(ds) === 'stop'
+        || !await dispatchAdmittedBusinessTurn({
           ds,
-          wrappedInput,
-          { resume: ds.hasHistory, turnId },
-          {
-            onAdmission: admission => { forkAdmission = admission; },
-            deferDuringDeviceIsolation: false,
+          turnId,
+          payload: wrappedInput,
+          options: {
+            resume: ds.hasHistory,
+            queueAfterActiveTurn: true,
+            ...(wrappedInput.trustedCaller ? { trustedCaller: wrappedInput.trustedCaller } : {}),
           },
-        );
-        if (!forked || forkAdmission === undefined || forkAdmission === 'rejected') {
-          throw new Error('worker fork did not accept document comment input');
-        }
-        acceptDocCommentSession(ds);
+          boundary: centralTurnWorkerBoundary,
+          permitStore: centralTurnPermitStore,
+          retireUnproven: async (current, reservedGeneration) => {
+            const currentGeneration = current.workerGeneration ?? current.session.workerGeneration ?? 0;
+            if (currentGeneration !== reservedGeneration) return undefined;
+            const workerPid = current.worker?.pid ?? current.session.pid ?? null;
+            return await retireWorkerForReplacement(current)
+              ? { retiredGeneration: currentGeneration, workerPid }
+              : undefined;
+          },
+        })) {
+        throw new Error('worker did not accept document comment input');
       }
+      // Persist replay/history and presentation only after the worker accepted
+      // the typed permit. From this point projection failures are not retryable:
+      // the business input is already executing and a provider retry duplicates it.
+      try {
+        rememberLastCliInput(ds, promptContent, wrappedInput, turnId);
+        beginNewTurn(ds, text, turnId);
+      } catch (err) {
+        logger.error(`[${tag(ds)}] doc-comment refork post-admission projection failed (turn ${turnId.slice(0, 8)}): ${err instanceof Error ? err.message : String(err)}`);
+      }
+      acceptDocCommentSession(ds);
       markDocCommentActivityAfterAdmission(ds, turnId);
     }, cleanupFailedDelivery);
   } catch (err) {
@@ -33507,11 +33499,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
   // The host-wide schema epoch is resolved before any optional subsystem,
   // session restore, durable queue driver, IPC release, or IM ingress starts.
-  const existingWorkspaceManifest = readWorkspaceMigrationManifest(config.session.dataDir);
-  if (!existingWorkspaceManifest || existingWorkspaceManifest.phase !== 'complete'
-    || !workspaceMigrationIngressReady(config.session.dataDir)) {
-    throw new Error('workspace migration requires a completed supervisor-proven epoch');
-  }
+  await ensureWorkspaceMigrationReadyForStartup(config.session.dataDir, {
+    coreOnly: process.env.BOTMUX_CORE_ONLY === '1',
+  });
   // 会话存储 SQLite 能力硬门：package.json engines 只要求 node>=22（npm 对
   // 不匹配只告警；编译版走 bun:sqlite）。这里经 sqlite-compat 探测，失败
   // 信息可行动，避免拖到首次落盘才炸。

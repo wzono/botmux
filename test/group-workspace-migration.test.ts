@@ -8,10 +8,12 @@ import { GroupWorkspaceStore } from '../src/services/group-workspace-store.js';
 import { GroupWorkspaceOperationStore } from '../src/services/group-workspace-operation-store.js';
 import { writeBotAdminUnions } from '../src/services/bot-admin-unions-store.js';
 import { assertGroupWorkspaceSessionExecutable, repairKnownGroupWorkspaceSession } from '../src/core/session-cwd.js';
+import { WorkspaceMigrationSupervisorFence } from '../src/core/workspace-migration-supervisor.js';
 import type { Session } from '../src/types.js';
 import {
   WorkspaceMigrationFenceError,
   WorkspaceSchemaMigrator,
+  ensureWorkspaceMigrationReadyForStartup,
   assertWorkspaceWriterFence,
   readWorkspaceMigrationManifest,
 } from '../src/services/workspace-schema-migrator.js';
@@ -21,6 +23,91 @@ function dataDir(): string {
 }
 
 describe('host-wide workspace schema migration', () => {
+  it('bootstraps a fresh empty data directory without supervisor fleet proof', async () => {
+    const root = dataDir();
+    await expect(ensureWorkspaceMigrationReadyForStartup(root, { coreOnly: true }))
+      .resolves.toMatchObject({ status: 'complete', epoch: 1 });
+    expect(readWorkspaceMigrationManifest(root)).toMatchObject({ phase: 'complete', stores: {} });
+  });
+
+  it('serializes concurrent fresh starters onto one completed epoch', async () => {
+    const root = dataDir();
+    const [left, right] = await Promise.all([
+      ensureWorkspaceMigrationReadyForStartup(root, { coreOnly: true }),
+      ensureWorkspaceMigrationReadyForStartup(root, { coreOnly: true }),
+    ]);
+    expect(left).toMatchObject({ status: 'complete', epoch: 1 });
+    expect(right).toMatchObject({ status: 'complete', epoch: 1 });
+    expect(readWorkspaceMigrationManifest(root)).toMatchObject({ phase: 'complete', epoch: 1 });
+  });
+
+  it('ignores recoverable file-lock crash claims when proving freshness', async () => {
+    const root = dataDir();
+    writeFileSync(join(root, '.botmux-stale-claim-crashed-lock'), 'stale');
+    await expect(ensureWorkspaceMigrationReadyForStartup(root, { coreOnly: true }))
+      .resolves.toMatchObject({ status: 'complete', epoch: 1 });
+  });
+
+  it('publishes the writer fence before the final fresh-state check', async () => {
+    const root = dataDir();
+    let writerWasBlocked = false;
+    await ensureWorkspaceMigrationReadyForStartup(root, {
+      coreOnly: true,
+      afterFreshFencePublished: () => {
+        try { assertWorkspaceWriterFence(root); }
+        catch (error) { writerWasBlocked = error instanceof WorkspaceMigrationFenceError; }
+      },
+    });
+    expect(writerWasBlocked).toBe(true);
+  });
+
+  it('keeps any non-empty manifest-less data directory supervisor-gated', async () => {
+    const root = dataDir();
+    writeFileSync(join(root, 'unrecognized-durable-state'), 'present');
+    await expect(ensureWorkspaceMigrationReadyForStartup(root, { coreOnly: true }))
+      .rejects.toThrow(/supervisor-proven epoch/);
+    expect(readWorkspaceMigrationManifest(root)).toMatchObject({ phase: 'prepared' });
+  });
+
+  it('rejects a complete non-empty epoch without durable supervisor provenance', async () => {
+    const root = dataDir();
+    writeFileSync(join(root, 'group-workspaces.json'), JSON.stringify({ schemaVersion: 2, records: {}, receipts: {} }));
+    await new WorkspaceSchemaMigrator(root, { ownerId: 'offline', requiredStores: ['group_json'] }).migrateOrRecover();
+    expect(readWorkspaceMigrationManifest(root)).toMatchObject({ phase: 'complete' });
+    await expect(ensureWorkspaceMigrationReadyForStartup(root, { coreOnly: false }))
+      .rejects.toThrow(/supervisor-proven epoch/);
+  });
+
+  it('rejects forged fresh-bootstrap provenance when durable data exists', async () => {
+    const root = dataDir();
+    await ensureWorkspaceMigrationReadyForStartup(root, { coreOnly: true });
+    writeFileSync(join(root, 'forged-durable-state'), 'present');
+    await expect(ensureWorkspaceMigrationReadyForStartup(root, { coreOnly: true }))
+      .rejects.toThrow(/supervisor-proven epoch/);
+  });
+
+  it('lets a proven supervisor recover a failed fresh bootstrap with real legacy data', async () => {
+    const root = dataDir();
+    writeFileSync(join(root, 'group-workspaces.json'), JSON.stringify({ schemaVersion: 1, records: {}, receipts: {} }));
+    await expect(ensureWorkspaceMigrationReadyForStartup(root, { coreOnly: true }))
+      .rejects.toThrow(/supervisor-proven epoch/);
+    await expect(new WorkspaceSchemaMigrator(root, { ownerId: 'forged', supervisorProofToken: 'invalid' })
+      .migrateOrRecover()).rejects.toThrow(/restart block was lost|writer lease is held/);
+    const gate = new WorkspaceMigrationSupervisorFence(root, 99);
+    const acquired = await gate.acquire(1, () => [], { alive: () => true });
+    gate.markMigrating(acquired.proofToken);
+    const ownerId = `supervisor:99:${acquired.lease.leaseId}`;
+    await expect(new WorkspaceSchemaMigrator(root, { ownerId, supervisorProofToken: acquired.proofToken })
+      .migrateOrRecover()).resolves.toMatchObject({ status: 'complete', epoch: 1 });
+    expect(JSON.parse(readFileSync(join(root, 'group-workspaces.json'), 'utf8')).schemaVersion).toBe(2);
+    expect(readWorkspaceMigrationManifest(root)).toMatchObject({ phase: 'complete', fleetQuiescence: {
+      restartBlocked: true, supervisorProofToken: acquired.proofToken,
+    } });
+    await gate.release(acquired.proofToken, { alive: () => true });
+    await expect(ensureWorkspaceMigrationReadyForStartup(root, { coreOnly: false }))
+      .resolves.toMatchObject({ status: 'complete', epoch: 1 });
+  });
+
   it('publishes one monotonic epoch and rejects stale normal writers while the batch is active', async () => {
     const root = dataDir();
     writeFileSync(join(root, 'group-workspaces.json'), JSON.stringify({ schemaVersion: 2, records: {}, receipts: {} }));
@@ -80,6 +167,72 @@ describe('host-wide workspace schema migration', () => {
     expect(byId.legacy.workingDirSource).toBe('legacy-unknown');
     expect(byId.known).toMatchObject({ workspaceSchemaVersion: 2, groupWorkspaceIdentity: group.records.chat.workspaceIdentity });
     expect(byId.stale.groupWorkspaceQuarantine).toMatchObject({ kind: 'known_group_identity_unprovable', expectedRevision: 0 });
+  });
+
+  it('keeps an unprovable historical set receipt readable after migrating to v2', async () => {
+    const root = dataDir();
+    const current = join(root, 'current');
+    mkdirSync(current);
+    const actor = { tenantKey: 'tenant', unionId: 'on_admin' };
+    const historicalSource = 'group-workspace-text-source-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const currentSource = 'group-workspace-text-source-v1:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    const historicalKey = `group-workspace-operation-v1:sha256:${createHash('sha256')
+      .update(JSON.stringify([1, historicalSource, 'set'])).digest('hex')}`;
+    const currentKey = `group-workspace-operation-v1:sha256:${createHash('sha256')
+      .update(JSON.stringify([1, currentSource, 'set'])).digest('hex')}`;
+    const receipt = (operationKey: string, sourceEventId: string, target: string, expectedRevision: number) => ({
+      operationKey, sourceEventId, kind: 'set',
+      payloadDigest: `group-workspace-payload-v1:sha256:${createHash('sha256')
+        .update(JSON.stringify([1, 'chat', 'set', target])).digest('hex')}`,
+      chatId: 'chat', outcome: 'committed', resultingRevision: expectedRevision + 1,
+      resultingDirectory: { kind: 'bound', workingDir: target }, actor,
+      completedAt: expectedRevision + 1, expectedRevision, canonicalTargetWorkingDir: target,
+    });
+    writeFileSync(join(root, 'group-workspaces.json'), JSON.stringify({ schemaVersion: 1, records: {
+      chat: { chatId: 'chat', revision: 2, directory: { kind: 'bound', workingDir: current },
+        updatedAt: 2, updatedBy: actor },
+    }, receipts: {
+      [historicalKey]: receipt(historicalKey, historicalSource, join(root, 'removed'), 0),
+      [currentKey]: receipt(currentKey, currentSource, current, 1),
+    } }));
+
+    await new WorkspaceSchemaMigrator(root, { ownerId: 'daemon-a', requiredStores: ['group_json'] }).migrateOrRecover();
+
+    const raw = JSON.parse(readFileSync(join(root, 'group-workspaces.json'), 'utf8'));
+    expect(raw.receipts[historicalKey]).toMatchObject({ historicalIdentity: 'legacy_unprovable' });
+    await expect(new GroupWorkspaceStore(root).read('chat')).resolves.toMatchObject({
+      status: 'available', record: { revision: 2, directory: { kind: 'bound', workingDir: current } },
+    });
+  });
+
+  it('refreshes latest receipt identity and removes stale identity from opaque history', async () => {
+    const root = dataDir(); const current = join(root, 'current'); mkdirSync(current);
+    const actor = { tenantKey: 'tenant', unionId: 'on_admin' };
+    const historicalSource = 'group-workspace-text-source-v1:sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc';
+    const currentSource = 'group-workspace-text-source-v1:sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd';
+    const key = (sourceEventId: string) => `group-workspace-operation-v1:sha256:${createHash('sha256')
+      .update(JSON.stringify([1, sourceEventId, 'set'])).digest('hex')}`;
+    const receipt = (sourceEventId: string, target: string, expectedRevision: number, identity: object) => ({
+      operationKey: key(sourceEventId), sourceEventId, kind: 'set',
+      payloadDigest: `group-workspace-payload-v1:sha256:${createHash('sha256')
+        .update(JSON.stringify([1, 'chat', 'set', target])).digest('hex')}`,
+      chatId: 'chat', outcome: 'committed', resultingRevision: expectedRevision + 1,
+      resultingDirectory: { kind: 'bound', workingDir: target }, actor, completedAt: expectedRevision + 1,
+      expectedRevision, canonicalTargetWorkingDir: target, workspaceIdentity: identity,
+    });
+    const removed = join(root, 'removed');
+    writeFileSync(join(root, 'group-workspaces.json'), JSON.stringify({ schemaVersion: 1, records: {
+      chat: { chatId: 'chat', revision: 2, directory: { kind: 'bound', workingDir: current }, updatedAt: 2, updatedBy: actor },
+    }, receipts: {
+      [key(historicalSource)]: receipt(historicalSource, removed, 0, { path: removed, dev: 9, ino: '9' }),
+      [key(currentSource)]: receipt(currentSource, current, 1, { path: current, dev: '9', ino: '9' }),
+    } }));
+    await new WorkspaceSchemaMigrator(root, { ownerId: 'daemon-a', requiredStores: ['group_json'] }).migrateOrRecover();
+    const raw = JSON.parse(readFileSync(join(root, 'group-workspaces.json'), 'utf8'));
+    expect(raw.receipts[key(historicalSource)]).toMatchObject({ historicalIdentity: 'legacy_unprovable' });
+    expect(raw.receipts[key(historicalSource)]).not.toHaveProperty('workspaceIdentity');
+    expect(raw.receipts[key(currentSource)].workspaceIdentity).toEqual(raw.records.chat.workspaceIdentity);
+    await expect(new GroupWorkspaceStore(root).read('chat')).resolves.toMatchObject({ status: 'available' });
   });
 
   it('rolls back before the first publish and resumes instead of rolling back after a publish point', async () => {

@@ -6,7 +6,7 @@ export interface WorkspaceBusinessDispatchInput {
   ds: DaemonSession;
   turnId: string;
   payload: string | CliTurnPayload;
-  options: { resume: boolean; dispatchAttempt?: number; atMostOnce?: true; codexAppSteerable?: true; trustedCaller?: CliTurnPayload['trustedCaller'] };
+  options: { resume: boolean; dispatchAttempt?: number; atMostOnce?: true; codexAppSteerable?: true; queueAfterActiveTurn?: true; trustedCaller?: CliTurnPayload['trustedCaller'] };
   markAttempting?: () => Promise<boolean>;
   expectedWorkspace?: { workspace: WorkspaceIdentity; groupRevision?: number };
 }

@@ -1,12 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { terminalWorkspaceBytesAllowed } from '../src/worker.js';
+import { statSync } from 'node:fs';
+import { terminalWorkspaceBytesAllowed, terminalWorkspacePathAllowed } from '../src/worker.js';
 import { classifyTurn, resumeAdmittedControlReply } from '../src/core/turn-admission.js';
 import { TurnPermitStore } from '../src/services/turn-permit-store.js';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const workspace = (path = '/old') => ({ path, dev: '1', ino: '2' });
+const probeStat = (path: string) => { const stat = statSync(path, { bigint: true }); return { dev: String(stat.dev), ino: String(stat.ino) }; };
 
 describe('group workspace durable ingress', () => {
   it('fences terminal bytes against the current group revision and directory identity', () => {
@@ -20,6 +22,21 @@ describe('group workspace durable ingress', () => {
     expect(terminalWorkspaceBytesAllowed(frozen, {
       type: 'terminal_workspace_fence', source: 'group', groupRevision: 1, workspaceIdentity: workspace('/new'),
     })).toBe(false);
+  });
+
+  it('keeps only the accepted symlink target writable', () => {
+    const root = mkdtempSync(join(tmpdir(), 'terminal-workspace-alias-'));
+    const actual = join(root, 'actual'); const other = join(root, 'other'); const alias = join(root, 'alias');
+    mkdirSync(actual); mkdirSync(other); symlinkSync(actual, alias);
+    const stat = probeStat(actual);
+    const frozenIdentity = { path: alias, ...stat };
+    const frozen = { source: 'group' as const, groupRevision: 1, workspaceIdentity: frozenIdentity };
+    expect(terminalWorkspaceBytesAllowed(frozen, {
+      type: 'terminal_workspace_fence', source: 'group', groupRevision: 1, workspaceIdentity: frozenIdentity,
+    })).toBe(true);
+    expect(terminalWorkspacePathAllowed(realpathSync(alias), frozenIdentity, stat, realpathSync(alias))).toBe(true);
+    expect(terminalWorkspacePathAllowed(realpathSync(alias), frozenIdentity, stat, realpathSync(other))).toBe(false);
+    expect(terminalWorkspacePathAllowed(realpathSync(alias), frozenIdentity, { ...stat, ino: 'wrong' }, realpathSync(alias))).toBe(false);
   });
 
   it('keeps output delivery outside business admission classification', () => {

@@ -11,7 +11,7 @@ import {
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { fsyncFilesAndDirectorySync } from '../utils/fs-durability.js';
 import { withFileLock } from '../utils/file-lock.js';
-import { WORKSPACE_SCHEMA_VERSION, type WorkspaceIdentity } from '../types.js';
+import { WORKSPACE_SCHEMA_VERSION, workspaceIdentityEqual, type WorkspaceIdentity } from '../types.js';
 import { assertWorkspaceWriterFence } from './workspace-schema-migrator.js';
 
 export const GROUP_WORKSPACE_STORE_FILE = 'group-workspaces.json';
@@ -43,11 +43,10 @@ export type GroupOperationTerminalOutcome =
   | 'unauthorized'
   | 'store_unavailable';
 
-export interface GroupOperationReceipt {
+interface GroupOperationReceiptBase {
   operationKey: string;
   sourceEventId: string;
   originMessageId?: string;
-  kind: GroupOperationKind;
   payloadDigest: string;
   chatId: string;
   outcome: GroupOperationTerminalOutcome;
@@ -61,6 +60,11 @@ export interface GroupOperationReceipt {
   canonicalTargetWorkingDir?: string;
   workspaceIdentity?: WorkspaceIdentity;
 }
+
+export type GroupOperationReceipt = GroupOperationReceiptBase & (
+  | { kind: 'set'; historicalIdentity?: 'legacy_unprovable' }
+  | { kind: 'unbind'; historicalIdentity?: never }
+);
 
 interface GroupWorkspaceRegistry {
   schemaVersion: 2;
@@ -333,8 +337,13 @@ function validateReceipt(value: unknown, key: string): asserts value is GroupOpe
     throw new Error(`invalid group workspace committed revision: ${key}`);
   }
   if (value.kind === 'set') {
+    const historicalIdentity = value.historicalIdentity === 'legacy_unprovable';
+    if (value.historicalIdentity !== undefined && !historicalIdentity) {
+      throw new Error(`invalid group workspace set receipt historical identity: ${key}`);
+    }
     if (typeof value.canonicalTargetWorkingDir !== 'string'
-      || (committed && (!isWorkspaceIdentity(value.workspaceIdentity)
+      || (historicalIdentity && (!committed || value.workspaceIdentity !== undefined))
+      || (committed && !historicalIdentity && (!isWorkspaceIdentity(value.workspaceIdentity)
         || value.workspaceIdentity.path !== value.canonicalTargetWorkingDir))) {
       throw new Error(`invalid group workspace set receipt target: ${key}`);
     }
@@ -347,6 +356,9 @@ function validateReceipt(value: unknown, key: string): asserts value is GroupOpe
       throw new Error(`invalid group workspace set receipt payload: ${key}`);
     }
   } else {
+    if (value.historicalIdentity !== undefined) {
+      throw new Error(`invalid group workspace unbind receipt historical identity: ${key}`);
+    }
     const expectedDigest = digest('group-workspace-payload-v1', [
       PAYLOAD_VERSION, value.chatId, value.kind, 'tombstone',
     ]);
@@ -407,6 +419,9 @@ function validateRegistryHistory(registry: GroupWorkspaceRegistry): void {
     const latest = committedByChatRevision.get(JSON.stringify([record.chatId, record.revision]));
     if (!latest
       || JSON.stringify(latest.resultingDirectory) !== JSON.stringify(record.directory)
+      || (latest.kind === 'set' && (latest.historicalIdentity !== undefined
+        || !latest.workspaceIdentity || !record.workspaceIdentity
+        || !workspaceIdentityEqual(latest.workspaceIdentity, record.workspaceIdentity)))
       || !sameActor(latest.actor, record.updatedBy)
       || latest.completedAt !== record.updatedAt) {
       throw new Error(`latest group workspace receipt disagrees with record: ${record.chatId}`);

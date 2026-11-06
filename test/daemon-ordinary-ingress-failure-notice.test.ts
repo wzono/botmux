@@ -98,6 +98,7 @@ const mocks = vi.hoisted(() => {
     forkWorker: vi.fn((ds: any) => {
       ds.worker = { killed: false, send: vi.fn() };
     }),
+    dispatchAdmittedBusinessTurn: vi.fn(),
     sendWorkerInput: vi.fn(() => true),
     updateCodexCliEffort: vi.fn(async () => ({ status: 'future_only', reason: 'cli_next_turn' })),
     scanMultipleProjects: vi.fn(() => [] as any[]),
@@ -154,7 +155,7 @@ vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
   const actual = await vi.importActual<any>('../src/core/admitted-turn-dispatch.js');
   return {
     ...actual,
-    dispatchAdmittedBusinessTurn: async (input: any) => {
+    dispatchAdmittedBusinessTurn: mocks.dispatchAdmittedBusinessTurn.mockImplementation(async (input: any) => {
       if (!input.ds.worker || input.ds.worker.killed) {
         let terminal: 'accepted' | 'rejected' | 'deferred' | undefined;
         let release!: () => void;
@@ -183,7 +184,7 @@ vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
       if (input.resource?.acquire && !await input.resource.acquire(permit)) return false;
       if (input.resource?.markAttempting && !await input.resource.markAttempting(permit)) return false;
       return input.boundary.submit(input.ds, input.payload, permit, 'fixture-digest', input.options);
-    },
+    }),
   };
 });
 
@@ -973,6 +974,30 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(ds.failedIdleTurnId).toBeUndefined();
     expect(ds.silentIdleTurnId).toBeUndefined();
     expect(ds.completedIdleTurnId).toBeUndefined();
+  });
+
+  it('routes a workerless document comment through central admission before any fork', async () => {
+    const anchor = 'om_doc_central_admission';
+    const ds = seedThreadSession(anchor, 'seeded');
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    const sub: DocSubscription = { fileToken: 'doc_central_admission', fileType: 'docx', sessionAnchor: anchor,
+      sessionId: ds.session.sessionId, scope: 'thread', chatId: CHAT, commentTriggerMode: 'mention-only', ownerOpenId: OWNER, createdAt: Date.now() };
+    putDocSubscription(mocks.dataDir, APP, sub);
+    mocks.dispatchAdmittedBusinessTurn.mockResolvedValueOnce(false);
+
+    expect(await __testOnly_handleDocComment({ larkAppId: APP, sub, commentId: 'comment_central_admission', text: 'new comment', authorOpenId: OWNER })).toBe(false);
+
+    expect(mocks.dispatchAdmittedBusinessTurn).toHaveBeenCalledWith(expect.objectContaining({
+      ds,
+      turnId: 'comment_central_admission',
+      options: expect.objectContaining({ queueAfterActiveTurn: true }),
+      boundary: expect.any(Object),
+      permitStore: expect.any(Object),
+    }));
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
+    expect(ds.session.lastUserPrompt).toBeUndefined();
+    expect(ds.session.lastCliInput).toBeUndefined();
   });
 
   it('successful delivery sends no failure notice', async () => {

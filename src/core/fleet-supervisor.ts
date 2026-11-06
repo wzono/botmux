@@ -442,26 +442,29 @@ export class FleetSupervisor {
         processStart: proc.processStart!, generation: proc.generation }));
     };
     const signal = (pid: number) => { try { process.kill(pid, 'SIGUSR2'); } catch { /* timeout fails closed */ } };
+    const identityRuntime = this.opts.processIdentityRuntime ?? fleetProcessIdentityRuntime;
     const gate = new WorkspaceMigrationSupervisorFence(dataDir);
-    const proof = await gate.acquire(currentEpoch + 1, enumerateActive, { timeoutMs: options.timeoutMs, signal });
-    // Re-read the exact fleet set after every quiescence ACK and before the first
-    // migration publish. The restart block forbids additions; any removal or
-    // identity drift means the proof no longer describes the active fleet.
-    const beforePublish = enumerateActive();
-    if (JSON.stringify(beforePublish) !== JSON.stringify(proof.lease.targets)) {
-      throw new Error('active daemon set changed after quiescence');
+    const proof = await gate.acquire(currentEpoch + 1, enumerateActive, {
+      timeoutMs: options.timeoutMs, signal, readIdentity: pid => identityRuntime.readIdentity(pid),
+    });
+    if (proof.lease.phase === 'quiesced') {
+      // Re-read the exact fleet set after every quiescence ACK and before the first
+      // migration publish. The restart block forbids additions; any removal or
+      // identity drift means the proof no longer describes the active fleet.
+      const beforePublish = enumerateActive();
+      if (JSON.stringify(beforePublish) !== JSON.stringify(proof.lease.targets)) {
+        throw new Error('active daemon set changed after quiescence');
+      }
     }
-    gate.markMigrating(proof.proofToken);
+    if (proof.lease.phase === 'quiesced') gate.markMigrating(proof.proofToken);
     const result = await new WorkspaceSchemaMigrator(dataDir, {
       ownerId: `supervisor:${process.pid}:${proof.lease.leaseId}`,
       supervisorProofToken: proof.proofToken,
     }).migrateOrRecover();
     if (result.status !== 'complete') throw new Error('workspace migration did not complete');
     await gate.release(proof.proofToken, { timeoutMs: options.timeoutMs, signal,
-      dead: target => {
-        const identity = (this.opts.processIdentityRuntime ?? fleetProcessIdentityRuntime).readIdentity(target.pid);
-        return identity !== target.processStart;
-      },
+      readIdentity: pid => identityRuntime.readIdentity(pid),
+      dead: target => identityRuntime.readIdentity(target.pid) !== target.processStart,
     });
     return { status: 'complete', epoch: result.epoch };
   }

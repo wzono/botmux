@@ -3,6 +3,7 @@ import { realpathSync, statSync } from 'node:fs';
 import type { DaemonSession } from './types.js';
 import type { CliTurnPayload } from '../types.js';
 import { probePathUsability } from './path-usability.js';
+import { getSessionWorkingDir } from './session-manager.js';
 import {
   dispatchAdmittedBusinessTurn as dispatchWithPermit,
   type BlankBootstrapPermit,
@@ -18,6 +19,7 @@ export type BusinessTurnSubmitOptions = {
   notifyRejection?: false;
   codexAppSteerable?: true;
   atMostOnce?: true;
+  queueAfterActiveTurn?: true;
   trustedCaller?: CliTurnPayload['trustedCaller'];
   onIpcDispatchAttempted?: () => void;
 };
@@ -51,20 +53,23 @@ function exactIdentity(path: string): WorkspaceIdentity | undefined {
 }
 
 export function frozenSessionWorkspace(ds: DaemonSession): { workspace: WorkspaceIdentity; groupRevision?: number } | undefined {
-  const path = ds.session.workingDir ?? ds.workingDir;
+  const path = getSessionWorkingDir(ds);
   if (!path) return undefined;
   const actual = exactIdentity(path);
   if (!actual) return undefined;
   if (ds.session.workingDirSource !== 'group') return { workspace: actual };
-  // Reuse the canonical path from the single identity probe. A second realpath
-  // can observe a symlink swap between probes and must never authorize the new
-  // target with the old persisted inode tuple.
+  // The accepted binding may preserve an absolute symlink spelling while the
+  // dispatch boundary deliberately returns a canonical path. Bind that spelling
+  // to the session's frozen path plus the probed inode; never realpath it a second
+  // time, because a symlink swap between probes must fail rather than authorize a
+  // different target.
   const persisted = ds.session.groupWorkspaceIdentity ?? (ds.session.groupWorkspaceDirectoryIdentity
     ? { path: actual.path, ...ds.session.groupWorkspaceDirectoryIdentity }
     : undefined);
-  if (!persisted || persisted.path !== actual.path || persisted.dev !== actual.dev || persisted.ino !== actual.ino
+  if (!persisted || persisted.path !== path
+    || persisted.dev !== actual.dev || persisted.ino !== actual.ino
     || ds.session.groupWorkspaceRevision === undefined) return undefined;
-  return { workspace: actual, groupRevision: ds.session.groupWorkspaceRevision };
+  return { workspace: { path, dev: actual.dev, ino: actual.ino }, groupRevision: ds.session.groupWorkspaceRevision };
 }
 
 export function authoritativeWorkerWorkspaceIdentity(ds: DaemonSession): WorkspaceIdentity | undefined {
@@ -91,6 +96,12 @@ function sameWorkspaceIdentity(a: WorkspaceIdentity, b: WorkspaceIdentity): bool
   return a.path === b.path && a.dev === b.dev && a.ino === b.ino;
 }
 
+export function backendMatchesFrozen(ds: DaemonSession, backend: WorkspaceIdentity, frozen: WorkspaceIdentity): boolean {
+  if (backend.dev !== frozen.dev || backend.ino !== frozen.ino) return false;
+  if (ds.session.workingDirSource !== 'group') return backend.path === frozen.path;
+  try { return backend.path === realpathSync(frozen.path); } catch { return false; }
+}
+
 async function waitForExactReady(ds: DaemonSession, permit: BlankBootstrapPermit): Promise<{
   actualGeneration: number; cwd: WorkspaceIdentity; backend: WorkspaceIdentity;
 } | undefined> {
@@ -102,7 +113,8 @@ async function waitForExactReady(ds: DaemonSession, permit: BlankBootstrapPermit
       const frozen = frozenSessionWorkspace(ds);
       const backend = authoritativeWorkerWorkspaceIdentity(ds);
       if (!frozen || !backend) return undefined;
-      return { actualGeneration: generation, cwd: frozen.workspace, backend };
+      if (!backendMatchesFrozen(ds, backend, frozen.workspace)) return undefined;
+      return { actualGeneration: generation, cwd: frozen.workspace, backend: frozen.workspace };
     }
     // A durable fork may be accepted but deferred by routing/device isolation.
     // Keep waiting for the exact reserved generation until cancellation/timeout.
@@ -140,7 +152,7 @@ export async function dispatchAdmittedBusinessTurn(input: {
         return generation === (input.ds.workerGeneration ?? input.ds.session.workerGeneration)
           && input.ds.workerReady === true && input.ds.cliReady === true
           && !!current && sameWorkspaceIdentity(current.workspace, workspace)
-          && !!backend && sameWorkspaceIdentity(backend, workspace);
+          && !!backend && backendMatchesFrozen(input.ds, backend, workspace);
       },
       issueExistingBusiness: async request => input.permitStore.issueBusiness({
         ...request, expiresAt: Date.now() + PERMIT_TTL_MS,

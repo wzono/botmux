@@ -13801,6 +13801,7 @@ export async function dispatchWorkspaceAdmittedBusinessTurn(input: {
     options: { resume: input.resume,
       ...(input.dispatchAttempt === undefined ? {} : { dispatchAttempt: input.dispatchAttempt }),
       ...(input.codexAppSteerable ? { codexAppSteerable: true as const } : {}),
+      ...(input.queueAfterActiveTurn ? { queueAfterActiveTurn: true as const } : {}),
       ...(input.atMostOnce ? { atMostOnce: true as const } : {}),
       ...(input.queueAfterActiveTurn ? { queueAfterActiveTurn: true as const } : {}),
       ...(input.trustedCaller ? { trustedCaller: input.trustedCaller } : {}),

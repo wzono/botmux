@@ -1557,6 +1557,7 @@ async function triggerSessionTurnAdmitted(
       markAttempting: async () => true,
       ...(options.dispatchAttempt === undefined ? {} : { dispatchAttempt: options.dispatchAttempt }),
       ...(options.codexAppSteerable ? { codexAppSteerable: true as const } : {}),
+      ...(options.queueAfterActiveTurn ? { queueAfterActiveTurn: true as const } : {}),
       ...(options.atMostOnce ? { atMostOnce: true as const } : {}),
       ...(options.queueAfterActiveTurn ? { queueAfterActiveTurn: true as const } : {}),
     });

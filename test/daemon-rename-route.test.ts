@@ -165,9 +165,20 @@ vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
       if (input.ds.worker) {
         return workerPool.sendWorkerInput(input.ds, input.payload, input.turnId, input.options);
       }
-      const options = { ...input.options, turnId: input.turnId };
-      const accepted = mocks.forkWorker(input.ds, input.payload, options, options);
-      if (accepted && input.ds.session.queuedActivationTail?.length) {
+      let admission: 'accepted' | 'rejected' | 'deferred' | undefined;
+      const options = {
+        ...input.options,
+        turnId: input.turnId,
+        onAdmission: (state: 'accepted' | 'rejected' | 'deferred') => { admission = state; },
+      };
+      const accepted = input.ds.adoptedFrom
+        ? mocks.forkAdoptWorker(input.ds, { payload: input.payload, turnId: input.turnId }) === 'accepted'
+        : mocks.forkWorker(input.ds, '', options, options);
+      if (!input.ds.adoptedFrom && accepted && admission === undefined) admission = 'accepted';
+      if (!accepted || admission === 'rejected') return false;
+      if (!input.ds.adoptedFrom
+        && !workerPool.sendWorkerInput(input.ds, input.payload, input.turnId, input.options)) return false;
+      if (input.ds.session.queuedActivationTail?.length) {
         const tail = input.ds.session.queuedActivationTail[0];
         workerPool.sendWorkerInput(input.ds, tail.cliInput, tail.turnId, input.options);
         input.ds.worker?.send?.({
@@ -4033,6 +4044,13 @@ describe('document comment canonical ownership and single-flight delivery', () =
     const sub = docSub(`doc-refork-activity-rejected-${Date.now()}`);
     const ds = seedThreadSession(sub.sessionAnchor, 'rejected refork activity');
     const before = Date.now() - 60_000;
+    const presentationBefore = {
+      currentTurnId: ds.currentTurnId,
+      currentTurnTitle: ds.currentTurnTitle,
+      streamCardPending: ds.streamCardPending,
+      streamCardPendingTurnId: ds.streamCardPendingTurnId,
+      streamCardTurnGeneration: ds.streamCardTurnGeneration,
+    };
     ds.lastMessageAt = before;
     ds.session.lastMessageAt = new Date(before).toISOString();
     bindSubToSession(sub, ds);
@@ -4046,6 +4064,13 @@ describe('document comment canonical ownership and single-flight delivery', () =
     expect(ds.lastMessageAt).toBe(before);
     expect(ds.session.lastMessageAt).toBe(new Date(before).toISOString());
     expect(ds.session.lastHumanMessageAt).toBeUndefined();
+    expect({
+      currentTurnId: ds.currentTurnId,
+      currentTurnTitle: ds.currentTurnTitle,
+      streamCardPending: ds.streamCardPending,
+      streamCardPendingTurnId: ds.streamCardPendingTurnId,
+      streamCardTurnGeneration: ds.streamCardTurnGeneration,
+    }).toEqual(presentationBefore);
     removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
   });
 
@@ -4282,13 +4307,16 @@ describe('document comment canonical ownership and single-flight delivery', () =
     removeDocSubscription(config.session.dataDir, APP, fileToken);
   });
 
-  it('keeps a live-worker comment accepted when post-send projection fails', async () => {
-    const fileToken = `doc-live-projection-${Date.now()}`;
+  it.each([
+    ['live-worker', true],
+    ['refork', false],
+  ])('keeps an admitted %s comment accepted when post-send projection fails', async (_label, live) => {
+    const fileToken = `doc-${live ? 'live' : 'refork'}-projection-${Date.now()}`;
     const sub = docSub(fileToken);
     sub.commentTriggerMode = 'mention-only';
-    const ds = seedThreadSession(sub.sessionAnchor, 'live projection');
+    const ds = seedThreadSession(sub.sessionAnchor, 'projection');
     const send = vi.fn();
-    ds.worker = { killed: false, send } as any;
+    if (live) ds.worker = { killed: false, send } as any;
     bindSubToSession(sub, ds);
     mocks.persistStreamCardState.mockImplementationOnce(() => {
       throw new Error('projection persistence failed');
@@ -4296,7 +4324,8 @@ describe('document comment canonical ownership and single-flight delivery', () =
 
     await expect(handleDocComment(docCtx(sub, 'projection'))).resolves.toBe(true);
 
-    expect(send).toHaveBeenCalledTimes(1);
+    if (live) expect(send).toHaveBeenCalledTimes(1);
+    else expect(mocks.sendWorkerInput).toHaveBeenCalledTimes(1);
     expect(ds.session.docCommentTargets).toHaveProperty('reply-projection');
     expect(getDocSubscription(config.session.dataDir, APP, fileToken)?.pendingDocCommentDeliveries).toBeUndefined();
     removeDocSubscription(config.session.dataDir, APP, fileToken);
@@ -4313,8 +4342,9 @@ describe('document comment canonical ownership and single-flight delivery', () =
     await expect(handleDocComment(docCtx(sub, 'rejected'))).resolves.toBe(false);
 
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[1]).toBe('');
     expect(mocks.forkWorker.mock.calls[0]?.[3]).toEqual(expect.objectContaining({
-      deferDuringDeviceIsolation: false,
+      onAdmission: expect.any(Function),
     }));
     expect(mocks.closeWorkerPoolSession).toHaveBeenCalledTimes(1);
     expect(activeSessions.has(sessionKey(`doc:${fileToken}:comment-rejected`, APP))).toBe(false);

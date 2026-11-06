@@ -14,7 +14,7 @@ import { basename, dirname, join, relative } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { fsyncDirectorySyncPortable, fsyncFilesAndDirectorySync, fsyncRegularFileSync } from '../utils/fs-durability.js';
 import { withFileLock } from '../utils/file-lock.js';
-import { workspaceRestartBlocked } from '../core/workspace-migration-supervisor.js';
+import { workspaceRestartBlocked, workspaceSupervisorProofSupersedes, workspaceSupervisorProofValid } from '../core/workspace-migration-supervisor.js';
 import { openDatabaseSyncOrThrow } from './sqlite-compat.js';
 
 export const WORKSPACE_MIGRATION_MANIFEST_FILE = 'workspace-migration-manifest.json';
@@ -61,6 +61,7 @@ export interface WorkspaceMigrationManifest {
   createdAt: number;
   updatedAt: number;
   fleetQuiescence?: { provenAt: number; restartBlocked: boolean; supervisorProofToken?: string };
+  freshBootstrap?: { provenEmptyAt: number };
 }
 
 export interface WorkspaceWriterFence {
@@ -189,6 +190,28 @@ export function workspaceMigrationIngressReady(dataDir: string): boolean {
   }
 }
 
+/**
+ * Admit startup only behind a completed epoch. A genuinely fresh data root has
+ * no legacy stores to quiesce, so it may publish an empty epoch locally; every
+ * non-empty legacy shape remains supervisor-gated.
+ */
+export async function ensureWorkspaceMigrationReadyForStartup(
+  dataDir: string,
+  options: { coreOnly: boolean; afterFreshFencePublished?: () => void },
+): Promise<{ status: 'complete'; epoch: number; fence: WorkspaceWriterFence }> {
+  mkdirSync(dataDir, { recursive: true });
+  const result = await new WorkspaceSchemaMigrator(dataDir, {
+    ownerId: `${options.coreOnly ? 'core-only' : 'daemon'}-fresh-start:${process.pid}`,
+    requiredStores: [],
+    freshStartup: true,
+    afterFreshFencePublished: options.afterFreshFencePublished,
+  }).migrateOrRecover();
+  if (result.status !== 'complete') {
+    throw new WorkspaceMigrationFenceError('workspace migration requires a completed supervisor-proven epoch');
+  }
+  return result;
+}
+
 function writeManifest(dataDir: string, manifest: WorkspaceMigrationManifest): void {
   manifest.updatedAt = Date.now();
   atomicWriteFileSync(manifestPath(dataDir), `${JSON.stringify(manifest, null, 2)}\n`, {
@@ -309,7 +332,11 @@ function migrateGroupJson(path: string): void {
     if (isObject(receipt.workspaceIdentity)
       && receipt.workspaceIdentity.path === target
       && typeof receipt.workspaceIdentity.dev === 'string'
-      && typeof receipt.workspaceIdentity.ino === 'string') continue;
+      && typeof receipt.workspaceIdentity.ino === 'string') {
+      const current = typeof receipt.chatId === 'string' ? value.records[receipt.chatId] : undefined;
+      const isLatest = isObject(current) && current.revision === receipt.resultingRevision;
+      if (!isLatest) continue;
+    }
     let identity: { path: string; dev: string; ino: string } | undefined;
     if (typeof receipt.chatId === 'string') {
       const current = value.records[receipt.chatId];
@@ -324,8 +351,13 @@ function migrateGroupJson(path: string): void {
       const current = typeof receipt.chatId === 'string' ? value.records[receipt.chatId] : undefined;
       if (isObject(current) && current.revision === receipt.resultingRevision) identity = pathIdentity(target);
     }
-    if (identity) receipt.workspaceIdentity = identity;
-    else receipt.historicalIdentity = 'legacy_unprovable';
+    if (identity) {
+      receipt.workspaceIdentity = structuredClone(identity);
+      delete receipt.historicalIdentity;
+    } else {
+      delete receipt.workspaceIdentity;
+      receipt.historicalIdentity = 'legacy_unprovable';
+    }
   }
   value.schemaVersion = TARGET_SCHEMA_VERSION;
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
@@ -442,6 +474,10 @@ export interface WorkspaceSchemaMigratorOptions {
    * quiescence. Required by the production supervisor path; tests may exercise
    * the offline migrator without one. */
   supervisorProofToken?: string;
+  /** Startup-only bootstrap: permit creating epoch 1 only while the migration
+   * lock proves the data root contains no durable state. */
+  freshStartup?: boolean;
+  afterFreshFencePublished?: () => void;
 }
 
 export class WorkspaceSchemaMigrator {
@@ -465,11 +501,26 @@ export class WorkspaceSchemaMigrator {
 
   private prepare(): WorkspaceMigrationManifest {
     const prior = readWorkspaceMigrationManifest(this.dataDir);
-    if (prior) return prior;
+    if (prior) {
+      if (this.options.freshStartup) {
+        const ignorable = new Set([
+          WORKSPACE_MIGRATION_MANIFEST_FILE, `${WORKSPACE_MIGRATION_MANIFEST_FILE}.lock`, 'workspace-migrations',
+        ]);
+        const durableEntries = readdirSync(this.dataDir).filter(entry =>
+          !ignorable.has(entry) && !entry.startsWith('.botmux-stale-claim-'));
+        const fresh = prior.freshBootstrap !== undefined && Object.keys(prior.stores).length === 0
+          && durableEntries.length === 0;
+        const supervisorProven = prior.fleetQuiescence?.restartBlocked === true
+          && typeof prior.fleetQuiescence.supervisorProofToken === 'string'
+          && prior.fleetQuiescence.supervisorProofToken.length > 0;
+        if (!fresh && !supervisorProven) {
+          throw new WorkspaceMigrationFenceError('workspace migration requires a completed supervisor-proven epoch');
+        }
+      }
+      return prior;
+    }
     const now = this.now();
     const batchId = randomUUID();
-    const root = join(this.dataDir, 'workspace-migrations', batchId);
-    mkdirSync(root, { recursive: true, mode: 0o700 });
     const manifest: WorkspaceMigrationManifest = {
       manifestVersion: MANIFEST_VERSION,
       batchId,
@@ -487,16 +538,34 @@ export class WorkspaceSchemaMigrator {
         supervisorProofToken: this.options.supervisorProofToken,
       } } : {}),
     };
-    // Publish the enforceable host fence before discovery, checkpoint, checksum,
-    // or copying. Every current/future production writer consults this manifest.
+    // Publish the enforceable host fence before deciding that startup is fresh.
+    // Every normal workspace writer now fails closed while the migration lock
+    // serializes competing starters onto this exact manifest.
     writeManifest(this.dataDir, manifest);
     this.probe('fence:published', manifest);
+    if (this.options.freshStartup) {
+      this.options.afterFreshFencePublished?.();
+      const ignorable = new Set([
+        WORKSPACE_MIGRATION_MANIFEST_FILE,
+        `${WORKSPACE_MIGRATION_MANIFEST_FILE}.lock`,
+        'workspace-migrations',
+      ]);
+      const entries = readdirSync(this.dataDir).filter(entry =>
+        !ignorable.has(entry) && !entry.startsWith('.botmux-stale-claim-'));
+      if (entries.length !== 0) {
+        throw new WorkspaceMigrationFenceError('workspace migration requires a completed supervisor-proven epoch');
+      }
+      manifest.freshBootstrap = { provenEmptyAt: this.now() };
+      writeManifest(this.dataDir, manifest);
+    }
+    mkdirSync(join(this.dataDir, 'workspace-migrations', batchId), { recursive: true, mode: 0o700 });
     return manifest;
   }
 
   private populateStores(manifest: WorkspaceMigrationManifest): void {
     if (manifest.phase !== 'prepared') return;
     const root = join(this.dataDir, 'workspace-migrations', manifest.batchId);
+    mkdirSync(root, { recursive: true, mode: 0o700 });
     for (const store of this.selectedStores()) {
       const key = storeKey(store.kind, store.path, this.dataDir);
       if (manifest.stores[key]) continue;
@@ -529,7 +598,18 @@ export class WorkspaceSchemaMigrator {
 
   private assertOwner(manifest: WorkspaceMigrationManifest): void {
     if (manifest.writer.ownerId !== this.options.ownerId) {
-      if (manifest.writer.leaseExpiresAt > this.now()) {
+      const unprovenFreshFailure = manifest.phase === 'prepared'
+        && manifest.freshBootstrap === undefined
+        && manifest.fleetQuiescence === undefined
+        && Object.keys(manifest.stores).length === 0;
+      const supervisorTakeover = this.options.supervisorProofToken !== undefined && (
+        (manifest.fleetQuiescence?.supervisorProofToken !== undefined
+          && workspaceSupervisorProofSupersedes(this.dataDir,
+            manifest.fleetQuiescence.supervisorProofToken, this.options.supervisorProofToken))
+        || (unprovenFreshFailure
+          && workspaceSupervisorProofValid(this.dataDir, this.options.supervisorProofToken))
+      );
+      if (!supervisorTakeover && manifest.writer.leaseExpiresAt > this.now()) {
         throw new WorkspaceMigrationFenceError('workspace migration writer lease is held');
       }
       manifest.writer = {
@@ -537,6 +617,12 @@ export class WorkspaceSchemaMigrator {
         leaseExpiresAt: this.now() + this.leaseMs,
         fencingToken: manifest.writer.fencingToken + 1,
       };
+      if (supervisorTakeover && this.options.supervisorProofToken) {
+        manifest.fleetQuiescence = {
+          provenAt: this.now(), restartBlocked: true,
+          supervisorProofToken: this.options.supervisorProofToken,
+        };
+      }
       writeManifest(this.dataDir, manifest);
     }
   }

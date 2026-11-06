@@ -89,7 +89,10 @@ export async function runGroupWorkspaceSessionFollow(
   if (!session.groupWorkspaceFollow
       && session.groupWorkspaceRevision === target.revision
       && session.workingDir === target.workingDir) return { kind: 'unchanged' };
-  if (!session.groupWorkspaceFollow && !deps.isIdle(ds)) return { kind: 'deferred' };
+  // A dormant local session has no live generation to protect from replacement.
+  // It can durably adopt the newer binding and spawn the blank replacement now;
+  // only a live worker must prove the ordinary idle boundary first.
+  if (!session.groupWorkspaceFollow && deps.isWorkerLive(ds) && !deps.isIdle(ds)) return { kind: 'deferred' };
   let notified = false;
   const fail = (error: unknown): GroupWorkspaceFollowResult => {
     if (!notified) { notified = true; deps.notice('failed'); }

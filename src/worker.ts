@@ -3048,6 +3048,16 @@ let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
 let currentTerminalWorkspaceFence: Extract<DaemonToWorker, { type: 'terminal_workspace_fence' }> | undefined;
 
+export function terminalWorkspacePathAllowed(
+  canonicalWorkingDir: string,
+  frozen: NonNullable<Extract<DaemonToWorker, { type: 'init' }>['terminalWorkspaceFence']>['workspaceIdentity'],
+  observed: { dev: string; ino: string },
+  canonicalFrozenPath: string,
+): boolean {
+  return canonicalWorkingDir === canonicalFrozenPath
+    && observed.dev === frozen.dev && observed.ino === frozen.ino;
+}
+
 export function terminalWorkspaceBytesAllowed(
   frozen: Extract<DaemonToWorker, { type: 'init' }>['terminalWorkspaceFence'],
   current: Extract<DaemonToWorker, { type: 'terminal_workspace_fence' }> | undefined,
@@ -3067,9 +3077,10 @@ function canWriteTerminalBytes(): boolean {
   try {
     const real = realpathSync(lastInitConfig!.workingDir);
     const stat = statSync(real, { bigint: true });
-    return real === frozen.workspaceIdentity.path
-      && String(stat.dev) === frozen.workspaceIdentity.dev
-      && String(stat.ino) === frozen.workspaceIdentity.ino;
+    const frozenReal = realpathSync(frozen.workspaceIdentity.path);
+    return terminalWorkspacePathAllowed(real, frozen.workspaceIdentity, {
+      dev: String(stat.dev), ino: String(stat.ino),
+    }, frozenReal);
   } catch { return false; }
 }
 let traexAutoModelController: TraexAutoModelController | null = null;

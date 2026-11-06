@@ -52,6 +52,19 @@ export function readWorkspaceRestartBlock(dataDir: string): WorkspaceRestartBloc
   }
   return lease;
 }
+export function workspaceSupervisorProofValid(dataDir: string, token: string): boolean {
+  const lease = readWorkspaceRestartBlock(dataDir);
+  return !!lease && token === proofToken(lease);
+}
+
+export function workspaceSupervisorProofSupersedes(dataDir: string, priorToken: string, token: string): boolean {
+  const lease = readWorkspaceRestartBlock(dataDir);
+  if (!lease || token !== proofToken(lease)) return false;
+  const prior = priorToken.split(':');
+  return prior.length === 3 && prior[0] === lease.leaseId && prior[1] === String(lease.epoch)
+    && Number.isSafeInteger(Number(prior[2])) && Number(prior[2]) > 0;
+}
+
 export function workspaceRestartBlocked(dataDir: string): boolean {
   // A malformed on-disk lease is still a block: callers must fail closed rather
   // than treating unreadable coordination state as permission to spawn.
@@ -75,20 +88,36 @@ export class WorkspaceMigrationSupervisorFence {
    * generation after the returned target set is sampled. */
   async acquire(epoch: number, enumerateActive: () => WorkspaceRestartBlockLease['targets'], options: {
     timeoutMs?: number; signal?: (pid: number) => void; now?: () => number;
-    alive?: (pid: number) => boolean;
+    alive?: (pid: number) => boolean; readIdentity?: (pid: number) => string | undefined;
   } = {}): Promise<{ lease: WorkspaceRestartBlockLease; proofToken: string }> {
     const now = options.now ?? Date.now;
     const alive = options.alive ?? (pid => { try { process.kill(pid, 0); return true; } catch { return false; } });
+    const exactAlive = (target: WorkspaceRestartBlockLease['targets'][number]) => alive(target.pid)
+      && (options.readIdentity === undefined || options.readIdentity(target.pid) === target.processStart);
     const timeoutMs = options.timeoutMs ?? 15_000;
     mkdirSync(fenceDir(this.dataDir), { recursive: true, mode: 0o700 });
     return withFileLock(leasePath(this.dataDir), async () => {
       let lease = readWorkspaceRestartBlock(this.dataDir);
       if (lease) {
-        // A successor supervisor durably takes over an interrupted batch. It
-        // retains leaseId/epoch/targets so old ACKs remain attributable, but the
-        // new supervisor identity mints a new proof token.
+        // Before migration starts, a successor must refresh the fleet snapshot
+        // under the already-durable restart block. Otherwise a daemon replaced
+        // after an interrupted quiesce can leave this lease targeting its dead
+        // predecessor forever. Once quiesced/migrating/releasing, keep the exact
+        // proven generations so their ACKs and proof remain attributable.
+        if (lease.phase === 'blocking' || lease.phase === 'quiescing' || lease.phase === 'rollback') {
+          const targets = enumerateActive();
+          if (targets.some(target => !target.larkAppId || !target.processStart || target.generation < 1 || !exactAlive(target))) {
+            lease.phase = 'rollback'; writeFenceJson(this.dataDir, leasePath(this.dataDir), lease);
+            throw new Error('active daemon identity/liveness is unprovable');
+          }
+          lease.epoch = epoch;
+          lease.targets = structuredClone(targets);
+        }
         lease.supervisorPid = this.supervisorPid;
         writeFenceJson(this.dataDir, leasePath(this.dataDir), lease);
+        if (lease.phase === 'quiesced' || lease.phase === 'migrating' || lease.phase === 'releasing') {
+          return { lease, proofToken: proofToken(lease) };
+        }
       } else {
         lease = { leaseId: randomUUID(), epoch, supervisorPid: this.supervisorPid,
           acquiredAt: now(), phase: 'blocking', targets: [] };
@@ -97,7 +126,7 @@ export class WorkspaceMigrationSupervisorFence {
         // a spawn window.
         writeFenceJson(this.dataDir, leasePath(this.dataDir), lease);
         const targets = enumerateActive();
-        if (targets.some(target => !target.larkAppId || !target.processStart || target.generation < 1 || !alive(target.pid))) {
+        if (targets.some(target => !target.larkAppId || !target.processStart || target.generation < 1 || !exactAlive(target))) {
           lease.phase = 'rollback'; writeFenceJson(this.dataDir, leasePath(this.dataDir), lease);
           throw new Error('active daemon identity/liveness is unprovable');
         }
@@ -109,7 +138,7 @@ export class WorkspaceMigrationSupervisorFence {
         const heartbeat = readJson<WorkspaceDaemonFenceHeartbeat>(workspaceFenceHeartbeatPath(this.dataDir, target.larkAppId));
         if (!heartbeat || heartbeat.protocol !== WORKSPACE_FENCE_PROTOCOL || heartbeat.schemaVersion !== WORKSPACE_FENCE_SCHEMA_VERSION
           || heartbeat.pid !== target.pid || heartbeat.processStart !== target.processStart
-          || heartbeat.generation !== target.generation || !alive(target.pid)) {
+          || heartbeat.generation !== target.generation || !exactAlive(target)) {
           lease.phase = 'rollback'; writeFenceJson(this.dataDir, leasePath(this.dataDir), lease);
           throw new Error(`daemon fence capability/generation unavailable: ${target.larkAppId}`);
         }
@@ -124,7 +153,7 @@ export class WorkspaceMigrationSupervisorFence {
           const ack = readJson<WorkspaceFenceAck>(workspaceFenceAckPath(this.dataDir, target.larkAppId));
           return ack?.leaseId === lease!.leaseId && ack.epoch === lease!.epoch && ack.action === 'quiesce'
             && ack.generation === target.generation && ack.pid === target.pid && ack.processStart === target.processStart
-            && alive(target.pid) && !ack.sqlite.open && ack.sqlite.writers === 0
+            && exactAlive(target) && !ack.sqlite.open && ack.sqlite.writers === 0
             && ack.sqlite.inflight === 0 && ack.sqlite.checkpointed;
         });
         if (exact) {
@@ -148,14 +177,18 @@ export class WorkspaceMigrationSupervisorFence {
    * reopened the post-migration SQLite file. A crash cannot silently unlink the
    * lease; the successor supervisor resumes this durable releasing phase. */
   async release(token: string, options: { timeoutMs?: number; signal?: (pid: number) => void; now?: () => number;
-    alive?: (pid: number) => boolean; dead?: (target: WorkspaceRestartBlockLease['targets'][number]) => boolean } = {}): Promise<void> {
+    alive?: (pid: number) => boolean; readIdentity?: (pid: number) => string | undefined;
+    dead?: (target: WorkspaceRestartBlockLease['targets'][number]) => boolean } = {}): Promise<void> {
     const now = options.now ?? Date.now;
     const alive = options.alive ?? (pid => { try { process.kill(pid, 0); return true; } catch { return false; } });
+    const exactAlive = (target: WorkspaceRestartBlockLease['targets'][number]) => alive(target.pid)
+      && (options.readIdentity === undefined || options.readIdentity(target.pid) === target.processStart);
     await withFileLock(leasePath(this.dataDir), async () => {
       const lease = readWorkspaceRestartBlock(this.dataDir);
       if (!lease || token !== proofToken(lease)) throw new Error('invalid supervisor proof token');
       lease.phase = 'releasing'; writeFenceJson(this.dataDir, leasePath(this.dataDir), lease);
       for (const target of lease.targets) {
+        if (!exactAlive(target) && options.dead?.(target) === true) continue;
         const command: WorkspaceFenceCommand = { leaseId: lease.leaseId, epoch: lease.epoch,
           action: 'release', generation: target.generation };
         writeFenceJson(this.dataDir, workspaceFenceCommandPath(this.dataDir, target.larkAppId), command);
@@ -167,11 +200,11 @@ export class WorkspaceMigrationSupervisorFence {
           // An attested-dead original generation has nothing left to reopen. It
           // stays blocked from replacement until the lease is removed, then the
           // supervisor's deferred restart can create a fresh generation.
-          if (!alive(target.pid) && options.dead?.(target) === true) return true;
+          if (!exactAlive(target) && options.dead?.(target) === true) return true;
           const ack = readJson<WorkspaceFenceAck>(workspaceFenceAckPath(this.dataDir, target.larkAppId));
           return ack?.leaseId === lease.leaseId && ack.epoch === lease.epoch && ack.action === 'release'
             && ack.generation === target.generation && ack.pid === target.pid && ack.processStart === target.processStart
-            && alive(target.pid) && ack.sqlite.open && ack.sqlite.writers === 0 && ack.sqlite.inflight === 0;
+            && exactAlive(target) && ack.sqlite.open && ack.sqlite.writers === 0 && ack.sqlite.inflight === 0;
         });
         if (reopened) { unlinkSync(leasePath(this.dataDir)); return; }
         await new Promise(resolve => setTimeout(resolve, 20));

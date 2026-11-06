@@ -6,7 +6,7 @@ import {
 
 type HarnessOptions = {
   source?: string; scope?: 'chat' | 'thread'; revision?: number; idle?: boolean;
-  local?: boolean; adopted?: boolean;
+  local?: boolean; adopted?: boolean; workerless?: boolean;
   fail?: 'retire' | 'persist' | 'spawn' | 'ready' | 'cwd';
   journalPhase?: 'prepared' | 'old_exited' | 'persisted' | 'spawned';
 };
@@ -21,7 +21,7 @@ function harness(opts: HarnessOptions = {}) {
       nextGeneration: 5, phase: opts.journalPhase,
     } } : {}),
   };
-  let liveWorkers = opts.journalPhase === 'old_exited' || opts.journalPhase === 'persisted' ? 0 : 1;
+  let liveWorkers = opts.workerless || opts.journalPhase === 'old_exited' || opts.journalPhase === 'persisted' ? 0 : 1;
   const ds: any = { scope: opts.scope ?? 'chat', session, workingDir: session.workingDir,
     adoptedFrom: opts.adopted ? { cwd: '/x1' } : undefined };
   const deps: any = {
@@ -95,6 +95,17 @@ describe('group workspace pre-turn worker follow', () => {
       })).toEqual({ kind: 'follow', target: { workingDir: '/x2', revision: 2, workspaceIdentity: { path: '/x2', dev: '1', ino: '2' } } });
     },
   );
+
+  it('adopts a newer binding for a workerless local session before its blank business bootstrap', async () => {
+    const h = harness({ workerless: true, idle: false });
+    const result = await runGroupWorkspaceSessionFollow(h.ds, {
+      workingDir: '/x2', revision: 2, workspaceIdentity: { path: '/x2', dev: '1', ino: '2' },
+    }, h.deps);
+    expect(result).toEqual({ kind: 'migrated' });
+    expect(h.order).toEqual(['persist:prepared', 'retire', 'persist:old_exited', 'persist:group',
+      'spawn', 'persist:spawned', 'ready', 'persist:complete', 'notice:migrated']);
+    expect(h.ds.session.workingDir).toBe('/x2');
+  });
 
   it.each(['claude', 'codex'])('replaces an idle local PTY generation before delivering on %s', async () => {
     const h = harness();
