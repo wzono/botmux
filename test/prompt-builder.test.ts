@@ -150,6 +150,16 @@ describe('buildNewTopicPrompt', () => {
     expect(prompt).not.toContain('botmux send');
   });
 
+  it('keeps no-transport service openings free of transport response context', () => {
+    const prompt = buildNewTopicPrompt(
+      'diagnose', SESSION_ID, 'ebsd', undefined, undefined, undefined,
+      undefined, undefined, undefined, 'en', undefined, { chatId: 'http_async_fixture' },
+    );
+    expect(prompt).not.toContain('<botmux_response_style>');
+    expect(prompt).not.toContain('Response formatting:');
+    expect(prompt).toMatch(/\n\ndiagnose$/);
+  });
+
   it('should include heredoc guidance for non-Claude CLIs', () => {
     const prompt = buildNewTopicPrompt('hello', SESSION_ID, 'codex');
     expect(prompt).toContain("botmux send <<'EOF'");
