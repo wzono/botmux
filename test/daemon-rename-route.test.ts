@@ -41,6 +41,7 @@ const mocks = vi.hoisted(() => {
   const sessions = new Map<string, any>();
   return {
     dataDir,
+    frozenSessionWorkspace: vi.fn(),
     resolveLarkCliHomeForTurn: vi.fn(async () => `${dataDir}/fixture-lark-home`),
     replyMessage: vi.fn(async () => 'om_reply'),
     sendMessage: vi.fn(async () => 'om_top'),
@@ -152,16 +153,15 @@ vi.mock('../src/services/session-store.js', async () => {
   };
 });
 
-vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
-  const actual = await vi.importActual<any>('../src/core/admitted-turn-dispatch.js');
-  const workerPool = await vi.importActual<any>('../src/core/worker-pool.js');
+vi.mock('../src/core/admitted-turn-dispatch.js', () => {
   return {
-    ...actual,
+    frozenSessionWorkspace: mocks.frozenSessionWorkspace,
     // Narrow route-fixture seam: these tests exercise daemon routing with
     // synthetic sessions that intentionally have no filesystem identity/ready
     // handshake. Terminate the central-admission adapter at the worker boundary;
     // permit semantics have their own real-store suites.
     dispatchAdmittedBusinessTurn: vi.fn(async (input: any) => {
+      const workerPool = await vi.importActual<any>('../src/core/worker-pool.js');
       if (input.ds.worker) {
         return workerPool.sendWorkerInput(input.ds, input.payload, input.turnId, input.options);
       }
@@ -176,11 +176,18 @@ vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
         : mocks.forkWorker(input.ds, '', options, options);
       if (!input.ds.adoptedFrom && accepted && admission === undefined) admission = 'accepted';
       if (!accepted || admission === 'rejected') return false;
-      if (!input.ds.adoptedFrom
-        && !workerPool.sendWorkerInput(input.ds, input.payload, input.turnId, input.options)) return false;
+      if (!input.ds.adoptedFrom) {
+        // The fixture's blank child has no ready/submit handshake. Deliver the
+        // proven opening at its IPC boundary, ahead of its already-admitted tail.
+        const payload = typeof input.payload === 'string' ? { content: input.payload } : input.payload;
+        const { codexAppSteerable: _payloadSteer, ...opening } = payload;
+        if (input.ds.worker?.send?.({
+          type: 'message', ...opening, turnId: input.turnId,
+          ...input.options,
+        }) === false) return false;
+      }
       if (input.ds.session.queuedActivationTail?.length) {
         const tail = input.ds.session.queuedActivationTail[0];
-        workerPool.sendWorkerInput(input.ds, tail.cliInput, tail.turnId, input.options);
         input.ds.worker?.send?.({
           type: 'message',
           ...tail.cliInput,
@@ -300,6 +307,13 @@ import type { ScheduleAuthorityStore } from '../src/services/schedule-authority-
 import { sessionIdentityPath } from '../src/core/cli-identity.js';
 import { _resetForTest as resetAsks, registerAsk } from '../src/core/ask-broker.js';
 import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
+// Resolve the real workspace proof after the mocked module graph is initialized.
+// Awaiting it in a mock factory cycles through session-manager and worker-pool.
+const admittedTurnDispatch = await vi.importActual<typeof import('../src/core/admitted-turn-dispatch.js')>(
+  '../src/core/admitted-turn-dispatch.js',
+);
+mocks.frozenSessionWorkspace.mockImplementation(admittedTurnDispatch.frozenSessionWorkspace);
+
 const APP = 'rename_route_app';
 const CHAT = 'oc_rename_route_chat';
 const OWNER = 'ou_owner';
@@ -307,6 +321,13 @@ const PEER = 'ou_peer_bot';
 const PEER_UNION = 'on_peer_bot';
 const NOW = new Date().toISOString();
 const repoFixtureDirs: string[] = [];
+
+function submittedOpeningPayload(): any {
+  const ds = mocks.forkWorker.mock.calls[0]?.[0];
+  return ds?.worker?.send.mock.calls
+    .map((call: any[]) => call[0])
+    .find((message: any) => message.type === 'message');
+}
 
 describe('document Ask production routing', () => {
   beforeEach(() => {
@@ -1630,7 +1651,8 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.replyMessage.mock.invocationCallOrder[0]).toBeLessThan(
       mocks.forkWorker.mock.invocationCallOrder[0]!,
     );
-    expect(JSON.stringify(mocks.forkWorker.mock.calls[0]?.[1])).toContain('om_distinct_quoted_message');
+    expect(mocks.forkWorker.mock.calls[0]?.[1]).toBe('');
+    expect(JSON.stringify(submittedOpeningPayload())).toContain('om_distinct_quoted_message');
     expect(mocks.createSession).toHaveBeenCalledTimes(1);
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
   });
@@ -1655,7 +1677,7 @@ describe('/rename production routing — must not pre-create a session (review P
       },
     );
 
-    const openingInput = JSON.stringify(mocks.forkWorker.mock.calls[0]?.[1]);
+    const openingInput = JSON.stringify(submittedOpeningPayload());
     expect(openingInput).toContain('转发的原始背景');
     expect(openingInput).toContain('处理这份背景');
     expect(mocks.replyMessage.mock.calls[0]?.[2]).toBe('↪️ 已转入新话题，正在处理…');
@@ -2219,7 +2241,7 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.scanMultipleProjects).not.toHaveBeenCalled();
     expect(mocks.createSession).toHaveBeenCalledTimes(1);
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
-    expect(JSON.stringify(mocks.forkWorker.mock.calls[0]?.[1])).toContain('检查实现');
+    expect(JSON.stringify(submittedOpeningPayload())).toContain('检查实现');
   });
 
 
@@ -2368,7 +2390,7 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.replyMessage.mock.invocationCallOrder[0]).toBeLessThan(
       mocks.forkWorker.mock.invocationCallOrder[0]!,
     );
-    expect(JSON.stringify(mocks.forkWorker.mock.calls[0]?.[1])).toContain('检查实现');
+    expect(JSON.stringify(submittedOpeningPayload())).toContain('检查实现');
     expect(mocks.sendMessage).not.toHaveBeenCalled();
     expect(mocks.addReaction).toHaveBeenCalledWith(
       APP,
@@ -2470,8 +2492,8 @@ describe('/rename production routing — must not pre-create a session (review P
     );
 
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
-    // forkWorker's 2nd arg is the opening CliTurnPayload; it must carry the flag.
-    const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
+    // Business input is submitted after the blank bootstrap, with its frozen flag.
+    const openingPayload = submittedOpeningPayload();
     expect(openingPayload?.codexAppSteerable).toBe(true);
   });
 
@@ -2496,7 +2518,7 @@ describe('/rename production routing — must not pre-create a session (review P
       );
 
       expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
-      const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
+      const openingPayload = submittedOpeningPayload();
       expect(openingPayload?.codexAppSteerable).toBeUndefined();
     } finally {
       delete process.env.BOTMUX_WORKFLOW_ENABLED;
@@ -2523,7 +2545,7 @@ describe('/rename production routing — must not pre-create a session (review P
     await handleNewTopic(botEvent, makeCtx('om_ct_bot', 'om_ct_bot'));
 
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
-    const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
+    const openingPayload = submittedOpeningPayload();
     expect(openingPayload?.codexAppSteerable).toBeUndefined();
   });
 
@@ -2561,7 +2583,7 @@ describe('/rename production routing — must not pre-create a session (review P
       await handleNewTopic(peerEvent, makeCtx('om_kp_new', 'om_kp_new'));
 
       expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
-      const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
+      const openingPayload = submittedOpeningPayload();
       expect(openingPayload?.codexAppSteerable).toBeUndefined();
     } finally {
       rmSync(crossRefPath, { force: true });
@@ -2593,7 +2615,7 @@ describe('/rename production routing — must not pre-create a session (review P
       await handleNewTopic(humanEvent, makeCtx('om_human_new', 'om_human_new'));
 
       expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
-      const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
+      const openingPayload = submittedOpeningPayload();
       expect(openingPayload?.codexAppSteerable).toBe(true);
     } finally {
       rmSync(crossRefPath, { force: true });
@@ -2703,7 +2725,7 @@ describe('/rename production routing — must not pre-create a session (review P
     await first;
 
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
-    const openingInput = mocks.forkWorker.mock.calls[0]![1];
+    const openingInput = submittedOpeningPayload();
     expect(openingInput.content.indexOf('first task')).toBeGreaterThanOrEqual(0);
     expect(openingInput.content).not.toContain('second task');
     expect(owner.worker!.send).toHaveBeenCalledWith(expect.objectContaining({
@@ -2722,16 +2744,21 @@ describe('/rename production routing — must not pre-create a session (review P
     const send = vi.fn();
     mocks.forkWorker.mockImplementationOnce((owner: any, input: any) => {
       expect(owner.session.queued).toBe(true);
-      expect(input.content).toContain('OPENING_TEXT_N');
-      Object.assign(owner.session, {
-        queued: false,
-        queuedActivationPending: true,
-        queuedActivationToken: openingToken,
-        queuedActivationInput: input,
-        queuedActivationTurnId: anchor,
-        queuedActivationResume: false,
-      });
+      expect(input).toBe('');
       owner.worker = { killed: false, send };
+      send.mockImplementationOnce((message: any) => {
+        expect(message.content).toContain('OPENING_TEXT_N');
+        Object.assign(owner.session, {
+          queued: false,
+          queuedActivationPending: true,
+          queuedActivationToken: openingToken,
+          queuedActivationInput: message,
+          queuedActivationTurnId: anchor,
+          queuedActivationResume: false,
+        });
+        return true;
+      });
+      return true;
     });
 
     await handleNewTopic(
@@ -2744,6 +2771,7 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(owner.pendingRepo).toBe(false);
     expect(owner.initialStartPending).toBe(true);
     expect(owner.session.queuedActivationToken).toBe(openingToken);
+    send.mockClear();
 
     await handleThreadReply(
       makeEventData('om_no_project_text_n1', 'FOLLOWER_TEXT_N_PLUS_1', anchor),
@@ -4325,7 +4353,7 @@ describe('document comment canonical ownership and single-flight delivery', () =
     await expect(handleDocComment(docCtx(sub, 'projection'))).resolves.toBe(true);
 
     if (live) expect(send).toHaveBeenCalledTimes(1);
-    else expect(mocks.sendWorkerInput).toHaveBeenCalledTimes(1);
+    else expect(ds.worker?.send).toHaveBeenCalledTimes(1);
     expect(ds.session.docCommentTargets).toHaveProperty('reply-projection');
     expect(getDocSubscription(config.session.dataDir, APP, fileToken)?.pendingDocCommentDeliveries).toBeUndefined();
     removeDocSubscription(config.session.dataDir, APP, fileToken);

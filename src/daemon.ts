@@ -24189,6 +24189,7 @@ async function dispatchReservedInitialSession(
     options: {
       ...options,
       resume: options.resume,
+      ...(input.codexAppSteerable ? { codexAppSteerable: true as const } : {}),
       ...(trustedCaller ? { trustedCaller } : {}),
     },
     boundary: centralTurnWorkerBoundary,
@@ -24206,7 +24207,8 @@ async function dispatchReservedInitialSession(
   rememberLastCliInput(ds, userPrompt, input, turnId);
   if (trustedCaller) setActiveInteractiveTurn(ds, turnId, trustedCaller);
   ds.pendingTurnId = undefined;
-  ds.initialStartPending = (ds.session.queuedActivationTail?.length ?? 0) > 0
+  ds.initialStartPending = ds.session.queuedActivationPending === true
+    || (ds.session.queuedActivationTail?.length ?? 0) > 0
     || hasPendingSessionTurns(ds.session.sessionId);
   clearInitialStartBuffers(ds);
   return true;
