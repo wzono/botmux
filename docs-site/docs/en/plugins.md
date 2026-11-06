@@ -538,7 +538,79 @@ botmux plugin service start my-plugin   # skip if there is no Service
 botmux plugin service status
 ```
 
-The point is not "it runs inside the repo" but that the extracted `dist/` works on its own, without the source tree or `node_modules`.
+Omit the Service commands for a plugin without a Service. The important
+acceptance criterion is not merely that the repository works, but that the
+extracted `dist/` remains functional without source files or the development
+`node_modules`.
+
+## Installation, enablement, and Service lifecycle
+
+Install from npm:
+
+```bash
+# Third-party package: use the full name and pin an exact version
+botmux plugin install @your-org/plugin-my-plugin@1.2.3
+
+# Official short ID: expands to @botmux-ai/plugin-my-plugin
+botmux plugin install my-plugin
+```
+
+Enablement scopes:
+
+```bash
+# Machine default, effective for every Bot
+botmux plugin enable my-plugin
+
+# One Bot, or every currently configured Bot explicitly
+botmux plugin enable my-plugin --bot <name|index|all>
+
+botmux plugin disable my-plugin
+botmux plugin disable my-plugin --bot <name|index|all>
+```
+
+Without `--bot`, the machine default is used; `--global` is neither needed nor
+accepted. If the plugin is already enabled as a machine default, disable that
+default before configuring individual Bots. Start a new Agent session after
+enabling or updating a plugin.
+
+Service management:
+
+```bash
+botmux plugin service status
+botmux plugin service start my-plugin
+botmux plugin service stop my-plugin
+botmux plugin service restart my-plugin
+```
+
+Updating currently means installing the new version again. Stop an existing
+Service first:
+
+```bash
+botmux plugin service stop my-plugin
+botmux plugin install @your-org/plugin-my-plugin@1.2.4
+botmux plugin enable my-plugin
+botmux plugin service start my-plugin
+```
+
+Botmux never stops a running Service implicitly during install, update, or
+uninstall.
+
+`botmux plugin repair [id|--all] [--dry-run]` is supported only on Linux hosts.
+It explicitly repairs legacy contribution materialization and Service identity
+state; other platforms fail closed and do not enable the Dashboard Service
+Bridge.
+
+Uninstall:
+
+```bash
+botmux plugin service stop my-plugin
+botmux plugin uninstall my-plugin
+```
+
+Uninstall removes plugin bindings and `~/.botmux/plugins/<id>/`, which can
+include private plugin configuration. Back it up first when needed. Although
+current help text lists `--force`, the implementation does not use it to bypass
+dependency or Service lifecycle guards.
 
 ## Publish to npm
 

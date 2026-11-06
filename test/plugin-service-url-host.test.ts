@@ -51,6 +51,20 @@ describe('plugin serviceUrls IPv6-safe host', () => {
     expect(serviceUrls(fakeRecord(), def).openUrl).toBe('http://10.0.12.34:8080/');
   });
 
+  it('does not synthesize an external openUrl when custom urls only declares health', () => {
+    const def: PluginServiceDefinition = {
+      port: 9362,
+      pm2: { script: 'server.js', env: { HOST: '127.0.0.1' } },
+      urls: ({ port }) => ({ healthUrl: `http://127.0.0.1:${port}/health` }),
+    };
+
+    expect(serviceUrls(fakeRecord(), def)).toEqual({
+      host: '127.0.0.1',
+      port: 9362,
+      healthUrl: 'http://10.0.12.34:9362/health',
+    });
+  });
+
   // Class 2: custom urls() — the contract now hands a URL-ready host, so a plugin
   // interpolating it straight into a URL still gets a valid IPv6 URL.
   it('custom urls() receives a URL-ready (bracketed) IPv6 host', () => {

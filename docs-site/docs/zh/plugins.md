@@ -538,7 +538,69 @@ botmux plugin service start my-plugin   # 没有 Service 的插件跳过
 botmux plugin service status
 ```
 
-验收的重点不是「仓库里能跑」，而是解压后的 `dist/` 离开源码和 `node_modules` 也能正常工作。
+没有 Service 的插件省略 Service 命令。验收重点不是“仓库里能跑”，而是解压后的
+`dist/` 脱离源码与 `node_modules` 仍能工作。
+
+## 安装、启用和 Service 生命周期
+
+从 npm 安装：
+
+```bash
+# 第三方包：使用完整包名，并建议固定精确版本
+botmux plugin install @your-org/plugin-my-plugin@1.2.3
+
+# 官方短 ID：展开为 @botmux-ai/plugin-my-plugin
+botmux plugin install my-plugin
+```
+
+启用范围：
+
+```bash
+# 机器默认，对所有 Bot 生效
+botmux plugin enable my-plugin
+
+# 指定 Bot，或显式配置所有现有 Bot
+botmux plugin enable my-plugin --bot <name|index|all>
+
+botmux plugin disable my-plugin
+botmux plugin disable my-plugin --bot <name|index|all>
+```
+
+无 `--bot` 就是机器默认作用域，不需要
+`--global`。如果插件已在机器默认作用域启用，必须先关闭机器默认绑定，才能按 Bot 单独配置。启用或更新后请新建 Agent 会话。
+
+Service 管理：
+
+```bash
+botmux plugin service status
+botmux plugin service start my-plugin
+botmux plugin service stop my-plugin
+botmux plugin service restart my-plugin
+```
+
+更新当前通过重新 install 完成。存在 Service 时必须先停止：
+
+```bash
+botmux plugin service stop my-plugin
+botmux plugin install @your-org/plugin-my-plugin@1.2.4
+botmux plugin enable my-plugin
+botmux plugin service start my-plugin
+```
+
+Botmux 不会在安装、更新或卸载时隐式停止正在运行的 Service。
+
+`botmux plugin repair [id|--all] [--dry-run]` 仅支持 Linux 主机。它用于显式修复旧安装的贡献物化与 Service 身份状态；其他平台会保持 fail closed，不开放 Dashboard Service Bridge。
+
+卸载：
+
+```bash
+botmux plugin service stop my-plugin
+botmux plugin uninstall my-plugin
+```
+
+卸载会清理插件绑定和
+`~/.botmux/plugins/<id>/`，其中可能包含插件配置；需要保留时请先备份。帮助文本中的
+`--force` 当前不能绕过依赖或 Service 生命周期保护。
 
 ## 发布到 npm
 
