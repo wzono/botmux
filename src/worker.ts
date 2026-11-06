@@ -4252,7 +4252,7 @@ const STARTUP_CMD_CAP_MS = 4_000;
 async function sendRawCommandLine(
   be: NonNullable<typeof backend>,
   content: string,
-  opts: { submit?: boolean } = {},
+  opts: { submit?: boolean; nativeForkCurrent?: () => boolean } = {},
 ): Promise<void> {
   // Long-lived framed runners (minimax, …) must receive even raw passthrough
   // lines through their frame protocol's full submit transaction. The generic
@@ -4290,7 +4290,9 @@ async function sendRawCommandLine(
   // implementation used, letting runAmbiguousSubmissionTransaction cancel the WAL.
   const writeOptions = {
     ...rawCommandWriteOptionsFor(cliAdapter ?? undefined, lastInitConfig?.cliId),
-    isCurrent: () => backend === be && !nativeSessionForkPending() && canWriteTerminalBytes(),
+    isCurrent: () => backend === be
+      && (opts.nativeForkCurrent ? opts.nativeForkCurrent() : !nativeSessionForkPending())
+      && canWriteTerminalBytes(),
   };
   // `submit: false` types the line and leaves it in the composer; the caller
   // presses Enter itself. Used by the Codex effort controller, whose Enter must
@@ -4477,6 +4479,7 @@ async function sendRawCommandLineWithRecoveryFence(
   be: NonNullable<typeof backend>,
   content: string,
   beforeWrite?: () => void,
+  nativeForkCurrent?: () => boolean,
 ): Promise<void> {
   const previous = commandLineWriteTail;
   let release!: () => void;
@@ -4486,7 +4489,7 @@ async function sendRawCommandLineWithRecoveryFence(
   try {
     const transaction = await runAmbiguousSubmissionTransaction(
       be,
-      () => sendRawCommandLine(be, content),
+      () => sendRawCommandLine(be, content, nativeForkCurrent ? { nativeForkCurrent } : {}),
       undefined,
       beforeWrite,
     );
@@ -18767,7 +18770,9 @@ function holdForNativeSessionFork(): boolean {
     if (!cfg.cliSessionId) throw new Error('Cannot fork Antigravity without an exact source conversation');
     const childId = await fork({
       sourceSessionId: cfg.cliSessionId,
-      sendCommand: command => sendRawCommandLineWithRecoveryFence(target, command),
+      sendCommand: command => sendRawCommandLineWithRecoveryFence(target, command, undefined,
+        () => current() && nativeSessionForkInFlight?.backend === target
+          && nativeSessionForkInFlight.generation === generation),
       captureScreen: () => captureBackendScreen(target),
       isCurrent: current,
     });
