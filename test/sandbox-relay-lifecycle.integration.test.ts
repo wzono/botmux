@@ -488,10 +488,14 @@ describe.each(sandboxed)('%s sandbox tree across a real worker lifecycle', (flav
   it.skipIf(!realTmux || !runtime)('tmux × fresh launch failing before the pane exists: rolls the tree back', async () => {
     const lab = createLab({ flavour, backend: 'tmux' });
     try {
-      const first = lab.start('boot-1', { env: { BOTMUX_TEST_FORCE_TMUX_NEW_SESSION_FAIL: '1' } });
+      const first = lab.start('boot-1', {
+        env: { BOTMUX_TEST_FORCE_TMUX_NEW_SESSION_FAIL: '1' },
+        envPolicy: { mode: 'strict' },
+      });
       await vi.waitFor(() => expect(first.logs()).toMatch(/Sandbox ON \(|in credential-only bwrap/), { timeout: 60_000 });
       await workerExit(first);
-      expect(first.errors().join('\n'), first.logs()).toContain('new-session refused by test');
+      expect(first.errors().join('\n'), first.logs()).toContain('Strict tmux pane startup failed');
+      expect(first.logs()).toContain('new-session refused by test');
       expect(lab.paneAlive()).toBe(false);
       expect(lab.starts()).toEqual([]);
       expect(existsSync(lab.sessionRoot), first.logs()).toBe(false);
