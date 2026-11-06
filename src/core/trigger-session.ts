@@ -40,7 +40,6 @@ import { stagePendingRepoSetup } from './pending-repo-journal.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
 import { headlessChatId, isHeadlessId, newHeadlessId, saveHeadlessSession, updateHeadlessSession } from '../services/headless-session-store.js';
-import { config } from '../config.js';
 import { setSessionWorkingDirMetadata, type SessionWorkingDirMutation } from './session-cwd.js';
 
 export interface TriggerSessionDeps {

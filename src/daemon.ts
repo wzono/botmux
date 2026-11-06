@@ -7905,7 +7905,9 @@ const workflowMainWake = createWorkflowMainWake({
   },
   // The cascade's idle evidence (cli-idle-wait); until restore re-attached
   // the CLIs that survived a restart, every session counts as busy.
-  sessionState: (sessionId) => workflowMainWakeSessionState(findActiveBySessionId(sessionId), { sessionsRestored }),
+  sessionState: (sessionId) => workflowMainWakeSessionState(findActiveBySessionId(sessionId), {
+    sessionsRestored: startupAdmission.isReady(workflowSelfAppId()),
+  }),
   deliver: (request, internal) => triggerSessionTurn(request, { larkAppId: workflowSelfAppId(), activeSessions }, internal),
   drive: (runId) => v3GateRunner.driveDetached(runId),
   listRunIds: () => {
