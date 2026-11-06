@@ -99,6 +99,8 @@ Codex 容量不足自动续跑**默认关闭**。管理员可用 `/botconfig set
 - **`/rename <标题>`**：在已有会话里发，改 Botmux 会话名（Dashboard、`/sessions` 列表跟着变），运行中的 Codex / Claude Code 会同步改原生会话名。飞书群名、话题名不变。
 - **`/cli <cliId>`**：只给**还没启动 CLI** 的会话选 CLI，例如在新话题里第一条就发 `/cli codex`，再发任务，这个会话就用 Codex 跑，Bot 的默认 CLI 不变。`cliId` 取值见[支持的 CLI](/adapters#支持的-cli--agent)。以下情况会被拒绝：会话已有历史或 CLI 已经起来、接管（adopt）的会话、排队中的会话、Bot 配了 `env`、用 Riff 后端、选的是 `riff`，以及所选 CLI 和 Bot 的零注入（`promptInjection: "none"`）或 `codexRpcInput` 不兼容。`/cli` 不在 `/help` 里显示。
 
+容量反馈与上述“自动续跑”相互独立。TraeX 只依据当前 viewport 的原生排队 UI；Codex/Claude Proxy 只依据签名的 `capacity-wait.v3` sideband，不能从普通文本或静默猜测。反馈状态和表情意图成功写入 SessionStore 后可在 daemon 重启后继续收敛；provider 结果不确定时先 LIST 自身表情，再决定删除或创建。首次终态反馈提交失败只跳过反馈表情，不阻断或重放 Botmux 原有终态流程。全量发布使用同一版本并分阶段启用；无权威信号的 provider 显示 unsupported。
+
 ## 群负责人（Agent 工具）
 
 在普通群里 @ 目标机器人说“执行 botmux manager set”即可设置负责人；取消用“执行 botmux manager clear”，查询可让机器人运行 `botmux manager status`。这不是 daemon 的 `/manager` 斜杠命令，而是内置 `botmux-chat-manager` skill 调用会话 IPC。
@@ -405,3 +407,9 @@ Dashboard 的「Bot 配置 → 权限与安全 → Slash 命令」还有一个�
 ## ⏰ 定时 & ❓帮助
 
 `/schedule ...`（见 [定时任务](/schedule)）· `/help`（话题内显示完整清单）
+
+### 容量反馈
+
+- `/capacity status`：查看容量反馈分批阶段，以及已持久禁用的机器人 × adapter。
+- 宿主 CLI：`botmux capacity status --json`、`phase <shadow|traex|proxy|full|off>`、`disable <appId> <adapter> --reason <原因>`、`enable <appId> <adapter>`。
+- 等待只由 TraeX 当前视口或签名 `capacity-wait.v3` 触发；不从静默、普通文本或引用内容猜测。

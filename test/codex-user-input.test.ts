@@ -14,7 +14,8 @@ const params = { threadId: 'native-thread', turnId: 'native-turn', questions: [
   { id: '__proto__', question: 'Choose channel', multiSelect: true, options: [{ label: 'Lark' }, { label: 'Email' }] },
 ] };
 const result = { kind: 'answered' as const, answers: [['Staging (Recommended)'], ['Lark', 'Email']], by: 'answerer', comment: null, timedOut: false as const };
-const context = { sessionId: 'session', larkAppId: 'app', chatId: 'chat', rootMessageId: 'om_root', originTurnId: 'reply-turn', env: {} };
+const context = { sessionId: 'session', larkAppId: 'app', chatId: 'chat', rootMessageId: 'om_root',
+  originTurnId: 'reply-turn', originWorkerGeneration: 3, env: {} };
 beforeEach(() => {
   vi.resetAllMocks();
   mocks.daemon.mockReturnValue({ ipcPort: 12345 });
@@ -54,7 +55,8 @@ describe('Codex native user input bridge', () => {
     const [port, route, init] = mocks.post.mock.calls[0];
     expect([port, route]).toEqual([12345, '/api/asks']);
     expect(JSON.parse(init.body)).toMatchObject({ originTurnId: 'reply-turn', rootMessageId: 'om_root',
-      originKind: 'native-user-input', questions: [{ prompt: expect.stringContaining('Test first') }, {}] });
+      originWorkerGeneration: 3, originKind: 'native-user-input',
+      questions: [{ prompt: expect.stringContaining('Test first') }, {}] });
     expect(mocks.loopback).not.toHaveBeenCalled();
   });
   it('uses the live capability and port in a read-isolated runner instead of accessing the host secret', async () => {

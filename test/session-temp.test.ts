@@ -30,39 +30,7 @@ afterEach(() => {
 });
 
 describe('session temp', () => {
-  it('preserves an empty live scratch from the flat legacy layout', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'legacy-flat-'));
-    roots.push(root);
-    const path = join(root, '0123456789abcdef0123');
-    mkdirSync(path);
-    const old = new Date(Date.now() - 120_000);
-    utimesSync(path, old, old);
-    await sweepOrphanSessionTempDirs(dataDir(), new Set(['active']), {
-      root, liveReferences: async () => new Set([path]),
-    });
-    expect(existsSync(path)).toBe(true);
-  });
-
-  it('sweeps orphaned scratch in the old cache root while protecting active sessions', async () => {
-    const data = dataDir();
-    const oldRoot = join(homedir(), '.cache', 'botmux', 'session-tmp');
-    const orphan = ensureSessionTempDir(data, 'legacy-orphan', oldRoot);
-    const active = ensureSessionTempDir(data, 'legacy-active', oldRoot);
-    roots.push(dirname(orphan));
-    writeFileSync(join(orphan, 'artifact'), 'old');
-    writeFileSync(join(active, 'artifact'), 'active');
-    const old = new Date(Date.now() - 120_000);
-    utimesSync(orphan, old, old);
-    utimesSync(active, old, old);
-    const removed = await sweepOrphanSessionTempDirs(data, new Set(['legacy-active']), {
-      liveReferences: async paths => new Set(paths.filter(path => path !== orphan)),
-    });
-    expect(removed).toContain(orphan);
-    expect(existsSync(orphan)).toBe(false);
-    expect(readFileSync(join(active, 'artifact'), 'utf8')).toBe('active');
-  });
-
-  it('creates stable per-session scratch in a short user-owned cache tree', () => {
+  it('creates stable per-session scratch in the user cache tree', () => {
     const data = dataDir();
     const path = ensureSessionTempDir(data, 'session-123');
     roots.push(dirname(path));
@@ -94,34 +62,16 @@ describe('session temp', () => {
     }
   });
 
-  it('stays visible through scratch sandbox fresh tmpfs mounts', () => {
-    const path = sessionTempDir(dataDir(), 'scratch-compatible');
-    expect(path.startsWith(`${homedir()}/`)).toBe(true);
-    for (const masked of ['/tmp/', '/var/tmp/', '/run/', '/dev/shm/']) {
-      expect(path.startsWith(masked)).toBe(false);
-    }
-  });
-
-  it('also retires scratch left in prior cache, flat short, and var-tmp layouts', async () => {
+  it('also retires scratch left in the pre-shortening layout', async () => {
     const data = dataDir();
     const sessionId = '6c255026-e993-495d-80ec-85d2c3c440dc';
-    const digest = createHash('sha256').update(resolve(data)).digest('hex');
-    const sessionKey = createHash('sha256').update(sessionId).digest('hex').slice(0, 16);
-    const flatShortKey = createHash('sha256').update(resolve(data)).update('\0').update(sessionId).digest('hex').slice(0, 20);
-    const legacyRoot = join(homedir(), '.cache', 'botmux', 'session-tmp');
-    const legacyPaths = [
-      join(legacyRoot, digest.slice(0, 8), sessionKey),
-      join(legacyRoot, digest.slice(0, 16), sessionId),
-      join(homedir(), '.cache', 'bm', flatShortKey),
-      ...(process.getuid ? [join('/var/tmp', `botmux-${process.getuid()}`, digest.slice(0, 8), sessionKey)] : []),
-    ];
-    roots.push(dirname(legacyPaths[0]), dirname(legacyPaths[1]), legacyPaths[2]);
-    for (const path of legacyPaths) {
-      mkdirSync(path, { recursive: true });
-      writeFileSync(join(path, 'artifact'), 'x');
-    }
+    const profile = createHash('sha256').update(resolve(data)).digest('hex').slice(0, 16);
+    const legacy = join(homedir(), '.cache', 'botmux', 'session-tmp', profile, sessionId);
+    roots.push(dirname(legacy));
+    mkdirSync(legacy, { recursive: true });
+    writeFileSync(join(legacy, 'artifact'), 'x');
     await cleanupSessionTempDir(data, sessionId);
-    for (const path of legacyPaths) expect(existsSync(path)).toBe(false);
+    expect(existsSync(legacy)).toBe(false);
   });
 
   it('separates sibling data directories with the same session id', () => {

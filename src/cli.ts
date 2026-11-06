@@ -17342,6 +17342,9 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   const larkAppId = process.env.BOTMUX_LARK_APP_ID!;
   const askSessionId = process.env.BOTMUX_SESSION_ID!;
   const liveAskOrigin = resolveSessionContext(resolveDataDir(), askSessionId);
+  const askWorkerGeneration = liveAskOrigin?.workerGeneration
+    ?? (Number(process.env.BOTMUX_WORKER_GENERATION) > 0
+      ? Number(process.env.BOTMUX_WORKER_GENERATION) : undefined);
   const askRelayDir = process.env.BOTMUX_SEND_RELAY;
   const askOriginCapability = readManagedOriginCapability(
     resolveDataDir(),
@@ -17368,6 +17371,9 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     ...(liveAskOrigin?.turnId ? { originTurnId: liveAskOrigin.turnId } : {}),
     ...(liveAskOrigin?.dispatchAttempt !== undefined
       ? { originDispatchAttempt: liveAskOrigin.dispatchAttempt }
+      : {}),
+    ...(askWorkerGeneration !== undefined
+      ? { originWorkerGeneration: askWorkerGeneration }
       : {}),
     ...(askOriginCapability ? { originCapability: askOriginCapability } : {}),
     // `botmux ask --mention <open_id>`：daemon 在卡片问题正文前注入真实 <at>，
@@ -17505,7 +17511,7 @@ export async function runHook(
   /** 按 OpenCode 原生会话 id（payload.session_id，ses_*）反查所属 botmux 会话；
    *  缺省用真实实现（在线 daemon 并发查询 + budget 封顶）。测试注入 stub。 */
   resolveCliSessionRouteFn?: (cliSessionId: string) => Promise<import('./adapters/adopt-route.js').AdoptRoute | null>,
-  resolveTurnOriginFn: (sessionId: string) => { turnId?: string; dispatchAttempt?: number } | null | undefined =
+  resolveTurnOriginFn: (sessionId: string) => { turnId?: string; dispatchAttempt?: number; workerGeneration?: number } | null | undefined =
     sessionId => resolveSessionContext(resolveDataDir(), sessionId),
 ): Promise<{ stdout: string }> {
   const { getHookAdapter } = await import('./core/ask-hook/registry.js');
@@ -17609,6 +17615,7 @@ export async function runHook(
       return { stdout: adapter.passthrough(payload) };
     }
     // adopt 命中 → 使用 adopt 路由信息
+    explicitRoute = adopt;
     routeSessionId = adopt.sessionId;
     routeChatId = adopt.chatId;
     routeLarkAppId = adopt.larkAppId;
@@ -17660,6 +17667,8 @@ export async function runHook(
   // routing cannot borrow this process's ambient turn identity.
   const hookOrigin = !explicitRoute && routeSessionId === sessionId && ['claude-code', 'codex'].includes(cliId)
     ? resolveTurnOriginFn(routeSessionId!) : undefined;
+  const hookWorkerGeneration = hookOrigin?.workerGeneration
+    ?? (Number(env.BOTMUX_WORKER_GENERATION) > 0 ? Number(env.BOTMUX_WORKER_GENERATION) : undefined);
 
   const body: Record<string, unknown> = {
     sessionId: routeSessionId,
@@ -17672,6 +17681,7 @@ export async function runHook(
     originKind: 'hook',
     ...(hookOrigin?.turnId ? { originTurnId: hookOrigin.turnId } : {}),
     ...(hookOrigin?.dispatchAttempt !== undefined ? { originDispatchAttempt: hookOrigin.dispatchAttempt } : {}),
+    ...(hookWorkerGeneration !== undefined ? { originWorkerGeneration: hookWorkerGeneration } : {}),
   };
 
   // Post the ask, RETRYING across a daemon restart. The daemon holds pending
@@ -20360,6 +20370,20 @@ switch (command) {
   case 'codex-instances': {
     const { runCodexInstancesCommand } = await import('./cli/codex-instances.js');
     await runCodexInstancesCommand(process.argv.slice(3));
+    break;
+  }
+  case 'capacity': {
+    try {
+      const { parseCapacityCommand, runCapacityCommand } = await import('./cli/capacity-command.js');
+      const { createCapacityRolloutStore } = await import('./services/capacity-rollout-store.js');
+      const command = parseCapacityCommand(process.argv.slice(3));
+      const result = runCapacityCommand(command, createCapacityRolloutStore(resolveDataDir()));
+      if (command.json) console.log(JSON.stringify(result));
+      else console.log(`capacity phase=${result.phase} disabled=${Object.keys(result.disabled).length}`);
+    } catch (error) {
+      console.error(`botmux capacity: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 2;
+    }
     break;
   }
   case 'upgrade':

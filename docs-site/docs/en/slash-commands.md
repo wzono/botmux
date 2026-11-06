@@ -99,6 +99,8 @@ Both are available by default and need operate permission (admins / `allowedUser
 - **`/rename <title>`**: send it in an existing session to rename the Botmux session (the Dashboard and the `/sessions` list follow); a running Codex / Claude Code session also gets its native session name updated. The Lark group and topic names don't change.
 - **`/cli <cliId>`**: picks the CLI only for a session **whose CLI hasn't started yet** — for example, send `/cli codex` as the first message of a new topic, then send the task, and that session runs on Codex while the bot's default CLI stays the same. For `cliId` values see [Supported CLIs](/en/adapters#supported-clis--agents). It is refused when the session already has history or a running CLI, for adopted sessions, for queued sessions, when the bot sets `env`, when it uses the Riff backend, when you pick `riff`, or when the chosen CLI doesn't work with the bot's zero prompt injection (`promptInjection: "none"`) or `codexRpcInput`. `/cli` is not listed in `/help`.
 
+Capacity feedback is independent from automatic continuation. TraeX trusts only its current viewport queue UI; Codex/Claude Proxy trusts only signed `capacity-wait.v3` sideband events, never ordinary prose or silence. Feedback rows and reaction intents become restart-recoverable after their SessionStore commit. Provider uncertainty is reconciled by listing the app's own reactions before any delete or create. A failed first terminal-feedback commit skips that feedback reaction without blocking or replaying Botmux's existing terminal lifecycle. One release rolls out in stages across the fleet; providers without authoritative evidence report unsupported.
+
 ## Group manager (Agent tool)
 
 In a regular group, mention the target bot and ask it to run `botmux manager set`, `botmux manager clear`, or `botmux manager status`. The built-in `botmux-chat-manager` skill calls session-scoped IPC; this is not a daemon `/manager` slash command.
@@ -405,3 +407,9 @@ To see which bots in the current group you can collaborate with: `botmux bots li
 ## ⏰ Scheduling & ❓ Help
 
 `/schedule ...` (see [Scheduled Tasks](/en/schedule)) · `/help` (shows the full list inside the topic)
+
+### Capacity feedback
+
+- `/capacity status`: show the capacity-feedback rollout phase and persisted bot × adapter disables.
+- Host CLI: `botmux capacity status --json`, `phase <shadow|traex|proxy|full|off>`, `disable <appId> <adapter> --reason <reason>`, and `enable <appId> <adapter>`.
+- Waiting is driven only by the current TraeX viewport or signed `capacity-wait.v3` events; silence, prose, and quoted text never synthesize it.
