@@ -114,6 +114,10 @@ function harness(cliId: CliId, opts: {
     effectiveBackendType: opts.backendType ?? 'tmux',
     backendScreenEvidenceIsAuthoritativeForMutation: () => opts.authoritative ?? true,
     isRemoteBackendType: () => false,
+    // These hold tests use an admitted workspace and no pending native fork.
+    // Individual refusal cases override the gates while keeping the real handler.
+    canWriteTerminalBytes: () => true,
+    nativeSessionForkPending: () => false,
     captureBackendScreen: (be: any) => be.captureViewport(),
     lastAnalyzerSnapshot: '',
     renderer: { rawSnapshot: () => scope.screen },
@@ -559,6 +563,17 @@ describe('tui_keys IPC from a stuck card (real handler)', () => {
       },
       expect.objectContaining({ type: 'stuck_warning', reason: 'input_held', matchedPattern: 'hook review startup', turnId: 'turn_held' }),
     ]);
+  });
+
+  it('drops a valid stuck-card key when workspace authorization blocks terminal bytes', async () => {
+    const k = keyHarness([TRAEX_L1, TRAEX_STARTUP_AFTER_ESC]);
+    k.scope.canWriteTerminalBytes = () => false;
+
+    await k.click('hook review level 1', ['Escape']);
+
+    expect(k.written).toEqual([]);
+    expect(k.settles).toEqual([]);
+    expect(k.sent).toEqual([]);
   });
 
   it('a click that expired because the page moved on raises the card for the page on screen now', async () => {
