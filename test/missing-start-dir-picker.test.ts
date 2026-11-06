@@ -99,6 +99,10 @@ vi.mock('../src/services/session-store.js', async () => {
     ...actual,
     createSession: mocks.createSession,
     updateSession: mocks.updateSession,
+    updateSessionWorkingDir: vi.fn((sessionId: string, workingDir: string, metadata: any) => {
+      const session = mocks.sessions.get(sessionId);
+      if (session) Object.assign(session, { workingDir }, metadata);
+    }),
     getSession: mocks.getSession,
     getOwnedSession: mocks.getSession,
     listSessions: mocks.listSessionsStrict,
@@ -112,6 +116,14 @@ vi.mock('../src/core/worker-pool.js', async () => {
   return { ...actual, forkWorker: mocks.forkWorker };
 });
 
+vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/admitted-turn-dispatch.js');
+  return { ...actual, dispatchAdmittedBusinessTurn: vi.fn(async (input: any) => {
+    mocks.forkWorker(input.ds, input.payload, { ...input.options, turnId: input.turnId });
+    return true;
+  }) };
+});
+
 vi.mock('../src/core/session-manager.js', async () => {
   const actual = await vi.importActual<any>('../src/core/session-manager.js');
   return {
@@ -120,6 +132,15 @@ vi.mock('../src/core/session-manager.js', async () => {
     downloadResources: mocks.downloadResources,
   };
 });
+
+vi.mock('../src/core/session-cwd.js', () => ({
+  setSessionWorkingDirMetadata: (session: any, mutation: any) => Object.assign(session, mutation),
+  repinSessionWorkingDir: (ds: any, mutation: any) => {
+    Object.assign(ds.session, mutation);
+    ds.workingDir = mutation.workingDir;
+    mocks.updateSession(ds.session);
+  },
+}));
 
 vi.mock('../src/services/project-scanner.js', async () => {
   const actual = await vi.importActual<any>('../src/services/project-scanner.js');

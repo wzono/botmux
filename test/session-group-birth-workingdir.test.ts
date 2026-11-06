@@ -125,6 +125,14 @@ vi.mock('../src/core/worker-pool.js', async () => {
   return { ...actual, forkWorker: (...args: any[]) => mocks.forkWorker(...args) };
 });
 
+vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/admitted-turn-dispatch.js');
+  return { ...actual, dispatchAdmittedBusinessTurn: vi.fn(async (input: any) => {
+    mocks.forkWorker(input.ds, input.payload, { ...input.options, turnId: input.turnId });
+    return true;
+  }) };
+});
+
 vi.mock('../src/core/session-manager.js', async () => {
   const actual = await vi.importActual<any>('../src/core/session-manager.js');
   return { ...actual, downloadResources: (...args: any[]) => mocks.downloadResources(...args) };

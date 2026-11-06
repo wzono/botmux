@@ -19,6 +19,9 @@ export interface PendingCliInput {
   dispatchAttempt?: number;
   /** This item belongs to the durable-primary Lark Inbox commit protocol. */
   durablePrimaryInbox?: true;
+  /** Exact durable control reply submission correlated through worker commit. */
+  controlDispatchId?: string;
+  controlReplyDigest?: string;
   /** Admission-frozen mode for the exact queued turn. */
   linkRefMode?: Exclude<LinkRefMode, 'disabled'>;
   /** Open id of the human whose turn this is. The worker publishes it beside

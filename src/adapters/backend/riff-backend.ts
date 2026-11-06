@@ -16,6 +16,7 @@ import { detectImageFormat } from '../../core/attachment-image-format.js';
 import { shellQuote } from '../../core/cli-launch-mode.js';
 import type { RiffHostBinding } from '../../services/riff-host-tools.js';
 import { RIFF_HOST_UNREACHABLE_HINT } from '../../services/riff-host-hint.js';
+import { HostWorkingDirContract } from './host-working-dir-contract.js';
 
 /**
  * Fallback system prompt injected into every riff task when no explicit
@@ -381,6 +382,47 @@ export async function cancelRiffTaskById(
       return false;
     }
   }
+}
+
+/**
+ * The one-line bootstrap the Riff agent runs before any botmux helper: make sure
+ * the sandbox CLI is the host's exact build, then write this turn's binding.
+ *
+ * `command -v botmux` is usually NOT the binary. npm links the `bin` entry
+ * (scripts/botmux-launcher.sh) and postinstall writes the ~/.botmux/bin/botmux
+ * wrapper `exec "<abs>/botmux-linux-x64/botmux" "$@"` (≈107 bytes). Hashing that
+ * file never matched, so every turn re-downloaded a build that was already
+ * installed — and when the host endpoint answered 502, `set -e` aborted the line
+ * before the bind, turning a clear transport error into `botmux send` ENOENT.
+ * So the check hashes every place the command can resolve to (the file, its
+ * symlink target, the wrapper's exec target, both npm platform-package layouts),
+ * and a failed download/verification falls back to the installed CLI when it
+ * speaks the host-tools protocol, so later helpers report the real HTTP error.
+ *
+ * Runs in a subshell: the agent's shell keeps no options or helper names, and
+ * the line's status is the bind's (or 1 with a named reason). Every value from
+ * the binding is shell-quoted; the checksum is also validated by the host.
+ */
+export function buildRiffHostBootstrap(binding: RiffHostBinding): string {
+  const bind = `BOTMUX_RIFF_HOST_TOOLS=1 botmux riff-host-bind ${Buffer.from(JSON.stringify(binding)).toString('base64url')}`;
+  if (!binding.cliSha256) return bind;
+  const download = shellQuote(`riff_host_cli_download_failed (see the curl error above): ${RIFF_HOST_UNREACHABLE_HINT}`);
+  const verify = shellQuote('riff_host_cli_checksum_mismatch: the downloaded CLI does not match the host build');
+  const fallback = shellQuote('riff_host_cli_not_updated: continuing with the installed botmux (it supports riff_host_tools_v1); botmux helpers may still fail with the same host error');
+  const unavailable = shellQuote('riff_host_cli_unavailable: no installed botmux supports riff_host_tools_v1, so botmux helpers cannot run in this turn; report this error');
+  return [
+    `( want=${shellQuote(binding.cliSha256)}`,
+    `target="$(command -v botmux || printf '%s/bin/botmux' "$(npm prefix -g 2>/dev/null)")"`,
+    `real="$(readlink -f "$target" 2>/dev/null || printf '%s' "$target")"`,
+    `pkg="$(dirname "$(dirname "$real")")"`,
+    // The postinstall wrapper's exact shape; anything else yields no candidate.
+    `wrapped="$(sed -n 's/^exec "\\(\\/[^"]*\\)" "\\$@"$/\\1/p' "$real" 2>/dev/null | head -n 1)"`,
+    'ok=0',
+    `for c in "$target" "$real" "$wrapped" "$pkg/node_modules/botmux-linux-x64/botmux" "$pkg/../botmux-linux-x64/botmux" "$pkg/node_modules/botmux-linux-x64-musl/botmux" "$pkg/../botmux-linux-x64-musl/botmux"; do if [ -n "$c" ] && [ -f "$c" ] && [ "$(sha256sum "$c" 2>/dev/null | cut -d' ' -f1)" = "$want" ]; then ok=1; break; fi; done`,
+    `if [ "$ok" != 1 ]; then artifact="$(mktemp)"; if ! curl --noproxy '*' --fail --silent --show-error --max-time 180 -H ${shellQuote(`x-riff-host-token: ${binding.token}`)} ${shellQuote(`${binding.url}?artifact=cli`)} -o "$artifact"; then printf '%s\\n' ${download} >&2; elif [ "$(sha256sum "$artifact" 2>/dev/null | cut -d' ' -f1)" != "$want" ]; then printf '%s\\n' ${verify} >&2; elif chmod 755 "$artifact" && mv -f "$artifact" "$target"; then ok=1; fi; rm -f "$artifact"; fi`,
+    `if [ "$ok" != 1 ]; then if botmux capabilities --json 2>/dev/null | grep -q '"riff_host_tools_v1": *true'; then printf '%s\\n' ${fallback} >&2; else printf '%s\\n' ${unavailable} >&2; exit 1; fi; fi`,
+    `${bind} )`,
+  ].join('; ');
 }
 
 /** Irreversible short hash of a sandbox URL for log correlation — the unique
@@ -1063,6 +1105,7 @@ export class RiffBackend implements SessionBackend {
    *  arriving before the first task-execute HTTP returns would see
    *  currentTaskId === null and create a duplicate task. */
   private writeChain: Promise<void> = Promise.resolve();
+  private readonly hostWorkingDirContract = new HostWorkingDirContract();
 
   constructor(config: RiffBackendConfig, sessionId: string) {
     this.config = config;
@@ -1234,43 +1277,85 @@ export class RiffBackend implements SessionBackend {
     return readBytecloudKeychainJwt(home, env);
   }
 
-  spawn(_bin: string, _args: string[], _opts: SpawnOpts): void {
+  spawn(_bin: string, _args: string[], opts: SpawnOpts): void {
+    this.hostWorkingDirContract.capture(opts);
+    if (opts.expectedWorkingDirIdentity) {
+      const derived = deriveRiffRepoFromWorkingDir(opts.cwd);
+      const override = this.config.repos?.[0];
+      if (!derived || !derived.repo.repoBranch || (this.config.repos && this.config.repos.length !== 1)
+        || (override && (override.repoName !== derived.repo.repoName
+        || override.repoBranch !== derived.repo.repoBranch))) {
+        this.groupWorkspaceRepoProof = undefined;
+      } else this.groupWorkspaceRepoProof = { hostPath: opts.cwd, identity: { ...opts.expectedWorkingDirIdentity }, repository: derived.repo };
+    }
     logger.info(`[riff] spawn (ignoring bin/args, using config: ${this.config.baseUrl})`);
     // No actual process to spawn. Task creation happens on first write().
   }
 
+  validateWorkingDirBeforeBusinessInput(): boolean {
+    return this.hostWorkingDirContract.identityMatches()
+      && (!this.hostWorkingDirContract.hasExpectedIdentity() || !!this.effectiveWorkspaceProof());
+  }
+
+  private groupWorkspaceRepoProof?: { hostPath: string; identity: { dev: string; ino: string }; repository: RiffRepoRef };
+
+  effectiveWorkspaceProof() {
+    const frozen = this.groupWorkspaceRepoProof;
+    if (!frozen || !this.hostWorkingDirContract.identityMatches()) return undefined;
+    const actual = deriveRiffRepoFromWorkingDir(frozen.hostPath);
+    // Git derivation spawns multiple reads. Re-probe the exact admitted inode
+    // afterwards so a path swap during derivation cannot pair the old identity
+    // with repository metadata observed from its replacement.
+    if (!actual || !this.hostWorkingDirContract.identityMatches()
+      || actual.repo.repoName !== frozen.repository.repoName
+      || actual.repo.repoBranch !== frozen.repository.repoBranch) return undefined;
+    return { kind: 'riff-repository' as const, ...frozen };
+  }
+
+  validatedHostWorkingDirContract() {
+    return this.hostWorkingDirContract.validatedProof();
+  }
+
   write(data: string): boolean {
-    if (this.killed) return false;
-    if (this.shutdownDetaching) {
-      logger.warn('[riff] write rejected while graceful shutdown detach is preparing/prepared');
-      return false;
-    }
-    if (this.closing) {
-      logger.warn('[riff] write rejected while explicit close is preparing/prepared');
-      return false;
-    }
+    if (this.killed || this.shutdownDetaching || this.closing) return false;
+    void this.writeBusinessInput(data);
+    return true;
+  }
 
+  writeBusinessInput(data: string): Promise<'submitted' | 'retryable_pre_dispatch_rejection'> {
+    if (this.killed || this.shutdownDetaching || this.closing) {
+      return Promise.resolve('retryable_pre_dispatch_rejection');
+    }
     const { text, attachments } = this.extractAttachments(data);
-
+    let resolveResult!: (result: 'submitted' | 'retryable_pre_dispatch_rejection') => void;
+    const result = new Promise<'submitted' | 'retryable_pre_dispatch_rejection'>(resolve => { resolveResult = resolve; });
     this.writeChain = this.writeChain
       .then(async () => {
-        // closing 也要在链内复查：write 可能在 close 之前就排进了队列。
-        if (this.killed || this.closing) return;
-        // Route by task lineage only: task-follow-up is exactly the "continue
-        // the conversation after the parent finished" API, so a completed task
-        // (taskDone) must still route to followUp — spinning up a fresh task
-        // per turn would cold-boot a new sandbox (minutes) and drop context.
+        const proof = this.effectiveWorkspaceProof();
+        const groupBound = this.hostWorkingDirContract.hasExpectedIdentity();
+        if (this.killed || this.closing || !this.hostWorkingDirContract.identityMatches() || (groupBound && !proof)) {
+          resolveResult('retryable_pre_dispatch_rejection');
+          return;
+        }
         this.taskDone = false;
-        if (!this.currentTaskId) {
-          await this.createTask(text, attachments);
-        } else {
-          await this.followUp(text, attachments);
+        let dispatched = false;
+        const onDispatched = () => {
+          if (dispatched) return;
+          dispatched = true;
+          resolveResult('submitted');
+        };
+        try {
+          if (!this.currentTaskId) await this.createTask(text, attachments, proof, onDispatched);
+          else await this.followUp(text, attachments, proof, onDispatched);
+        } catch (err) {
+          if (!dispatched) resolveResult('retryable_pre_dispatch_rejection');
+          throw err;
         }
       })
       .catch((err) => {
         logger.warn(`[riff] queued write failed: ${err}`);
       });
-    return true;
+    return result;
   }
 
   resize(_cols: number, _rows: number): void {
@@ -1727,7 +1812,7 @@ export class RiffBackend implements SessionBackend {
     return parts[parts.length - 1] ?? p;
   }
 
-  private async createTask(prompt: string, attachments: RiffAttachment[]): Promise<void> {
+  private async createTask(prompt: string, attachments: RiffAttachment[], effectiveProof?: ReturnType<RiffBackend['effectiveWorkspaceProof']>, onDispatched?: () => void): Promise<void> {
     const url = `${this.config.baseUrl}/api/task-execute`;
 
     // riff task-execute body: origin at top level, prompt inside config.userPrompt
@@ -1754,6 +1839,7 @@ export class RiffBackend implements SessionBackend {
         for (const w of this.config.repoWarnings ?? []) this.emitLine(`[riff] ⚠️ ${w}`, 'warn');
       }
     }
+    if (effectiveProof) config.effectiveWorkspaceProof = structuredClone(effectiveProof);
     // Inject env into the riff sandbox so the agent can use `botmux send` etc.
     // Merged from: per-bot env (bots.json `env`) + botmux session context vars +
     // any explicit config.env (which takes precedence).
@@ -1778,13 +1864,14 @@ export class RiffBackend implements SessionBackend {
     if (this.config.templateId) payload.templateId = this.config.templateId;
 
     try {
-      const taskId = await this.uploadAndCreate(url, payload, attachments, this.createTimeoutMs);
+      const taskId = await this.uploadAndCreate(url, payload, attachments, this.createTimeoutMs, onDispatched);
       if (!(await this.adoptLateTask(taskId))) return;
       this.markActivity();
       this.reconnectAttempts = 0; // per-task budget (see streamTask)
       this.streamTask(taskId);
     } catch (err) {
       this.emitError(`创建 riff 任务失败: ${err}`);
+      throw err;
     }
   }
 
@@ -1808,12 +1895,13 @@ export class RiffBackend implements SessionBackend {
     return cold ? this.followUpColdTimeoutMs : this.followUpHotTimeoutMs;
   }
 
-  private async followUp(prompt: string, attachments: RiffAttachment[]): Promise<void> {
+  private async followUp(prompt: string, attachments: RiffAttachment[], effectiveProof?: ReturnType<RiffBackend['effectiveWorkspaceProof']>, onDispatched?: () => void): Promise<void> {
     const url = `${this.config.baseUrl}/api/task-follow-up`;
 
     // Capture the parent BEFORE the request: reconcile-on-timeout below needs the
     // exact parent this follow-up hung off, independent of any later mutation.
     const parentTaskId = this.currentTaskId;
+
 
     // riff task-follow-up body: parentTaskId + origin + prompt at top level
     const payload: Record<string, unknown> = {
@@ -1822,6 +1910,8 @@ export class RiffBackend implements SessionBackend {
       prompt: this.injectSystemPrompt(prompt),
     };
 
+    if (effectiveProof) payload.effectiveWorkspaceProof = structuredClone(effectiveProof);
+
     // Send-time floor for reconcile-on-timeout: only a task created at/after this
     // instant can be THIS follow-up's child (see reconcileAfterFollowUpTimeout).
     // Read before the request so a slow pre-flight cannot push it past the child's
@@ -1829,7 +1919,7 @@ export class RiffBackend implements SessionBackend {
     const sentAtMs = Date.now();
 
     try {
-      const taskId = await this.uploadAndCreate(url, payload, attachments, this.followUpTimeoutMs());
+      const taskId = await this.uploadAndCreate(url, payload, attachments, this.followUpTimeoutMs(), onDispatched);
       if (!(await this.adoptLateTask(taskId))) return;
       this.markActivity();
       this.reconnectAttempts = 0; // per-task budget (see streamTask)
@@ -1864,6 +1954,7 @@ export class RiffBackend implements SessionBackend {
       this.currentTaskId = null;
       this.taskIdCb?.(null);
       this.emitError(`riff follow-up 失败: ${err}（下一条消息将新建任务）`);
+      throw err;
     }
   }
 
@@ -2062,11 +2153,8 @@ export class RiffBackend implements SessionBackend {
       logger.warn('[riff] host-tools binding unavailable; continuing task without host tools');
       unavailable = true;
     }
-    const install = binding?.cliSha256
-      ? `set -e; target="$(command -v botmux || printf '%s/bin/botmux' "$(npm prefix -g)")"; if [ "$(sha256sum "$target" 2>/dev/null | cut -d' ' -f1)" != ${shellQuote(binding.cliSha256)} ]; then artifact="$(mktemp)"; curl --noproxy '*' --fail --silent --show-error --max-time 180 -H ${shellQuote(`x-riff-host-token: ${binding.token}`)} ${shellQuote(`${binding.url}?artifact=cli`)} -o "$artifact" || { printf '%s\\n' ${shellQuote(`riff_host_cli_download_failed (see the curl error above): ${RIFF_HOST_UNREACHABLE_HINT}`)} >&2; exit 1; }; printf '%s  %s\\n' ${shellQuote(binding.cliSha256)} "$artifact" | sha256sum -c -; chmod 755 "$artifact"; mv -f "$artifact" "$target"; fi; `
-      : '';
     const host = binding
-      ? `\n\n<botmux_host_tools>\nBefore ANY botmux helper in this turn, run this exact bootstrap command once (also on follow-ups). It installs the verified host build before binding:\n${install}BOTMUX_RIFF_HOST_TOOLS=1 botmux riff-host-bind ${Buffer.from(JSON.stringify(binding)).toString('base64url')}\nFor EVERY following botmux helper, also use the explicit prefix BOTMUX_RIFF_HOST_TOOLS=1 (including in existing tasks whose creation-time environment cannot change).\nAll stateful botmux helpers execute on the owning host. Card stream open/write/snapshot/reanchor/finish are supported. Whiteboard supports status only; skip other whiteboard operations even if a generic skill describes them.\nNever print or forward this private binding. If the host is unavailable, report the error; do not call Lark directly or start a sandbox daemon.\n</botmux_host_tools>`
+      ? `\n\n<botmux_host_tools>\nBefore ANY botmux helper in this turn, run this exact bootstrap command once (also on follow-ups). It installs the verified host build before binding:\n${buildRiffHostBootstrap(binding)}\nFor EVERY following botmux helper, also use the explicit prefix BOTMUX_RIFF_HOST_TOOLS=1 (including in existing tasks whose creation-time environment cannot change).\nAll stateful botmux helpers execute on the owning host. Card stream open/write/snapshot/reanchor/finish are supported. Whiteboard supports status only; skip other whiteboard operations even if a generic skill describes them.\nNever print or forward this private binding. If the host is unavailable, report the error; do not call Lark directly or start a sandbox daemon.\n</botmux_host_tools>`
       : unavailable
         ? '\n\n<botmux_host_tools_unavailable>Host tools are unavailable for this turn. Continue processing the request, but report the delivery/tool failure in the task output. Do not use a previous binding, call Lark directly, seek other credentials, or start a sandbox daemon. This overrides the direct-API fallback above.</botmux_host_tools_unavailable>'
         : '';
@@ -2094,7 +2182,9 @@ export class RiffBackend implements SessionBackend {
     payload: Record<string, unknown>,
     attachments: RiffAttachment[],
     timeoutMs: number,
+    onDispatched?: () => void,
   ): Promise<string> {
+    const groupBound = this.hostWorkingDirContract.hasExpectedIdentity();
     // Assemble the request body FIRST (attachment reads can be slow on large
     // files / slow disks), THEN resolve the JWT immediately before fetch. The
     // keychain selector skips tokens expiring within a safety window, but that
@@ -2135,9 +2225,21 @@ export class RiffBackend implements SessionBackend {
     // in the wrong environment). The timeout is the caller's per-endpoint budget
     // (create vs follow-up cold/hot), not a fixed constant.
     const post = (jwt: string | null): Promise<Response> => {
-      const h = { ...headers };
-      if (jwt) h['x-jwt-token'] = jwt;
-      return fetch(url, { method: 'POST', headers: h, body, signal: AbortSignal.timeout(timeoutMs) });
+      let attemptBody = body;
+      if (groupBound) {
+        const freshProof = this.effectiveWorkspaceProof();
+        if (!freshProof) throw new Error('riff effective workspace changed before HTTP dispatch');
+        if (body instanceof FormData) {
+          const form = new FormData();
+          for (const [key, value] of body.entries()) form.append(key, value);
+          form.set('payload', JSON.stringify({ ...payload, effectiveWorkspaceProof: freshProof }));
+          attemptBody = form;
+        } else attemptBody = JSON.stringify({ ...payload, effectiveWorkspaceProof: freshProof });
+      }
+      const h = { ...headers }; if (jwt) h['x-jwt-token'] = jwt;
+      const request = fetch(url, { method: 'POST', headers: h, body: attemptBody, signal: AbortSignal.timeout(timeoutMs) });
+      onDispatched?.();
+      return request;
     };
 
     const firstJwt = await this.getJwt();
@@ -2211,6 +2313,7 @@ export class RiffBackend implements SessionBackend {
       return false;
     }
     this.currentTaskId = taskId;
+
     this.taskIdCb?.(taskId);
     if (this.killed || this.shutdownDetaching) return false;
     return true;

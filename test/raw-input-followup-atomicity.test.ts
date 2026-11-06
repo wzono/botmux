@@ -17,6 +17,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import {
   finalizeRawCommandDelivery,
+  typeRawCommandLine,
   writeRawCommandLine,
 } from '../src/core/raw-command-writer.js';
 
@@ -257,6 +258,25 @@ describe('raw command backend acceptance', () => {
     expect(onDurableFailure).toHaveBeenCalledOnce();
   });
 
+  it.each(['paste', 'sendText', 'write'] as const)(
+    'rejects stale %s text before emitting any bytes', async mode => {
+      const write = vi.fn(() => true);
+      const sendText = vi.fn(() => true);
+      const pasteText = vi.fn(() => true);
+      const sendSpecialKeys = vi.fn(() => true);
+      const backend = mode === 'paste'
+        ? { write, pasteText, sendSpecialKeys, supportsRawCommandPasteLine: true }
+        : mode === 'sendText' ? { write, sendText, sendSpecialKeys } : { write };
+      await expect(writeRawCommandLine(backend, '/model x', {
+        pasteLine: mode === 'paste', isCurrent: () => false, delay: immediateDelay,
+      })).resolves.toBe(false);
+      expect(write).not.toHaveBeenCalled();
+      expect(sendText).not.toHaveBeenCalled();
+      expect(pasteText).not.toHaveBeenCalled();
+      expect(sendSpecialKeys).not.toHaveBeenCalled();
+    },
+  );
+
   it('CoCo: types char-by-char with the throttle, then exactly one Enter after the submit beat', async () => {
     // A one-shot write coalesces into a paste on CoCo, skipping command mode and
     // the slash picker; a stray second Enter would confirm a /model selector pick.
@@ -355,5 +375,38 @@ describe('worker input fences', () => {
     const hold = markReady.search(/if \(bareShellLaunchBlocked\)/);
     expect(hold).toBeGreaterThanOrEqual(0);
     expect(markReady.indexOf('isPromptReady = true')).toBeGreaterThan(hold);
+  });
+});
+
+describe('type / submit split', () => {
+  const noDelay = async () => {};
+
+  it('types the line without submitting it, including on key-writing backends', async () => {
+    // The effort controller types `/model`, re-checks the screen, and only then
+    // presses Enter itself. If typing also submitted, the re-check would run
+    // after the damage. Cover both delivery shapes.
+    const write = vi.fn(() => true);
+    expect(await typeRawCommandLine({ write }, '/model', { delay: noDelay })).toBe(true);
+    expect(write.mock.calls.map(call => call[0])).toEqual(['/model']);
+
+    const keys: string[] = [];
+    const sendText = vi.fn(() => true);
+    expect(await typeRawCommandLine(
+      { write: vi.fn(() => true), sendText, sendSpecialKeys: (key => { keys.push(key); return true; }) as never },
+      '/model',
+      { delay: noDelay },
+    )).toBe(true);
+    expect(sendText).toHaveBeenCalledWith('/model');
+    expect(keys).toEqual([]);
+  });
+
+  it('still submits through writeRawCommandLine', async () => {
+    const sendSpecialKeys = vi.fn(() => true);
+    expect(await writeRawCommandLine(
+      { write: vi.fn(() => true), sendText: vi.fn(() => true), sendSpecialKeys },
+      '/model',
+      { delay: noDelay },
+    )).toBe(true);
+    expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
   });
 });

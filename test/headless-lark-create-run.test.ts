@@ -29,7 +29,12 @@ vi.mock('../src/services/session-store.js', async importOriginal => ({
 vi.mock('../src/core/worker-pool.js', async importOriginal => ({
   ...await importOriginal<Record<string, unknown>>(),
   forkWorker: (...args: any[]) => state.fork(...args),
+  dispatchWorkspaceAdmittedBusinessTurn: async (input: any) => { state.fork(input.ds, input.payload, { turnId: input.turnId, resume: input.resume }); return true; },
   getCurrentCliVersion: () => 'test',
+}));
+vi.mock('../src/core/session-manager.js', async importOriginal => ({
+  ...await importOriginal<Record<string, unknown>>(),
+  resolveIngressWorkspace: async () => ({ status: 'resolved', workspace: { path: process.cwd(), dev: '1', ino: '1' }, mutation: { workingDir: process.cwd(), source: 'bot-default' } }),
 }));
 vi.mock('../src/services/message-queue.js', () => ({ ensureQueue: vi.fn() }));
 vi.mock('../src/services/groups-store.js', async importOriginal => ({

@@ -123,6 +123,15 @@ async function main(): Promise<void> {
   else if (scope.action === 'failed') logger.warn(`[supervisor] staying in ${scope.unit}: could not create an own systemd scope (${scope.reason})`);
 
   logger.info(`[supervisor] starting fleet: ${botCount} bot(s) + dashboard`);
+  // Existing daemons (upgrade/recovery) are fenced before migration. On a cold
+  // start there are no active daemon targets, but the durable restart block is
+  // still acquired before any child can spawn.
+  const migration = await supervisor.migrateWorkspaceSchema();
+  if (migration.status === 'owned_elsewhere') {
+    logger.info(`[supervisor] fleet is already owned by pid ${migration.supervisorPid}; duplicate exits`);
+    process.exit(0);
+  }
+  logger.info(`[supervisor] workspace schema epoch ${migration.epoch} is complete`);
   if (!supervisor.start(members)) {
     // Another live supervisor already owns the fleet (two `botmux start`s
     // overlapped, e.g. the autostart watchdog and a slow first start). It keeps

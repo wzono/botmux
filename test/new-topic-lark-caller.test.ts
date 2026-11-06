@@ -148,7 +148,7 @@ async function runCase(name: string, options: Record<string, any> = {}) {
     },
     localeForBot: () => 'en', runDetachedBotTurnAdmission: async (_app: string, fn: () => any) => fn(),
     join, existsSync: () => !options.missingSubdir, pathBasename: basename,
-    sessionStore: { updateSession: noop }, AutoWorktreeFailClosedError: class extends Error {},
+    sessionStore: { updateSession: noop }, repinSessionWorkingDir: noop, AutoWorktreeFailClosedError: class extends Error {},
     activeSessionKey: () => 'test-key', withBotTurnMutation: async (_app: string, fn: () => any) => fn(),
     sessionCliId: () => ds.session.cliId, getAvailableBots: async () => [], ensureSessionWhiteboard: noop,
     buildNewTopicCliInput: () => ({ content: 'test prompt' }), sessionPromptInjection: () => undefined,

@@ -40,7 +40,7 @@ export async function bindOncall(
 ): Promise<{ ok: true; entry: OncallChat; created: boolean } | { ok: false; reason: string }> {
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
-  const next: OncallChat = { chatId, workingDir };
+  const next: OncallChat = { chatId, workingDir, provenance: 'oncall-explicit' };
 
   const r = await rmwBotEntry<{ created: boolean }>(larkAppId, (entry) => {
     const cur: any[] = Array.isArray(entry.oncallChats) ? entry.oncallChats : [];
@@ -334,7 +334,7 @@ export async function autoBindOncallFromDefault(
 > {
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
-  const next: OncallChat = { chatId, workingDir };
+  const next: OncallChat = { chatId, workingDir, provenance: 'oncall-default-auto' };
 
   type Result =
     | { kind: 'bound'; created: boolean }

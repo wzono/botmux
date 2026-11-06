@@ -86,4 +86,3 @@ Commit message: `fix(feedback): 按真实回合终态结算表情`
 
 Freeze the new SHA and ask the reviewer to verify the `/th` startup race, exact success/failure
 mapping, type-ahead isolation, focused tests and clean build. Do not integrate or deploy.
-

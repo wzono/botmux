@@ -86,6 +86,8 @@ import { normalizePromptCacheConfig, type PromptCacheConfig } from './services/p
 import { normalizeLinkRefConfig } from './services/link-ref-config.js';
 import type { LinkRefConfig } from './services/link-ref-types.js';
 import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
+import { normalizeFeedbackPresentation } from './services/feedback-presentation.js';
+import type { FeedbackPresentationConfig } from './services/feedback-extension-types.js';
 import type { FeedbackWebhookDestination } from './services/feedback-outbox.js';
 import {
   normalizeReplyStyleConfig,
@@ -1259,6 +1261,8 @@ export interface OncallChat {
   chatId: string;
   /** Default working directory used for every new topic spawned in this chat. */
   workingDir: string;
+  /** Missing means a legacy/manual binding and is treated conservatively as explicit. */
+  provenance?: 'oncall-explicit' | 'oncall-default-auto';
 }
 
 /**
@@ -1468,6 +1472,7 @@ export interface BotConfig {
   dispatchLaunchPolicy?: import('./core/dispatch-launch-contract.js').DispatchLaunchPolicyV1;
   /** Final-answer feedback policy. Missing/disabled is intentionally inert. */
   feedback?: FeedbackPolicyInput | FeedbackPolicy;
+  feedbackPresentation?: FeedbackPresentationConfig;
   oncallGroup?: OncallGroupPolicy;
   /** Opt-in defaults for explicit /g group creation. */
   groupCreation?: GroupCreationDefaults;
@@ -1666,8 +1671,9 @@ export interface BotConfig {
    * 系统提示不再提及 `botmux send`、不再注入每轮 reminder；solo 会话（私聊 / 仅
    * owner 的 1v1 群）还会去掉 `<user_message>` 壳与 `<sender/>`。只对有转写采集
    * 的 CLI 有效（见 core/reply-delivery.ts），不支持的 CLI 运行时自动回落 send。
-   * 缺省为 `send`（`defaultReplyDeliveryFor`）；显式 `'send'` / `'transcript'`
-   * 都持久化。系统提示部分需 /restart 生效，逐轮信封立即生效。
+   * 缺省见 `defaultReplyDeliveryFor`（doubao 缺省 transcript，其余 CLI 缺省 send）；
+   * 显式 `'send'` / `'transcript'` 都持久化。系统提示部分需 /restart 生效，逐轮
+   * 信封立即生效。
    */
   replyDelivery?: 'send' | 'transcript';
   turnResults?: { enabled: boolean };
@@ -2917,7 +2923,8 @@ export function getOwnerOpenId(larkAppId: string): string | undefined {
 }
 
 /** Per-bot 最终回复投递方式的**显式**配置值；未配置 / 未注册的 bot 返回 undefined，
- *  由 core/reply-delivery.ts 的 effectiveReplyDelivery 补缺省 send。只读内存
+ *  由 core/reply-delivery.ts 的 effectiveReplyDelivery 按 CLI 补缺省（doubao 缺省
+ *  transcript，其余缺省 send）。只读内存
  *  registry：worker 通过 init IPC 拿冻结值，不需要磁盘 mtime 缓存。 */
 export function resolveReplyDelivery(larkAppId: string): 'send' | 'transcript' | undefined {
   const v = bots.get(larkAppId)?.config.replyDelivery;
@@ -3015,7 +3022,13 @@ function refreshRegisteredOncallChatsFromDisk(): void {
       if (Array.isArray(entry.oncallChats)) {
         for (const chat of entry.oncallChats) {
           if (chat && typeof chat.chatId === 'string' && typeof chat.workingDir === 'string') {
-            const normalized = { chatId: chat.chatId, workingDir: chat.workingDir };
+            const normalized: OncallChat = {
+              chatId: chat.chatId,
+              workingDir: chat.workingDir,
+              ...(chat.provenance === 'oncall-explicit' || chat.provenance === 'oncall-default-auto'
+                ? { provenance: chat.provenance }
+                : {}),
+            };
             botChats.push(normalized);
             chats.set(normalized.chatId, normalized);
           }
@@ -3818,6 +3831,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         .map((c: any) => ({
           chatId: c.chatId,
           workingDir: c.workingDir,
+          ...(c.provenance === 'oncall-explicit' || c.provenance === 'oncall-default-auto'
+            ? { provenance: c.provenance }
+            : {}),
         }));
     }
 
@@ -4187,6 +4203,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       feedback: entry.feedback === undefined
         ? undefined
         : normalizeFeedbackPolicyLayer(entry.feedback),
+      feedbackPresentation: entry.feedbackPresentation === undefined
+        ? undefined
+        : normalizeFeedbackPresentation(entry.feedbackPresentation),
       chatFeedbackPolicies: entry.chatFeedbackPolicies && typeof entry.chatFeedbackPolicies === 'object' && !Array.isArray(entry.chatFeedbackPolicies)
         ? Object.fromEntries(Object.entries(entry.chatFeedbackPolicies).map(([chatId, layer]) => [chatId, normalizeFeedbackPolicyLayer(layer)]))
         : undefined,

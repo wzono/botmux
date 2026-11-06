@@ -8,6 +8,8 @@ export interface PtyHandle {
   /** `false` means the backend rejected the write before it could confirm
    * delivery. Callers must not silently promote that result to success. */
   write(data: string): void | boolean;
+  /** Remote backends resolve this at the serialized dispatch edge. */
+  writeBusinessInput?(data: string): Promise<'submitted' | 'retryable_pre_dispatch_rejection'>;
   /** Send text literally via tmux send-keys -l (tmux mode only).
    *  Returns `false` when the backend could not confirm the write (for example,
    *  send-keys timed out while the pane stayed alive). Delivery may still have
@@ -844,6 +846,13 @@ export interface CliAdapter {
    *  The ambiguous item is never replayed by this fence; only later queued
    *  inputs survive for explicit recovery. */
   readonly quarantineUnconfirmedSubmits?: boolean;
+
+  /** This CLI renders the codex_core hook-review / migration pages recognised
+   *  by `classifyStuckPage` (utils/stuck-detector.ts). Opts the session into
+   *  the "CLI is stuck" card: queued input is held off any of those pages and
+   *  the card offers the page's safe keys (core/stuck-page-catalog.ts).
+   *  Undefined = only the legacy hook-review input hold, never a card. */
+  readonly stuckPageFamily?: 'codex-family';
 
   /** The adapter PUBLISHES a structured `limited` screen_update from a machine
    *  rate-limit signal in its transcript (not from scraping screen text). When

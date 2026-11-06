@@ -83,6 +83,35 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
     });
     return true;
   },
+  dispatchWorkspaceAdmittedBusinessTurn: vi.fn(async (input: any) => {
+    if (!input.ds.session.workingDir && input.ds.workingDir) input.ds.session.workingDir = input.ds.workingDir;
+    if (!await input.markAttempting()) return false;
+    const opts = {
+      ...(input.dispatchAttempt === undefined ? {} : { dispatchAttempt: input.dispatchAttempt }),
+      ...(input.atMostOnce ? { atMostOnce: true } : {}),
+      ...(input.codexAppSteerable ? { codexAppSteerable: true } : {}),
+      ...(input.queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
+    };
+    if (!input.ds.worker || input.ds.worker.killed) {
+      (input as any).__beforeFork?.();
+      mockForkWorker(input.ds, input.payload, { resume: input.resume, turnId: input.turnId });
+      input.ds.initialStartPending = false;
+      input.ds.pendingPrompt = undefined;
+      return true;
+    }
+    sentInputs.calls.push({ turnId: input.turnId, opts });
+    if (sentInputs.refuse) return false;
+    if (actual.hasQueuedActivationAdmissionGate(input.ds)) {
+      return mockQueuedTailAdmission(input.ds, input.payload, input.turnId, opts);
+    }
+    input.ds.worker.send({
+      type: 'message',
+      content: typeof input.payload === 'string' ? input.payload : input.payload.content,
+      turnId: input.turnId,
+      ...(opts.dispatchAttempt === undefined ? {} : { dispatchAttempt: opts.dispatchAttempt }),
+    });
+    return true;
+  }),
   hasQueuedActivationAdmissionGate: actual.hasQueuedActivationAdmissionGate,
   admitQueuedActivationTail: actual.admitQueuedActivationTail,
   getCurrentCliVersion: vi.fn(() => 'test-cli-version'),
@@ -126,6 +155,10 @@ const mockBuildNewTopicCliInput = vi.fn((prompt: string, ...args: any[]) => ({
   codexAppInput: args[1] === 'codex-app' && args[10]?.codexAppText ? { text: args[10].codexAppText } : undefined,
 }));
 vi.mock('../src/core/session-manager.js', () => ({
+  resolveIngressWorkspace: vi.fn(async () => ({
+    status: 'resolved',
+    mutation: { workingDir: '/tmp', source: 'bot-default' },
+  })),
   buildFollowUpContent: vi.fn((prompt: string) => `follow:${prompt}`),
   buildFollowUpCliInput: (...args: any[]) => mockBuildFollowUpCliInput(...args),
   buildNewTopicPrompt: vi.fn((prompt: string) => `new:${prompt}`),
@@ -262,8 +295,9 @@ describe('main-bot wake through the real trigger', () => {
   it('no live session: a new session in the main topic, its first turn the wake', async () => {
     const runDir = seed();
     const active = new Map<string, DaemonSession>();
-    await issuerOver(active).wake.scan(RUN);
-    expect(readV3MainWakeIssued(runDir, 3)).toMatchObject({ sessionId: 'sess_new', rootMessageId: ROOT });
+    const { wake, warnings } = issuerOver(active);
+    await wake.scan(RUN);
+    expect(readV3MainWakeIssued(runDir, 3), warnings.join('\n')).toMatchObject({ sessionId: 'sess_new', rootMessageId: ROOT });
     expect(mockForkWorker).toHaveBeenCalledTimes(1);
   });
 

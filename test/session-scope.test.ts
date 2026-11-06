@@ -409,4 +409,3 @@ describe('releasing a session scope name before a fresh launch', () => {
     return base.replace('.scope', `-p${pid}g${generation}.scope`);
   }
 });
-

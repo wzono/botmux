@@ -3,7 +3,7 @@ import type { FailedTurnRecord, TrustedCaller, CliTurnPayload, Session } from '.
 import type { DaemonSession } from './types.js';
 import { activeSessionKey } from './types.js';
 import * as store from '../services/session-store.js';
-import { buildFailedTurnRecord, shouldRecordFailedTurn } from '../services/failed-turn-retry.js';
+import { buildFailedTurnRecord } from '../services/failed-turn-retry.js';
 import { isAutoCompactSafeComposerRefusal } from './auto-compact.js';
 import { canTalk } from '../im/lark/event-dispatcher.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
@@ -15,8 +15,9 @@ import { localeForBot } from '../i18n/index.js';
 import { inheritSessionLaunchConfiguration } from './session-launch-inheritance.js';
 import { armSilentScheduledTurn, disarmSilentScheduledTurn, isSilentScheduledTurn } from './silent-schedule-turns.js';
 import {
-  findActiveBySessionId, closeSessionForBackgroundCleanup, forkWorker, sendWorkerInput,
+  findActiveBySessionId, closeSessionForBackgroundCleanup,
   getActiveSessionsRegistry, setActiveSessionIfActive, prepareFailedTurnRecoveryIdentity,
+  dispatchWorkspaceAdmittedBusinessTurn,
 } from './worker-pool.js';
 
 export interface FailedTurnRecoveryRequest {
@@ -69,8 +70,7 @@ export function failedTurnCaller(ds: DaemonSession, turnId: string): TrustedCall
 /** Some structured quota failures have no turn_terminal. Record their input
  * once at the native limited edge, while the authenticated turn still exists. */
 export function recordLimitedFailedTurn(ds: DaemonSession, turnId: string | undefined): void {
-  if (!turnId || !ds.usageLimit?.limited || ds.session.lastFailedTurn?.turnId === turnId
-      || !shouldRecordFailedTurn({ turnId, status: 'failed' }, ds.currentReplyTarget?.turnId)) return;
+  if (!turnId || ds.lastCliInputTurnId !== turnId || !ds.usageLimit?.limited || ds.session.lastFailedTurn?.turnId === turnId) return;
   const caller = failedTurnCaller(ds, turnId);
   if (!caller) return;
   const record = buildFailedTurnRecord({ turnId, status: 'failed', errorCode: `${ds.usageLimit.kind}_limited` }, {
@@ -111,7 +111,7 @@ export function recordFailedTurnTerminal(
   // state, not a failed human turn. Recording it would reuse ds.lastCliInput
   // from the previous human turn and make /retry replay already-completed work.
   if (isAutoCompactSafeComposerRefusal(terminal)) return;
-  if (!shouldRecordFailedTurn(terminal, ds.currentReplyTarget?.turnId)
+  if (ds.lastCliInputTurnId !== terminal.turnId
       || ds.session.lastFailedTurn?.turnId === terminal.turnId && ds.session.lastFailedTurn.recovery) return;
   const record = buildFailedTurnRecord({ ...terminal, status: terminal.status }, {
     userPrompt: ds.lastUserPrompt, cliInput: ds.lastCliInput, codexAppInput: ds.lastCodexAppInput,
@@ -137,7 +137,7 @@ function newerInput(ds: DaemonSession, record: FailedTurnRecord): boolean {
     || hasProtectedSessionMutationOwnership(ds)
     || !!ds.pendingPrompt || !!ds.pendingFollowUps?.length || !!ds.pendingFollowUpTurnIds?.length
     || !!ds.activeInteractiveTurn && ds.activeInteractiveTurn.turnId !== record.turnId
-    || !!ds.currentReplyTarget?.turnId && ds.currentReplyTarget.turnId !== record.turnId
+    || !!ds.lastCliInputTurnId && ds.lastCliInputTurnId !== record.turnId
     || ds.lastMessageAt > Date.parse(record.failedAt)
     || ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'analyzing';
 }
@@ -193,7 +193,9 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
         ds.session.lastFailedTurn = record;
         store.updateSession(ds.session);
       };
-      // Throws before close/IPC when persistence is unavailable.
+      // Persist the claim before fresh teardown. This is not business
+      // `attempting`; the admitted callback below persists that state again only
+      // after workspace proof and a typed permit, immediately before IPC.
       persistRecord();
       const setState = (state: NonNullable<FailedTurnRecord['recovery']>['state']) => {
         record.recovery!.state = state;
@@ -227,13 +229,12 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
           const created = store.createSession(ds.chatId, ds.session.rootMessageId, ds.session.title,
             ds.chatType, ds.scope, { source: 'other', inherit: ds.session });
           created.larkAppId = ds.larkAppId;
-          inheritSessionLaunchConfiguration(ds.session, created);
+          inheritSessionLaunchConfiguration(ds.session, created, ds.workingDir ?? ds.session.workingDir);
           for (const name of ['ownerOpenId', 'ownerUnionId', 'creatorOpenId', 'lastCallerOpenId',
             'larkThreadId', 'whiteboardId', 'quoteTargetId',
             'quoteTargetSenderOpenId', 'quoteTargetSenderIsBot'] as const) {
             if (name in ds.session) (created as unknown as Record<string, unknown>)[name] = structuredClone(ds.session[name as keyof Session]);
           }
-          created.workingDir = ds.workingDir ?? ds.session.workingDir;
           target = { session: created, worker: null, workerPort: null, workerToken: null,
             larkAppId: ds.larkAppId, chatId: ds.chatId, chatType: ds.chatType, scope: ds.scope,
             workingDir: created.workingDir, spawnedAt: Date.now(), cliVersion: ds.cliVersion,
@@ -253,9 +254,15 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
           [turnId]: { ...priorReply, rootMessageId: priorReply?.rootMessageId ?? ds.session.rootMessageId,
             senderOpenId: caller.requestUserOpenId, participants: priorReply?.participants ?? [{ openId: caller.requestUserOpenId, isBot: false }], updatedAt: new Date().toISOString() } };
         target.activeInteractiveTurn = { turnId, caller: recoveredCaller, userPrompt: record.userPrompt };
-        target.currentReplyTarget = { rootMessageId: priorReply?.rootMessageId ?? ds.session.rootMessageId,
-          turnId, updatedAt: new Date().toISOString() };
-        target.session.currentReplyTarget = { ...target.currentReplyTarget };
+        // The mutable reply cursor belongs only to chat-scope routing. Thread
+        // ingress updates replyTargets but never advances this cursor; recovery
+        // must not manufacture chat routing state for a thread session.
+        target.currentReplyTarget = target.scope === 'chat'
+          ? { rootMessageId: priorReply?.rootMessageId ?? ds.session.rootMessageId,
+            turnId, updatedAt: new Date().toISOString() }
+          : undefined;
+        target.session.currentReplyTarget = target.currentReplyTarget
+          ? { ...target.currentReplyTarget } : undefined;
         const codexAppInput = record.codexAppInput
           ? (({ clientUserMessageId: _oldId, ...input }) => input)(record.codexAppInput) : undefined;
         const input: CliTurnPayload = request.mode === 'fresh'
@@ -269,21 +276,35 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
             ...(codexAppInput.localImages ? { localImages: structuredClone(codexAppInput.localImages) } : {}) };
         }
         store.updateSession(target.session);
-        persistRecord();
         await prepareFailedTurnRecoveryIdentity(target, turnId);
         if (record.silent) armSilentScheduledTurn(target, turnId);
-        // Synchronous final check + worker admission is the linearization edge.
+        // Cancellation is checked again after workspace proof, before submission.
         if (transaction.cancelled) { abandonUndispatched(); return setState('cancelled'); }
-        let rejected = false;
-        ipcAttempted = true;
-        const accepted = target.worker && !target.worker.killed
-          ? sendWorkerInput(target, input, turnId, { trustedCaller: recoveredCaller, atMostOnce: true })
-          : forkWorker(target, input, { resume: request.mode === 'retry' && target.hasHistory,
-            turnId, trustedCaller: recoveredCaller, atMostOnce: true }, {
-            onAdmission: admission => { rejected = admission === 'rejected'; },
-          });
-        if (!accepted || rejected) return setState('dispatch_unknown');
-        rememberLastCliInput(target, record.userPrompt, input);
+        const accepted = await dispatchWorkspaceAdmittedBusinessTurn({
+          ds: target,
+          turnId,
+          payload: input,
+          resume: request.mode === 'retry' && target.hasHistory,
+          trustedCaller: recoveredCaller,
+          atMostOnce: true,
+          onIpcDispatchAttempted: () => { ipcAttempted = true; },
+          markAttempting: async () => {
+            if (transaction.cancelled) return false;
+            persistRecord();
+            return true;
+          },
+        });
+        if (!accepted) {
+          if (ipcAttempted) return setState('dispatch_unknown');
+          if (transaction.cancelled) return setState('cancelled');
+          // Admission rejected before IPC: release this claim so the same failed
+          // turn remains retryable after the workspace/follow condition heals.
+          record.recovery = undefined;
+          persistRecord();
+          abandonUndispatched();
+          return { ok: false, error: 'workspace_admission_rejected' };
+        }
+        rememberLastCliInput(target, record.userPrompt, input, turnId);
         store.updateSession(target.session);
         return setState('accepted');
       } catch {

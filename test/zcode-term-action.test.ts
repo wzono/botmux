@@ -69,6 +69,7 @@ function harness(
     traexQuotaPending: undefined,
     emitReadyCodexTurns: vi.fn(),
     runAfterAmbiguousSubmissionWrites: async (_backend: unknown, action: () => unknown) => action(),
+    canWriteTerminalBytes: () => true,
   };
   const factory = new Function('state', `with (state) { ${slice}; return { handleTermAction }; }`);
   const handler = factory(state) as { handleTermAction: (key: string) => Promise<void> };

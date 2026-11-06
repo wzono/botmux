@@ -50,4 +50,3 @@ terminal ownership。
 - type-ahead A/B 通过逐 turn 持久反馈行独立结算。
 - 持久反馈状态机与相关回归测试通过，build 通过。
 - 新固定 SHA 经非作者限定复核后才可进入集成/发布流程。
-

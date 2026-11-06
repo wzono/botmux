@@ -1,3 +1,4 @@
+import { forkManualTurn } from '../../core/manual-turn-dispatch.js';
 import { isCodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
 import { botAcceptsLaunchModel } from '../../core/launch-model-capability.js';
 import { randomUUID } from 'node:crypto';
@@ -99,8 +100,10 @@ import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
-import { fallbackTurnId, rehomeReplyTargetState } from '../../core/reply-target.js';
+import { fallbackTurnId, rehomeReplyTargetState, inheritTurnReplyRouting } from '../../core/reply-target.js';
 import { sendWorkerIpc } from '../../core/worker-ipc.js';
+import { stuckPageOptionAt, type StuckPageOption } from '../../core/stuck-page-catalog.js';
+import { decideStuckKeyClick } from '../../core/stuck-warning-card.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
 import { activeSessionKey, sessionKey, sessionAnchorId, frozenDisplayMode, markRepoCardConsumed, isActiveRepoCard, larkTransportEnabled } from '../../core/types.js';
@@ -109,7 +112,7 @@ import { readPrincipalLaneTurnBinding } from '../../core/principal-lane-turn.js'
 import { buildTerminalUrl, platformTerminalReadEntryActive } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, restoreDeletedWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
-import { repinSessionWorkingDir } from '../../core/session-cwd.js';
+import { repinSessionWorkingDir, setSessionWorkingDirMetadata } from '../../core/session-cwd.js';
 import { answerRestartWithoutWorkingDir, reclaimUnstartedOpening, recoveryCardForm, workingDirRecoveryPending } from '../../core/working-dir-recovery.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
 import { handleCommand } from '../../core/command-handler.js';
@@ -138,6 +141,11 @@ import { hasProtectedSessionMutationOwnership } from '../../core/session-mutatio
 import { persistPendingRepoCardMessageId } from '../../core/pending-repo-journal.js';
 import { runDetachedBotTurnAdmission, withBotTurnMutation, tryWithBotTurnMutation } from '../../core/bot-turn-mutation-gate.js';
 import { isSharedAdoptSession } from '../../core/shared-adopt.js';
+import {
+  authorizeGroupWorkspaceRoute,
+  classifyGroupWorkspaceCardRoute,
+  type GroupWorkspaceRouteIntent,
+} from '../../core/group-workspace-policy.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -196,6 +204,9 @@ export interface CardHandlerDeps {
     payload?: string;
     sig?: string;
   }) => Promise<{ ok: true; chatId: string; run: () => Promise<unknown> } | { ok: false; reason: string }>;
+  /** Task-4 authorization/classification seam; the operation saga is wired later. */
+  resolveGroupWorkspaceRouteAuthority?: GroupWorkspaceCardRouteDeps['resolveAuthority'];
+  handleGroupWorkspaceRoute?: GroupWorkspaceCardRouteDeps['handleRoute'];
 }
 
 /**
@@ -214,7 +225,7 @@ export interface CardHandlerDeps {
 export interface CardActionData {
   event_id?: string;
   uuid?: string;
-  header?: { event_id?: string };
+  header?: { event_id?: string; tenant_key?: string };
   event?: { event_id?: string };
   operator?: {
     open_id?: string;
@@ -300,10 +311,132 @@ export async function resolveCardOperatorUnionId(
   }
 }
 
+export interface GroupWorkspaceCardRouteInput {
+  repoKey?: string;
+  selection?: string;
+  chatId: string;
+  callbackChatId?: string;
+  rootId?: string;
+  chatType: 'group' | 'p2p';
+  cardMessageId?: string;
+  currentRepoCardMessageId?: string;
+  operatorOpenId?: string;
+  operatorUnionId?: string;
+  tenantKey?: string;
+  actionId?: string;
+  humanProvenance?: boolean;
+}
+
+export interface GroupWorkspaceCardRouteDeps {
+  resolveAuthority: (input: GroupWorkspaceCardRouteInput) => Promise<import('../../core/group-workspace-policy.js').GroupWorkspaceRouteAuthorityResult | undefined>;
+  handleRoute: (route: GroupWorkspaceRouteIntent & {
+    source: 'card'; chatId: string; actor: import('../../services/bot-admin-unions-store.js').TenantHumanId;
+    authorityFingerprint: string; actorOpenId?: string; originMessageId: string; actionId: string;
+  }) => Promise<void> | void;
+  canRunGenericCardAction: () => boolean;
+  locale?: import('../../i18n/index.js').Locale;
+}
+
+/** Narrow card counterpart of the text pre-gate seam. It performs no saga/store write. */
+export async function tryDispatchGroupWorkspaceCardRoute(
+  input: GroupWorkspaceCardRouteInput,
+  deps: GroupWorkspaceCardRouteDeps,
+): Promise<{ status: 'dispatched' | 'switch_denied' | 'recognized_denied' | 'not_authorized' | 'not_applicable'; toast?: string }> {
+  const intent = classifyGroupWorkspaceCardRoute(input);
+  if (!intent) {
+    deps.canRunGenericCardAction();
+    return { status: 'not_applicable' };
+  }
+  const authority = await deps.resolveAuthority(input);
+  if (!authorizeGroupWorkspaceRoute(authority)) {
+    if (authority?.status === 'recognized_denied') {
+      return { status: 'recognized_denied', toast: t(`cmd.repo.group.denied_${authority.reason}`, undefined, deps.locale) };
+    }
+    deps.canRunGenericCardAction();
+    return { status: 'not_authorized' };
+  }
+  if (intent.kind === 'set' && !authority.canSwitchSession) {
+    return {
+      status: 'switch_denied',
+      toast: t('cmd.repo.group.switch_denied', undefined, deps.locale),
+    };
+  }
+  await deps.handleRoute({
+    ...intent,
+    source: 'card',
+    chatId: input.chatId,
+    actor: authority.actor,
+    authorityFingerprint: authority.configFingerprint,
+    actorOpenId: input.operatorOpenId,
+    originMessageId: input.cardMessageId!,
+    actionId: input.actionId!,
+  });
+  return { status: 'dispatched' };
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
 function tag(ds: DaemonSession): string {
   return ds.session.sessionId.substring(0, 8);
+}
+
+/**
+ * Press one stuck-card key: claim the card (a second click while the first is
+ * in flight is dropped), forward the key with the warning's nonce / CLI
+ * lifetime / page type taken from the daemon session (never from the card),
+ * and show "processing" until the worker answers with tui_keys_delivered,
+ * stuck_warning_expired or tui_prompt_submit_failed. Callers have already
+ * mapped (page type, button index) to `option` and checked who clicked.
+ */
+async function pressStuckWarningKey(
+  ds: DaemonSession,
+  option: StuckPageOption,
+  cardMessageId: string | undefined,
+): Promise<any> {
+  if (!ds.worker) return undefined;
+  if (ds.stuckWarningProcessing) {
+    logger.info(`[${tag(ds)}] Duplicate stuck-warning card click — dropped (processing already in flight)`);
+    return undefined;
+  }
+  ds.stuckWarningProcessing = true;
+  // Only Enter re-arms the detector (it advances from the hook list to a
+  // per-hook review page); t/Esc resolve or leave the page.
+  const rearmStuckDetector = option.key === 'Enter';
+  const stuckNonce = ds.stuckWarningNonce;
+  const locDs = localeForBot(ds.larkAppId);
+  const processingText = t('card.stuck.processing', undefined, locDs);
+  try {
+    await sendWorkerIpc(ds.worker, {
+      type: 'tui_keys',
+      keys: [option.key],
+      isFinal: true,
+      rearmStuckDetector,
+      stuckNonce,
+      stuckCliLifetime: ds.stuckWarningCliLifetime,
+      stuckPageType: ds.stuckWarningPageType,
+      selectedText: processingText,
+    } as DaemonToWorker);
+  } catch (err) {
+    ds.stuckWarningProcessing = false;
+    logger.warn(`[${tag(ds)}] TUI key IPC delivery failed: ${err instanceof Error ? err.message : String(err)}`);
+    return {
+      toast: {
+        type: 'warning',
+        content: t('card.action.tui_ipc_failed', undefined, locDs),
+      },
+    };
+  }
+  logger.info(`[${tag(ds)}] Stuck-warning key: [${option.key}] rearmStuck=${rearmStuckDetector} stuckNonce=${stuckNonce ?? 'none'}`);
+  // Do NOT clear authority or render success here: the worker may still
+  // refuse the key (screen changed). The card resolves on the worker's ACK.
+  const processingCard = buildTuiPromptProcessingCard(processingText, locDs);
+  if (cardMessageId) {
+    updateMessage(ds.larkAppId, cardMessageId, processingCard).catch(err =>
+      logger.debug(`[${tag(ds)}] Failed to set stuck-warning card to processing: ${err}`),
+    );
+  }
+  publishAttentionPatch(ds);
+  try { return JSON.parse(processingCard); } catch { return undefined; }
 }
 
 const LEGACY_SELF_HEAL_ACTIONS = new Set(['toggle_display', 'toggle_stream', 'refresh_screenshot']);
@@ -577,7 +710,7 @@ async function moveSessionForRecovery(
     if (hasProtectedSessionMutationOwnership(current)) return 'pending' as const;
     const suspended = !current.adoptedFrom && suspendWorker(current, 'working_dir_changed');
     if (!suspended) killWorker(current);
-    repinSessionWorkingDir(current, dirPath);
+    repinSessionWorkingDir(current, { workingDir: dirPath, source: 'explicit' });
     current.session.riffRepoDirs = riffRepoDirs;
     sessionStore.updateSession(current.session);
     markRepoCardConsumed(current, cardToWithdraw);
@@ -704,8 +837,7 @@ export async function commitRepoSelection(
       // "Start directly" launches in the resolved default cwd without pinning
       // HOME onto the session for sibling-bot inheritance.
       if (pinWorkingDir) {
-        ds.workingDir = dirPath;
-        ds.session.workingDir = dirPath;
+        repinSessionWorkingDir(ds, { workingDir: dirPath, source: 'explicit' });
       }
       // riff 多仓 stamp：只有多仓 worktree 流显式传入（保留用户选择顺序，首仓=primary）；
       // 其它选仓路径一律清除旧 stamp——workingDir 变了，旧的多仓组合不再成立。
@@ -813,14 +945,14 @@ export async function commitRepoSelection(
           codexAppInputGateFrozen: true,
         };
       }
-      if (pendingRawInput) rememberLastCliInput(ds, pendingRawInput, pendingRawInput);
-      else if (hasBufferedInput && wrappedInput) rememberLastCliInput(ds, pendingPrompt, wrappedInput);
+      if (pendingRawInput) rememberLastCliInput(ds, pendingRawInput, pendingRawInput, ds.pendingRawTurnId ?? ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId);
+      else if (hasBufferedInput && wrappedInput) rememberLastCliInput(ds, pendingPrompt, wrappedInput, ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId);
       // Keep the reservation and every buffered opening field intact through
       // forkWorker's synchronous pre-accept/write-ahead phase. If it throws,
       // the user can retry this exact selection without losing the first turn.
       const pendingTurnId = ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId;
       if (!emptyStart && pendingTurnId) await prepareTurn?.(ds, pendingTurnId);
-      forkWorker(
+      const accepted = forkWorker(
         ds,
         prompt,
         !emptyStart && !pendingRawInput && pendingTurnId ? {
@@ -828,6 +960,7 @@ export async function commitRepoSelection(
           ...(ds.pendingTrustedCaller ? { trustedCaller: ds.pendingTrustedCaller } : {}),
         } : false,
       );
+      if (accepted === false) return false;
       ds.pendingRepo = false;
       // A queued activation owns the route through its adapter-level ACK. Every
       // buffer below was synchronously folded into prompt N and is safe to clear;
@@ -993,8 +1126,9 @@ export async function commitRepoSelection(
         current.session = session;
         current.lastUserPrompt = undefined;
         current.lastCliInput = undefined;
+        current.lastCliInputTurnId = undefined;
         current.workingDir = dirPath;
-        session.workingDir = dirPath;
+        setSessionWorkingDirMetadata(session, { workingDir: dirPath, source: 'explicit' });
         session.larkAppId = current.larkAppId;
         session.chatDisplayName = oldSession.chatDisplayName;
         session.ownerOpenId = oldSession.ownerOpenId;
@@ -1013,7 +1147,9 @@ export async function commitRepoSelection(
         current.lastScreenContent = undefined;
         current.lastScreenStatus = undefined;
         activeSessions.set(key, current);
-        forkWorker(current, '', false);
+        if (forkWorker(current, '', false) === false) {
+          return { ok: false as const, reason: 'start_refused' as const };
+        }
         // Brand-new CLI in a brand-new session record: the next real business
         // message is its new-topic first turn (same invariant as the pending path).
         markInitialUserTurnPending(current);
@@ -2009,10 +2145,14 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     return handleCompletionProposalAction(data, larkAppId, deps.completionProposalDeps);
   }
 
-  if (['feedback_submit', 'feedback_reason', 'feedback_comment', 'skill_feedback_submit'].includes(value?.action ?? '') && larkAppId) {
+  if (['feedback_custom_action', 'feedback_submit', 'feedback_reason', 'feedback_comment', 'skill_feedback_submit'].includes(value?.action ?? '') && larkAppId) {
     const { handleSkillFeedbackCardAction } = await import('./skill-feedback-card.js');
     const { getSkillFeedbackStore } = await import('../../services/skill-feedback-store.js');
     const { config } = await import('../../config.js');
+    const { handleFeedbackExtensionCard } = await import('../../services/feedback-extension-host.js');
+    const extension = await handleFeedbackExtensionCard(data, larkAppId, config.session.dataDir);
+    if (extension !== undefined) return extension;
+    if (value?.action === 'feedback_custom_action') return { toast: { type: 'error', content: '动作不存在或已失效' } };
     return handleSkillFeedbackCardAction(data, larkAppId, {
       store: await getSkillFeedbackStore(config.session.dataDir),
       loadBaseCard: async (platformMessageId) => {
@@ -2365,16 +2505,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     let accepted = false;
     try {
       if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, cliInput, turnId);
-      // Cold session: fork a worker with the transcript as its opening input,
-      // matching how retry_last_task revives a dead worker. `forkWorker` throws
-      // on refusal rather than returning a flag, so acceptance is claimed only
-      // after it returns — the earlier `accepted = true` before the call would
-      // have reported success for a fork that never happened, with the
-      // one-shot follow-up token already consumed and no retry affordance.
-      else {
-        forkWorker(ds, cliInput, ds.hasHistory);
-        accepted = true;
-      }
+      else accepted = forkManualTurn(ds, cliInput, turnId, forkWorker);
     } catch (err) {
       logger.warn(`[${tag(ds)}] /quote injection threw: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -2393,7 +2524,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     // only ever driven through /quote would keep that flag forever — final text
     // answers still arrive, but its streaming card is permanently dead with no
     // visible cause and no way for the user to revive it.
-    rememberLastCliInput(ds, transcript.text, cliInput);
+    rememberLastCliInput(ds, transcript.text, cliInput, turnId);
     ds.lastScreenStatus = 'working';
     ds.streamCardPending = true;
     ds.currentTurnId = turnId;
@@ -3305,8 +3436,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       try {
         if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, voiceInput);
         else {
-          forkWorker(ds, voiceInput, ds.hasHistory);
-          accepted = true;
+          accepted = forkWorker(ds, voiceInput, ds.hasHistory);
         }
       } catch (err) {
         logger.warn(
@@ -3878,12 +4008,13 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         await sessionReply(rootId, t('card.action.retry_last_task_unavailable', undefined, locDs));
         return;
       }
+      const retryTurnId = `retry-${randomUUID()}`;
+      const rollbackReplyRouting = inheritTurnReplyRouting(ds, ds.lastCliInputTurnId, retryTurnId);
       let accepted = false;
       try {
-        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput);
+        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput, retryTurnId);
         else {
-          forkWorker(ds, retryInput, ds.hasHistory);
-          accepted = true;
+          accepted = forkManualTurn(ds, retryInput, retryTurnId, forkWorker);
         }
       } catch (err) {
         logger.warn(
@@ -3892,9 +4023,12 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         );
       }
       if (!accepted) {
+        rollbackReplyRouting();
+        sessionStore.updateSession(ds.session);
         await sessionReply(rootId, t('card.action.retry_last_task_unavailable', undefined, locDs));
         return;
       }
+      rememberLastCliInput(ds, ds.lastUserPrompt ?? cliInput, retryInput, retryTurnId);
       // Only now consume the one-shot retry state and advertise working: live
       // IPC or the durable activation tail already owns the exact retry input.
       clearUsageLimitState(ds);
@@ -4040,12 +4174,13 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         // 带上旧 sidecar 会让 CLI 收到与正文不符的结构化载荷。
         ...(!continueMode && retryCodexAppInput ? { codexAppInput: retryCodexAppInput } : {}),
       };
+      const retryTurnId = `retry-${randomUUID()}`;
+      const rollbackReplyRouting = inheritTurnReplyRouting(ds, failedTurn.turnId, retryTurnId);
       let accepted = false;
       try {
-        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput);
+        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput, retryTurnId);
         else {
-          forkWorker(ds, retryInput, ds.hasHistory);
-          accepted = true;
+          accepted = forkManualTurn(ds, retryInput, retryTurnId, forkWorker);
         }
       } catch (err) {
         logger.warn(
@@ -4054,12 +4189,14 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         );
       }
       if (!accepted) {
+        rollbackReplyRouting();
+        sessionStore.updateSession(ds.session);
         return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
       }
       // Start the cooldown only after acceptance: a rejected click must not
       // burn it (same post-acceptance ordering as /retry and retry_last_task).
       markRetryAttempt(ds.session);
-      rememberLastCliInput(ds, failedTurn.userPrompt, retryInput);
+      rememberLastCliInput(ds, failedTurn.userPrompt, retryInput, retryTurnId);
       sessionStore.updateSession(ds.session);
       ds.lastScreenStatus = 'working';
       ds.streamCardPending = true;
@@ -4082,6 +4219,48 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           ),
         },
       };
+    }
+
+    // Safe keys on the "CLI is stuck on a blocking page" card. Deliberately
+    // NOT in SENSITIVE_CARD_ACTIONS: the turn initiator (often a talk-only
+    // member) must be able to press the keys that only decline/skip; the gate
+    // is decideStuckKeyClick (core/stuck-warning-card.ts). The key comes from
+    // the catalog by (active page type, button index) — the card names none.
+    if (actionType === 'stuck_key' && ds) {
+      const locDs = localeForBot(ds.larkAppId);
+      if (isSessionTransferring(ds)) {
+        return {
+          toast: {
+            type: 'warning',
+            content: t('cmd.session.transfer_in_progress', undefined, locDs),
+          },
+        };
+      }
+      const decision = decideStuckKeyClick({
+        cardMessageId,
+        activeCardId: ds.stuckWarningCardId,
+        valueNonce: value?.nonce,
+        activeNonce: ds.stuckWarningNonce,
+        pageType: ds.stuckWarningPageType,
+        rawIndex: value?.selected_index,
+        operatorOpenId,
+        initiatorOpenId: ds.stuckWarningInitiatorOpenId,
+        // Global Dashboard switch, read live at click time: off = operators only.
+        initiatorKeysEnabled: config.stuckCardInitiatorKeys !== false,
+        operatorIsAdmin: () => canOperate(ds.larkAppId, ds.chatId, operatorOpenId),
+        operatorCanTalk: () => canTalk(
+          ds.larkAppId, ds.chatId, operatorOpenId, undefined, data?.operator?.union_id, ds.chatType,
+        ),
+      });
+      if (decision.kind === 'drop') {
+        logger.info(`[${tag(ds)}] stuck_key click dropped (${decision.reason}): card=${cardMessageId ?? 'none'} active=${ds.stuckWarningCardId ?? 'none'} nonce=${value?.nonce ?? 'none'}/${ds.stuckWarningNonce ?? 'none'} index=${value?.selected_index ?? 'none'}`);
+        return;
+      }
+      if (decision.kind === 'deny') {
+        logger.info(`[${tag(ds)}] stuck_key refused for ${operatorOpenId ?? 'unknown'} (index=${value?.selected_index})`);
+        return { toast: { type: 'warning', content: t(decision.toastKey, undefined, locDs) } };
+      }
+      return pressStuckWarningKey(ds, decision.option, cardMessageId);
     }
 
     if (actionType === 'purge_images_continue' && ds) {
@@ -4128,13 +4307,15 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
       }
       const submittedContent = buildTurnContinuePrompt();
+      const purgeTurnId = `purge-${randomUUID()}`;
+      const rollbackReplyRouting = inheritTurnReplyRouting(ds, failedTurn.turnId, purgeTurnId);
       let accepted = false;
       try {
         if (ds.worker && !ds.worker.killed) {
           // Same turnId handling as retry_turn: do NOT reuse failedTurn.turnId —
           // that om_ id is a committed ordinary turn and the worker would dedupe
           // it before reaching the purge branch.
-          accepted = sendWorkerInput(ds, { content: submittedContent }, undefined, {
+          accepted = sendWorkerInput(ds, { content: submittedContent }, purgeTurnId, {
             purgeUndersizedImages: true,
           });
         } else {
@@ -4149,10 +4330,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         );
       }
       if (!accepted) {
+        rollbackReplyRouting();
         return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
       }
       markRetryAttempt(ds.session);
-      rememberLastCliInput(ds, failedTurn.userPrompt, { content: submittedContent });
+      rememberLastCliInput(ds, failedTurn.userPrompt, { content: submittedContent }, purgeTurnId);
       sessionStore.updateSession(ds.session);
       ds.lastScreenStatus = 'working';
       ds.streamCardPending = true;
@@ -4187,24 +4369,39 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         logger.info(`[${tag(ds)}] tui_keys from stale card ${cardMessageId} — ignored (active tui=${ds.tuiPromptCardId ?? 'none'} stuck=${ds.stuckWarningCardId ?? 'none'})`);
         return;
       }
+      // Stuck-warning card (only reached by operators here: `tui_keys` is
+      // behind the canOperate card gate; the same card's `stuck_key` buttons
+      // have their own gate). Derive the single allowed key from the page
+      // type + selected index via the catalog the card was built from —
+      // NEVER trust value.keys / value.is_final / option_type, which could be
+      // tampered. A missing/malformed/out-of-range index resolves to nothing,
+      // never to a default (index 0 is "trust" on the hook pages). Toggle
+      // state belongs to the ScreenAnalyzer card only.
+      if (isActiveStuckCard) {
+        if ((value?.option_type ?? 'select') === 'toggle') {
+          logger.info(`[${tag(ds)}] Ignored toggle from non-TUI card ${cardMessageId}`);
+          return;
+        }
+        const option = stuckPageOptionAt(ds.stuckWarningPageType, value?.selected_index);
+        if (!option) {
+          logger.info(`[${tag(ds)}] Stuck-warning card click with invalid selected_index=${value?.selected_index ?? 'none'} for pageType=${ds.stuckWarningPageType ?? 'none'} — dropped`);
+          return;
+        }
+        return pressStuckWarningKey(ds, option, cardMessageId);
+      }
+
       let keys: string[] = [];
       try { keys = JSON.parse(value?.keys ?? '[]'); } catch { /* bad json */ }
       const isFinal = value?.is_final === '1';
       const optionType = value?.option_type ?? 'select';
       const selectedIndex = Number(value?.selected_index ?? 0);
       const selectedText = value?.selected_text ?? `Option ${selectedIndex + 1}`;
-      if (isActiveTuiCard && ds.tuiPromptProcessing) {
+      if (ds.tuiPromptProcessing) {
         logger.info(`[${tag(ds)}] Duplicate TUI prompt card click — dropped (processing already in flight)`);
         return;
       }
 
       if (optionType === 'toggle') {
-        // Only a ScreenAnalyzer TUI card may own toggle state. A stuck-warning
-        // card must never read or mutate the other card's global selections.
-        if (!isActiveTuiCard) {
-          logger.info(`[${tag(ds)}] Ignored toggle from non-TUI card ${cardMessageId}`);
-          return;
-        }
         // Toggle: only update card UI, do NOT send keys to terminal yet.
         // Keys will be sent in batch when confirm is clicked.
         if (!ds.tuiToggledIndices) ds.tuiToggledIndices = [];
@@ -4233,15 +4430,10 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       }
 
       // For a normal TUI confirm: batch all toggled options' keys first.
-      // For a stuck-warning card: derive the single allowed key from the
-      // page type + selected index — NEVER trust value.keys from the card,
-      // which could be tampered to inject arbitrary keys. The allowlist is
-      // exactly the documented controls for each Codex hook-review screen.
       if (ds.worker) {
-        let allKeys: string[] = [];
-        let isFinalStuck = false;
+        const allKeys: string[] = [];
         let dispatchedKeys = false;
-        if (isActiveTuiCard && ds.tuiToggledIndices?.length && ds.tuiPromptOptions) {
+        if (ds.tuiToggledIndices?.length && ds.tuiPromptOptions) {
           // Send each toggled option's keys in sequence
           for (const ti of ds.tuiToggledIndices.sort((a, b) => a - b)) {
             const opt = ds.tuiPromptOptions[ti];
@@ -4249,96 +4441,27 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
               allKeys.push(...opt.keys);
             }
           }
-          // Then the action's own keys (confirm/select)
-          allKeys.push(...keys);
-        } else if (isActiveStuckCard) {
-          // P1-4: do NOT trust the callback's selected_index. Require it to be
-          // present and a safe integer, then range-check against the page type's
-          // option count. A missing/malformed index must NOT default to 0 (trust),
-          // which is the highest-risk action.
-          const rawIdx = value?.selected_index;
-          if (rawIdx === undefined || rawIdx === null || rawIdx === '') {
-            logger.info(`[${tag(ds)}] Stuck-warning card click missing selected_index — dropped`);
-            return;
-          }
-          const idx = Number(rawIdx);
-          if (!Number.isSafeInteger(idx)) {
-            logger.info(`[${tag(ds)}] Stuck-warning card click with non-integer selected_index=${rawIdx} — dropped`);
-            return;
-          }
-          // Allowlist: map (pageType, idx) → the one safe key.
-          // Level 1: 0=t, 1=Enter, 2=Esc ; Level 2: 0=t, 1=Esc
-          const pt = ds.stuckWarningPageType;
-          const allowlist = pt === 'hook review level 1'
-            ? ['t', 'Enter', 'Escape']
-            : pt === 'hook review level 2'
-              ? ['t', 'Escape']
-              : null;
-          if (!allowlist || idx < 0 || idx >= allowlist.length) {
-            logger.info(`[${tag(ds)}] Stuck-warning card click with out-of-range index ${idx} for pageType=${pt ?? 'none'} — dropped`);
-            return;
-          }
-          allKeys = [allowlist[idx]];
-          // Stuck-card actions are always final (they resolve the current
-          // hook-review screen). Define this server-side — do NOT trust
-          // value.is_final from the callback.
-          isFinalStuck = true;
-        } else {
-          // Non-stuck, non-TUI card (shouldn't happen given the active-card
-          // guard above, but fail-closed).
-          allKeys.push(...keys);
         }
+        // Then the action's own keys (confirm/select)
+        allKeys.push(...keys);
 
+        const resolveText = ds.tuiToggledIndices?.length
+          ? ds.tuiToggledIndices.map(i => ds.tuiPromptOptions?.[i]?.text).filter(Boolean).join(', ')
+          : selectedText;
         if (allKeys.length > 0) {
-          const effectiveFinal = isFinal || isFinalStuck;
-          // Atomic processing claim: if a previous click is already in flight
-          // (waiting for tui_keys_delivered / stuck_warning_expired ACK), drop
-          // this duplicate. Without this, two rapid clicks could both pass the
-          // fresh-capture guard and inject keys twice.
-          if (isActiveStuckCard) {
-            if (ds.stuckWarningProcessing) {
-              logger.info(`[${tag(ds)}] Duplicate stuck-warning card click — dropped (processing already in flight)`);
-              return;
-            }
-            ds.stuckWarningProcessing = true;
-          }
-          if (isActiveTuiCard && effectiveFinal) {
-            ds.tuiPromptProcessing = true;
-          }
-          // Only the stuck-warning card's Enter action re-arms the detector
-          // (Enter advances from the hook list to a per-hook review). Match by
-          // the actual keys sent — NOT by optionType, since t is typed 'confirm'
-          // in the card definition. t/Esc and all ScreenAnalyzer cards never
-          // set this flag. Also require the source card to be our own.
-          const isStuckWarningEnter = isActiveStuckCard
-            && allKeys.length === 1
-            && allKeys[0] === 'Enter';
-          // If this click is from a stuck-warning card, forward the nonce,
-          // cliLifetime, and page type so the worker can re-verify the current
-          // screen still matches before injecting keys. A stale click (CLI
-          // recovered) will be dropped at the worker boundary.
-          const stuckNonce = isActiveStuckCard ? ds.stuckWarningNonce : undefined;
-          const stuckCliLifetime = isActiveStuckCard ? ds.stuckWarningCliLifetime : undefined;
-          const stuckPage = isActiveStuckCard ? ds.stuckWarningPageType : undefined;
-          const resolveText = isActiveTuiCard && ds.tuiToggledIndices?.length
-            ? ds.tuiToggledIndices.map(i => ds.tuiPromptOptions?.[i]?.text).filter(Boolean).join(', ')
-            : selectedText;
+          if (isFinal) ds.tuiPromptProcessing = true;
           try {
             await sendWorkerIpc(ds.worker, {
               type: 'tui_keys',
               keys: allKeys,
-              isFinal: effectiveFinal,
-              rearmStuckDetector: isStuckWarningEnter,
-              stuckNonce,
-              stuckCliLifetime,
-              stuckPageType: stuckPage,
-              cardMessageId: isActiveTuiCard ? cardMessageId : undefined,
+              isFinal,
+              rearmStuckDetector: false,
+              cardMessageId,
               selectedText: resolveText || selectedText,
             } as DaemonToWorker);
             dispatchedKeys = true;
           } catch (err) {
-            if (isActiveStuckCard) ds.stuckWarningProcessing = false;
-            if (isActiveTuiCard && effectiveFinal) ds.tuiPromptProcessing = false;
+            if (isFinal) ds.tuiPromptProcessing = false;
             logger.warn(`[${tag(ds)}] TUI key IPC delivery failed: ${err instanceof Error ? err.message : String(err)}`);
             return {
               toast: {
@@ -4347,32 +4470,13 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
               },
             };
           }
-          logger.info(`[${tag(ds)}] TUI keys: [${allKeys.join(',')}] final=${effectiveFinal} rearmStuck=${isStuckWarningEnter} stuckNonce=${stuckNonce ?? 'none'} — "${selectedText}"`);
+          logger.info(`[${tag(ds)}] TUI keys: [${allKeys.join(',')}] final=${isFinal} — "${selectedText}"`);
         }
 
-        if ((isFinal || isFinalStuck) && dispatchedKeys) {
-          const resolveText = isActiveTuiCard && ds.tuiToggledIndices?.length
-            ? ds.tuiToggledIndices.map(i => ds.tuiPromptOptions?.[i]?.text).filter(Boolean).join(', ')
-            : selectedText;
+        if (isFinal && dispatchedKeys) {
           const finalText = resolveText || selectedText;
           const locDs = localeForBot(ds.larkAppId);
-          // For a stuck-warning card, do NOT clear authority or render success
-          // here. The worker may still reject the keys (stale screen). We show a
-          // "processing" state to block duplicate clicks, and wait for the
-          // worker's tui_keys_delivered (success), stuck_warning_expired
-          // ("page changed, not sent"), or tui_prompt_submit_failed ACK before
-          // resolving the card.
-          if (isActiveStuckCard) {
-            if (cardMessageId) {
-              const processingCard = buildTuiPromptProcessingCard('处理中…', locDs);
-              updateMessage(ds.larkAppId, cardMessageId, processingCard).catch(err =>
-                logger.debug(`[${tag(ds)}] Failed to set stuck-warning card to processing: ${err}`),
-              );
-            }
-            publishAttentionPatch(ds);
-            try { return JSON.parse(buildTuiPromptProcessingCard('处理中…', locDs)); } catch { /* fall through */ }
-          }
-          // Normal TUI prompt cards also remain in processing until the worker
+          // Normal TUI prompt cards remain in processing until the worker
           // confirms backend delivery via tui_prompt_resolved. A worker/backend
           // rejection produces tui_prompt_submit_failed instead.
           publishAttentionPatch(ds);
@@ -5428,9 +5532,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     return;
   }
 
-  // Handle dropdown selections (option-based)
-  const option = action?.option;
-  if (!option) {
+  // Handle dropdown selections (option-based). The reserved group-unbind
+  // callback is button-shaped and therefore intentionally carries no option.
+  const reservedGroupWorkspaceUnbind = action?.value?.key === 'group_workspace_unbind';
+  const option = reservedGroupWorkspaceUnbind ? '' : action?.option;
+  if (!reservedGroupWorkspaceUnbind && !option) {
     logger.warn('Card action received but no option or action value');
     return;
   }
@@ -5504,19 +5610,22 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
 
   // Handle repo select card (option-based dropdowns: plain switch, or
   // `repo_worktree` = create a worktree from the picked repo and open that).
+  // `group_workspace_unbind` is a reserved authenticated callback contract for
+  // Task 4. It intentionally reuses the exact current repo-card capability and
+  // does not appear in the UI until the later operation coordinator exists.
   // Require an explicit, recognized key: botmux's own dropdowns always set
   // `repo_switch` / `repo_worktree` (card-builder.ts). Treating a keyless
   // `option + root_id` as a plain switch let a hand-crafted card drive the
   // session's working dir to an arbitrary path — reject anything unrecognized.
   const repoKey = action?.value?.key;
-  if (repoKey !== 'repo_switch' && repoKey !== 'repo_worktree') {
+  if (repoKey !== 'repo_switch' && repoKey !== 'repo_worktree' && repoKey !== 'group_workspace_unbind') {
     logger.warn(`Card action: unrecognized repo dropdown key ${repoKey ?? '(none)'} — ignoring`);
     return;
   }
   const isWorktreeOpen = repoKey === 'repo_worktree';
   const selectedPath = option;
   const rootId = action?.value?.root_id;
-  logger.info(`Card action: repo ${isWorktreeOpen ? 'worktree-open' : 'switch'} to ${selectedPath} (root_id: ${rootId})`);
+  logger.info(`Card action: repo ${repoKey === 'group_workspace_unbind' ? 'group-unbind' : isWorktreeOpen ? 'worktree-open' : 'switch'} to ${selectedPath} (root_id: ${rootId})`);
 
   if (!rootId) {
     logger.warn('Card action: no root_id in action value');
@@ -5545,6 +5654,43 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         content: t('card.repo.toast_stale_picker', undefined, localeForBot(targetDs.larkAppId)),
       },
     };
+  }
+
+  // A top-level regular-group picker may use the same stable-human pre-gate as
+  // text `/repo`. Exact current-card capability was proven above. The dedicated
+  // route owns the action completely; non-matches retain the existing gate.
+  if (deps.resolveGroupWorkspaceRouteAuthority && deps.handleGroupWorkspaceRoute && larkAppId) {
+    const groupRoute = await tryDispatchGroupWorkspaceCardRoute({
+      repoKey,
+      selection: selectedPath,
+      chatId: targetDs.chatId,
+      callbackChatId: data.context?.open_chat_id,
+      rootId,
+      chatType: targetDs.chatType,
+      cardMessageId,
+      currentRepoCardMessageId: targetDs.repoCardMessageId,
+      operatorOpenId,
+      operatorUnionId: data.operator?.union_id,
+      // The callback header is signed by Lark together with the receiving app.
+      // Never accept the mutable action value (or a flattened synthetic field)
+      // as tenant authority.
+      tenantKey: data.header?.tenant_key,
+      actionId: data.event_id ?? data.header?.event_id ?? data.event?.event_id,
+      // Card callbacks expose an SDK-verified human operator envelope rather than sender_type.
+      humanProvenance: !!operatorOpenId,
+    }, {
+      resolveAuthority: deps.resolveGroupWorkspaceRouteAuthority,
+      handleRoute: deps.handleGroupWorkspaceRoute,
+      canRunGenericCardAction: () => false,
+      locale: localeForBot(larkAppId),
+    });
+    if (groupRoute.status === 'dispatched') return;
+    if (groupRoute.status === 'switch_denied' || groupRoute.status === 'recognized_denied') {
+      return { toast: { type: 'error', content: groupRoute.toast } };
+    }
+  }
+  if (repoKey === 'group_workspace_unbind') {
+    return { toast: { type: 'error', content: '群目录解绑未通过专用授权路由，本次未写入群目录。' } };
   }
 
   // 权限边界：pendingRepo（首次选 repo 才能 spawn）放行「会话发起人 或 canOperate」，

@@ -31,6 +31,13 @@ const wp = vi.hoisted(() => ({
 vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: wp.forkWorker,
   sendWorkerInput: wp.sendWorkerInput,
+  dispatchWorkspaceAdmittedBusinessTurn: vi.fn(async (input: any) => {
+    if (!await input.markAttempting()) return false;
+    if (input.ds.worker && !input.ds.worker.killed) return wp.sendWorkerInput(input.ds, input.payload, input.turnId,
+      input.trustedCaller ? { trustedCaller: input.trustedCaller } : {});
+    wp.forkWorker(input.ds, input.payload, input.turnId);
+    return true;
+  }),
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
   withActiveSessionKeyLock: vi.fn(async (_map: Map<string, any>, _key: string, action: () => any) => action()),
   setActiveSessionIfActive: vi.fn((map: Map<string, any>, key: string, ds: any) => {

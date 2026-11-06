@@ -156,6 +156,7 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
 vi.mock('../src/core/session-manager.js', () => ({
   ensureSessionWhiteboard: vi.fn(),
   persistStreamCardState: vi.fn(),
+  getSessionWorkingDir: (ds?: DaemonSession) => ds?.workingDir ?? ds?.session.workingDir ?? REPO,
 }));
 
 vi.mock('../src/core/dashboard-events.js', () => ({
@@ -245,6 +246,7 @@ import {
   sendWorkerInput,
   admitQueuedActivationTail,
   setActiveSessionsRegistry,
+  setWorkspaceAdmittedBusinessTurnDispatcher,
   suspendWorker,
   currentGatewayCallerOpenId,
   __testOnly_setSuspendBackingVerifier,
@@ -280,7 +282,7 @@ import { config } from '../src/config.js';
 import { setLinkRefRuntime, type LinkRefRuntime } from '../src/services/link-ref-runtime.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { retireCodexAppDispatchAfterBackingMissing } from '../src/utils/codex-app-dispatch-ledger.js';
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -289,7 +291,14 @@ import { join } from 'node:path';
 // back to $HOME), and a fixed path like `/repo` exists on some hosts but not on
 // CI, which is how a missing-directory failure once hid behind a green local run.
 const REPO = mkdtempSync(join(tmpdir(), 'botmux-lifecycle-repo-'));
-afterAll(() => { rmSync(REPO, { recursive: true, force: true }); });
+const disposeWorkspaceAdmissionMock = setWorkspaceAdmittedBusinessTurnDispatcher(async input => {
+  if (!await input.markAttempting?.()) return false;
+  return sendWorkerInput(input.ds, input.payload, input.turnId, input.options);
+});
+afterAll(() => {
+  disposeWorkspaceAdmissionMock();
+  rmSync(REPO, { recursive: true, force: true });
+});
 
 function makeFakeWorker() {
   const worker = new EventEmitter() as any;
@@ -2264,15 +2273,47 @@ describe('TraeX task continuation', () => {
       eligible: true,
     });
 
+    const workspacePath = realpathSync(REPO);
+    const workspaceStat = statSync(workspacePath, { bigint: true });
     expect(ds.session.readonlyTaskContinuation).toMatchObject({
       logicalTurnId: 'om_original',
       currentTurnId: 'om_original',
       currentWorkerGeneration: ds.workerGeneration,
+      workspaceIdentity: {
+        path: workspacePath,
+        dev: String(workspaceStat.dev),
+        ino: String(workspaceStat.ino),
+      },
       status: 'active',
       authorizationMode: 'inherited',
       startMode: 'automatic',
       trustedCaller,
     });
+  });
+
+  it('refuses automatic lease arming when the admitted turn directory is missing', () => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.activeInteractiveTurn = { turnId: 'om_original', caller: trustedCaller };
+    ds.managedTurnOrigin = { capability: 'capability', turnId: 'om_original' };
+    ds.workingDir = ds.session.workingDir = join(REPO, 'missing-continuation-dir');
+
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof',
+      eligible: true,
+    });
+
+    expect(ensureAutomaticTaskContinuationLease(ds)).toBe(false);
+    expect(ds.session.readonlyTaskContinuation).toBeUndefined();
+    expect(vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.turnId?.startsWith('bmx-continuation-'))).toHaveLength(0);
   });
 
   it('settles an automatically armed normal completion after a default progress reply', async () => {

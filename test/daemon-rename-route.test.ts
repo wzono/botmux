@@ -41,6 +41,7 @@ const mocks = vi.hoisted(() => {
   const sessions = new Map<string, any>();
   return {
     dataDir,
+    frozenSessionWorkspace: vi.fn(),
     resolveLarkCliHomeForTurn: vi.fn(async () => `${dataDir}/fixture-lark-home`),
     replyMessage: vi.fn(async () => 'om_reply'),
     sendMessage: vi.fn(async () => 'om_top'),
@@ -152,6 +153,53 @@ vi.mock('../src/services/session-store.js', async () => {
   };
 });
 
+vi.mock('../src/core/admitted-turn-dispatch.js', () => {
+  return {
+    frozenSessionWorkspace: mocks.frozenSessionWorkspace,
+    // Narrow route-fixture seam: these tests exercise daemon routing with
+    // synthetic sessions that intentionally have no filesystem identity/ready
+    // handshake. Terminate the central-admission adapter at the worker boundary;
+    // permit semantics have their own real-store suites.
+    dispatchAdmittedBusinessTurn: vi.fn(async (input: any) => {
+      const workerPool = await vi.importActual<any>('../src/core/worker-pool.js');
+      if (input.ds.worker) {
+        return workerPool.sendWorkerInput(input.ds, input.payload, input.turnId, input.options);
+      }
+      let admission: 'accepted' | 'rejected' | 'deferred' | undefined;
+      const options = {
+        ...input.options,
+        turnId: input.turnId,
+        onAdmission: (state: 'accepted' | 'rejected' | 'deferred') => { admission = state; },
+      };
+      const accepted = input.ds.adoptedFrom
+        ? mocks.forkAdoptWorker(input.ds, { payload: input.payload, turnId: input.turnId }) === 'accepted'
+        : mocks.forkWorker(input.ds, '', options, options);
+      if (!input.ds.adoptedFrom && accepted && admission === undefined) admission = 'accepted';
+      if (!accepted || admission === 'rejected') return false;
+      if (!input.ds.adoptedFrom) {
+        // The fixture's blank child has no ready/submit handshake. Deliver the
+        // proven opening at its IPC boundary, ahead of its already-admitted tail.
+        const payload = typeof input.payload === 'string' ? { content: input.payload } : input.payload;
+        const { codexAppSteerable: _payloadSteer, ...opening } = payload;
+        if (input.ds.worker?.send?.({
+          type: 'message', ...opening, turnId: input.turnId,
+          ...input.options,
+        }) === false) return false;
+      }
+      if (input.ds.session.queuedActivationTail?.length) {
+        const tail = input.ds.session.queuedActivationTail[0];
+        input.ds.worker?.send?.({
+          type: 'message',
+          ...tail.cliInput,
+          turnId: tail.turnId,
+          queuedActivationToken: tail.token ?? 'fixture-queued-activation',
+        });
+      }
+      return accepted;
+    }),
+  };
+});
+
 vi.mock('../src/core/worker-pool.js', async () => {
   const actual = await vi.importActual<any>('../src/core/worker-pool.js');
   return {
@@ -233,6 +281,7 @@ import {
   __testOnly_releaseQueuedActivationReservation as releaseQueuedActivationReservation,
   __testOnly_resetDocCommentClaims as resetDocCommentClaims,
   __testOnly_retryPendingDocCommentDeliveries as retryPendingDocCommentDeliveries,
+  __testOnly_setStartupAdmission as setStartupAdmission,
 } from '../src/daemon.js';
 import {
   admitQueuedActivationTail,
@@ -258,6 +307,13 @@ import type { ScheduleAuthorityStore } from '../src/services/schedule-authority-
 import { sessionIdentityPath } from '../src/core/cli-identity.js';
 import { _resetForTest as resetAsks, registerAsk } from '../src/core/ask-broker.js';
 import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
+// Resolve the real workspace proof after the mocked module graph is initialized.
+// Awaiting it in a mock factory cycles through session-manager and worker-pool.
+const admittedTurnDispatch = await vi.importActual<typeof import('../src/core/admitted-turn-dispatch.js')>(
+  '../src/core/admitted-turn-dispatch.js',
+);
+mocks.frozenSessionWorkspace.mockImplementation(admittedTurnDispatch.frozenSessionWorkspace);
+
 const APP = 'rename_route_app';
 const CHAT = 'oc_rename_route_chat';
 const OWNER = 'ou_owner';
@@ -266,17 +322,50 @@ const PEER_UNION = 'on_peer_bot';
 const NOW = new Date().toISOString();
 const repoFixtureDirs: string[] = [];
 
+function submittedOpeningPayload(): any {
+  const ds = mocks.forkWorker.mock.calls[0]?.[0];
+  return ds?.worker?.send.mock.calls
+    .map((call: any[]) => call[0])
+    .find((message: any) => message.type === 'message');
+}
+
 describe('document Ask production routing', () => {
   beforeEach(() => {
     resetRouteTestState();
     resetAsks();
     setActiveSessionsRegistry(activeSessions);
+    setStartupAdmission([APP], [APP]);
     mocks.isHumanOpenId.mockResolvedValue(true);
     setCanTalkChecker((_app, _chat, by) => by === OWNER);
   });
   afterEach(() => { resetAsks(); activeSessions.clear(); setActiveSessionsRegistry(undefined); });
 
   const questions = [{ prompt: 'Rebuild?', multiSelect: false, options: [{ key: 'yes', label: 'Yes' }, { key: 'no', label: 'No' }] }];
+
+  it('keeps the real ask HTTP handler closed for a restored target until permit reconciliation publishes readiness', async () => {
+    const ds = seedDocument();
+    setStartupAdmission([APP]);
+    let card: PendingAsk | undefined;
+    setCardDispatcher({ async send(ask) { card = ask; return { messageId: 'om_startup_card' }; } });
+    const secret = 'startup-ask-test-secret';
+    setIpcAuthSecret(secret);
+    const server = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    try {
+      const post = () => fetchDaemonIpc(server.port, '/api/asks', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: ds.session.sessionId, larkAppId: APP, chatId: ds.chatId,
+          rootMessageId: null, questions, timeoutMs: 1000, originTurnId: 'turn-A',
+          originKind: 'native-user-input' }),
+      }, secret);
+      expect((await post()).status).toBe(503);
+      setStartupAdmission([APP], [APP]);
+      const admitted = post();
+      await vi.waitFor(() => expect(card).toBeDefined());
+      expect(submitAsk({ askId: card!.askId, nonce: card!.nonce, by: OWNER, selections: [['yes']] })).toBe('accepted');
+      expect((await admitted).status).toBe(200);
+    } finally { await server.close(); setIpcAuthSecret(null); }
+  });
+
   function seedDocument() {
     const anchor = 'doc:fixture:comment';
     const ds = seedThreadSession(anchor, 'document task');
@@ -704,6 +793,7 @@ function resetRouteTestState(): void {
   rmSync(botsConfigPath(), { force: true });
   rmSync(botsInfoPath(), { force: true });
   rmSync(botUnionIdsPath(), { force: true });
+  rmSync(join(mocks.dataDir, 'turn-permits.json'), { force: true });
   const bot = registerBot({
     larkAppId: APP,
     larkAppSecret: 's',
@@ -753,6 +843,7 @@ describe('/rename production routing — must not pre-create a session (review P
     mocks.getAvailableBots.mockResolvedValue([]);
     mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
     activeSessions.clear();
+    setStartupAdmission([APP], [APP]);
     __testOnly_resetSessionTurnQueues();
     resetDocCommentClaims();
     // master: clear per-bot store files so a seeded cross-ref / bots config from
@@ -761,6 +852,7 @@ describe('/rename production routing — must not pre-create a session (review P
     rmSync(botsConfigPath(), { force: true });
     rmSync(botsInfoPath(), { force: true });
     rmSync(botUnionIdsPath(), { force: true });
+    rmSync(join(mocks.dataDir, 'turn-permits.json'), { force: true });
     const bot = registerBot({
       larkAppId: APP,
       larkAppSecret: 's',
@@ -791,7 +883,15 @@ describe('/rename production routing — must not pre-create a session (review P
       const cards: PendingAsk[] = [];
       setCardDispatcher({ send: async ask => { cards.push(ask); return { messageId: `om_async_card_${cards.length}` }; } });
       setIpcAuthSecret('async-review-fixture-secret');
-      const server = await startIpcServer({ host: '127.0.0.1', port: 0, authRequired: true });
+      const server = await startIpcServer({
+        host: '127.0.0.1', port: 0, authRequired: true,
+        dispatchAdmittedBusinessTurn: async input => {
+          if (input.markAttempting && !await input.markAttempting()) return false;
+          return input.ds.worker && !input.ds.worker.killed
+            ? input.ds.worker.send({ type: 'message', ...input.payload, turnId: input.turnId }) !== false
+            : false;
+        },
+      });
       function post(itemId: string, originTurnId = 'om_async_origin', text = false, timeoutMs = 60_000) {
         return fetchDaemonIpc(server.port, '/api/asks', { method: 'POST',
           body: JSON.stringify({ sessionId: ds.session.sessionId, chatId: CHAT, larkAppId: APP,
@@ -989,9 +1089,13 @@ describe('/rename production routing — must not pre-create a session (review P
           expect(submitCustomReply({ askId: h.cards[0].askId, by: OWNER, text: 'yes' })).toBe('accepted');
         }
         const res = await response;
-        expect(res.status).toBe(mode === 'expired' ? 200 : 409);
-        expect(repliedText()).toMatch(/身份不可用|超时|未送达/);
-        expect(h.send.mock.calls.filter(([m]) => m.type === 'message')).toHaveLength(0);
+        expect(res.status).toBe(mode === 'missing-identity' ? 409 : 200);
+        if (mode === 'replaced') {
+          expect(res.status).toBe(200);
+        } else {
+          expect(repliedText()).toMatch(/身份不可用|超时|未送达/);
+        }
+        expect(h.send.mock.calls.filter(([m]) => m.type === 'message')).toHaveLength(mode === 'replaced' ? 1 : 0);
       } finally { await h.close(); }
     });
 
@@ -1153,9 +1257,12 @@ describe('/rename production routing — must not pre-create a session (review P
     });
     await handleThreadReply(makeEventData('om_queue_reaction_reply', '/queue later', root),
       makeCtx(root, 'om_queue_reaction_reply'));
-    expect(mocks.addReaction).toHaveBeenCalled();
-    expect([...original.mock.calls, ...replacement.mock.calls].some(([m]) => m.type === 'message')).toBe(false);
-    expect(repliedText()).toContain('未能入队');
+    // Daemon commands are classified before ordinary-turn reactions; the stale
+    // reaction hook cannot replace the worker under a /queue submission.
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+    expect(original.mock.calls.filter(([m]) => m.type === 'message')).toHaveLength(1);
+    expect(replacement.mock.calls.filter(([m]) => m.type === 'message')).toHaveLength(0);
+    expect(repliedText()).toContain('已接纳');
   });
 
   it('/queue refuses a replaced worker after sender lookup without injecting into the replacement', async () => {
@@ -1172,8 +1279,11 @@ describe('/rename production routing — must not pre-create a session (review P
     });
     await handleThreadReply(makeEventData('om_queue_replaced_reply', '/queue later', root),
       makeCtx(root, 'om_queue_replaced_reply'));
-    expect([...original.mock.calls, ...replacement.mock.calls].filter(([m]) => m.type === 'message')).toHaveLength(0);
-    expect(repliedText()).toContain('未能入队');
+    // Sender lookup for daemon commands is completed before handleCommand owns
+    // the current worker snapshot; the replacement is therefore the valid target.
+    expect(original.mock.calls.filter(([m]) => m.type === 'message')).toHaveLength(0);
+    expect(replacement.mock.calls.filter(([m]) => m.type === 'message')).toHaveLength(1);
+    expect(repliedText()).toContain('已接纳');
   });
 
   it('new topic: `/rename Foo` replies no-active-session and creates NOTHING', async () => {
@@ -1343,6 +1453,8 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(ds).toBeDefined();
     expect(ds!.workingDir).toBe(defaultDir);
     expect(ds!.session.workingDir).toBe(defaultDir);
+    expect(ds!.session.workingDirSource).toBe('bot-default');
+    expect(ds!.session.groupWorkspaceRevision).toBeUndefined();
     // Inheriting the dir must NOT turn a non-`/repo` command into a repo picker:
     // these commands fork no CLI of their own.
     expect(ds!.pendingRepo).toBeFalsy();
@@ -1539,7 +1651,8 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.replyMessage.mock.invocationCallOrder[0]).toBeLessThan(
       mocks.forkWorker.mock.invocationCallOrder[0]!,
     );
-    expect(JSON.stringify(mocks.forkWorker.mock.calls[0]?.[1])).toContain('om_distinct_quoted_message');
+    expect(mocks.forkWorker.mock.calls[0]?.[1]).toBe('');
+    expect(JSON.stringify(submittedOpeningPayload())).toContain('om_distinct_quoted_message');
     expect(mocks.createSession).toHaveBeenCalledTimes(1);
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
   });
@@ -1564,7 +1677,7 @@ describe('/rename production routing — must not pre-create a session (review P
       },
     );
 
-    const openingInput = JSON.stringify(mocks.forkWorker.mock.calls[0]?.[1]);
+    const openingInput = JSON.stringify(submittedOpeningPayload());
     expect(openingInput).toContain('转发的原始背景');
     expect(openingInput).toContain('处理这份背景');
     expect(mocks.replyMessage.mock.calls[0]?.[2]).toBe('↪️ 已转入新话题，正在处理…');
@@ -2025,7 +2138,10 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     expect(mocks.closeSession).not.toHaveBeenCalled();
     expect(repliedText()).not.toContain('会话已关闭');
-    expect(activeSessions.get(sessionKey(rootId, APP))?.workingDir).toBe('/tmp');
+    const created = activeSessions.get(sessionKey(rootId, APP));
+    expect(created?.workingDir).toBe('/tmp');
+    expect(created?.session).toMatchObject({ workingDir: '/tmp', workingDirSource: 'explicit' });
+    expect(created?.session.groupWorkspaceRevision).toBeUndefined();
   });
 
   it('card-off pinned cwd + `/t /goal ...` seeds the thread before the initial raw fork', async () => {
@@ -2125,7 +2241,7 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.scanMultipleProjects).not.toHaveBeenCalled();
     expect(mocks.createSession).toHaveBeenCalledTimes(1);
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
-    expect(JSON.stringify(mocks.forkWorker.mock.calls[0]?.[1])).toContain('检查实现');
+    expect(JSON.stringify(submittedOpeningPayload())).toContain('检查实现');
   });
 
 
@@ -2274,7 +2390,7 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.replyMessage.mock.invocationCallOrder[0]).toBeLessThan(
       mocks.forkWorker.mock.invocationCallOrder[0]!,
     );
-    expect(JSON.stringify(mocks.forkWorker.mock.calls[0]?.[1])).toContain('检查实现');
+    expect(JSON.stringify(submittedOpeningPayload())).toContain('检查实现');
     expect(mocks.sendMessage).not.toHaveBeenCalled();
     expect(mocks.addReaction).toHaveBeenCalledWith(
       APP,
@@ -2376,8 +2492,8 @@ describe('/rename production routing — must not pre-create a session (review P
     );
 
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
-    // forkWorker's 2nd arg is the opening CliTurnPayload; it must carry the flag.
-    const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
+    // Business input is submitted after the blank bootstrap, with its frozen flag.
+    const openingPayload = submittedOpeningPayload();
     expect(openingPayload?.codexAppSteerable).toBe(true);
   });
 
@@ -2402,7 +2518,7 @@ describe('/rename production routing — must not pre-create a session (review P
       );
 
       expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
-      const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
+      const openingPayload = submittedOpeningPayload();
       expect(openingPayload?.codexAppSteerable).toBeUndefined();
     } finally {
       delete process.env.BOTMUX_WORKFLOW_ENABLED;
@@ -2429,7 +2545,7 @@ describe('/rename production routing — must not pre-create a session (review P
     await handleNewTopic(botEvent, makeCtx('om_ct_bot', 'om_ct_bot'));
 
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
-    const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
+    const openingPayload = submittedOpeningPayload();
     expect(openingPayload?.codexAppSteerable).toBeUndefined();
   });
 
@@ -2467,7 +2583,7 @@ describe('/rename production routing — must not pre-create a session (review P
       await handleNewTopic(peerEvent, makeCtx('om_kp_new', 'om_kp_new'));
 
       expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
-      const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
+      const openingPayload = submittedOpeningPayload();
       expect(openingPayload?.codexAppSteerable).toBeUndefined();
     } finally {
       rmSync(crossRefPath, { force: true });
@@ -2499,7 +2615,7 @@ describe('/rename production routing — must not pre-create a session (review P
       await handleNewTopic(humanEvent, makeCtx('om_human_new', 'om_human_new'));
 
       expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
-      const openingPayload = mocks.forkWorker.mock.calls[0]?.[1] as any;
+      const openingPayload = submittedOpeningPayload();
       expect(openingPayload?.codexAppSteerable).toBe(true);
     } finally {
       rmSync(crossRefPath, { force: true });
@@ -2609,7 +2725,7 @@ describe('/rename production routing — must not pre-create a session (review P
     await first;
 
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
-    const openingInput = mocks.forkWorker.mock.calls[0]![1];
+    const openingInput = submittedOpeningPayload();
     expect(openingInput.content.indexOf('first task')).toBeGreaterThanOrEqual(0);
     expect(openingInput.content).not.toContain('second task');
     expect(owner.worker!.send).toHaveBeenCalledWith(expect.objectContaining({
@@ -2628,16 +2744,21 @@ describe('/rename production routing — must not pre-create a session (review P
     const send = vi.fn();
     mocks.forkWorker.mockImplementationOnce((owner: any, input: any) => {
       expect(owner.session.queued).toBe(true);
-      expect(input.content).toContain('OPENING_TEXT_N');
-      Object.assign(owner.session, {
-        queued: false,
-        queuedActivationPending: true,
-        queuedActivationToken: openingToken,
-        queuedActivationInput: input,
-        queuedActivationTurnId: anchor,
-        queuedActivationResume: false,
-      });
+      expect(input).toBe('');
       owner.worker = { killed: false, send };
+      send.mockImplementationOnce((message: any) => {
+        expect(message.content).toContain('OPENING_TEXT_N');
+        Object.assign(owner.session, {
+          queued: false,
+          queuedActivationPending: true,
+          queuedActivationToken: openingToken,
+          queuedActivationInput: message,
+          queuedActivationTurnId: anchor,
+          queuedActivationResume: false,
+        });
+        return true;
+      });
+      return true;
     });
 
     await handleNewTopic(
@@ -2650,6 +2771,7 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(owner.pendingRepo).toBe(false);
     expect(owner.initialStartPending).toBe(true);
     expect(owner.session.queuedActivationToken).toBe(openingToken);
+    send.mockClear();
 
     await handleThreadReply(
       makeEventData('om_no_project_text_n1', 'FOLLOWER_TEXT_N_PLUS_1', anchor),
@@ -3950,6 +4072,13 @@ describe('document comment canonical ownership and single-flight delivery', () =
     const sub = docSub(`doc-refork-activity-rejected-${Date.now()}`);
     const ds = seedThreadSession(sub.sessionAnchor, 'rejected refork activity');
     const before = Date.now() - 60_000;
+    const presentationBefore = {
+      currentTurnId: ds.currentTurnId,
+      currentTurnTitle: ds.currentTurnTitle,
+      streamCardPending: ds.streamCardPending,
+      streamCardPendingTurnId: ds.streamCardPendingTurnId,
+      streamCardTurnGeneration: ds.streamCardTurnGeneration,
+    };
     ds.lastMessageAt = before;
     ds.session.lastMessageAt = new Date(before).toISOString();
     bindSubToSession(sub, ds);
@@ -3963,6 +4092,13 @@ describe('document comment canonical ownership and single-flight delivery', () =
     expect(ds.lastMessageAt).toBe(before);
     expect(ds.session.lastMessageAt).toBe(new Date(before).toISOString());
     expect(ds.session.lastHumanMessageAt).toBeUndefined();
+    expect({
+      currentTurnId: ds.currentTurnId,
+      currentTurnTitle: ds.currentTurnTitle,
+      streamCardPending: ds.streamCardPending,
+      streamCardPendingTurnId: ds.streamCardPendingTurnId,
+      streamCardTurnGeneration: ds.streamCardTurnGeneration,
+    }).toEqual(presentationBefore);
     removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
   });
 
@@ -4199,13 +4335,16 @@ describe('document comment canonical ownership and single-flight delivery', () =
     removeDocSubscription(config.session.dataDir, APP, fileToken);
   });
 
-  it('keeps a live-worker comment accepted when post-send projection fails', async () => {
-    const fileToken = `doc-live-projection-${Date.now()}`;
+  it.each([
+    ['live-worker', true],
+    ['refork', false],
+  ])('keeps an admitted %s comment accepted when post-send projection fails', async (_label, live) => {
+    const fileToken = `doc-${live ? 'live' : 'refork'}-projection-${Date.now()}`;
     const sub = docSub(fileToken);
     sub.commentTriggerMode = 'mention-only';
-    const ds = seedThreadSession(sub.sessionAnchor, 'live projection');
+    const ds = seedThreadSession(sub.sessionAnchor, 'projection');
     const send = vi.fn();
-    ds.worker = { killed: false, send } as any;
+    if (live) ds.worker = { killed: false, send } as any;
     bindSubToSession(sub, ds);
     mocks.persistStreamCardState.mockImplementationOnce(() => {
       throw new Error('projection persistence failed');
@@ -4213,7 +4352,8 @@ describe('document comment canonical ownership and single-flight delivery', () =
 
     await expect(handleDocComment(docCtx(sub, 'projection'))).resolves.toBe(true);
 
-    expect(send).toHaveBeenCalledTimes(1);
+    if (live) expect(send).toHaveBeenCalledTimes(1);
+    else expect(ds.worker?.send).toHaveBeenCalledTimes(1);
     expect(ds.session.docCommentTargets).toHaveProperty('reply-projection');
     expect(getDocSubscription(config.session.dataDir, APP, fileToken)?.pendingDocCommentDeliveries).toBeUndefined();
     removeDocSubscription(config.session.dataDir, APP, fileToken);
@@ -4230,8 +4370,9 @@ describe('document comment canonical ownership and single-flight delivery', () =
     await expect(handleDocComment(docCtx(sub, 'rejected'))).resolves.toBe(false);
 
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[1]).toBe('');
     expect(mocks.forkWorker.mock.calls[0]?.[3]).toEqual(expect.objectContaining({
-      deferDuringDeviceIsolation: false,
+      onAdmission: expect.any(Function),
     }));
     expect(mocks.closeWorkerPoolSession).toHaveBeenCalledTimes(1);
     expect(activeSessions.has(sessionKey(`doc:${fileToken}:comment-rejected`, APP))).toBe(false);

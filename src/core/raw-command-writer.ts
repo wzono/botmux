@@ -16,6 +16,53 @@ export interface RawCommandWriteOptions {
   pasteSettleMs?: number;
   submitBeatMs?: number;
   delay?: (ms: number) => Promise<void>;
+  isCurrent?: () => boolean;
+}
+
+/** Type one literal input line WITHOUT submitting it.
+ *
+ * Split out of `writeRawCommandLine` for callers that must re-check the screen
+ * between the typed text and the submitting Enter (a TUI popup that appears in
+ * that window would otherwise receive the Enter). Mirrors the same delivery
+ * choreography — the CoCo keystroke throttle, the paste-line settle, and the
+ * generic text-then-beat — but stops before the submit key. Kept next to the
+ * submitting variant so the two cannot drift. */
+export async function typeRawCommandLine(
+  backend: RawCommandWriter,
+  content: string,
+  opts: RawCommandWriteOptions = {},
+): Promise<boolean> {
+  const delay = opts.delay ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  const beatMs = opts.submitBeatMs ?? 200;
+  const sendText = backend.sendText?.bind(backend);
+  const pasteText = backend.pasteText?.bind(backend);
+
+  if (backend.sendSpecialKeys) {
+    if (opts.coco && sendText) {
+      const cmd = content.trim();
+      const typed = cmd.includes(' ') ? cmd : `${cmd} `;
+      for (const ch of typed) {
+        if (sendText(ch) === false) return false;
+        await delay(opts.cocoThrottleMs ?? 40);
+      }
+      await delay(beatMs);
+      return true;
+    }
+    if (opts.pasteLine && backend.supportsRawCommandPasteLine && pasteText) {
+      if (pasteText(content) === false) return false;
+      await delay(opts.pasteSettleMs ?? beatMs);
+      return true;
+    }
+    if (sendText) {
+      if (sendText(content) === false) return false;
+      await delay(beatMs);
+      return true;
+    }
+  }
+
+  if (backend.write(content) === false) return false;
+  await delay(beatMs);
+  return true;
 }
 
 /** Type one literal input line and report whether both the text and submit
@@ -37,27 +84,27 @@ export async function writeRawCommandLine(
       const cmd = content.trim();
       const typed = cmd.includes(' ') ? cmd : `${cmd} `;
       for (const ch of typed) {
-        if (sendText(ch) === false) return false;
+        if (opts.isCurrent?.() === false || sendText(ch) === false) return false;
         await delay(opts.cocoThrottleMs ?? 40);
       }
       await delay(beatMs);
-      return sendSpecialKeys('Enter') !== false;
+      return opts.isCurrent?.() !== false && sendSpecialKeys('Enter') !== false;
     }
     if (opts.pasteLine && backend.supportsRawCommandPasteLine && pasteText) {
-      if (pasteText(content) === false) return false;
+      if (opts.isCurrent?.() === false || pasteText(content) === false) return false;
       await delay(opts.pasteSettleMs ?? beatMs);
-      return sendSpecialKeys('Enter') !== false;
+      return opts.isCurrent?.() !== false && sendSpecialKeys('Enter') !== false;
     }
     if (sendText) {
-      if (sendText(content) === false) return false;
+      if (opts.isCurrent?.() === false || sendText(content) === false) return false;
       await delay(beatMs);
-      return sendSpecialKeys('Enter') !== false;
+      return opts.isCurrent?.() !== false && sendSpecialKeys('Enter') !== false;
     }
   }
 
-  if (backend.write(content) === false) return false;
+  if (opts.isCurrent?.() === false || backend.write(content) === false) return false;
   await delay(beatMs);
-  return backend.write('\r') !== false;
+  return opts.isCurrent?.() !== false && backend.write('\r') !== false;
 }
 
 export interface RawCommandDeliveryFinalizer {
