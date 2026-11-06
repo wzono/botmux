@@ -5,12 +5,13 @@
  * new node session and when an existing one is reused. Without a delegation
  * (the switch off) the turn starts exactly as before, with no identity step.
  */
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 let tempDir: string;
+let defaultWorkingDir: string;
 
 vi.mock('../src/config.js', () => ({
   config: {
@@ -25,6 +26,10 @@ vi.mock('../src/utils/logger.js', () => ({
 
 const order = vi.hoisted(() => [] as string[]);
 const wp = vi.hoisted(() => ({
+  dispatchWorkspaceAdmittedBusinessTurn: vi.fn(async (input: any) => {
+    order.push('dispatch:' + String(input.turnId));
+    return true;
+  }),
   forkWorker: vi.fn((_ds: unknown, _prompt: unknown, turnId: unknown) => { order.push(`fork:${String(typeof turnId === 'object' ? (turnId as any).turnId : turnId)}`); }),
   sendWorkerInput: vi.fn((_ds: unknown, _payload: unknown, turnId: unknown) => { order.push(`send:${String(turnId)}`); return true; }),
 }));
@@ -32,6 +37,7 @@ const wp = vi.hoisted(() => ({
 vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: wp.forkWorker,
   sendWorkerInput: wp.sendWorkerInput,
+  dispatchWorkspaceAdmittedBusinessTurn: wp.dispatchWorkspaceAdmittedBusinessTurn,
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
   withActiveSessionKeyLock: vi.fn(async (_map: Map<string, any>, _key: string, action: () => any) => action()),
   setActiveSessionIfActive: vi.fn((map: Map<string, any>, key: string, ds: any) => {
@@ -46,13 +52,14 @@ vi.mock('../src/core/worker-pool.js', () => ({
 }));
 
 vi.mock('../src/bot-registry.js', () => {
-  const bot = { config: { larkAppId: 'cli_main', cliId: 'claude-code' }, botName: '主 Bot', botOpenId: 'ou_bot' };
+  const bot = { config: { larkAppId: 'cli_main', cliId: 'claude-code',
+    get workingDir() { return defaultWorkingDir; } }, botName: '主 Bot', botOpenId: 'ou_bot' };
   return {
     getBot: vi.fn(() => bot),
     getAllBots: vi.fn(() => [bot]),
     getOwnerOpenId: vi.fn(() => undefined),
     findOncallChat: vi.fn(() => undefined),
-    effectiveDefaultWorkingDir: vi.fn(() => undefined),
+    effectiveDefaultWorkingDir: vi.fn(() => defaultWorkingDir),
   };
 });
 
@@ -68,6 +75,8 @@ vi.mock('../src/core/session-activity.js', () => ({
 import { deliverWorkflowNodeTurn } from '../src/core/session-manager.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { sessionKey } from '../src/core/types.js';
+import { setSessionWorkingDirMetadata } from '../src/core/session-cwd.js';
+import { canonicalTextSourceEventId, GroupWorkspaceStore } from '../src/services/group-workspace-store.js';
 
 const MARKER = {
   runId: 'r', nodeId: 'write', attemptId: 'write#001/attempts/001', handoffMessageId: 'om_handoff',
@@ -80,10 +89,13 @@ const INPUT = {
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'wf-self-turn-'));
+  defaultWorkingDir = join(tempDir, 'bot-default');
+  mkdirSync(defaultWorkingDir);
   sessionStore.init('cli_main');
   order.length = 0;
   wp.forkWorker.mockClear();
   wp.sendWorkerInput.mockClear();
+  wp.dispatchWorkspaceAdmittedBusinessTurn.mockClear();
 });
 afterEach(() => rmSync(tempDir, { recursive: true, force: true }));
 
@@ -98,40 +110,81 @@ describe('deliverWorkflowNodeTurn identity step', () => {
     const prepareTurnIdentity = prepare();
     await deliverWorkflowNodeTurn({ ...INPUT, prepareTurnIdentity }, new Map(), () => false);
     expect(prepareTurnIdentity).toHaveBeenCalledTimes(1);
-    expect(order).toEqual(['identity:om_handoff', 'fork:om_handoff']);
+    expect(order).toEqual(['identity:om_handoff', 'dispatch:om_handoff']);
+    expect(wp.dispatchWorkspaceAdmittedBusinessTurn).toHaveBeenCalledTimes(1);
+    expect(wp.dispatchWorkspaceAdmittedBusinessTurn.mock.calls[0]![0]).toMatchObject({
+      turnId: 'om_handoff', resume: false, markAttempting: expect.any(Function),
+    });
+    expect(wp.forkWorker).not.toHaveBeenCalled();
   });
 
   it('…and before the turn is handed to a reused node session', async () => {
     const map = new Map<string, any>();
     const session = sessionStore.createSession('oc_chat', 'om_node_card', 'node', 'group');
     session.larkAppId = 'cli_main';
+    setSessionWorkingDirMetadata(session, { workingDir: defaultWorkingDir, source: 'explicit' });
     sessionStore.updateSession(session);
     map.set(sessionKey('om_node_card', 'cli_main'), {
       session, worker: { killed: false }, larkAppId: 'cli_main', chatId: 'oc_chat', chatType: 'group', scope: 'thread',
+      workingDir: defaultWorkingDir, hasHistory: true,
     });
     const prepareTurnIdentity = prepare();
     await deliverWorkflowNodeTurn({ ...INPUT, prepareTurnIdentity }, map, () => false);
-    expect(order).toEqual(['identity:om_handoff', 'send:om_handoff']);
+    expect(order).toEqual(['identity:om_handoff', 'dispatch:om_handoff']);
+    expect(wp.dispatchWorkspaceAdmittedBusinessTurn.mock.calls[0]![0]).toMatchObject({
+      ds: { session: { workingDir: defaultWorkingDir } },
+      turnId: 'om_handoff', resume: true, markAttempting: expect.any(Function),
+    });
+    expect(wp.sendWorkerInput).not.toHaveBeenCalled();
   });
 
   it('without a delegation the turn starts as before, with no identity step', async () => {
     await deliverWorkflowNodeTurn(INPUT, new Map(), () => false);
-    expect(order).toEqual(['fork:om_handoff']);
+    expect(order).toEqual(['dispatch:om_handoff']);
+    expect(wp.dispatchWorkspaceAdmittedBusinessTurn).toHaveBeenCalledTimes(1);
+    expect(wp.forkWorker).not.toHaveBeenCalled();
   });
 });
 
 describe('deliverWorkflowNodeTurn working dir (design §15.4)', () => {
-  const forkedDs = () => wp.forkWorker.mock.calls.at(-1)![0] as { workingDir?: string; session: { workingDir?: string } };
+  const admittedDs = () => wp.dispatchWorkspaceAdmittedBusinessTurn.mock.calls.at(-1)![0].ds;
 
   it('a new node session starts in the run\'s (already checked) directory and keeps it on record', async () => {
-    await deliverWorkflowNodeTurn({ ...INPUT, workingDir: '/srv/task' }, new Map(), () => false);
-    expect(forkedDs().workingDir).toBe('/srv/task');
-    expect(forkedDs().session.workingDir).toBe('/srv/task');
+    const workingDir = join(tempDir, 'run-dir');
+    mkdirSync(workingDir);
+    await deliverWorkflowNodeTurn({ ...INPUT, workingDir }, new Map(), () => false);
+    expect(admittedDs().workingDir).toBe(workingDir);
+    expect(admittedDs().session.workingDir).toBe(workingDir);
+    expect(admittedDs().session.workingDirSource).toBe('explicit');
   });
 
   it('without one it starts where it always did (the bot\'s default)', async () => {
     await deliverWorkflowNodeTurn(INPUT, new Map(), () => false);
-    expect(forkedDs().workingDir).toBeUndefined();
-    expect(forkedDs().session.workingDir).toBeUndefined();
+    expect(admittedDs().workingDir).toBe(defaultWorkingDir);
+    expect(admittedDs().session.workingDir).toBe(defaultWorkingDir);
+    expect(admittedDs().session.workingDirSource).toBe('bot-default');
+  });
+
+  it('without a pinned directory it resolves the current group binding before the bot default', async () => {
+    const workingDir = join(tempDir, 'group-dir');
+    mkdirSync(workingDir);
+    const canonical = realpathSync(workingDir);
+    const stat = statSync(canonical, { bigint: true });
+    const workspaceIdentity = { path: canonical, dev: String(stat.dev), ino: String(stat.ino) };
+    const source = canonicalTextSourceEventId({ tenantKey: 'tenant', chatId: INPUT.chatId, messageId: 'om_group_repo' });
+    if (!source.ok) throw new Error('expected canonical group operation source');
+    const result = await new GroupWorkspaceStore(tempDir).mutate({
+      sourceEventId: source.sourceEventId, kind: 'set', chatId: INPUT.chatId,
+      requestedWorkingDir: canonical, directoryValid: true, expectedWorkspaceIdentity: workspaceIdentity,
+      expectedRevision: 0, expectedSessionGeneration: 1, authorized: true,
+      actor: { tenantKey: 'tenant', unionId: 'on_admin' }, now: Date.now(),
+    });
+    expect(result.outcome).toBe('committed');
+    await deliverWorkflowNodeTurn(INPUT, new Map(), () => false);
+    expect(admittedDs().workingDir).toBe(canonical);
+    expect(admittedDs().session).toMatchObject({
+      workingDir: canonical, workingDirSource: 'group',
+      groupWorkspaceRevision: 1, groupWorkspaceIdentity: workspaceIdentity,
+    });
   });
 });

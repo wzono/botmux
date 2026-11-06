@@ -33494,6 +33494,9 @@ async function waitForManagedActivationCommit(index: number, appId: string): Pro
 }
 
 export async function startDaemon(botIndex?: number): Promise<void> {
+  // Install before migration can await: every daemon entrypoint needs the
+  // same process-wide rejection guard throughout startup.
+  installDaemonRejectionGuard(logger);
   if (feedbackMaintenanceActive(config.session.dataDir)) {
     logger.warn('[feedback] Persisted maintenance is active. Inspect `botmux feedback storage status`; resume or cancel the original migration. New turns remain blocked until explicit recovery.');
   }
@@ -33522,8 +33525,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // missed `.catch` on one session's teardown would otherwise end every other
   // live Lark session too. The rejection is logged loudly at error level — this
   // is a backstop for the next missed `.catch`, not permission to omit them.
-  installDaemonRejectionGuard(logger);
-
   // Optional provider-neutral coordination process. `shadow` proves the
   // configured provider speaks the public contract without replacing the live
   // route. `primary` is explicitly admitted only here, where ingress,
