@@ -15,6 +15,10 @@ export const STRICT_ENV_BASELINE = [
   'LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE', 'LC_COLLATE', 'LC_MESSAGES',
   'LC_MONETARY', 'LC_NUMERIC', 'LC_TIME', 'TERM', 'COLORTERM', 'TERMINFO_DIRS',
   'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'XDG_RUNTIME_DIR',
+  // tmux socket placement is non-secret process runtime state. A strict pane's
+  // tmux client must keep the same private/operator-selected socket root as its
+  // worker; otherwise `-L botmux` silently falls back to the host /tmp server.
+  'TMUX_TMPDIR',
   'SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT', 'USERPROFILE',
 ] as const;
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -84,6 +88,11 @@ export function buildBotWorkerEnv(base: NodeJS.ProcessEnv, policy?: EnvPolicy): 
       'BOTMUX_WORKFLOW_ENABLED', 'BOTMUX_REQUIRE_MENTION_DECISION', 'BOTMUX_LANG',
       'BOTMUX_WORKER_HTTP_HOST', 'BOTMUX_WORKER_HOST', 'LARK_APP_ID', 'LARK_APP_SECRET',
       'BOTMUX_PROGRAM_STATUS_RELAY',
+      // Test-only backend fault injection. Strict mode rebuilds the worker env
+      // from this control-plane allowlist; preserve the seam so the lifecycle
+      // suite can exercise rollback after sandbox preparation but before tmux
+      // creates a pane. Production never sets this key.
+      'BOTMUX_TEST_FORCE_TMUX_NEW_SESSION_FAIL',
     ]) {
       if (isReservedPerBotEnvKey(key) && base[key] !== undefined) env[key] = base[key];
     }
@@ -94,7 +103,11 @@ export function buildBotWorkerEnv(base: NodeJS.ProcessEnv, policy?: EnvPolicy): 
     // BOTMUX_TMUX_SOCKET: which tmux server the worker creates managed panes on
     // (tmux-socket.ts) — dropping it would undo an operator's opt-out per bot.
     for (const key of ['WEB_HOST', 'WEB_EXTERNAL_HOST', 'WEB_EXTERNAL_PORT',
-      'STUCK_DETECTOR_ENABLED', 'STUCK_DETECTOR_TIMEOUT_MS', 'BOTMUX_TMUX_SOCKET']) {
+      'STUCK_DETECTOR_ENABLED', 'STUCK_DETECTOR_TIMEOUT_MS', 'BOTMUX_TMUX_SOCKET',
+      // Socket placement is a worker/backend concern, not CLI business env.
+      // Dropping it in strict mode silently redirects managed `-L botmux`
+      // clients from an operator/test-private root back to the host /tmp server.
+      'TMUX_TMPDIR']) {
       if (base[key] !== undefined) env[key] = base[key];
     }
   }

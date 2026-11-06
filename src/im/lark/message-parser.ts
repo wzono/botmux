@@ -23,6 +23,7 @@ interface RawEventData {
       app_id?: string;
       user_id?: string;
       union_id?: string;
+      tenant_key?: string;
     };
     sender_type: string;
     tenant_key?: string;
@@ -583,6 +584,7 @@ export function parseEventMessage(
     parentId: message.parent_id || undefined,
     senderId: sender.sender_id?.open_id ?? '',
     senderUnionId: sender.sender_id?.union_id,
+    tenantKey: sender.tenant_key ?? sender.sender_id?.tenant_key,
     senderType: sender.sender_type,
     msgType: message.message_type,
     ...(message.message_type === 'post' ? { rawPostContent: message.content } : {}),

@@ -245,6 +245,7 @@ import {
   sendWorkerInput,
   admitQueuedActivationTail,
   setActiveSessionsRegistry,
+  setWorkspaceAdmittedBusinessTurnDispatcher,
   suspendWorker,
   currentGatewayCallerOpenId,
   __testOnly_setSuspendBackingVerifier,
@@ -289,7 +290,14 @@ import { join } from 'node:path';
 // back to $HOME), and a fixed path like `/repo` exists on some hosts but not on
 // CI, which is how a missing-directory failure once hid behind a green local run.
 const REPO = mkdtempSync(join(tmpdir(), 'botmux-lifecycle-repo-'));
-afterAll(() => { rmSync(REPO, { recursive: true, force: true }); });
+const disposeWorkspaceAdmissionMock = setWorkspaceAdmittedBusinessTurnDispatcher(async input => {
+  if (!await input.markAttempting?.()) return false;
+  return sendWorkerInput(input.ds, input.payload, input.turnId, input.options);
+});
+afterAll(() => {
+  disposeWorkspaceAdmissionMock();
+  rmSync(REPO, { recursive: true, force: true });
+});
 
 function makeFakeWorker() {
   const worker = new EventEmitter() as any;

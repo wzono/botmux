@@ -431,6 +431,26 @@ describe('dashboard IPC server', () => {
     expect(mutations).toBe(1);
   });
 
+  it('lets ask registration return retryable startup status without opening other IPC routes', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    let releaseReady!: () => void;
+    const ready = new Promise<void>(resolve => { releaseReady = resolve; });
+    let asks = 0;
+    ipcRoute('POST', '/api/asks', (_req, res) => {
+      asks += 1;
+      res.writeHead(503, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'startup_not_ready' }));
+    });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, ready });
+    const response = await fetch(`http://127.0.0.1:${handle.port}/api/asks`, {
+      method: 'POST',
+      headers: trustedHostHeaders('POST', '/api/asks', handle.port),
+    });
+    expect(response.status).toBe(503);
+    expect(asks).toBe(1);
+    releaseReady();
+  });
+
   it('denies sandbox-like loopback reads and mutations but accepts route-bound trusted-host calls', async () => {
     setIpcAuthSecret(TEST_IPC_SECRET);
     let mutations = 0;
@@ -5067,6 +5087,7 @@ describe('POST /api/sessions/:sessionId/durable-send', () => {
       chatType: 'group',
     } as any;
     const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(active);
+    const admissionSpy = vi.spyOn(workerPool, 'dispatchWorkspaceAdmittedBusinessTurn');
     const deliver = vi.fn(async () => ({ kind: 'delivered' as const, messageId: 'om_outbox' }));
     setDurableSessionSendHandler(deliver);
     setIpcAuthSecret(TEST_IPC_SECRET);
@@ -5100,7 +5121,9 @@ describe('POST /api/sessions/:sessionId/durable-send', () => {
         daemonSession: active,
         ...payload,
       });
+      expect(admissionSpy).not.toHaveBeenCalled();
     } finally {
+      admissionSpy.mockRestore();
       findSpy.mockRestore();
     }
   });
@@ -5248,6 +5271,7 @@ describe('POST /api/sessions/:sessionId/board queued activation', () => {
         getSessionWorkingDir: () => { throw new Error('forced pre-init failure'); },
         getActiveCount: () => 1,
         closeSession: vi.fn(),
+        dispatchAdmittedBusinessTurn: async () => { throw new Error('forced pre-init failure'); },
       });
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
 
@@ -6365,6 +6389,22 @@ describe('POST /api/sessions/:sessionId/resume', () => {
       config.session.dataDir = prevConfigDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('embedded workspace admission ownership', () => {
+  it('keeps the newer dispatcher when overlapping servers close out of order', async () => {
+    const calls: string[] = [];
+    const first = await startIpcServer({ port: 0, host: '127.0.0.1',
+      dispatchAdmittedBusinessTurn: async () => { calls.push('first'); return true; } });
+    const second = await startIpcServer({ port: 0, host: '127.0.0.1',
+      dispatchAdmittedBusinessTurn: async () => { calls.push('second'); return true; } });
+    await first.close();
+    const ds = { session: { sessionId: 's' } } as any;
+    await workerPool.dispatchWorkspaceAdmittedBusinessTurn({ ds, turnId: 't', payload: 'x', resume: false,
+      markAttempting: async () => true });
+    expect(calls).toEqual(['second']);
+    await second.close();
   });
 });
 
@@ -11849,6 +11889,7 @@ describe('role profile IPC routes', () => {
       workingDir: process.cwd(),
     });
     const activeSessions = new Map<string, any>();
+    sessionStore.init('cli_listener_run');
     const now = Date.now();
     const historySpy = vi.spyOn(larkClient, 'listChatMessagesUntil').mockResolvedValue([
       {
@@ -11865,7 +11906,13 @@ describe('role profile IPC routes', () => {
     const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
     try {
       workerPool.setActiveSessionsRegistry(activeSessions);
-      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      handle = await startIpcServer({
+        port: 0, host: '127.0.0.1',
+        dispatchAdmittedBusinessTurn: async input => {
+          forkSpy(input.ds, input.payload, input.turnId);
+          return true;
+        },
+      });
       const base = `http://127.0.0.1:${handle.port}`;
       const res = await fetch(`${base}/api/message-listeners/oc_alerts/run-preview`, {
         method: 'POST',
@@ -11947,7 +11994,13 @@ describe('role profile IPC routes', () => {
     const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
     try {
       workerPool.setActiveSessionsRegistry(activeSessions);
-      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      handle = await startIpcServer({
+        port: 0, host: '127.0.0.1',
+        dispatchAdmittedBusinessTurn: async input => {
+          forkSpy(input.ds, input.payload, input.turnId);
+          return true;
+        },
+      });
       const base = `http://127.0.0.1:${handle.port}`;
       const res = await fetch(`${base}/api/message-listeners/oc_alerts/run-preview`, {
         method: 'POST',
@@ -12012,7 +12065,13 @@ describe('role profile IPC routes', () => {
     const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
     try {
       workerPool.setActiveSessionsRegistry(activeSessions);
-      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      handle = await startIpcServer({
+        port: 0, host: '127.0.0.1',
+        dispatchAdmittedBusinessTurn: async input => {
+          forkSpy(input.ds, input.payload, input.turnId);
+          return true;
+        },
+      });
       const base = `http://127.0.0.1:${handle.port}`;
       const res = await fetch(`${base}/api/message-listeners/oc_alerts/run-preview`, {
         method: 'POST',
@@ -12053,6 +12112,7 @@ describe('role profile IPC routes', () => {
       workingDir: process.cwd(),
     });
     const activeSessions = new Map<string, any>();
+    sessionStore.init('cli_listener_status');
     const now = Date.now();
     const historySpy = vi.spyOn(larkClient, 'listChatMessagesUntil').mockResolvedValue([
       {
@@ -12069,7 +12129,13 @@ describe('role profile IPC routes', () => {
     const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
     try {
       workerPool.setActiveSessionsRegistry(activeSessions);
-      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      handle = await startIpcServer({
+        port: 0, host: '127.0.0.1',
+        dispatchAdmittedBusinessTurn: async input => {
+          forkSpy(input.ds, input.payload, input.turnId);
+          return true;
+        },
+      });
       const base = `http://127.0.0.1:${handle.port}`;
       const runRes = await fetch(`${base}/api/message-listeners/oc_alerts/run-preview`, {
         method: 'POST',

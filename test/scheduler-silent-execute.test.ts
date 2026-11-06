@@ -102,6 +102,21 @@ vi.mock('../src/core/worker-pool.js', () => ({
     return forkWorkerMock(...a);
   },
   sendWorkerInput: (...a: any[]) => sendWorkerInputMock(...a),
+  dispatchWorkspaceAdmittedBusinessTurn: vi.fn(async (input: any) => {
+    if (!await input.markAttempting()) return false;
+    if (input.ds.worker && !input.ds.worker.killed) {
+      const accepted = sendWorkerInputMock(input.ds, input.payload, input.turnId, {
+        ...(input.trustedCaller ? { trustedCaller: input.trustedCaller } : {}),
+      });
+      if (accepted) return true;
+    }
+    forkWorkerMock(input.ds, input.payload, {
+      resume: input.resume,
+      turnId: input.turnId,
+      ...(input.trustedCaller ? { trustedCaller: input.trustedCaller } : {}),
+    });
+    return true;
+  }),
   forkAdoptWorker: vi.fn(),
   adoptSandboxBlocked: vi.fn((botCfg, session) => botCfg?.sandbox === true || botCfg?.readIsolation === true || session?.sandbox === true || process.env.BOTMUX_SANDBOX === '1'),
   killStalePids: vi.fn(),
@@ -239,7 +254,8 @@ function forkedCliInput(): string {
 }
 
 function forkedTurnId(): string {
-  return forkWorkerMock.mock.calls[0][2];
+  const arg = forkWorkerMock.mock.calls[0][2];
+  return typeof arg === 'string' ? arg : arg.turnId;
 }
 
 function forkedPayload(): any {

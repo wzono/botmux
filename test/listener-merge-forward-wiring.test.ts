@@ -103,6 +103,15 @@ vi.mock('../src/core/worker-pool.js', async () => {
   };
 });
 
+vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/admitted-turn-dispatch.js');
+  return { ...actual, dispatchAdmittedBusinessTurn: vi.fn(async (input: any) => {
+    return input.ds.worker && !input.ds.worker.killed
+      ? mocks.sendWorkerInput(input.ds, input.payload, input.turnId, input.options)
+      : mocks.forkWorker(input.ds, input.payload, { ...input.options, turnId: input.turnId });
+  }) };
+});
+
 vi.mock('../src/im/lark/merge-forward.js', async () => {
   const actual = await vi.importActual<any>('../src/im/lark/merge-forward.js');
   return { ...actual, expandMergeForward: (...args: any[]) => mocks.expandMergeForward(...args) };

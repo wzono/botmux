@@ -343,6 +343,7 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
       chatId: input.chatId,
       rootMessageId: input.rootMessageId,
       sessionId: input.sessionId,
+      controlWait: input.controlWait ? structuredClone(input.controlWait) : undefined,
       chatType: input.chatType,
       answererOpenId: input.answererOpenId,
       mentionedOpenId: input.mentionedOpenId,
@@ -421,6 +422,7 @@ function sameIdentity(ask: InternalPending, input: CreateAskInput): boolean {
     ask.rootMessageId === input.rootMessageId &&
     ask.originKind === (input.originKind ?? 'hook') &&
     ask.answererOpenId === input.answererOpenId &&
+    JSON.stringify(ask.controlWait) === JSON.stringify(input.controlWait) &&
     JSON.stringify(ask.deliveryTarget) === JSON.stringify(input.deliveryTarget) &&
     questionsShape(ask.questions) === questionsShape(input.questions)
   );
@@ -606,6 +608,7 @@ function persistFromInternal(ask: InternalPending, strict = false): void {
     chatId: ask.chatId,
     rootMessageId: ask.rootMessageId,
     sessionId: ask.sessionId,
+    controlWait: ask.controlWait ? structuredClone(ask.controlWait) : undefined,
     chatType: ask.chatType,
     answererOpenId: ask.answererOpenId,
     mentionedOpenId: ask.mentionedOpenId,
@@ -1069,6 +1072,7 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       chatId: p.chatId,
       rootMessageId: p.rootMessageId,
       sessionId: p.sessionId,
+      controlWait: p.controlWait ? structuredClone(p.controlWait) : undefined,
       chatType: p.chatType,
       answererOpenId: p.answererOpenId,
       mentionedOpenId: p.mentionedOpenId,
@@ -1455,6 +1459,30 @@ export function submitAskFromDesktop(args: {
 export function _getPending(askId: string): PendingAsk | undefined {
   return getAskSnapshot(askId);
 }
+
+export function originalControlWaitState(input: {
+  sessionId: string; originalTurnId: string; askId: string;
+}): 'needs_user' | 'terminal' | undefined {
+  for (const ask of pending.values()) {
+    const wait = ask.controlWait;
+    if (ask.sessionId === input.sessionId && wait?.originalTurnId === input.originalTurnId
+      && wait.wait.askId === input.askId) return ask.settled ? 'terminal' : wait.state;
+  }
+  return undefined;
+}
+
+
+export function originalControlWaitAcceptedAnswer(input: {
+  sessionId: string; originalTurnId: string; askId: string;
+}): boolean {
+  for (const ask of pending.values()) {
+    const wait = ask.controlWait;
+    if (ask.sessionId === input.sessionId && wait?.originalTurnId === input.originalTurnId
+      && wait.wait.askId === input.askId) return ask.settled && ask.terminalResult?.kind === 'answered';
+  }
+  return false;
+}
+
 
 /** 返回当前 pending map 中所有 askId 列表（含 settled 但仍在 retention 内的条目）。
  *  仅供测试使用。 */

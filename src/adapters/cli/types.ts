@@ -8,6 +8,8 @@ export interface PtyHandle {
   /** `false` means the backend rejected the write before it could confirm
    * delivery. Callers must not silently promote that result to success. */
   write(data: string): void | boolean;
+  /** Remote backends resolve this at the serialized dispatch edge. */
+  writeBusinessInput?(data: string): Promise<'submitted' | 'retryable_pre_dispatch_rejection'>;
   /** Send text literally via tmux send-keys -l (tmux mode only).
    *  Returns `false` when the backend could not confirm the write (for example,
    *  send-keys timed out while the pane stayed alive). Delivery may still have

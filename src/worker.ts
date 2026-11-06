@@ -11,6 +11,8 @@ import {claudeActionPrompt} from './services/claude-action-prompt.js';
 import { GOAL_ENV } from './workflows/v3/contract.js';
 import { CODEX_CONFIG_FILE, hostCodexConfigPath } from './services/codex-isolated-config.js';
 import { supportsZeroPromptInjection } from './core/prompt-injection.js';
+import { probePathUsability } from './core/path-usability.js';
+import { awaitAuthoritativeWorkerCwd } from './core/worker-cwd-launch-guard.js';
 import { SCHEDULE_PROMPT_UNDELIVERED_ERROR_CODE } from './core/deferred-schedule-settlement.js';
 import { supportsTranscriptReplyDeliveryForBot } from './core/reply-delivery.js';
 import { TurnProgressNotice, progressNoticeIntervalMinutes } from './utils/turn-progress-notice.js';
@@ -474,6 +476,7 @@ import {
   bareShellLaunchGuidance,
   settleLaunchComm,
   readProcessStartTime,
+  readCwd,
 } from './core/session-discovery.js';
 import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay, scaleMs } from './utils/timing.js';
@@ -850,6 +853,7 @@ scrubClaudeSessionMarkerEnv(process.env);
 let cliAdapter: CliAdapter | null = null;
 let codexCleanupLaunchTarget: { codexBin: string; codexHome: string } | undefined;
 let backend: SessionBackend | null = null;
+let replacementRetirementExitResolve: (() => void) | undefined;
 let backendScreenRevision = 0;
 let idleScreenSettleTask: {
   backend: SessionBackend;
@@ -3042,6 +3046,32 @@ function ensureZellijAttachConfig(): string {
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
+let currentTerminalWorkspaceFence: Extract<DaemonToWorker, { type: 'terminal_workspace_fence' }> | undefined;
+
+export function terminalWorkspaceBytesAllowed(
+  frozen: Extract<DaemonToWorker, { type: 'init' }>['terminalWorkspaceFence'],
+  current: Extract<DaemonToWorker, { type: 'terminal_workspace_fence' }> | undefined,
+): boolean {
+  if (!frozen || frozen.source !== 'group') return true;
+  const actual = current?.workspaceIdentity;
+  return current?.source === 'group' && current.groupRevision === frozen.groupRevision
+    && !!actual && actual.path === frozen.workspaceIdentity.path
+    && actual.dev === frozen.workspaceIdentity.dev && actual.ino === frozen.workspaceIdentity.ino;
+}
+
+function canWriteTerminalBytes(): boolean {
+  const frozen = lastInitConfig?.terminalWorkspaceFence;
+  if (currentTerminalWorkspaceFence?.source === 'group' && !frozen) return false;
+  if (!terminalWorkspaceBytesAllowed(frozen, currentTerminalWorkspaceFence)) return false;
+  if (!frozen || frozen.source !== 'group') return true;
+  try {
+    const real = realpathSync(lastInitConfig!.workingDir);
+    const stat = statSync(real, { bigint: true });
+    return real === frozen.workspaceIdentity.path
+      && String(stat.dev) === frozen.workspaceIdentity.dev
+      && String(stat.ino) === frozen.workspaceIdentity.ino;
+  } catch { return false; }
+}
 let traexAutoModelController: TraexAutoModelController | null = null;
 let traexAutoModelSwitching = false;
 let traexAutoModelTurnReplayForbidden = false;
@@ -4247,7 +4277,10 @@ async function sendRawCommandLine(
   // recovery-fence transaction detects a failed submission by a thrown error, so
   // bridge the two: turn an explicit `false` into the same throw the inline
   // implementation used, letting runAmbiguousSubmissionTransaction cancel the WAL.
-  const writeOptions = rawCommandWriteOptionsFor(cliAdapter ?? undefined, lastInitConfig?.cliId);
+  const writeOptions = {
+    ...rawCommandWriteOptionsFor(cliAdapter ?? undefined, lastInitConfig?.cliId),
+    isCurrent: () => backend === be && !nativeSessionForkPending() && canWriteTerminalBytes(),
+  };
   // `submit: false` types the line and leaves it in the composer; the caller
   // presses Enter itself. Used by the Codex effort controller, whose Enter must
   // come after a screen re-check (see typeRawCommandLine).
@@ -5117,6 +5150,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
               const result = await writeAdoptMessage(
                 followUpContent,
                 msg.followUpTurnId,
+                undefined,
                 undefined,
                 undefined,
                 undefined,
@@ -14571,6 +14605,7 @@ async function writeAdoptMessage(
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin,
   trustedCaller?: TrustedCaller,
   trustedController?: TrustedCaller,
+  control?: { controlDispatchId?: string; controlReplyDigest?: string },
   fence?: AdoptWriteFence,
 ): Promise<AdoptWriteResult> {
   rememberTurnLinkRefMode(turnId, dispatchAttempt, linkRefMode);
@@ -14714,8 +14749,11 @@ async function writeAdoptMessage(
         persistCliSessionId(result.cliSessionId);
         codexBridgeNotifyCliSessionId(result.cliSessionId);
       }
-      if (result?.submitted === true && adoptStructuredBridgeTurnId) {
-        codexBridgeQueue.confirmPendingTurn(adoptStructuredBridgeTurnId, undefined, dispatchAttempt);
+      if (result?.submitted === true) {
+        if (adoptStructuredBridgeTurnId) {
+          codexBridgeQueue.confirmPendingTurn(adoptStructuredBridgeTurnId, undefined, dispatchAttempt);
+        }
+        acknowledgeTurnInputCommitted(turnId, dispatchAttempt, undefined, control);
       } else if (adoptStructuredBridgeTurnId && !(result?.submitted === false && result.recheck && !result.failureReason)) {
         codexBridgeQueue.finishSubmitVerification(adoptStructuredBridgeTurnId, undefined, dispatchAttempt);
       }
@@ -14861,6 +14899,7 @@ async function runAdoptMessageForCapturedGeneration(
       item.vcMeetingImTurnOrigin,
       item.trustedCaller,
       item.trustedController,
+      { controlDispatchId: item.controlDispatchId, controlReplyDigest: item.controlReplyDigest },
       fence,
     ),
   });
@@ -15339,7 +15378,7 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   const targetBackend = backend;
   const lifetime = cliLifetimeNonce;
   if (codexCliEffortOperation) await cancelCodexCliEffort();
-  if (backend !== targetBackend || cliLifetimeNonce !== lifetime || nativeSessionForkPending()) return;
+  if (backend !== targetBackend || cliLifetimeNonce !== lifetime || nativeSessionForkPending() || !canWriteTerminalBytes()) return;
   const isHalfPage = key === 'half_page_up' || key === 'half_page_down';
 
   // Tmux copy-mode scroll (works around alternate-buffer scrollback limitation)
@@ -15370,16 +15409,23 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
   if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
 
   const criticalInterrupt = isCriticalInterruptKey(key);
+  let retryCancelledByFence = false;
   let delivered = false;
   try {
     delivered = await runAfterAmbiguousSubmissionWrites(
       targetBackend,
       async () => {
-        if (nativeSessionForkPending()) return false;
+        if (backend !== targetBackend || cliLifetimeNonce !== lifetime || nativeSessionForkPending() || !canWriteTerminalBytes()) {
+          retryCancelledByFence = true;
+          return true;
+        }
         if (criticalInterrupt) {
           return sendCriticalControlKey(key, () => {
             // Never retry an old interrupt into a replacement CLI generation.
-            if (backend !== targetBackend || nativeSessionForkPending()) return true;
+            if (backend !== targetBackend || cliLifetimeNonce !== lifetime || nativeSessionForkPending() || !canWriteTerminalBytes()) {
+              retryCancelledByFence = true;
+              return true;
+            }
             return sendTermActionOnce(targetBackend, key);
           });
         }
@@ -15391,7 +15437,7 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
       log(`Term action ${key} failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
-  if (backend !== targetBackend) return;
+  if (backend !== targetBackend || retryCancelledByFence) return;
   if (!delivered) {
     log(`Term action ${key} was not delivered${criticalInterrupt ? ' after retry' : ''}`);
     if (criticalInterrupt) {
@@ -15662,7 +15708,7 @@ async function handleTuiKeysDirect(
       targetBackend,
       keys,
       KEY_TO_ANSI,
-      { isCurrent: () => backend === targetBackend && !nativeSessionForkPending() },
+      { isCurrent: () => backend === targetBackend && !nativeSessionForkPending() && canWriteTerminalBytes() },
     );
     if (!delivered) {
       logError('handleTuiKeys write rejected or backend replaced');
@@ -15762,6 +15808,7 @@ async function flushPendingInjections(): Promise<void> {
       // workingDir; non-barrier injects are best-effort and not replayed
       // cross-process), unlike pendingMessages which killCli preserves.
       if (cliRestartInProgress) return;
+      if (!canWriteTerminalBytes()) return;
       const item = pendingInjections.shift()!;
       const cmd = item.command;
       isPromptReady = false;
@@ -15769,6 +15816,8 @@ async function flushPendingInjections(): Promise<void> {
       try {
         // Serially：与 startupCommands / raw_input / native-rename 共用同一条
         // 字面命令行写入互斥链（text → beat → Enter 窗口不被拼接）。
+        if (!canWriteTerminalBytes()) return;
+        if (!canWriteTerminalBytes()) return;
         await sendRawCommandLineWithRecoveryFence(backend, cmd);
         await awaitPtyQuiescence(STARTUP_CMD_QUIET_MS, STARTUP_CMD_CAP_MS);
         log(`Injected command: ${cmd}`);
@@ -15801,7 +15850,7 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<boolean
   const targetAdapter = cliAdapter;
   const lifetime = cliLifetimeNonce;
   if (codexCliEffortOperation) await cancelCodexCliEffort();
-  if (backend !== targetBackend || cliAdapter !== targetAdapter || cliLifetimeNonce !== lifetime) return false;
+  if (backend !== targetBackend || cliAdapter !== targetAdapter || cliLifetimeNonce !== lifetime || !canWriteTerminalBytes()) return false;
   const navKeyCount = keys[keys.length - 1] === 'Enter' ? keys.length - 1 : keys.length;
 
   log(`TUI text input: writing "${text.substring(0, 80)}" to PTY (after ${navKeyCount} nav keys)`);
@@ -15813,7 +15862,7 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<boolean
         keys,
         text,
         keyToAnsi: KEY_TO_ANSI,
-        isCurrent: () => backend === targetBackend && cliAdapter === targetAdapter && !nativeSessionForkPending(),
+        isCurrent: () => backend === targetBackend && cliAdapter === targetAdapter && !nativeSessionForkPending() && canWriteTerminalBytes(),
         writeInput: async (target, content) => {
           const result = await targetAdapter.writeInput(target, content);
           if (targetBackend.captureAmbiguousSubmissionFence) {
@@ -15902,7 +15951,7 @@ async function driveCocoPicker(navKeys: string[], needsReviewSubmit: boolean, co
 
   // The hook returns passthrough → CoCo renders the picker; only then send keys.
   const appeared = await waitFor(/Enter to select|Tab\/Arrow keys|Review your answers/, 30_000);
-  if (!appeared) { log('coco_drive_picker: picker not detected within 30s — aborting drive'); return; }
+  if (!appeared || !canWriteTerminalBytes()) { log('coco_drive_picker: picker not detected or workspace fence changed — aborting drive'); return; }
   if (!backend) return;
   const targetBackend = backend;
   tuiPromptBlocking = true;
@@ -15935,20 +15984,20 @@ async function driveCocoPicker(navKeys: string[], needsReviewSubmit: boolean, co
             targetBackend,
             navKeys,
             KEY_TO_ANSI,
-            { isCurrent: () => backend === targetBackend },
+            { isCurrent: () => backend === targetBackend && canWriteTerminalBytes() },
           );
           if (!navigated) {
             throw new Error('backend rejected free-text navigation');
           }
           await new Promise(r => setTimeout(r, 150));
-          if (backend !== targetBackend) {
+          if (backend !== targetBackend || !canWriteTerminalBytes()) {
             throw new Error('backend changed before free-text input');
           }
           const input = strictInputHandle(targetBackend as SessionBackend & PtyHandle);
           if (typeof input.sendText === 'function') input.sendText(comment);
           else input.write(comment);
           await new Promise(r => setTimeout(r, 200));
-          if (backend !== targetBackend) {
+          if (backend !== targetBackend || !canWriteTerminalBytes()) {
             throw new Error('backend changed before free-text submit');
           }
           if (!await handleTuiKeysDirect(targetBackend, ['Enter'], true)) {
@@ -15986,7 +16035,7 @@ async function driveCocoPicker(navKeys: string[], needsReviewSubmit: boolean, co
   if (needsReviewSubmit) {
     const review = await waitFor(/Review your answers|Submit answers/, 8_000);
     if (!review) log('coco_drive_picker: Review screen not detected — submitting anyway');
-    if (backend !== targetBackend) {
+    if (backend !== targetBackend || !canWriteTerminalBytes()) {
       reportFailure();
       return;
     }
@@ -17588,6 +17637,17 @@ function adapterInputHandle(target: SessionBackend): PtyHandle {
     : target;
 }
 
+function backendRequiresEffectiveWorkspaceProof(backendType: BackendType | undefined): boolean {
+  return backendType === 'riff' || backendType === 'mojo' || backendType === 'remote-runner';
+}
+
+function writeBackendWorkingDirRejected(target: SessionBackend): boolean {
+  if (target.validateWorkingDirBeforeBusinessInput?.() === false) return true;
+  return !!lastInitConfig?.expectedWorkingDirIdentity
+    && backendRequiresEffectiveWorkspaceProof(lastInitConfig.backendType)
+    && !target.effectiveWorkspaceProof?.();
+}
+
 function adoptComposerConflict(target: SessionBackend): string | undefined {
   if (target instanceof OrcaBackend) {
     const state = target.inspectDraftSync();
@@ -17816,7 +17876,7 @@ async function runAfterAmbiguousSubmissionWrites<T>(
   ambiguousSubmissionWriteTail = new Promise<void>(resolve => { release = resolve; });
   await previous;
   try {
-    if (backend !== target) {
+    if (backend !== target || !canWriteTerminalBytes()) {
       throw new Error('backend changed before queued terminal action');
     }
     return await action();
@@ -20127,8 +20187,10 @@ async function flushPending(): Promise<void> {
     // rename. Some passthroughs (/clear, /new) can rotate the native session;
     // applying the canonical title last keeps the resume-picker label aligned.
     if (rawInputReady && pendingRawInputs.length > 0 && backend) {
+      if (!canWriteTerminalBytes()) return;
       const raw = freshnessInputQueue.takeRaw();
       if (!raw) return;
+      if (!canWriteTerminalBytes()) { pendingRawInputs.unshift(raw); return; }
       await deliverRawInput(raw);
       return;
     }
@@ -20224,6 +20286,16 @@ async function flushPending(): Promise<void> {
       if (activeTurnBlocks(pendingMessages[0]!)) break;
       if (traexAutoModelRuntimeEligible()
         && !(await admitTraexAutoModelPendingInput(pendingMessages[0]!))) break;
+      const nextItem = pendingMessages[0]!;
+      if (writeBackendWorkingDirRejected(backend)) {
+        send({
+          type: 'user_notify',
+          message: `${effectiveBackendType === 'riff' ? 'Riff' : 'Mojo'} 工作目录绑定已变化，业务输入未发送；原消息已保留，请修复目录后重试。`,
+          turnId: nextItem.turnId,
+          ...(nextItem.dispatchAttempt !== undefined ? { dispatchAttempt: nextItem.dispatchAttempt } : {}),
+        });
+        break;
+      }
       const item = freshnessInputQueue.takeNormal();
       if (!item) break;
       attachDeferredPluginSkillCatalog(item);
@@ -20844,6 +20916,7 @@ async function flushPending(): Promise<void> {
           item.turnId,
           item.dispatchAttempt,
           item.durablePrimaryInbox,
+          { controlDispatchId: item.controlDispatchId, controlReplyDigest: item.controlReplyDigest },
         );
       }
       const queuedPostSubmitNativeTitle = result?.submitted !== false
@@ -20984,7 +21057,22 @@ async function flushPending(): Promise<void> {
         // and continually replaces their deferred confirmation timer. Only the
         // adapter's explicit safe non-submission disposition permits retry.
         if (!recoveryFailureReason && codexAppSafeNonSubmission) {
-          requeueUnsubmittedQueuedActivation(item);
+          if (item.queuedActivationToken) {
+            requeueUnsubmittedQueuedActivation(item);
+          } else {
+            inflightInputs.forget(item);
+            pendingMessages.unshift(item);
+            log('Retained definitely-unwritten input at queue head for retry');
+            if (writeBackend.validateWorkingDirBeforeBusinessInput) {
+              send({
+                type: 'user_notify',
+                message: `${effectiveBackendType === 'riff' ? 'Riff' : 'Mojo'} 工作目录绑定已变化，业务输入未发送；原消息已保留，请修复目录后重试。`,
+                turnId: item.turnId,
+                ...(item.dispatchAttempt !== undefined ? { dispatchAttempt: item.dispatchAttempt } : {}),
+              });
+              markPromptReady();
+            }
+          }
         }
         if (deliveryQuarantine) break;
       } else if (item.queuedActivationToken) {
@@ -22083,6 +22171,8 @@ async function spawnCli(
   if (proxyError) throw new Error(proxyError + FROZEN_NETWORK_POLICY_HINT);
   const spawnGeneration = ++cliSpawnGeneration;
   const spawnStartedAtMs = Date.now();
+  let cwdGuardOutputPending = false;
+  const cwdGuardOutput: string[] = [];
   restartInterruptionScanBeforeMs = undefined;
   // Every spawn is a new CLI process that can show the picker again. Not all
   // respawns pass through killCli() (e.g. the retry after a crash-loop park),
@@ -24273,7 +24363,9 @@ async function spawnCli(
     : cfg.deferredScheduleRun && cliAdapter.findInitialPromptArgSubmission
       ? cliAdapter.captureInitialPromptArgSubmission?.() ?? null
       : null;
-  const deferInitialPrompt = traexAutoModelController?.config.trigger === 'quota' || shouldDeferInitialPromptForStartup({
+  const deferInitialPrompt = cfg.expectedWorkingDirIdentity !== undefined
+    || traexAutoModelController?.config.trigger === 'quota'
+    || shouldDeferInitialPromptForStartup({
     hasStartupCommands: spawnHasStartupWork(cfg.startupCommands, cfg.initialNativeRename),
     adoptMode: cfg.adoptMode === true,
     passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
@@ -26708,8 +26800,12 @@ async function spawnCli(
         log('[program-status] relay entry not runnable from this install; launching CLI directly (no OSC 7501 handshake under tmux)');
       }
     }
+    cwdGuardOutputPending = cfg.expectedWorkingDirIdentity !== undefined;
     backend.spawn(spawnBin, spawnArgs, {
       cwd: spawnCwd,
+      ...(cfg.expectedWorkingDirIdentity
+        ? { expectedWorkingDirIdentity: cfg.expectedWorkingDirIdentity }
+        : {}),
       cols: PTY_COLS,
       rows: PTY_ROWS,
       env: childEnv as Record<string, string>,
@@ -26766,6 +26862,51 @@ async function spawnCli(
   cliOutlivesWorker = cliSurvivesWorkerExit({ backendType: effectiveBackendType, persistentSessionName });
   const actuallyReattachedPersistent = 'isReattach' in backend
     && backend.isReattach === true;
+  // Group-bound launches carry an immutable directory identity on every init
+  // generation, including in-worker restarts. The backend must first create (or
+  // reattach) the real CLI process; only its authoritative /proc cwd can satisfy
+  // this gate. No pending business input, startup command, or ready hook is
+  // materialized before the gate succeeds.
+  if (cfg.expectedWorkingDirIdentity
+    && !backend.validateWorkingDirBeforeBusinessInput) {
+    const guardedBackend = backend;
+    guardedBackend.onData(data => {
+      if (backend !== guardedBackend) return;
+      if (cwdGuardOutputPending) cwdGuardOutput.push(data);
+      else onPtyData(data);
+    });
+    const cwdGuard = await awaitAuthoritativeWorkerCwd({
+      expectedWorkingDir: cfg.workingDir,
+      expectedIdentity: cfg.expectedWorkingDirIdentity,
+      getChildPid: () => guardedBackend === backend ? guardedBackend.getChildPid?.() : null,
+      readCwd,
+      probe: (path, expectedIdentity) => {
+        const result = probePathUsability(path, { expectedIdentity });
+        return result.ok;
+      },
+    });
+    if (!cwdGuard.ok) {
+      cwdGuardOutputPending = false;
+      try {
+        if (guardedBackend.destroySession) await guardedBackend.destroySession();
+        else guardedBackend.kill();
+      } catch (error) {
+        throw new Error(
+          `[workspace-cwd] refusing generation ${spawnGeneration}: ${cwdGuard.reason}; `
+          + `authoritative teardown failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      } finally {
+        if (backend === guardedBackend) backend = null;
+      }
+      throw new Error(
+        `[workspace-cwd] refusing generation ${spawnGeneration}: ${cwdGuard.reason}`
+        + `${cwdGuard.cwd ? ` (${cwdGuard.cwd})` : ''}`,
+      );
+    }
+    cwdGuardOutputPending = false;
+    for (const data of cwdGuardOutput.splice(0)) onPtyData(data);
+    log(`Workspace cwd validated for generation ${spawnGeneration}: ${cwdGuard.cwd}`);
+  }
   prepareDeploymentContinuationForSpawn(cfg, actuallyReattachedPersistent);
   // A NEW process resuming the same conversation — not a re-attach, whose CLI
   // never stopped: the transcript bridge's baseline reads what the previous
@@ -27547,10 +27688,18 @@ async function spawnCli(
     });
   }
 
+  // Output ownership is independent from workspace proof. Local backends with
+  // no submit-time validator installed the guarded listener above; every other
+  // backend (including Riff/Mojo) must always remain observable.
   observedBackend.onData((data) => {
     if (backend !== observedBackend) return;
     onPtyData(data);
   });
+  if (cfg.expectedWorkingDirIdentity && observedBackend.validateWorkingDirBeforeBusinessInput
+    && (!observedBackend.validateWorkingDirBeforeBusinessInput()
+      || (backendRequiresEffectiveWorkspaceProof(effectiveBackendType) && !observedBackend.effectiveWorkspaceProof?.()))) {
+    throw new Error(`${effectiveBackendType} effective workspace proof unavailable for group-bound session`);
+  }
   if (observedBackend instanceof HerdrBackend) {
     const transcriptSettle = makeBridgeTranscriptSettle(
       () => bridgeHeadTurnAwaitingTerminal(),
@@ -27781,6 +27930,10 @@ async function spawnCli(
     restoreHerdrWebBindings();
   }
   backend.onExit((code, signal) => {
+    if (replacementRetirementExitResolve && backend === observedBackend) {
+      replacementRetirementExitResolve();
+      replacementRetirementExitResolve = undefined;
+    }
     const intentionalRestart = intentionalRestartBackend === observedBackend;
     if (intentionalRestart) intentionalRestartBackend = null;
     // destroySession()/kill() may report exit after the 500ms replacement spawn
@@ -28915,7 +29068,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
           });
 
           // Replay any input that arrived during the spawn window.
-          if (!nativeSessionForkPending()) for (const data of pendingInput) cp.write(data);
+          if (!nativeSessionForkPending() && canWriteTerminalBytes()) for (const data of pendingInput) cp.write(data);
           pendingInput.length = 0;
         };
 
@@ -28934,6 +29087,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
                 cp.resize(msg.cols, msg.rows);
               }
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
+              if (!canWriteTerminalBytes()) return;
               // Mouse protocols carry clicks, releases, drags and wheel input;
               // a mouse-aware TUI may bind any of them to approvals/actions.
               // A view capability therefore forwards no input bytes at all.
@@ -28941,12 +29095,14 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               const inputBackend = backend;
               const inputLifetime = cliLifetimeNonce;
               if (!await cancelDeploymentForTerminalInput()) return;
-              if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
+              if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || !authedClients.has(ws)) return;
+              if (nativeSessionForkPending() || !canWriteTerminalBytes()) return;
               if (codexCliEffortOperation) {
                 const target = backend;
                 const lifetime = cliLifetimeNonce;
                 await cancelCodexCliEffort();
-                if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
+                if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws)) return;
+                if (nativeSessionForkPending() || !canWriteTerminalBytes()) return;
               }
               auditTerminalInput(auditUser, msg.data);
               if (cp) cp.write(msg.data);
@@ -29010,7 +29166,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
             clientPtys.delete(ws);
             if (ws.readyState === WebSocket.OPEN) ws.close();
           });
-          if (!nativeSessionForkPending()) for (const data of pendingInput) cp.write(data);
+          if (!nativeSessionForkPending() && canWriteTerminalBytes()) for (const data of pendingInput) cp.write(data);
           pendingInput.length = 0;
         };
 
@@ -29023,16 +29179,19 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               if (!cp) { clearTimeout(spawnTimer); startAttach(msg.cols, msg.rows); }
               else cp.resize(msg.cols, msg.rows);
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
+              if (!canWriteTerminalBytes()) return;
               if (!authedClients.has(ws)) return;
               const inputBackend = backend;
               const inputLifetime = cliLifetimeNonce;
               if (!await cancelDeploymentForTerminalInput()) return;
-              if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
+              if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || !authedClients.has(ws)) return;
+              if (nativeSessionForkPending() || !canWriteTerminalBytes()) return;
               if (codexCliEffortOperation) {
                 const target = backend;
                 const lifetime = cliLifetimeNonce;
                 await cancelCodexCliEffort();
-                if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
+                if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws)) return;
+                if (nativeSessionForkPending() || !canWriteTerminalBytes()) return;
               }
               auditTerminalInput(auditUser, msg.data);
               if (cp) cp.write(msg.data);
@@ -29133,18 +29292,21 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
                 broadcastOwnedTmuxReadOnlyFollowerGrid();
               }
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
+              if (!canWriteTerminalBytes()) return;
               // Mouse protocols can encode approvals/actions as well as wheel input.
               // A read-only view capability must never forward bytes to the backend.
               if (!authedClients.has(ws)) return;
               const inputBackend = backend;
               const inputLifetime = cliLifetimeNonce;
               if (!await cancelDeploymentForTerminalInput()) return;
-              if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
+              if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || !authedClients.has(ws)) return;
+              if (nativeSessionForkPending() || !canWriteTerminalBytes()) return;
               if (codexCliEffortOperation) {
                 const target = backend;
                 const lifetime = cliLifetimeNonce;
                 await cancelCodexCliEffort();
-                if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
+                if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws)) return;
+                if (nativeSessionForkPending() || !canWriteTerminalBytes()) return;
               }
               auditTerminalInput(auditUser, msg.data);
               lastWebTerminalInputAtMs = Date.now();
@@ -29155,7 +29317,8 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               }
               backend?.write(msg.data);
             } else if (msg.type === 'scroll' && typeof msg.data === 'string') {
-              if (!allowReadOnlyRemoteScroll || authedClients.has(ws) || nativeSessionForkPending()) return;
+              if (nativeSessionForkPending() || !canWriteTerminalBytes()) return;
+              if (!allowReadOnlyRemoteScroll || authedClients.has(ws)) return;
               const parsed = parseReadOnlyRemoteScrollPayload(msg.data);
               if (!parsed) return;
               if (!readOnlyRemoteScrollLimiter.tryConsume(parsed.eventCount)) return;
@@ -31144,6 +31307,7 @@ function acknowledgeTurnInputCommitted(
   turnId?: string,
   dispatchAttempt?: number,
   durablePrimaryInbox?: true,
+  control?: { controlDispatchId?: string; controlReplyDigest?: string },
 ): void {
   if (!turnId) return;
   if (universalOutputHandoff && lastInitConfig?.finalOutputHandoff?.admitNew && lastInitConfig.larkAppId && process.env.SESSION_DATA_DIR) new TurnSendLedger(process.env.SESSION_DATA_DIR).enableHandoffFence({ larkAppId: lastInitConfig.larkAppId, sessionId: sessionId!, turnId, dispatchAttempt });
@@ -31153,6 +31317,8 @@ function acknowledgeTurnInputCommitted(
     turnId,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     ...(durablePrimaryInbox ? { durablePrimaryInbox: true } : {}),
+    ...(control?.controlDispatchId ? { controlDispatchId: control.controlDispatchId } : {}),
+    ...(control?.controlReplyDigest ? { controlReplyDigest: control.controlReplyDigest } : {}),
   });
 }
 
@@ -31292,11 +31458,14 @@ const TRANSFER_DETACH_ACK_FLUSH_MS = 250;
  * so a wedged process.send callback must not keep this old worker alive and
  * strand the daemon behind its detach fence indefinitely.
  */
-async function flushTransferDetachAck(requestId: string): Promise<void> {
+async function flushRetirementAck(
+  requestId: string,
+  type: 'transfer_detached' | 'replacement_retired' = 'transfer_detached',
+): Promise<void> {
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
     await Promise.race([
-      sendAndFlush({ type: 'transfer_detached', requestId }),
+      sendAndFlush({ type, requestId }),
       new Promise<void>((resolve) => {
         timeout = setTimeout(resolve, TRANSFER_DETACH_ACK_FLUSH_MS);
         timeout.unref?.();
@@ -31439,6 +31608,10 @@ process.on('message', async (raw: unknown) => {
       else pending.resolve(msg.mode === 'enabled' ? 'enabled' : undefined);
       break;
     }
+    case 'terminal_workspace_fence': {
+      currentTerminalWorkspaceFence = msg;
+      break;
+    }
     case 'plugin_result_delivery_result': {
       const pending = pendingPluginResultDeliveries.get(msg.requestId);
       if (!pending) break;
@@ -31497,6 +31670,9 @@ process.on('message', async (raw: unknown) => {
         }
       }
       lastInitConfig = msg;
+      currentTerminalWorkspaceFence = msg.terminalWorkspaceFence
+        ? { type: 'terminal_workspace_fence', ...msg.terminalWorkspaceFence }
+        : undefined;
       configureTraexAutoModel(msg);
       if (isCodexAppCliId(msg.cliId) && msg.noProgressNotify?.timeoutMs !== undefined) {
         // Per-bot liveness window override (#1162). The value is normalized at
@@ -31966,8 +32142,15 @@ process.on('message', async (raw: unknown) => {
           flushPending();
         }
 
+        const backendPid = backend?.getChildPid?.() ?? undefined;
+        const observedCwd = backendPid ? readCwd(backendPid) : undefined;
+        const hostWorkingDirContract = backend?.validatedHostWorkingDirContract?.();
+        const effectiveWorkspaceProof = backend?.effectiveWorkspaceProof?.();
         send({
           type: 'ready',
+          ...(observedCwd ? { cwd: observedCwd } : {}),
+          ...(hostWorkingDirContract ? { hostWorkingDirContract } : {}),
+          ...(effectiveWorkspaceProof ? { effectiveWorkspaceProof } : {}),
           port,
           token: writeToken,
           viewToken,
@@ -32256,6 +32439,8 @@ process.on('message', async (raw: unknown) => {
           codexAppDispatchId: msg.codexAppDispatchId,
           ...(msg.codexAppSteerable ? { codexAppSteerable: true } : {}),
           ...(msg.atMostOnce ? { atMostOnce: true } : {}),
+          ...(msg.controlDispatchId ? { controlDispatchId: msg.controlDispatchId } : {}),
+          ...(msg.controlReplyDigest ? { controlReplyDigest: msg.controlReplyDigest } : {}),
           queuedActivationToken: msg.queuedActivationToken,
           replyTurnId: msg.replyTurnId,
           vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
@@ -32277,6 +32462,7 @@ process.on('message', async (raw: unknown) => {
               msg.turnId,
               msg.dispatchAttempt,
               msg.durablePrimaryInbox,
+              { controlDispatchId: msg.controlDispatchId, controlReplyDigest: msg.controlReplyDigest },
             );
           }
         } else if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, 'cli_input_unavailable');
@@ -32393,6 +32579,7 @@ process.on('message', async (raw: unknown) => {
       // One short, atomic frame; never splice into a chunked business input or
       // rotate currentBotmuxTurnId, readiness, the dispatch ledger, or the card.
       if (!isCodexAppCliId(lastInitConfig?.cliId) || !backend || !codexAppControlProven
+        || !canWriteTerminalBytes()
         || isFlushing || commandLineWritesPending > 0 || cliRestartInProgress
         || shouldHoldCodexRunnerInput(codexRunnerFreshness) || lastInitConfig.adoptMode) {
         send({ type: 'codex_app_effort_result', requestId: msg.requestId, status: 'unavailable' });
@@ -32412,6 +32599,7 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'raw_input': {
+      if (!canWriteTerminalBytes()) break;
       const unattendedRefusal = unattendedRawInputRefusal(msg);
       if (unattendedRefusal) {
         log(`Refused unattended raw input without safe composer evidence: ${unattendedRefusal}`);
@@ -32552,6 +32740,8 @@ process.on('message', async (raw: unknown) => {
       // （COPY 最新 <sid>.jsonl 进新 cwd 桶，已在 master）接住，上下文不丢。
       if (msg.updateWorkingDir && lastInitConfig) {
         lastInitConfig.workingDir = msg.updateWorkingDir;
+        lastInitConfig.terminalWorkspaceFence = undefined;
+        currentTerminalWorkspaceFence = undefined;
       }
       // per-bot env 热更：daemon 发 restart 时捎带 bots.json `env` 的最新值
       // （live-worker restart 不 refork，没有 init 重发这条通道），respawn 前
@@ -32775,6 +32965,7 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'tui_keys': {
+      if (!canWriteTerminalBytes()) break;
       // Stale-card guard: if this key press came from a stuck-warning card,
       // delegate to processStuckWarningTuiKeys which does a FRESH capture (not
       // the 2s-cached lastAnalyzerSnapshot) and re-verifies the current screen
@@ -32907,6 +33098,7 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'inject_command': {
+      if (!canWriteTerminalBytes()) break;
       discardDeploymentContinuation();
       // 唯一发送方是 /slash 路由的白名单 TUI 命令注入。cwd 移动不再走注入
       // （角色切换已改为 restart+updateWorkingDir 的 respawn），这里不接受
@@ -32917,6 +33109,7 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'tui_text_input': {
+      if (!canWriteTerminalBytes()) break;
       discardDeploymentContinuation();
       const wroteText = await handleTuiTextInput(msg.keys, msg.text);
       if (msg.cardMessageId) {
@@ -32946,6 +33139,7 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'coco_drive_picker': {
+      if (!canWriteTerminalBytes()) break;
       void driveCocoPicker(msg.navKeys, msg.needsReviewSubmit, msg.comment);
       break;
     }
@@ -33087,6 +33281,7 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'term_action': {
+      if (!canWriteTerminalBytes()) break;
       await handleTermAction(msg.key);
       break;
     }
@@ -33275,7 +33470,7 @@ process.on('message', async (raw: unknown) => {
       // gate would need preserveCliPidMarker here too.
       killCli({ preserveSandbox: true });
       cleanup();
-      await flushTransferDetachAck(msg.requestId);
+      await flushRetirementAck(msg.requestId);
       // NOTE: process.exit(0) can wedge in node-pty's native teardown when a
       // web-terminal client PTY was attached (the reader-thread join blocks and
       // the JS event loop is already stopped, so this process cannot self-kill
@@ -33493,6 +33688,33 @@ process.on('message', async (raw: unknown) => {
         ...(abortError ? { error: abortError } : {}),
       });
       break;
+    }
+
+    case 'retire_for_replacement': {
+      if (isRemoteBackendType(effectiveBackendType)) {
+        log(`Refused unsafe ${effectiveBackendType} replacement retirement`);
+        break;
+      }
+      log('Replacement retirement requested');
+      stopScreenshotLoop();
+      stopBridgeWatcher();
+      destroyCrashDiagnosticTerminal('replacement retirement');
+      revokeManagedTurnOriginForRestart();
+      const retiringBackend = backend;
+      const exited = retiringBackend
+        ? new Promise<void>(resolve => { replacementRetirementExitResolve = resolve; })
+        : Promise.resolve();
+      try { (retiringBackend?.destroySession ?? retiringBackend?.kill)?.call(retiringBackend); } catch { /* daemon timeout stays authoritative */ }
+      if (retiringBackend) await exited;
+      stopOwnedSessionScope('replacement retirement');
+      backend = null;
+      isPromptReady = false;
+      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } sandboxStopWatcher = null; }
+      sandboxCleanup = null;
+      sandboxTeardownDone = true;
+      await flushRetirementAck(msg.requestId, 'replacement_retired');
+      cleanup();
+      process.exit(0);
     }
 
     case 'suspend': {

@@ -19189,6 +19189,10 @@ if (__entrySubcommand) {
     await import('./background-execution-runner.js');
     process.exit(process.exitCode ?? 0);
   }
+  else if (__entrySubcommand === 'path-usability-runner') {
+    await import('./path-usability-runner.js');
+    process.exit(process.exitCode ?? 0);
+  }
   else if (__entrySubcommand === 'plugin-supervisor') await import('./index-plugin-supervisor.js');
   // CLI-adapter runners. Same mechanism, different role: these ARE the CLI session
   // process an adapter launches, not a fleet member. Without these branches the

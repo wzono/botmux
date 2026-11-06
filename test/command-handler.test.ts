@@ -68,6 +68,11 @@ vi.mock('../src/config.js', () => ({
   },
 }));
 
+vi.mock('../src/services/bot-admin-unions-store.js', async () => {
+  const actual = await vi.importActual<any>('../src/services/bot-admin-unions-store.js');
+  return { ...actual, withBotAdminIdentityPublication: async (_dataDir: string, effect: () => Promise<unknown>) => effect() };
+});
+
 // command-handler's cross-daemon calls are authenticated in production. These
 // unit tests exercise relay orchestration with a stubbed global fetch, so keep
 // that seam while bypassing host-secret filesystem setup.
@@ -5146,6 +5151,8 @@ describe('handleCommand', () => {
       expect(killWorker).toHaveBeenCalledWith(ds);
       expect(ds.workingDir).toBe('/home/testuser/other-project');
       expect(ds.session.workingDir).toBe('/home/testuser/other-project');
+      expect(ds.session.workingDirSource).toBe('explicit');
+      expect(ds.session.groupWorkspaceRevision).toBeUndefined();
       expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('工作目录已切换');
@@ -5267,6 +5274,35 @@ describe('handleCommand', () => {
   // ─── /repo ──────────────────────────────────────────────────────────────
 
   describe('/repo', () => {
+    it('routes repair with the exact current sender and signed tenant identity', async () => {
+      const ds = makeDaemonSession({ pendingRepo: false });
+      const deps = makeDeps(ds);
+      deps.repairGroupWorkspace = vi.fn().mockResolvedValue('repaired');
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo repair current', {
+        senderId: 'ou_current', senderUnionId: 'on_current', tenantKey: 'tenant_current', senderType: 'user',
+      }), deps, LARK_APP_ID);
+
+      expect(deps.repairGroupWorkspace).toHaveBeenCalledWith(ds, {
+        openId: 'ou_current', unionId: 'on_current', tenantKey: 'tenant_current', humanProvenance: true,
+      }, 'current');
+      expect(deps.sessionReply).toHaveBeenCalledTimes(1);
+    });
+
+    it('consumes a recognized repair with missing stable identity instead of falling into repo selection', async () => {
+      const ds = makeDaemonSession({ pendingRepo: false });
+      const deps = makeDeps(ds);
+      deps.repairGroupWorkspace = vi.fn().mockResolvedValue('unauthorized');
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo repair', {
+        senderId: 'ou_current', senderUnionId: undefined, tenantKey: undefined,
+      }), deps, LARK_APP_ID);
+
+      expect(deps.repairGroupWorkspace).toHaveBeenCalledTimes(1);
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(String(vi.mocked(deps.sessionReply).mock.calls[0][1])).toContain('无权');
+    });
+
     it('refuses a repo switch over a live Riff generation before teardown or refork', async () => {
       const oldSession = makeSession({
         cliId: 'riff',

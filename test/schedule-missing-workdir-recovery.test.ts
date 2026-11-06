@@ -113,13 +113,46 @@ vi.mock('../src/services/session-store.js', async () => {
 vi.mock('../src/core/worker-pool.js', async () => {
   const { existsSync } = await import('node:fs');
   const actual = await vi.importActual<any>('../src/core/worker-pool.js');
+  const forkWorker = (ds: any, ...rest: unknown[]) => {
+    if (!existsSync(mocks.getSessionWorkingDir!(ds))) return actual.forkWorker(ds, ...rest);
+    mocks.started(ds, ...rest);
+    ds.worker = { killed: false, send: vi.fn() };
+    return true;
+  };
   return {
     ...actual,
-    forkWorker: (ds: any, ...rest: unknown[]) => {
-      if (!existsSync(mocks.getSessionWorkingDir!(ds))) return actual.forkWorker(ds, ...rest);
-      mocks.started(ds, ...rest);
-      ds.worker = { killed: false, send: vi.fn() };
-      return true;
+    forkWorker,
+    dispatchWorkspaceAdmittedBusinessTurn: async (input: any) => {
+      if (!await input.markAttempting()) return false;
+      try {
+        return forkWorker(input.ds, input.payload, {
+          resume: input.resume,
+          turnId: input.turnId,
+          ...(input.trustedCaller ? { trustedCaller: input.trustedCaller } : {}),
+          ...(input.atMostOnce ? { atMostOnce: true as const } : {}),
+        });
+      } catch (error) {
+        if (error instanceof Error && error.name === 'MissingWorkingDirError') {
+          input.ds.initialStartPending = false;
+          input.ds.pendingPrompt = undefined;
+        }
+        throw error;
+      }
+    },
+  };
+});
+
+vi.mock('../src/core/session-cwd.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/session-cwd.js');
+  return {
+    ...actual,
+    repinSessionWorkingDir: (ds: any, mutation: any) => {
+      ds.workingDir = mutation.workingDir;
+      ds.session.workingDir = mutation.workingDir;
+      ds.session.workingDirSource = mutation.source;
+      delete ds.session.groupWorkspaceRevision;
+      delete ds.session.groupWorkspaceIdentity;
+      mocks.updateSession(ds.session);
     },
   };
 });

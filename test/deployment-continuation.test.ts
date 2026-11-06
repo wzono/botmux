@@ -134,6 +134,7 @@ it.each([
     freshnessInputQueue: { enqueueRaw: vi.fn() }, flushPending: vi.fn(), log: vi.fn(),
     flushPendingInjections: vi.fn(), handleTuiTextInput: vi.fn(async () => true),
     unattendedRawInputRefusal: () => undefined,
+    canWriteTerminalBytes: () => true,
   };
   scope.discardDeploymentContinuation = loadWorkerFunction('discardDeploymentContinuation', scope);
   await loadWorkerMessageHandler(message.type, scope)(message);

@@ -24,6 +24,7 @@ vi.mock('../src/core/fleet-supervisor.js', () => {
     FleetSupervisor: class {
       async stopAll(): Promise<void> {}
       async drainCommands(): Promise<void> {}
+      async migrateWorkspaceSchema() { return { status: 'migrated', epoch: 1 }; }
       start(): boolean {
         boundary.envAtFleetStart = { ...process.env };
         return true;

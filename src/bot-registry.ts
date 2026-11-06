@@ -1261,6 +1261,8 @@ export interface OncallChat {
   chatId: string;
   /** Default working directory used for every new topic spawned in this chat. */
   workingDir: string;
+  /** Missing means a legacy/manual binding and is treated conservatively as explicit. */
+  provenance?: 'oncall-explicit' | 'oncall-default-auto';
 }
 
 /**
@@ -3020,7 +3022,13 @@ function refreshRegisteredOncallChatsFromDisk(): void {
       if (Array.isArray(entry.oncallChats)) {
         for (const chat of entry.oncallChats) {
           if (chat && typeof chat.chatId === 'string' && typeof chat.workingDir === 'string') {
-            const normalized = { chatId: chat.chatId, workingDir: chat.workingDir };
+            const normalized: OncallChat = {
+              chatId: chat.chatId,
+              workingDir: chat.workingDir,
+              ...(chat.provenance === 'oncall-explicit' || chat.provenance === 'oncall-default-auto'
+                ? { provenance: chat.provenance }
+                : {}),
+            };
             botChats.push(normalized);
             chats.set(normalized.chatId, normalized);
           }
@@ -3823,6 +3831,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         .map((c: any) => ({
           chatId: c.chatId,
           workingDir: c.workingDir,
+          ...(c.provenance === 'oncall-explicit' || c.provenance === 'oncall-default-auto'
+            ? { provenance: c.provenance }
+            : {}),
         }));
     }
 
