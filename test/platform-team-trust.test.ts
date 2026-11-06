@@ -20,6 +20,7 @@ import { canOperate, evaluateBotTalk, evaluateTalk, isTrustedTeamBotSender, lear
 import { applyPlatformTeamSync } from '../src/services/platform-team-store.js';
 import { isTeamBot, recordTeamBot } from '../src/services/team-bots-store.js';
 import { recordTeamGroup } from '../src/services/team-groups-store.js';
+import { recordBotUnionId } from '../src/services/bot-union-ids-store.js';
 
 let dataDir: string;
 const prevBotsConfig = process.env.BOTS_CONFIG;
@@ -66,6 +67,35 @@ describe('isTrustedTeamBotSender (platform mode)', () => {
     seedPlatformTeam();
     // union_id not in roster yet (fresh bot, not yet echoed) but the hall is trusted
     expect(isTrustedTeamBotSender(dataDir, 'pf1', 'oc_hall', 'on_fresh')).toBe(true);
+  });
+
+  it('trusts a same-machine team bot when team-sync has appId before unionId', () => {
+    writeLocalBots(['pf1', 'cli_local_peer']);
+    recordBotUnionId(dataDir, 'cli_local_peer', 'on_local_peer');
+    applyPlatformTeamSync(dataDir, {
+      rev: 'r-local',
+      teams: [{
+        teamId: 't1', teamName: 'T1', groupChatIds: [],
+        bots: [{ appId: 'cli_local_peer' }], memberUnionIds: [],
+      }],
+    });
+
+    expect(isTrustedTeamBotSender(dataDir, 'pf1', 'oc_random', 'on_local_peer')).toBe(true);
+    expect(evaluateBotTalk('pf1', 'oc_random', 'ou_local_peer', 'on_local_peer'))
+      .toEqual({ allowed: true, reason: 'teamBot' });
+    expect(canOperate('pf1', 'oc_random', 'ou_local_peer', 'on_local_peer')).toBe(true);
+  });
+
+  it('does not trust a locally known bot after its appId leaves the team roster', () => {
+    recordBotUnionId(dataDir, 'cli_local_peer', 'on_local_peer');
+    applyPlatformTeamSync(dataDir, {
+      rev: 'r-removed',
+      teams: [{ teamId: 't1', teamName: 'T1', groupChatIds: [], bots: [], memberUnionIds: [] }],
+    });
+
+    expect(isTrustedTeamBotSender(dataDir, 'pf1', 'oc_random', 'on_local_peer')).toBe(false);
+    expect(evaluateBotTalk('pf1', 'oc_random', 'ou_local_peer', 'on_local_peer').allowed).toBe(false);
+    expect(canOperate('pf1', 'oc_random', 'ou_local_peer', 'on_local_peer')).toBe(false);
   });
 });
 

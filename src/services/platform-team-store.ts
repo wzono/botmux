@@ -32,6 +32,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { listTeamGroups, replaceTeamGroupsByPrefix } from './team-groups-store.js';
+import { getBotUnionId } from './bot-union-ids-store.js';
 
 /** teamId prefix used when mirroring platform team groups into team-groups.json. */
 export const PLATFORM_TEAM_PREFIX = 'platform:';
@@ -172,14 +173,23 @@ export function isPlatformHallChat(dataDir: string, chatId: string | undefined):
  *  Identity evidence only ("this union_id is a botmux bot"), NOT authorization:
  *  the roster is per MACHINE (every team the machine's owner is in), so a hit
  *  says nothing about whether the RECEIVING bot shares a team with the sender.
- *  Auth gates must use {@link isPlatformTeamBotTrustedBy}. */
+ *  Auth gates must use {@link isPlatformTeamBotTrustedBy}.
+ *
+ *  The platform roster can temporarily know only a local bot's appId: union_id
+ *  is learned asynchronously from Lark events and reaches the next heartbeat
+ *  after team-sync. For bots on this machine, join that authoritative team appId
+ *  with the locally learned self union_id. Team removal still revokes trust
+ *  immediately because an appId absent from the current roster is never read. */
 export function isPlatformTeamBot(dataDir: string, unionId: string | undefined): boolean {
   const id = (unionId ?? '').trim();
   if (!id) return false;
   const data = readFile(dataDir);
   if (!data) return false;
   for (const t of data.teams) {
-    for (const b of t.bots) if (b.unionId === id) return true;
+    for (const b of t.bots) {
+      if (b.unionId === id) return true;
+      if (!b.unionId && getBotUnionId(dataDir, b.appId) === id) return true;
+    }
   }
   return false;
 }
@@ -216,7 +226,8 @@ export function isPlatformTeamBotTrustedBy(
   if (!data) return false;
   let senderAppIds: string[] | undefined;
   for (const t of data.teams) {
-    const sender = t.bots.find((b) => b.unionId === id);
+    const sender = t.bots.find((b) => b.unionId === id
+      || (!b.unionId && isLocalApp(b.appId) && getBotUnionId(dataDir, b.appId) === id));
     if (!sender) continue;
     if (receiver && t.bots.some((b) => b.appId === receiver)) return true;
     (senderAppIds ??= []).push(sender.appId);
