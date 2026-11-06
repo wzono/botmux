@@ -4307,13 +4307,15 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
       }
       const submittedContent = buildTurnContinuePrompt();
+      const purgeTurnId = `purge-${randomUUID()}`;
+      const rollbackReplyRouting = inheritTurnReplyRouting(ds, failedTurn.turnId, purgeTurnId);
       let accepted = false;
       try {
         if (ds.worker && !ds.worker.killed) {
           // Same turnId handling as retry_turn: do NOT reuse failedTurn.turnId —
           // that om_ id is a committed ordinary turn and the worker would dedupe
           // it before reaching the purge branch.
-          accepted = sendWorkerInput(ds, { content: submittedContent }, undefined, {
+          accepted = sendWorkerInput(ds, { content: submittedContent }, purgeTurnId, {
             purgeUndersizedImages: true,
           });
         } else {
@@ -4328,11 +4330,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         );
       }
       if (!accepted) {
+        rollbackReplyRouting();
         return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
       }
       markRetryAttempt(ds.session);
-      rememberLastCliInput(ds, failedTurn.userPrompt, { content: submittedContent },
-        ds.pendingTurnId ?? failedTurn.turnId);
+      rememberLastCliInput(ds, failedTurn.userPrompt, { content: submittedContent }, purgeTurnId);
       sessionStore.updateSession(ds.session);
       ds.lastScreenStatus = 'working';
       ds.streamCardPending = true;

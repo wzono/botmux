@@ -408,6 +408,19 @@ describe('retry_turn — the one-shot interlock', () => {
 });
 
 describe('retry_turn — refusal branches', () => {
+  it('binds purge continuation delivery and remembered input to the same fresh turn', async () => {
+    const ds = makeDs();
+    const action = actionData();
+    action.action.value.action = 'purge_images_continue';
+    const res = await handleCardAction(action, depsWith(ds), LARK_APP_ID);
+    expect(res?.toast?.type).toBe('success');
+    expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+    const submittedTurn = sendWorkerInputMock.mock.calls[0][2];
+    expect(submittedTurn).toMatch(/^purge-/);
+    expect(submittedTurn).not.toBe(TURN);
+    expect(rememberLastCliInputMock.mock.calls[0][3]).toBe(submittedTurn);
+  });
+
   it('refuses when the session has no failed-turn record', async () => {
     const ds = makeDs({ sessionOverrides: { lastFailedTurn: undefined } });
     const res = await handleCardAction(actionData(), depsWith(ds), LARK_APP_ID);
