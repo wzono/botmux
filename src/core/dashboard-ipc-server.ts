@@ -341,6 +341,8 @@ import {
   listHeadlessSessions,
   readHeadlessSession,
   updateHeadlessSession,
+  headlessChatId,
+  isHeadlessId,
   deleteHeadlessSession,
   type HeadlessSessionRecord,
 } from '../services/headless-session-store.js';
@@ -594,7 +596,7 @@ import { executeChatRename } from './chat-rename-operation.js';
 import { authorizeHumanManager } from './human-manager-authorization.js';
 import { changeChatManager, getChatManagerStatus } from '../services/chat-manager.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
-import { sessionAnchorId, isHttpVirtualSession, larkTransportEnabled, type DaemonSession } from './types.js';
+import { sessionAnchorId, isHttpVirtualSession, isHeadlessSessionChatId, larkTransportEnabled, type DaemonSession } from './types.js';
 import { isRemoteBackendSession, persistentBackendTargetForSession, probePersistentBackendTarget } from './persistent-backend.js';
 import { recoverFailedTurn, parseFailedTurnRecoveryRequest } from './failed-turn-recovery.js';
 import { projectCoreOnlyHostFacts } from './core-only-host-facts.js';
@@ -3379,11 +3381,18 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   const detachedScheduled = backgroundInput ? resolveRegisteredBackgroundContext(backgroundInput) : null;
   const targetLarkAppId = ds?.larkAppId ?? detachedScheduled?.larkAppId;
   const targetChatId = ds?.chatId ?? detachedScheduled?.chatId;
-  let botConfig: { larkToolBinding?: boolean } | undefined;
+  const validHeadlessSession = !!ds?.session.headless
+    && ds.session.headless.source === 'cli'
+    && isHeadlessId(ds.session.headless.id)
+    && headlessChatId(ds.session.headless.id) === ds.chatId;
+  let botConfig: { larkToolBinding?: boolean; apiOnly?: boolean } | undefined;
   try { botConfig = targetLarkAppId ? getBot(targetLarkAppId).config : undefined; } catch { /* bot missing */ }
   if ((!ds && !detachedScheduled)
     || (ds && ds.session.status !== 'active')
-    || sessionTransportDisabled({ chatId: targetChatId, larkAppId: targetLarkAppId })
+    || (isHeadlessSessionChatId(targetChatId) && !validHeadlessSession)
+    || botConfig?.apiOnly === true
+    || (targetChatId !== undefined && !validHeadlessSession
+      && sessionTransportDisabled({ chatId: targetChatId, larkAppId: targetLarkAppId }))
     || !boundLarkToolRequest(req, params.sessionId, targetLarkAppId, botConfig)) {
     return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' });
   }
@@ -3391,7 +3400,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     return jsonRes(res, 400, { ok: false, error: 'invalid_lark_tool_request' });
   }
   res.setHeader('cache-control', 'no-store');
-  const bot = getBot(targetLarkAppId!).config;
+  let bot: ReturnType<typeof getBot>['config'];
+  try { bot = getBot(targetLarkAppId!).config; }
+  catch { return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' }); }
+  if (body.mode === 'user' && validHeadlessSession) {
+    return jsonRes(res, 403, { ok: false, error: 'lark_tool_user_transport_required' });
+  }
   if (body.mode === 'bot') {
     let token: unknown;
     try {
@@ -4558,6 +4572,7 @@ function findSessionRecord(sessionId: string): Session | undefined {
  *  getBotClient (which only throws for apiOnly) cannot. Accepts a live
  *  DaemonSession or a stored Session record. Never throws. */
 function sessionTransportDisabled(s: { chatId?: string; larkAppId?: string }): boolean {
+  if (isHeadlessSessionChatId(s.chatId)) return false;
   const appId = s.larkAppId;
   let apiOnly = false;
   if (appId) { try { apiOnly = getBot(appId).config.apiOnly === true; } catch { /* unknown bot → not apiOnly */ } }
