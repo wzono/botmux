@@ -22,6 +22,7 @@ export const messages: Record<string, string> = {
   'cmd.cli.unknown': '未知 CLI：{input}',
   'cmd.cli.ambiguous': '「{input}」对应多个 CLI，没有替你选。请改发其中一个：{choices}',
   'cmd.cli.choice': '/cli {cliId}（{name}）',
+  'worker.purge_images_none': '🧹 未能在当前会话记录中找到尺寸过小的图片（会话文件可能已轮转）。请把网页终端里的完整报错反馈给管理员，或先用 /clear 恢复。',
   'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> [任务] — 修改 Codex 推理强度；任务可同一行或换行附带，强度确认后再投递。CLI 从下一轮生效；App 更新当前轮需启用 step_model_switching（默认关闭，档位以模型为准）',
   'cmd.effort.task_not_submitted': '附带任务未投递：推理强度修改未确认、会话已变化或输入通道不可用。任务已保留在原消息，请重试本条任务。任务：{task}',
   'cmd.effort.cli_next_turn': '当前会话的推理强度已设为 {effort}，从下一轮生效；正在执行的这一轮保持原强度。',
@@ -137,6 +138,12 @@ export const messages: Record<string, string> = {
   'card.status.idle_failed': '执行失败',
   'card.status.idle_completed': '✓ 本轮已结束 · 等待输入',
   'card.status.background_wait': '⏳ 主回合已结束 · 后台子任务运行中（{count}）',
+  'card.capacity_wait.waiting': '☕ 等待模型容量',
+  'card.capacity_wait.waiting_minutes': '☕ 等待模型容量 · 已等待 {minutes} 分钟',
+  'card.capacity_wait.position': '☕ 等待模型容量 · 排位 {position}',
+  'card.capacity_wait.position_minutes': '☕ 等待模型容量 · 排位 {position} · 已等待 {minutes} 分钟',
+  'card.capacity_wait.stale': '☕ 等待模型容量 · 排位已过期',
+  'card.capacity_wait.stale_minutes': '☕ 等待模型容量 · 排位已过期 · 已等待 {minutes} 分钟',
   'card.status.dormant': '休眠',
   'card.status.analyzing': '正在分析…',
   'card.status.stalled': '长时间无进展',
@@ -666,6 +673,7 @@ export const messages: Record<string, string> = {
   'cmd.rename.updated_unsupported': '✅ Botmux 会话标题已更新：{title}\n{cliName} 暂不支持原生会话名同步。',
   'cmd.rename.updated_failed': '⚠️ Botmux 会话标题已更新：{title}\n向 {cliName} 发送原生改名请求失败。',
   'cmd.repo.no_prior_scan': '请先执行 /repo 查看项目列表。',
+  'card.repo.group_unbind': '解除群目录',
   'cmd.repo.index_out_of_range': '序号超出范围，有效范围：1-{max}',
   'cmd.repo.path_not_found': '❌ 找不到目录或项目：`{arg}`\n请传入绝对路径、相对路径，或 workingDir 下的一级项目名。',
   'cmd.repo.here_missing': '⚠️ 当前群聊还没有可复用的工作目录。请先在普通群启动一个会话或使用 /oncall bind 绑定目录。',
@@ -687,6 +695,31 @@ export const messages: Record<string, string> = {
   'cmd.repo.worktree_created_not_switched': '🌿 worktree 已创建：`{path}`（分支 `{branch}`），但会话状态已变化，未自动切换。需要时可用 `/repo {path}` 打开。',
   'cmd.repo.worktree_switch_failed': '⚠️ worktree 已创建：`{path}`，但自动切换失败：{error}\n可用 `/repo {path}` 手动打开。',
   'cmd.repo.switch_close_failed': '⚠️ 无法安全关闭当前会话，仓库未切换：{error}',
+  'cmd.repo.group.denied_identity_unavailable': '⚠️ 无法验证群目录操作身份；本次未切换会话，也未写入群目录。',
+  'cmd.repo.group.denied_stale_config': '⚠️ 群目录授权配置暂不可验证；本次未切换会话，也未写入群目录。',
+  'cmd.repo.group.denied_unauthorized': '⚠️ 你没有群目录管理权限；本次未切换会话，也未写入群目录。',
+  'cmd.repo.group.denied_tenant_mismatch': '⚠️ 群目录操作租户不匹配；本次未切换会话，也未写入群目录。',
+  'cmd.repo.group.switch_denied': '⚠️ 你有群目录管理权限，但没有接收机器人的会话切换权限；本次未切换会话，也未写入群目录。',
+  'cmd.repo.group.invalid_source': '⚠️ 无法验证操作来源，本次未切换会话，也未写入群目录。',
+  'cmd.repo.group.session_committed': '⏳ 会话已切换，群目录提交待确认；暂不宣告成功。',
+  'cmd.repo.group.conflict': '⚠️ 会话已切换，但群目录版本冲突，群目录未更新。请执行 `/repo show` 查看当前状态后重新操作。',
+  'cmd.repo.group.store_unavailable': '⚠️ 会话已切换，但群目录存储不可用，群目录未更新。',
+  'cmd.repo.group.unknown': '⚠️ 会话状态已变化，但群目录提交结果未知；为避免覆盖，未自动重试。请执行 `/repo show` 检查。',
+  'cmd.repo.group.convergence_quarantined': '⚠️ 群目录已提交，但会话代次无法安全收敛，操作已隔离且不会重复切换。请执行 `/repo show` 后修复。',
+  'cmd.repo.group.protocol_conflict': '⚠️ 同一来源对应了不同请求，协议冲突；本次未执行。',
+  'cmd.repo.group.invalid_dir': '⚠️ 目标目录无效、不可访问或目录实体已变化；本次未切换会话，也未写入群目录。',
+  'cmd.repo.group.unauthorized': '⚠️ 群目录操作权限已失效；本次未继续切换或写入。',
+  'cmd.repo.group.aborted': '⚠️ 会话未切换，群目录也未更新。',
+  'cmd.repo.group.committed': '✅ 群目录更新成功（revision {revision}）。',
+  'cmd.repo.group.unbind_committed': '✅ 群目录解绑成功（revision {revision}）。',
+  'cmd.repo.group.unbind_conflict': '⚠️ 解绑版本冲突，群目录未更新。请执行 `/repo show` 查看当前状态后重试。',
+  'cmd.repo.group.unbind_store_unavailable': '⚠️ 解绑存储不可用，暂不确认结果。',
+  'cmd.repo.group.unbind_unknown': '⚠️ 解绑结果未知；为避免覆盖，未自动重试。请执行 `/repo show` 检查。',
+  'cmd.repo.group.unbind_protocol_conflict': '⚠️ 解绑请求与同一来源的既有请求冲突，本次未执行。',
+  'cmd.repo.group.unbind_invalid_dir': '⚠️ 解绑请求无效，本次未执行。',
+  'cmd.repo.group.unbind_unauthorized': '⚠️ 无权解绑群目录，本次未执行。',
+  'cmd.repo.group.unbind_aborted': '⚠️ 解绑未执行，群目录未更新。',
+  'cmd.repo.group.unbind_session_committed': '⚠️ 解绑状态异常，暂不确认结果。',
   // 「仅默认目录」模式开启「自动创建 worktree」后，新会话启动时用（daemon 交互新话题 /
   // dashboard 建会话 / webhook 外部事件三条路复用）。
   'worktree.auto_creating': '🌿 正在为本会话创建独立 worktree（含 git fetch，可能需要几秒）…',
@@ -1173,6 +1206,7 @@ export const messages: Record<string, string> = {
   'cmd.models.inherit_saved': '已恢复跟随会话默认模型，下次重启生效。',
   'cmd.models.inherit_unsupported': '当前会话不支持此操作；仅支持本地 Codex 终端会话。',
   'cmd.models.inherit_unavailable': '暂时无法读取当前 Codex 设置，请等终端就绪后重试。',
+  'help.capacity': '/capacity status - 查看容量反馈分批阶段和已禁用的机器人 × adapter',
   'help.retry': '/retry      - 重试最近一个失败或被中断的 turn（10s 冷却）',
   'help.rewind': '/rewind [n|n confirm] - 回退会话上下文：不带参数列出最近检查点，`n` 预览、`n confirm` 回退到第 n 轮之前（仅 Claude Code，执行前自动备份 transcript）',
   'cmd.retry.no_session': '当前话题没有活跃的会话，无法重试。',
@@ -1378,6 +1412,7 @@ export const messages: Record<string, string> = {
   'ai.followup.reminder_no_resend': '发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND;send 成功即已送达,本轮无可见文本地结束是正常的,别因「无输出」提示重发',
   'ai.followup.feishu_safe_emphasis': '短进度优先纯文本；强调仅包短词或无中文标点的短语，标点和后文放在 `**` 外。',
   'ai.followup.no_local_addresses': '回复里不要放开发机路径、文件协议或本机服务地址，文件用附件或可访问链接。',
+  'ai.response_style.contract': '按任务自适应组织回复：先给结果或动作；多步骤才编号，每步一个有边界的动作；跨轮次重述当前阶段、已完成内容和下一阶段；估时使用具体单位或明确条件；完成时写明必要证据、剩余风险，并区分已保存、已验证、已发布或已部署；错误写清位置、现象、已知原因和下一诊断动作，未知保持未知；补足理解当前回复所需的上下文，使用短句和一致术语，项目有词汇表时遵循词汇表；先完成当前主问题再提出其它问题；只有有效开始、阶段完成、新风险或阻塞、需要决策时才发进度。有真实用户待办时只给一个下一动作；没有待办时直接结束。简单问题可以一句话回答，解释型问题可以充分展开。安全、审批、交付和岗位规则优先，不得为了简短省略确认、证据、风险或交付状态。',
   // No-transport 续轮（apiOnly bot / HTTP 虚拟会话）：这是程序发起的请求-应答，无飞书
   // 会话、无其它 bot 协作，也不该 botmux send。哨兵语义只在本轮内容里的
   // <botmux_http_response_mode> 出现一次（迁移不删，#808 async settle 依赖它），
@@ -1905,6 +1940,7 @@ export const messages: Record<string, string> = {
   'daemon.force_topic_started': '↪️ 已转入新话题，正在处理…',
   'daemon.force_topic_current_dir_missing': '⚠️ 当前群聊还没有可复用的工作目录。请先在普通群启动一个会话或使用 /oncall bind 绑定目录。',
   'daemon.force_topic_worktree_command_unsupported': '⚠️ /tw 后面不能直接跟 {cmd}：/tw 话题要等 worktree 建好才有会话，命令没有落点。不需要 worktree 就直接发 {cmd}；需要的话先发 /tw <任务> 开话题，再在话题里发 {cmd}。',
+  'daemon.group_workspace_repair_required': '⚠️ 群工作目录 `{path}` 已不可访问，本会话未启动，绑定仍保留。请管理员在群顶层重新执行 `/repo` 修复，或用 `/repo unbind` 解除绑定。',
   // ─── 话题指令头（`[标题] /t /repo … /model … 正文`）的拒绝文案 ───────────
   // fail closed：任一项不合法就整条不生效，所以这条回复是用户唯一的反馈，
   // 必须指名道姓说清哪一项错了。
@@ -2262,9 +2298,11 @@ export const messages: Record<string, string> = {
   // ─── i18n coverage v2: shared fragments + cards + chat messages ───────────
   'common.operator': '操作人：{by}',
   'common.empty_paren': '（空）',
+  'common.truncated_short': '…（已截断）',
 
   // Ask card
   'card.ask.field.deadline': '截止',
+  'card.ask.permanent': '等待你回答',
   'card.ask.field.answerable': '可答复',
   'card.ask.question_n': '问题 {n}',
   'card.ask.prompt_truncated': '（问题正文过长，卡片内已截断；完整内容见本话题中的附件文件）',

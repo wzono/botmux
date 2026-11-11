@@ -115,6 +115,19 @@ vi.mock('../src/core/worker-pool.js', async () => {
   const actual = await vi.importActual<any>('../src/core/worker-pool.js');
   return {
     ...actual,
+    dispatchWorkspaceAdmittedBusinessTurn: async (input: any) => {
+      if (!await input.markAttempting()) return false;
+      const options = { resume: input.resume, turnId: input.turnId,
+        ...(input.trustedCaller ? { trustedCaller: input.trustedCaller } : {}) };
+      // Keep the real missing-directory refusal/recovery-card path. Only a
+      // proven available directory reaches the fake CLI launch below.
+      if (!existsSync(mocks.getSessionWorkingDir!(input.ds))) {
+        return actual.forkWorker(input.ds, input.payload, options) !== false;
+      }
+      mocks.started(input.ds, input.payload, options);
+      input.ds.worker = { killed: false, send: vi.fn() };
+      return true;
+    },
     forkWorker: (ds: any, ...rest: unknown[]) => {
       if (!existsSync(mocks.getSessionWorkingDir!(ds))) return actual.forkWorker(ds, ...rest);
       mocks.started(ds, ...rest);
@@ -145,6 +158,7 @@ import {
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { registerBot } from '../src/bot-registry.js';
+import { init as initSessionStore } from '../src/services/session-store.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { ScheduledTask } from '../src/types.js';
@@ -274,6 +288,7 @@ async function fireIntoMissingDir(task: ScheduledTask, anchor: string): Promise<
 
 beforeEach(() => {
   vi.clearAllMocks();
+  initSessionStore(APP);
   mocks.sessions.clear();
   activeSessions.clear();
   lastRepoScan.clear();

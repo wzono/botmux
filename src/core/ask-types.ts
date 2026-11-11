@@ -7,6 +7,7 @@
  */
 
 import type { GroupContextDeliveryBinding } from '../services/group-context-delivery-store.js';
+import type { WorkspaceIdentity } from '../types.js';
 
 /** A single selectable option on an ask card. `key` is the stable identifier
  *  returned via stdout; `label` is the human-facing button text. When the user
@@ -147,6 +148,15 @@ export interface AskJsonOutput {
  *
  *  v0.1.8 变更：`options`/`prompt` 字段替换为 `questions: ReadonlyArray<AskQuestion>`。 */
 export interface CreateAskInput {
+  /** Daemon-frozen exact turn authority; never accepted from CLI JSON. */
+  controlWait?: {
+    originalTurnId: string;
+    expectedGeneration: number;
+    workspace: WorkspaceIdentity;
+    groupRevision?: number;
+    wait: { kind: 'ask'; askId: string };
+    state: 'needs_user' | 'terminal';
+  };
   /** Frozen by the daemon from the exact document turn, never CLI-supplied. */
   deliveryTarget?: AskDeliveryTarget;
   /** Daemon-bound presentation target; never accepted directly from CLI JSON. */
@@ -172,6 +182,9 @@ export interface CreateAskInput {
    *  'explicit' = `botmux ask buttons`, etc.). Namespaces the identity so an
    *  explicit ask can never re-claim a hook ask's card. Defaults to 'hook'. */
   originKind?: string;
+  /** Frozen worker generation that issued this Ask. Host acknowledgements must
+   * carry the same value so a later generation cannot consume its receipt. */
+  originWorkerGeneration?: number;
   /** DAEMON-COMPUTED authoritative persistence gate (codex P1-4): does the
    *  authenticated issuing session's FROZEN backend survive a daemon restart
    *  (tmux/herdr/zellij/zmx = yes; pty = no)? The broker persists + resumes ONLY
@@ -202,6 +215,7 @@ export interface CreateAskInput {
  *
  *  v0.1.8 变更：`options`/`prompt` 替换为 `questions`。 */
 export interface PendingAsk {
+  controlWait?: CreateAskInput['controlWait'];
   deliveryTarget?: AskDeliveryTarget;
   replyCardTarget?: CreateAskInput['replyCardTarget'];
   result?: AskResult;
@@ -354,26 +368,19 @@ export function isRetryableAskHttpStatus(status: number): boolean {
 
 /**
  * Whether the daemon's `/api/asks` handler must answer a RETRYABLE 503
- * `startup_not_ready` instead of proceeding (codex P1-2/P1-4, executable
- * decision seam). PURE + exported so daemon.ts and its unit test share the SAME
- * predicate rather than asserting against source regex.
+ * `startup_not_ready` instead of proceeding (executable decision seam). PURE +
+ * exported so daemon.ts and its unit test share the SAME predicate rather than
+ * asserting against source regex.
  *
- * True iff an unknown session hits the route while restore is still in flight —
- * regardless of how the caller authenticated. The earlier `trustedHost` escape
- * was WRONG (codex P1-2): a normal unsandbox hook IS the trusted-host path
- * (`postAsk` loads the host secret and calls the HMAC `fetchDaemonIpc` when
- * there's no relay), so exempting trusted callers let exactly the reconnecting
- * hook we must protect slip through during the descriptor-published-but-sessions-
- * not-yet-restored window — it would then register a NEW ask computed as
- * `backendSurvivesRestart:false` (session unknown) and be lost on the next
- * restart. Every `POST /api/asks` caller is a session-scoped ask registration
- * (the desktop/dashboard ANSWER path is a different route), so gating all
- * unknown sessions here is safe: once `sessionsRestored` flips true the gate
- * lifts and unknown sessions fall through to normal authorization.
+ * True until the exact target bot has completed restore and permit/control
+ * reconciliation, regardless of whether its Session row is already visible or
+ * how the caller authenticated. A visible row is not readiness: accepting its
+ * ask before reconciliation recreates the startup split-brain this gate exists
+ * to prevent. Once ready, unknown sessions fall through to normal authorization.
  */
 export function shouldReturnAskStartupNotReady(args: {
   hasSession: boolean;
-  sessionsRestored: boolean;
+  targetReady: boolean;
 }): boolean {
-  return !args.hasSession && !args.sessionsRestored;
+  return !args.targetReady;
 }

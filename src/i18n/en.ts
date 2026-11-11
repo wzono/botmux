@@ -19,6 +19,7 @@ export const messages: Record<string, string> = {
   'cmd.cli.unknown': 'Unknown CLI: {input}',
   'cmd.cli.ambiguous': '"{input}" matches several CLIs, so none was picked. Send one of: {choices}',
   'cmd.cli.choice': '/cli {cliId} ({name})',
+  'worker.purge_images_none': '🧹 No undersized images were found in the current session transcript (the file may have rotated). Forward the full error from the web terminal to the admin, or recover with /clear for now.',
   'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> [task] — Change Codex reasoning effort; a task may follow on the same or subsequent lines and is submitted after confirmation. CLI affects future turns; App active-turn updates require step_model_switching (off by default; levels depend on the model)',
   'cmd.effort.task_not_submitted': 'The attached task was not submitted: the effort change was unconfirmed, the session changed, or input is unavailable. The task remains in the original message; retry the task. Task: {task}',
   'cmd.effort.cli_next_turn': 'This session will use {effort} starting with the next turn; the running turn keeps its original effort.',
@@ -134,6 +135,12 @@ export const messages: Record<string, string> = {
   'card.status.idle_failed': 'Failed',
   'card.status.idle_completed': '✓ Turn ended · Awaiting input',
   'card.status.background_wait': '⏳ Main turn ended · background tasks running ({count})',
+  'card.capacity_wait.waiting': '☕ Waiting for model capacity',
+  'card.capacity_wait.waiting_minutes': '☕ Waiting for model capacity · waiting {minutes} min',
+  'card.capacity_wait.position': '☕ Waiting for model capacity · position {position}',
+  'card.capacity_wait.position_minutes': '☕ Waiting for model capacity · position {position} · waiting {minutes} min',
+  'card.capacity_wait.stale': '☕ Waiting for model capacity · position is stale',
+  'card.capacity_wait.stale_minutes': '☕ Waiting for model capacity · position is stale · waiting {minutes} min',
   'card.status.dormant': 'Dormant',
   'card.status.analyzing': 'Analyzing…',
   'card.status.stalled': 'No recent progress',
@@ -668,6 +675,7 @@ export const messages: Record<string, string> = {
   'cmd.rename.updated_unsupported': '✅ Botmux session title updated: {title}\n{cliName} does not support native session-name sync yet.',
   'cmd.rename.updated_failed': '⚠️ Botmux session title updated: {title}\nFailed to send the native rename request to {cliName}.',
   'cmd.repo.no_prior_scan': 'Run `/repo` first to see the project list.',
+  'card.repo.group_unbind': 'Unbind group workspace',
   'cmd.repo.index_out_of_range': 'Index out of range. Valid: 1-{max}',
   'cmd.repo.path_not_found': '❌ No such directory or project: `{arg}`\nPass an absolute path, a relative path, or a first-level project name under workingDir.',
   'cmd.repo.here_missing': '⚠️ This chat has no current working directory to reuse. Start a normal chat session first, or bind one with /oncall bind.',
@@ -689,6 +697,31 @@ export const messages: Record<string, string> = {
   'cmd.repo.worktree_created_not_switched': '🌿 Worktree created: `{path}` (branch `{branch}`), but the session changed meanwhile — not switched automatically. Use `/repo {path}` to open it.',
   'cmd.repo.worktree_switch_failed': '⚠️ Worktree created at `{path}`, but switching to it failed: {error}\nUse `/repo {path}` to open it manually.',
   'cmd.repo.switch_close_failed': '⚠️ Could not safely close the current session; repository was not switched: {error}',
+  'cmd.repo.group.denied_identity_unavailable': '⚠️ The group workspace actor identity could not be verified. The session and group workspace were not changed.',
+  'cmd.repo.group.denied_stale_config': '⚠️ Group workspace authority configuration could not be verified. The session and group workspace were not changed.',
+  'cmd.repo.group.denied_unauthorized': '⚠️ You are not authorized to manage the group workspace. The session and group workspace were not changed.',
+  'cmd.repo.group.denied_tenant_mismatch': '⚠️ The group workspace tenant does not match this callback. The session and group workspace were not changed.',
+  'cmd.repo.group.switch_denied': '⚠️ You may manage the group workspace, but you cannot replace this bot session. The session and group workspace were not changed.',
+  'cmd.repo.group.invalid_source': '⚠️ The operation source could not be verified. The session and group workspace were not changed.',
+  'cmd.repo.group.session_committed': '⏳ The session switched, but the group workspace commit is still pending; success is not confirmed yet.',
+  'cmd.repo.group.conflict': '⚠️ The session switched, but the group workspace revision conflicted and was not updated. Run `/repo show` and retry.',
+  'cmd.repo.group.store_unavailable': '⚠️ The session switched, but group workspace storage is unavailable and was not updated.',
+  'cmd.repo.group.unknown': '⚠️ The session changed, but the group workspace result is unknown. It was not retried automatically; run `/repo show` to inspect it.',
+  'cmd.repo.group.convergence_quarantined': '⚠️ The group workspace committed, but the session generation could not converge safely. The operation is quarantined and will not switch again; run `/repo show` and repair it.',
+  'cmd.repo.group.protocol_conflict': '⚠️ The same immutable source carried a different request. The conflicting request was rejected.',
+  'cmd.repo.group.invalid_dir': '⚠️ The target directory is invalid, inaccessible, or has a different identity. The session and group workspace were not changed.',
+  'cmd.repo.group.unauthorized': '⚠️ Group workspace authority was revoked. No further session replacement or group write was performed.',
+  'cmd.repo.group.aborted': '⚠️ The session was not switched and the group workspace was not updated.',
+  'cmd.repo.group.committed': '✅ Group workspace updated (revision {revision}).',
+  'cmd.repo.group.unbind_committed': '✅ Group workspace unbound (revision {revision}).',
+  'cmd.repo.group.unbind_conflict': '⚠️ Unbind revision conflict; the group workspace was not updated. Run `/repo show` and retry.',
+  'cmd.repo.group.unbind_store_unavailable': '⚠️ Unbind storage is unavailable; the result is not confirmed.',
+  'cmd.repo.group.unbind_unknown': '⚠️ The unbind result is unknown. It was not retried automatically; run `/repo show` to inspect it.',
+  'cmd.repo.group.unbind_protocol_conflict': '⚠️ The unbind request conflicts with an existing request from the same source and was not executed.',
+  'cmd.repo.group.unbind_invalid_dir': '⚠️ The unbind request is invalid and was not executed.',
+  'cmd.repo.group.unbind_unauthorized': '⚠️ You are not authorized to unbind the group workspace.',
+  'cmd.repo.group.unbind_aborted': '⚠️ Unbind was not executed; the group workspace was not updated.',
+  'cmd.repo.group.unbind_session_committed': '⚠️ The unbind state is inconsistent; the result is not confirmed.',
   // Used when 「default-directory-only」mode has「auto-create worktree」on, at new
   // session start (shared by interactive new topic / dashboard create / webhook).
   'worktree.auto_creating': '🌿 Creating an isolated worktree for this session (includes a git fetch, may take a few seconds)…',
@@ -1176,6 +1209,7 @@ export const messages: Record<string, string> = {
   'cmd.models.inherit_saved': 'This session will follow its default model on the next restart.',
   'cmd.models.inherit_unsupported': 'This operation is supported only for local Codex terminal sessions.',
   'cmd.models.inherit_unavailable': 'Could not read the current Codex settings. Please try again after the terminal is ready.',
+  'help.capacity': '/capacity status - Show capacity-feedback rollout phase and disabled bot × adapter cells',
   'help.retry': '/retry      - Retry the most recent failed or interrupted turn (10s cooldown)',
   'help.rewind': '/rewind [n|n confirm] - Roll the session context back: no args lists recent checkpoints, `n` previews, `n confirm` truncates the context to before turn n (Claude Code only; the transcript is backed up first)',
   'cmd.retry.no_session': 'No active session in this topic to retry.',
@@ -1381,6 +1415,7 @@ export const messages: Record<string, string> = {
   'ai.followup.reminder_no_resend': 'Respond to messages addressed to you at least once via `botmux send`, never stay silent; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND. A successful send is already delivered; ending a turn with no visible text is normal, so do not resend on a "no visible output" nudge.',
   'ai.followup.feishu_safe_emphasis': 'Prefer plain text for short progress updates. If emphasis is needed, wrap only a short phrase without CJK punctuation; keep punctuation and following prose outside `**`.',
   'ai.followup.no_local_addresses': 'Keep host paths, file URIs and local service addresses out of replies; deliver files as attachments or accessible URLs.',
+  'ai.response_style.contract': 'Shape each reply to the task: lead with the result or the first action; number only multi-step work, with one bounded action per step; across turns restate the current phase, completed work, and next phase; estimate in concrete units or explicit conditions; on completion state the necessary evidence and remaining risk, distinguishing saved, verified, published, and deployed; for errors state the location, symptom, known cause, and next diagnostic action, leaving unknowns explicit; include enough context to understand this reply, use short sentences and consistent terms, and follow the project glossary when present; finish the current main issue before raising another; send progress only on an effective start, phase completion, new risk or blocker, or needed decision. If the user has a real action, end with one next action; otherwise stop. A simple answer may be one sentence, and an explanation may expand fully. Safety, approval, delivery, and role rules take precedence: brevity never removes confirmation, evidence, risk, or delivery state.',
   // No-transport follow-up (apiOnly bot / HTTP virtual session): a program-driven
   // request/response turn with no Lark conversation, no sibling bots, and no
   // `botmux send`. The nothing-to-send sentinel appears exactly once, in this
@@ -1899,6 +1934,7 @@ export const messages: Record<string, string> = {
   'daemon.force_topic_started': '↪️ Moved into a new topic and started working…',
   'daemon.force_topic_current_dir_missing': '⚠️ This chat has no current working directory to reuse. Start a normal chat session first, or bind one with /oncall bind.',
   'daemon.force_topic_worktree_command_unsupported': '⚠️ {cmd} cannot follow /tw directly: a /tw topic has no session until its worktree is built, so the command has nowhere to run. If you do not need the worktree, send {cmd} on its own; otherwise start the topic with /tw <task> first, then send {cmd} inside the topic.',
+  'daemon.group_workspace_repair_required': '⚠️ The group workspace `{path}` is no longer accessible. This session was not started and the binding was preserved. Ask an administrator to repair it with a new top-level `/repo`, or use `/repo unbind`.',
   // ─── Topic directive header (`[title] /t /repo … /model … body`) rejections ──
   // Fail closed: one bad field voids the whole header, so this reply is the
   // user's only feedback and must name the offending field.
@@ -2259,9 +2295,11 @@ export const messages: Record<string, string> = {
   // ─── i18n coverage v2: shared fragments + cards + chat messages ───────────
   'common.operator': 'By: {by}',
   'common.empty_paren': '(empty)',
+  'common.truncated_short': '…(truncated)',
 
   // Ask card
   'card.ask.field.deadline': 'Deadline',
+  'card.ask.permanent': 'Waiting for your response',
   'card.ask.field.answerable': 'Can answer',
   'card.ask.question_n': 'Question {n}',
   'card.ask.prompt_truncated': '(The question is too long and was truncated in this card; see the attached file in this thread for the full text.)',

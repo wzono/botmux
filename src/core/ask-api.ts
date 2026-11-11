@@ -34,6 +34,7 @@ export interface AskApiBody {
   /** 显式 `botmux ask --mention <open_id>` 请求 @ 的人。只是请求：daemon 核实是本应用
    *  通讯录里的真人后才画进卡片（见 verifiedAskMention）。 */
   mentionedOpenId?: string;
+  originWorkerGeneration?: number;
   acknowledge?: boolean;
   asyncUserInput?: CodexAsyncUserInput;
   /** Optional narrowing only; never grants talk/approval authority. */
@@ -67,6 +68,7 @@ export type AskApiBodyError =
   | 'bad_requestId'
   | 'bad_originKind'
   | 'bad_mentionedOpenId'
+  | 'bad_originWorkerGeneration'
   | 'bad_acknowledge'
   | 'bad_asyncUserInput';
 
@@ -134,6 +136,10 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
   }
 
   if (r.acknowledge !== undefined && typeof r.acknowledge !== 'boolean') return { error: 'bad_acknowledge' };
+  if (r.originWorkerGeneration !== undefined && (typeof r.originWorkerGeneration !== 'number'
+    || !Number.isSafeInteger(r.originWorkerGeneration) || r.originWorkerGeneration < 1)) {
+    return { error: 'bad_originWorkerGeneration' };
+  }
 
   if (r.asyncFailure !== undefined && (originKind !== CODEX_ASYNC_ASK_ORIGIN
     || (r.asyncFailure !== 'limit' && r.asyncFailure !== 'invalid_questions'))) return { error: 'bad_asyncUserInput' };
@@ -185,6 +191,8 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     ...(requestId !== undefined ? { requestId } : {}),
     ...(originKind !== undefined ? { originKind } : {}),
     ...(mentionedOpenId !== undefined ? { mentionedOpenId } : {}),
+    ...(r.originWorkerGeneration !== undefined
+      ? { originWorkerGeneration: r.originWorkerGeneration as number } : {}),
     ...(r.acknowledge !== undefined ? { acknowledge: r.acknowledge as boolean } : {}),
     ...(asyncUserInput ? { asyncUserInput } : {}),
     ...(r.asyncFailure ? { asyncFailure: r.asyncFailure as 'limit' | 'invalid_questions' } : {}),
@@ -255,7 +263,7 @@ export function handleCliResolvedRequest(raw: unknown, ctx: {
   if ('error' in parsed) return { status: 400, body: { ok: false, error: parsed.error } };
   const claims = raw as Record<string, unknown>;
   const session = ctx.findSession(parsed.sessionId);
-  if (shouldReturnAskStartupNotReady({ hasSession: !!session, sessionsRestored: ctx.sessionsRestored })) {
+  if (shouldReturnAskStartupNotReady({ hasSession: !!session, targetReady: ctx.sessionsRestored })) {
     return { status: 503, body: { ok: false, error: 'startup_not_ready' } };
   }
   if (!ctx.trustedHost) {

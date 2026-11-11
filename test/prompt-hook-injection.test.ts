@@ -470,6 +470,9 @@ describe('buildNewTopicCliInput — hook 注入模式（opening）', () => {
 
   it('无 whiteboard/sender/mentions（envelope 为空）：回退 inline，保留外壳', () => {
     // envelope 为空时不写 sidecar，回退 inline——外壳保留给会话发现/标题提取用。
+    // Transport-free sessions also omit the global response-style block.
+    getBotMock.mockReturnValue({ config: { larkAppId: 'app_test', larkAppSecret: 'secret',
+      cliId: 'claude-code', apiOnly: true, envelopeInjection: 'hook' as const } });
     const result = buildNewTopicCliInput(
       '帮我修个 bug', SESSION_ID, 'claude-code', undefined,
       undefined, undefined, undefined, undefined,
