@@ -16,7 +16,6 @@ let directory: string;
 let oldDataDir: string;
 let ds: any;
 let ipc: IpcServerHandle;
-let restoreWorkspaceDispatcher: (() => void) | undefined;
 const secret = 'sqlite-recovery-isolated-secret';
 const caller = { requestUserOpenId: 'ou_user_a', requestLarkAppId: 'cli_fixture', senderType: 'user' as const };
 const at = '2026-10-16T00:00:00.000Z';
@@ -43,18 +42,11 @@ beforeEach(async () => {
   });
   vi.spyOn(manager, 'rememberLastCliInput').mockImplementation(() => undefined);
   vi.spyOn(manager, 'buildFollowUpCliInput').mockImplementation((prompt, id) => ({ content: `${id}:${prompt}` }));
-  restoreWorkspaceDispatcher = pool.setWorkspaceAdmittedBusinessTurnDispatcher(async input => {
-    if (input.markAttempting && !await input.markAttempting()) return false;
-    return input.ds.worker && !input.ds.worker.killed
-      ? pool.sendWorkerInput(input.ds, input.payload, input.turnId, input.options)
-      : pool.forkWorker(input.ds, input.payload, { ...input.options, turnId: input.turnId });
-  });
   setIpcAuthSecret(secret); setLarkAppId('cli_fixture');
   ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
 });
 afterEach(async () => {
-  await ipc?.close(); restoreWorkspaceDispatcher?.(); restoreWorkspaceDispatcher = undefined;
-  vi.restoreAllMocks(); pool.setActiveSessionsRegistry(undefined); setIpcAuthSecret(null);
+  await ipc?.close(); vi.restoreAllMocks(); pool.setActiveSessionsRegistry(undefined); setIpcAuthSecret(null);
   store.init('cli_fixture'); config.session.dataDir = oldDataDir;
   rmSync(directory, { recursive: true, force: true });
 });

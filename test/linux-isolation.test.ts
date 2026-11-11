@@ -16,15 +16,13 @@ import { readPersistedSessionRows, seedPersistedSessionRows } from './helpers/se
 
 const supported = ['x64', 'arm64', 'ia32', 'arm'].includes(process.arch);
 const linux = process.platform === 'linux';
-const bwrapArgs = ['--ro-bind', '/', '/', '--unshare-user', '--unshare-pid',
-  '--unshare-net', '--proc', '/proc', '--dev', '/dev', '--'];
-// The kernel probes include nested user/PID/mount namespaces. A shallow
-// `bwrap /bin/true` can succeed on a runner whose AppArmor policy rejects that
-// nested shape, so gate on the strongest baseline every case below requires.
 const canRunBwrap = linux && spawnSync('bwrap', [
-  ...bwrapArgs, 'bwrap', ...bwrapArgs, '/bin/true',
+  '--ro-bind', '/', '/', '--unshare-user', '--unshare-pid', '--proc', '/proc',
+  '--', '/bin/true',
 ], { stdio: 'ignore', timeout: 5_000 }).status === 0;
 const repoRoot = realpathSync(fileURLToPath(new URL('..', import.meta.url)));
+const bwrapArgs = ['--ro-bind', '/', '/', '--unshare-user', '--unshare-pid',
+  '--unshare-net', '--proc', '/proc', '--dev', '/dev', '--'];
 
 type Launch = ReturnType<typeof linuxIsolationLaunch>;
 
@@ -134,7 +132,7 @@ describe.skipIf(!supported)('Linux isolation filter', () => {
   });
 });
 
-describe('Linux isolation kernel probe', () => {
+describe.skipIf(!canRunBwrap || !supported)('Linux isolation kernel probe', () => {
   const snippet = tsEvalArgs(`
     import { getPriority } from 'node:os';
     import { readFileSync } from 'node:fs';
@@ -158,7 +156,7 @@ describe('Linux isolation kernel probe', () => {
     return JSON.parse(result.stdout);
   }
 
-  it.skipIf(!canRunBwrap || !supported)('keeps long bwrap options out of tmux-facing argv and preserves CLI argv exactly', () => {
+  it('keeps long bwrap options out of tmux-facing argv and preserves CLI argv exactly', () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-isolation-long-args-'));
     const specialArgs = [
       'plain',
@@ -202,26 +200,26 @@ describe('Linux isolation kernel probe', () => {
     }
   }, 20_000);
 
-  it.skipIf(!canRunBwrap || !supported)('keeps an ordinary host unmarked, including a bare HOME', () => {
+  it('keeps an ordinary host unmarked, including a bare HOME', () => {
     expect(linuxIsolationDetected()).toBe(false);
     expect(run({ bin: cleanCli[0]!, args: cleanCli.slice(1) })).toMatchObject({
       isolated: false, offline: false, input: 'interactive stdin',
     });
   });
 
-  it.skipIf(!canRunBwrap || !supported)('survives a cleared environment and preserves stdin/current priority', () => {
+  it('survives a cleared environment and preserves stdin/current priority', () => {
     expect(run(linuxIsolationLaunch('bwrap', [...bwrapArgs, ...cleanCli]))).toEqual({
       isolated: true, offline: true, input: 'interactive stdin', ownPriority: expect.any(Number),
     });
   }, 20_000);
 
-  it.skipIf(!canRunBwrap || !supported)('survives another user/PID/mount namespace with no environment markers', () => {
+  it('survives another user/PID/mount namespace with no environment markers', () => {
     expect(run(linuxIsolationLaunch('bwrap', [
       ...bwrapArgs, 'bwrap', ...bwrapArgs, ...cleanCli,
     ]))).toMatchObject({ isolated: true, offline: true });
   });
 
-  it.skipIf(!canRunBwrap || !supported).each([0, 3, 38])('does not trust an overlaid seccomp errno %s', errno => {
+  it.each([0, 3, 38])('does not trust an overlaid seccomp errno %s', errno => {
     const inner = linuxIsolationLaunch('bwrap', [...bwrapArgs, ...cleanCli]);
     const bytes = filterBytes(inner);
     let replaced = 0;
@@ -238,7 +236,7 @@ describe('Linux isolation kernel probe', () => {
     ]))).toMatchObject({ isolated: true, offline: true });
   });
 
-  it.skipIf(!canRunBwrap || !supported)('never executes the CLI if bwrap cannot install the filter', () => {
+  it('never executes the CLI if bwrap cannot install the filter', () => {
     const launch = replaceFilter(linuxIsolationLaunch('bwrap', [
       ...bwrapArgs, '/bin/sh', '-c', 'printf should-not-run',
     ]), Buffer.from([0]));
@@ -248,7 +246,7 @@ describe('Linux isolation kernel probe', () => {
     expect(result.stderr).toContain('seccomp');
   });
 
-  it.skipIf(!canRunBwrap || !supported)('marks credential-only bwrap as isolated even after all BOTMUX env is removed', () => {
+  it('marks credential-only bwrap as isolated even after all BOTMUX env is removed', () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-kernel-marker-')));
     const hidden = join(root, 'authority');
     mkdirSync(hidden);
@@ -267,7 +265,7 @@ describe('Linux isolation kernel probe', () => {
     }
   });
 
-  it.skipIf(!canRunBwrap || !supported)('refuses offline session mutation in credential-only mode with a writable store', () => {
+  it('refuses offline session mutation in credential-only mode with a writable store', () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-kernel-offline-')));
     const hidden = join(root, 'authority');
     const dataDir = join(root, 'data');

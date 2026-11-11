@@ -1,16 +1,20 @@
 import { hasAskForm } from '../../core/ask-form.js';
-import { buildAskFormElements } from './ask-form-elements.js';
+import { buildAskFormElements, formatAskDeadline } from './ask-form-elements.js';
 import type { ReplyCardAsk } from '../../services/turn-reply-card.js';
 import { stripCardMarkdownImages } from './md-card.js';
 import { t, type Locale } from '../../i18n/index.js';
 import { askOptionLayoutForBot } from './ask-option-layout.js';
 import { supportsAskCustomInput } from '../../core/ask-custom-input.js';
 import { buildAskCustomForm } from './ask-custom-form.js';
+import { optionDescriptions } from './ask-option-descriptions.js';
+import { permissionAskSettleStatus } from './ask-permission-status.js';
 
 const safe = (text: string) => stripCardMarkdownImages(text.replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, '[mention]'))
   .replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-/** Same broker actions as the standalone Ask card, expressed as Card JSON 2.0. */
+/** Same broker actions as the standalone Ask card, expressed as Card JSON 2.0.
+ * Option descriptions render in full: replyCardAskTarget only embeds asks whose whole
+ * questions JSON fits in 3000 bytes, so they cannot crowd out the reply card. */
 export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 'zh'): Array<Record<string, any>> {
   const { ask } = entry;
   if (hasAskForm(ask.questions)) return buildAskFormElements(ask, locale, entry.result);
@@ -33,40 +37,26 @@ export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 
   });
   const optionLayout = askOptionLayoutForBot(ask.larkAppId);
   ask.questions.forEach((q, i) => {
-    // 显式 `botmux ask --mention` 的点名（daemon 已剔除 bot open_id）：嵌入
-    // turn-reply 卡时同样要保留真实 <at>，不能走 safe()——safe 会把 at 抹成
-    // [mention]，通知触达丢失。仅第一问前注入一次。
-    const mentionPrefix = i === 0 && ask.mentionedOpenId
-      ? `<at id=${ask.mentionedOpenId}></at>\n`
-      : '';
-    const prompt = textReplyRequired && q.options.length
-      ? `${q.prompt}\n\n${q.options.map(o => o.label).join(' / ')}` : q.prompt;
-    elements.push({ tag: 'markdown', content: `${mentionPrefix}${safe(prompt)}` });
-    if (textReplyRequired) return; // Keep the batch intact; answer it with one text reply.
-
-    const selected = new Set(ask.selections?.[i] ?? []);
-    const buttons = q.options.map(option => ({
-      ...button(option.label,
-        { action: submit ? 'ask_toggle' : 'ask_select', key: option.key, question_index: String(i) },
-        selected.has(option.key) ? 'primary' : 'default',
-      ),
-      ...(submit ? { icon: { tag: 'standard_icon', token: selected.has(option.key) ? 'check_outlined' : 'rectangle_outlined' } } : {}),
-    }));
-    if (optionLayout === 'vertical') {
-      for (const b of buttons) elements.push(verticalRow(b));
-    } else {
-      for (let start = 0; start < buttons.length; start += 3) elements.push(row(buttons.slice(start, start + 3)));
+    elements.push({ tag: 'markdown', content: safe(textReplyRequired && q.options.length
+      ? `${q.prompt}\n\n${q.options.map(o => o.label).join(' / ')}` : q.prompt) });
+    // A text batch keeps no buttons: it is answered with one text reply.
+    if (!textReplyRequired) {
+      const selected = new Set(ask.selections?.[i] ?? []);
+      const buttons = q.options.map(option => ({
+        ...button(option.label,
+          { action: submit ? 'ask_toggle' : 'ask_select', key: option.key, question_index: String(i) },
+          selected.has(option.key) ? 'primary' : 'default',
+        ),
+        ...(submit ? { icon: { tag: 'standard_icon', token: selected.has(option.key) ? 'check_outlined' : 'rectangle_outlined' } } : {}),
+      }));
+      if (optionLayout === 'vertical') {
+        for (const b of buttons) elements.push(verticalRow(b));
+      } else {
+        for (let start = 0; start < buttons.length; start += 3) elements.push(row(buttons.slice(start, start + 3)));
+      }
     }
-    // 选项详细说明（Claude Code AskUserQuestion options[].description）：按钮无副标题，
-    // 在按钮行下用小字列出。safe() 已做转义，这里仅按 label 加粗。缺省不渲染。
-    const described = q.options.filter(option => option.description?.trim());
-    if (described.length) {
-      elements.push({
-        tag: 'markdown',
-        text_size: 'notation',
-        content: described.map(option => `**${safe(option.label)}**：${safe(option.description!.trim())}`).join('\n'),
-      });
-    }
+    const details = optionDescriptions(q, locale);
+    if (details) elements.push({ tag: 'markdown', text_size: 'notation', content: details.content });
   });
   if (submit && !textReplyRequired) {
     if (entry.confirmEmptyArmed) elements.push({ tag: 'markdown', content: t('card.ask.empty_warning', undefined, locale) });
@@ -76,9 +66,7 @@ export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 
   }
   elements.push({ tag: 'markdown', text_size: 'notation', content: [
     t(textReplyRequired ? 'card.ask.text_reply_hint' : 'card.ask.custom_reply_hint', undefined, locale),
-    ask.deadlineAt === null
-      ? `${t('card.ask.field.deadline', undefined, locale)}: ${t('card.grant.duration_permanent', undefined, locale)}`
-      : `${t('card.ask.field.deadline', undefined, locale)}: ${new Date(ask.deadlineAt).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN')}`,
+    `${t('card.ask.field.deadline', undefined, locale)}: ${formatAskDeadline(ask.deadlineAt, locale)}`,
     t('card.ask.answerable_talk_members', undefined, locale),
   ].join('\n') });
   return elements;
@@ -91,9 +79,12 @@ export function turnReplyAskSummary(entry: ReplyCardAsk, locale: Locale = 'zh'):
       ? result.customAnswers?.[i] ?? result.inputs?.[i] ?? result.answers[i]?.map(key => q.options.find(o => o.key === key)?.label ?? key).join(', ') : '';
     return `🙋 ${safe(q.prompt)}${labels ? `\n✓ ${safe(labels)}` : ''}`;
   });
+  const permission = result ? permissionAskSettleStatus(ask, result, locale) : undefined;
   if (result?.kind === 'answered') {
     if (result.comment) lines.push(`💬 ${safe(result.comment)}`);
     else if (!result.inputs?.some(Boolean) && !result.customAnswers?.some(Boolean) && result.answers.every(keys => keys.length === 0)) lines.push(locale === 'en' ? '✓ No options selected' : '✓ 未选择任何选项');
+  } else if (permission) {
+    lines.push(`${permission.headline}\n${permission.detail}`);
   } else {
     lines.push(result?.kind === 'timedOut' ? t('card.ask.timed_out', undefined, locale)
       : result?.kind === 'invalidated' ? t('card.ask.invalidated', undefined, locale)

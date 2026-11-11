@@ -22,25 +22,16 @@ export function parseFleetState(raw: unknown): FleetState | null {
   if (!Array.isArray(o.procs)) return null;
   const procs: FleetProcState[] = [];
   for (const p of o.procs) {
-    if (!p || typeof p !== 'object') throw new Error('fleet: malformed process row');
+    if (!p || typeof p !== 'object') continue;
     const q = p as Record<string, unknown>;
-    if (typeof q.name !== 'string' || !q.name.trim() || typeof q.appId !== 'string'
-      || !Number.isSafeInteger(q.pid) || (q.pid as number) < 0
-      || !Number.isSafeInteger(q.generation) || (q.generation as number) < 0
-      || !(['online', 'stopped', 'errored', 'launching'] as const).includes(q.status as never)) {
-      throw new Error('fleet: malformed process identity row');
-    }
-    const isBotDaemon = /^botmux-\d+$/.test(q.name);
-    if (q.status === 'online' && ((q.pid as number) <= 1 || (q.generation as number) < 1
-      || (isBotDaemon && (!q.appId || typeof q.processStart !== 'string' || !q.processStart)))) {
-      throw new Error('fleet: malformed online process identity row');
-    }
+    if (typeof q.name !== 'string' || typeof q.appId !== 'string') continue;
     procs.push({
       name: q.name,
       appId: q.appId,
-      pid: q.pid as number,
-      generation: q.generation as number,
-      status: q.status as FleetProcState['status'],
+      pid: Number.isSafeInteger(q.pid) ? (q.pid as number) : 0,
+      generation: Number.isSafeInteger(q.generation) ? (q.generation as number) : 0,
+      status: (['online', 'stopped', 'errored', 'launching'] as const).includes(q.status as never)
+        ? (q.status as FleetProcState['status']) : 'stopped',
       restarts: Number.isSafeInteger(q.restarts) ? (q.restarts as number) : 0,
       lastExitCode: typeof q.lastExitCode === 'number' ? q.lastExitCode : null,
       startedAt: typeof q.startedAt === 'string' ? q.startedAt : null,
@@ -67,9 +58,11 @@ export function parseFleetState(raw: unknown): FleetState | null {
 /** Read the fleet state file, or null if it's absent/unparseable/empty. */
 export function readFleetState(statePath: string): FleetState | null {
   if (!existsSync(statePath)) return null;
-  // Existing but malformed state is not absence. Propagate so supervisor boot
-  // and migration fail closed instead of normalizing an online generation away.
-  return parseFleetState(JSON.parse(readFileSync(statePath, 'utf-8')));
+  try {
+    return parseFleetState(JSON.parse(readFileSync(statePath, 'utf-8')));
+  } catch {
+    return null;
+  }
 }
 
 /**

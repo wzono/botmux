@@ -14,8 +14,8 @@
  * a persistent pane.
  *
  * Fully hermetic: HOME, BOTMUX_HOME, SESSION_DATA_DIR and bots.json live in a
- * temp dir, while managed tmux uses the test fence's private TMUX_TMPDIR. Runs
- * as root or unprivileged: pane liveness uses tmux `#{pane_pid}` (a host pid, not
+ * temp dir, and `tmux` on PATH is a shim pinned to a private socket. Runs as
+ * root or unprivileged: pane liveness uses tmux `#{pane_pid}` (a host pid, not
  * the bwrap-namespace one), the pane shell is pinned to /bin/sh, and every
  * sandbox mechanism is gated on a runtime probe of the exact primitive the
  * worker will use.
@@ -44,7 +44,6 @@ import {
 } from '../src/adapters/cli/read-isolation.js';
 import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-capability.js';
 import { recordedSandboxTreeFlavour } from '../src/adapters/backend/sandbox-tree-teardown.js';
-import { DEFAULT_MANAGED_TMUX_SOCKET } from '../src/adapters/backend/tmux-socket.js';
 import { readJsonLines } from './helpers/read-json-lines.js';
 import { onTestProcessExit } from './helpers/exit-cleanup.js';
 
@@ -84,6 +83,11 @@ function createLab(opts: { flavour: SandboxFlavour; backend: Backend }) {
   const sessionId = randomUUID();
   // Short path: tmux socket paths are length-limited.
   const dir = mkdtempSync('/tmp/sbx-life-');
+  // Strict launch drops TMUX_TMPDIR. A unique simulated -L label prevents its
+  // census from borrowing the host's botmux listener; the shim still routes
+  // every real tmux operation to this lab's private -S socket.
+  const socketName = `sbx-life-${sessionId.slice(0, 8)}`;
+  const socket = join(dir, 'socket');
   const botmuxHome = join(dir, '.botmux');
   const dataDir = join(botmuxHome, 'data');
   const workDir = join(dir, 'work');
@@ -154,11 +158,13 @@ console.log('Ready >');
 setInterval(() => {}, 1 << 30);
 `, { mode: 0o755 });
   const reportFile = (): string => join(flavour === 'off' ? workDir : outbox, 'fake-cli-report.jsonl');
-  // The oncall sandbox exposes the working tree, so keep the interception shim
-  // there; a sibling under the lab root is intentionally invisible in bwrap.
-  const bin = join(workDir, 'bin');
+  const bin = join(dir, 'bin');
   mkdirSync(bin);
   const paneTarget = `bmx-${sessionId.slice(0, 8)}`;
+  // `failNewSession` makes creating THIS session's pane fail (the worker's
+  // earlier backend-availability probe uses its own session), i.e. after the
+  // worker has already built the sandbox tree for a fresh launch.
+  const failNewSessionFlag = join(dir, 'fail-new-session');
   // `failKillSession` makes every kill fail (a pane that cannot be retired).
   const failKillSessionFlag = join(dir, 'fail-kill-session');
   // `corruptProofOnPipePane` garbles this session's PENDING isolation proof the
@@ -173,7 +179,15 @@ setInterval(() => {}, 1 << 30);
   // (diagnostic sessions, backend selection) neither arm nor count.
   const exitingServerFlag = join(dir, 'exiting-server-on-post-kill-probe');
   const paneMarker = isolationPaneMarkerPath(dataDir, sessionId);
-  const tmuxShim = `#!/bin/sh
+  writeFileSync(join(bin, 'tmux'), `#!/bin/sh
+if [ -e '${failNewSessionFlag}' ]; then
+  creating=0; ours=0
+  for arg in "$@"; do
+    [ "$arg" = new-session ] && creating=1
+    [ "$arg" = '${paneTarget}' ] && ours=1
+  done
+  if [ $creating = 1 ] && [ $ours = 1 ]; then echo 'new-session refused by test' >&2; exit 1; fi
+fi
 if [ -e '${failKillSessionFlag}' ]; then
   # Any kill: a plain kill-session, or the conditional one a retire sends.
   # Scan every argument: managed calls lead with the server (\`-L botmux\`).
@@ -209,9 +223,8 @@ if [ -e '${corruptProofFlag}' ]; then
     if [ "$arg" = pipe-pane ]; then printf 'garbled-by-test' > '${paneMarker}'; fi
   done
 fi
-exec '${realTmux}' "$@"
-`;
-  writeFileSync(join(bin, 'tmux'), tmuxShim, { mode: 0o755 });
+exec '${realTmux}' -S '${socket}' "$@"
+`, { mode: 0o755 });
   // Loaded into the worker only: SIGUSR2 throws on the event loop, i.e. a real
   // uncaughtException through the worker's own crash handler.
   const crashHook = join(dir, 'crash-hook.cjs');
@@ -220,6 +233,7 @@ exec '${realTmux}' "$@"
     ...process.env,
     PATH: `${bin}:${process.env.PATH}`,
     HOME: dir,
+    TMUX_TMPDIR: dir,
     // Pane launch goes through the user's shell; pin a plain one so the test
     // does not depend on the runner's login shell (nologin for service
     // accounts) or its rcfiles.
@@ -229,6 +243,9 @@ exec '${realTmux}' "$@"
     BOTMUX_NO_CLAIM: '1',
   };
   for (const key of Object.keys(env)) if (key.startsWith('BOTMUX_') && key !== 'BOTMUX_NO_CLAIM') delete env[key];
+  // Strict spawn filters TMUX_TMPDIR again; give the host-side socket census
+  // a private label too. The shim still routes every tmux command to `socket`.
+  env.BOTMUX_TMUX_SOCKET = `sbx-life-${sessionId}`;
   delete env.TMUX;
   delete env.TMUX_PANE;
   const init = (bootId: string) => ({
@@ -238,16 +255,11 @@ exec '${realTmux}' "$@"
     prompt: '',
     apiOnly: true, larkAppId: 'app_probe', larkAppSecret: '', ownerOpenId: 'ou_owner', daemonBootId: bootId,
     loadedBotsConfigPath: bots, loadedBotsConfigProvenance: 'loaded', promptInjection: 'none',
-    // Keep the fixture shim first inside bwrap too. The sandbox canonicalises
-    // this effective per-bot PATH; inherited PATH alone is not authoritative.
-    env: { PATH: `${bin}:${process.env.PATH}` },
     ...(flavour === 'oncall' ? { sandbox: 'oncall' } : {}),
     ...(flavour === 'scratch' ? { sandbox: 'scratch', scratchStorage } : {}),
   });
   const workers = new Set<ChildProcess>();
-  const tmuxCommand = (args: string[]) => spawnSync(realTmux!, [
-    '-L', DEFAULT_MANAGED_TMUX_SOCKET, ...args,
-  ], { encoding: 'utf8', env });
+  const tmuxCommand = (args: string[]) => spawnSync(realTmux!, ['-S', socket, ...args], { encoding: 'utf8' });
   const lab = {
     sessionId, dataDir, sessionRoot, outbox, capabilityLeaf, script,
     reports: (): Report[] => readJsonLines<Report>(reportFile()),
@@ -259,6 +271,7 @@ exec '${realTmux}' "$@"
     hostProcessAlive: (pid: number): boolean => {
       try { process.kill(pid, 0); return true; } catch { return false; }
     },
+    failNewSession: (): void => writeFileSync(failNewSessionFlag, ''),
     corruptProofOnPipePane: (): void => writeFileSync(corruptProofFlag, ''),
     exitingServerOnPostKillProbes: (ordinals: number[]): void => {
       if (ordinals.length) writeFileSync(exitingServerFlag, ordinals.join(' '));
@@ -279,13 +292,7 @@ exec '${realTmux}' "$@"
         import { killWorker } from './src/core/worker-pool.js';
         killWorker({
           larkAppId: 'app_probe', chatId: 'oc_probechat', chatType: 'group', scope: 'thread', worker: null,
-          session: {
-            sessionId: ${JSON.stringify(sessionId)}, backendType: 'tmux', rootMessageId: 'om_probe',
-            persistentBackendTarget: {
-              backendType: 'tmux', sessionName: ${JSON.stringify(paneTarget)},
-              socketName: ${JSON.stringify(DEFAULT_MANAGED_TMUX_SOCKET)},
-            },
-          },
+          session: { sessionId: ${JSON.stringify(sessionId)}, backendType: 'tmux', rootMessageId: 'om_probe' },
           initConfig: { backendType: 'tmux' },
         });
       `, { env, encoding: 'utf8', timeout: 60_000 });
@@ -370,11 +377,7 @@ exec '${realTmux}' "$@"
    *  pane outlives a worker by design), the CLI, the scratch overlay, the dir. */
   const takeDown = (): void => {
     for (const worker of workers) { try { worker.kill('SIGKILL'); } catch { /* gone */ } }
-    try {
-      execFileSync(realTmux!, ['-L', DEFAULT_MANAGED_TMUX_SOCKET, 'kill-session', '-t', `=${paneTarget}`], {
-        stdio: 'ignore', env,
-      });
-    } catch { /* gone */ }
+    try { execFileSync(realTmux!, ['-S', socket, 'kill-server'], { stdio: 'ignore' }); } catch { /* gone */ }
     for (const pid of lab.cliHostPids()) { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }
     // Never leave a host overlay / tmpfs slot behind a failed assertion.
     if (everScratch) teardownScratchSession(sessionId, dataDir);
@@ -488,14 +491,11 @@ describe.each(sandboxed)('%s sandbox tree across a real worker lifecycle', (flav
   it.skipIf(!realTmux || !runtime)('tmux × fresh launch failing before the pane exists: rolls the tree back', async () => {
     const lab = createLab({ flavour, backend: 'tmux' });
     try {
-      const first = lab.start('boot-1', {
-        env: { BOTMUX_TEST_FORCE_TMUX_NEW_SESSION_FAIL: '1' },
-        envPolicy: { mode: 'strict' },
-      });
+      lab.failNewSession();
+      const first = lab.start('boot-1');
       await vi.waitFor(() => expect(first.logs()).toMatch(/Sandbox ON \(|in credential-only bwrap/), { timeout: 60_000 });
       await workerExit(first);
-      expect(first.errors().join('\n'), first.logs()).toContain('Strict tmux pane startup failed');
-      expect(first.logs()).toContain('new-session refused by test');
+      expect(first.errors().join('\n'), first.logs()).toContain('new-session refused by test');
       expect(lab.paneAlive()).toBe(false);
       expect(lab.starts()).toEqual([]);
       expect(existsSync(lab.sessionRoot), first.logs()).toBe(false);

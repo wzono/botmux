@@ -1,4 +1,6 @@
 export const CODEX_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
+/** Common verified effort levels honored by both Antigravity terminal and ACP. */
+export const ANTIGRAVITY_REASONING_EFFORTS: readonly CodexReasoningEffort[] = ['low', 'medium', 'high'];
 export const CODEX_COMMON_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 4);
 export const GROK_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 4);
 export const GROK_COMMON_REASONING_EFFORTS = GROK_REASONING_EFFORTS.slice(0, 3);
@@ -18,6 +20,10 @@ export const REMOTE_RUNNER_REASONING_EFFORTS = CODEX_REASONING_EFFORTS;
 const CLAUDE_ALL_REASONING_EFFORTS: readonly CodexReasoningEffort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 /** Exported for the adapter's arg filter: the widest set any Claude model takes. */
 export const CLAUDE_REASONING_EFFORTS = CLAUDE_ALL_REASONING_EFFORTS;
+
+/** MCode's thinkingEffort option advertises these levels for M3.1-Flash.
+ * `default` means no BotMux override; `ultra` is not an advertised level. */
+const MINIMAX_REASONING_EFFORTS: readonly CodexReasoningEffort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 
 /** Only Haiku is withheld: it takes no effort parameter at all, yet the adapter
  *  lists it in `modelChoices` (both `haiku` and the pinned `claude-haiku-4-5-…`),
@@ -81,12 +87,12 @@ export function isBackendVariantCliId(cliId: string | undefined): boolean {
 
 export function isConfigurableReasoningCliId(cliId: string | undefined): boolean {
   return isCodexReasoningCliId(cliId) || cliId === 'grok' || isBackendVariantCliId(cliId)
-    || cliId === 'claude-code' || cliId === 'kimi'
+    || cliId === 'claude-code' || cliId === 'kimi' || cliId === 'minimax'
     // ZCode's per-model levels are declared in its own provider catalog and can
     // differ per model (grok-4.6 tops out at xhigh, GLM/Opus go to max, MiMo is
     // a switch). The launch path resolves the closest supported level, so the
     // whole vocabulary is offered here instead of a per-model subset.
-    || cliId === 'zcode';
+    || cliId === 'zcode' || cliId === 'antigravity';
 }
 
 export function isCodexReasoningEffort(value: unknown): value is CodexReasoningEffort {
@@ -127,6 +133,7 @@ export function reasoningEffortsForCliModel(
   cliId: string | undefined,
   model: string | undefined,
 ): readonly CodexReasoningEffort[] {
+  if (cliId === 'antigravity') return ANTIGRAVITY_REASONING_EFFORTS;
   if (cliId === 'grok') return grokReasoningEffortsForModel(model);
   if (cliId === 'remote-runner') return REMOTE_RUNNER_REASONING_EFFORTS;
   if (cliId === 'traex') return traexReasoningEffortsForModel(model);
@@ -140,6 +147,13 @@ export function reasoningEffortsForCliModel(
     // Kimi 的 effort 环境变量只作用于 kimi provider，不猜测自定义别名的能力。
     return model?.trim() === 'kimi-code/k3' || model?.trim() === 'kimi-code/k3-256k'
       ? ['low', 'high', 'max'] : [];
+  }
+  if (cliId === 'minimax') {
+    // Match only launchable names of the verified model/variant. An omitted
+    // model follows the user's MCode default, which may be M3 or a custom
+    // provider; neither an alias nor a substring proves effort support.
+    return /^(?:minimax\/)?MiniMax-M3\.1-Flash(?:#thinking)?$/.test(model?.trim() ?? '')
+      ? MINIMAX_REASONING_EFFORTS : [];
   }
   return [];
 }

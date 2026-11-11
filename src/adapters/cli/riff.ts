@@ -20,13 +20,10 @@ export function createRiffAdapter(_pathOverride?: string): CliAdapter {
       return [];
     },
 
-    async writeInput(pty: PtyHandle, content: string) {
+    async writeInput(pty: PtyHandle, content: string): Promise<void> {
       // Direct passthrough — no PTY paste-burst detection or bracketed paste needed.
-      const result = await pty.writeBusinessInput?.(content);
-      if (result === 'retryable_pre_dispatch_rejection') {
-        return { submitted: false, submissionDisposition: 'untouched' as const };
-      }
-      if (!result) pty.write(content);
+      // RiffBackend.write() handles the actual API call.
+      pty.write(content);
     },
 
     // riff 的路由/身份/@ 规则由 RiffBackend 统一前置到 userPrompt（见

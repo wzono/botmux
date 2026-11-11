@@ -66,11 +66,6 @@ vi.mock('../src/core/session-manager.js', () => ({
   ensureSessionWhiteboard: vi.fn(),
   getAvailableBots: vi.fn(async () => []),
   rememberLastCliInput: vi.fn(),
-  resolveIngressWorkspace: vi.fn(async () => ({
-    status: 'resolved',
-    workspace: { path: process.cwd(), dev: '1', ino: '1' },
-    mutation: { workingDir: process.cwd(), source: 'bot-default' },
-  })),
 }));
 vi.mock('../src/services/default-worktree.js', () => ({ botAutoWorktreeEnabled: vi.fn(() => false) }));
 vi.mock('../src/im/lark/card-handler.js', () => ({ runAutoWorktreeCommit: vi.fn(async () => {}) }));
@@ -82,12 +77,6 @@ const mockCloseSession = vi.fn(async () => ({ ok: true, outcome: 'closed', alrea
 vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: (...a: any[]) => mockForkWorker(...a),
   sendWorkerInput: vi.fn(() => true),
-  dispatchWorkspaceAdmittedBusinessTurn: vi.fn(async (input: any) => {
-    if (input.ds.worker && !input.ds.worker.killed) return true;
-    mockForkWorker(input.ds, input.payload, { resume: input.resume, turnId: input.turnId,
-      ...(input.atMostOnce ? { atMostOnce: true } : {}) });
-    return true;
-  }),
   getCurrentCliVersion: vi.fn(() => 'test'),
   setActiveSessionIfActive: (map: Map<string, any>, key: string, ds: any) => { map.set(key, ds); return true; },
   closeSession: (...a: any[]) => mockCloseSession(...a),

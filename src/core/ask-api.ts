@@ -6,10 +6,13 @@
  */
 
 import type { ServerResponse } from 'node:http';
-import { registerAsk } from './ask-broker.js';
+import { registerAsk, resolveHookAskFromCli } from './ask-broker.js';
 import { parseOption, parseAskQuestions } from './ask-questions.js';
 export { parseAskQuestions } from './ask-questions.js';
-import type { CreateAskInput, AskResult, AskOption, AskQuestion } from './ask-types.js';
+import type { CreateAskInput, AskResult, AskOption, AskQuestion, CliPermissionOutcome } from './ask-types.js';
+import { isCliPermissionOutcome, shouldReturnAskStartupNotReady } from './ask-types.js';
+import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
+import type { VcMeetingLiveManagedOrigin } from '../services/vc-meeting-send-policy.js';
 import { CODEX_ASYNC_ASK_ORIGIN, parseCodexAsyncUserInput, type CodexAsyncUserInput } from '../services/codex-async-user-input.js';
 
 export interface AskApiBody {
@@ -17,12 +20,10 @@ export interface AskApiBody {
   chatId: string;
   larkAppId: string;
   rootMessageId: string | null;
-  /** Explicit `--into` target; daemon validates it against the authenticated chat. */
-  requestedRootMessageId?: string;
   /** v0.1.8：替换旧的 options/prompt，支持多问多选。 */
   questions: AskQuestion[];
   /** Already in milliseconds. CLI side converts from `--timeout` seconds. */
-  timeoutMs: number | null;
+  timeoutMs: number;
   /** Per-invocation identity (hook generates once, reuses across reconnect
    *  retries) so a re-POST after a daemon restart re-attaches to the same ask.
    *  Optional — legacy callers omit it and the broker synthesizes one. */
@@ -30,10 +31,9 @@ export interface AskApiBody {
   /** Caller kind ('hook' | 'explicit' | …) namespacing the identity so an
    *  explicit `botmux ask` can't re-claim a hook ask's card. Optional. */
   originKind?: string;
-  /** 显式 `botmux ask --mention <open_id>` 要 @ 的人类成员。daemon 会在发卡前
-   *  剔除 bot open_id（卡片 at bot 触发 100290）。 */
+  /** 显式 `botmux ask --mention <open_id>` 请求 @ 的人。只是请求：daemon 核实是本应用
+   *  通讯录里的真人后才画进卡片（见 verifiedAskMention）。 */
   mentionedOpenId?: string;
-  originWorkerGeneration?: number;
   acknowledge?: boolean;
   asyncUserInput?: CodexAsyncUserInput;
   /** Optional narrowing only; never grants talk/approval authority. */
@@ -48,7 +48,6 @@ export type AskApiBodyError =
   | 'bad_chatId'
   | 'bad_larkAppId'
   | 'bad_rootMessageId'
-  | 'bad_requestedRootMessageId'
   | 'bad_prompt'
   | 'bad_timeoutMs'
   | 'bad_options'
@@ -68,7 +67,6 @@ export type AskApiBodyError =
   | 'bad_requestId'
   | 'bad_originKind'
   | 'bad_mentionedOpenId'
-  | 'bad_originWorkerGeneration'
   | 'bad_acknowledge'
   | 'bad_asyncUserInput';
 
@@ -89,20 +87,11 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
   if (r.rootMessageId !== null && typeof r.rootMessageId !== 'string') {
     return { error: 'bad_rootMessageId' };
   }
-  let requestedRootMessageId: string | undefined;
-  if (r.requestedRootMessageId !== undefined) {
-    if (typeof r.requestedRootMessageId !== 'string'
-      || !/^om_[A-Za-z0-9_-]{1,128}$/.test(r.requestedRootMessageId)) {
-      return { error: 'bad_requestedRootMessageId' };
-    }
-    requestedRootMessageId = r.requestedRootMessageId;
-  }
   if (
-    r.timeoutMs !== null && (
-      typeof r.timeoutMs !== 'number' ||
-      !Number.isFinite(r.timeoutMs) ||
-      r.timeoutMs < 1000
-    )
+    typeof r.timeoutMs !== 'number' ||
+    !Number.isFinite(r.timeoutMs) ||
+    (r.timeoutMs < 1000 && !(r.timeoutMs === 0 && r.originKind === 'explicit'
+      && typeof r.requestId === 'string' && r.requestId.trim()))
   ) {
     return { error: 'bad_timeoutMs' };
   }
@@ -131,12 +120,13 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     originKind = r.originKind;
   }
   let mentionedOpenId: string | undefined;
-  if (r.mentionedOpenId !== undefined && r.mentionedOpenId !== null) {
+  if (r.mentionedOpenId !== undefined) {
     // 卡片 `<at id=…>` 只接受 open_id（`ou_` 前缀）。union_id/user_id 等其它
     // ID 形态进了卡片会整条被飞书拒掉，这里 fail loud。
     if (
-      typeof r.mentionedOpenId !== 'string'
-      || !/^ou_[A-Za-z0-9]{6,64}$/.test(r.mentionedOpenId)
+      originKind !== 'explicit'
+      || typeof r.mentionedOpenId !== 'string'
+      || !/^ou_[A-Za-z0-9_-]{1,128}$/.test(r.mentionedOpenId)
     ) {
       return { error: 'bad_mentionedOpenId' };
     }
@@ -144,10 +134,6 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
   }
 
   if (r.acknowledge !== undefined && typeof r.acknowledge !== 'boolean') return { error: 'bad_acknowledge' };
-  if (r.originWorkerGeneration !== undefined && (typeof r.originWorkerGeneration !== 'number'
-    || !Number.isSafeInteger(r.originWorkerGeneration) || r.originWorkerGeneration < 1)) {
-    return { error: 'bad_originWorkerGeneration' };
-  }
 
   if (r.asyncFailure !== undefined && (originKind !== CODEX_ASYNC_ASK_ORIGIN
     || (r.asyncFailure !== 'limit' && r.asyncFailure !== 'invalid_questions'))) return { error: 'bad_asyncUserInput' };
@@ -160,7 +146,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
   if (Array.isArray(r.questions)) {
     // 新格式：questions[] 多问多选
     if (r.questions.length === 0) return { error: 'bad_questions' };
-    const parsed = parseAskQuestions(r.questions, { allowSingleOption: !!asyncUserInput });
+    const parsed = parseAskQuestions(r.questions, { allowSingleOption: !!asyncUserInput, clampDescription: originKind === 'hook' });
     if (typeof parsed === 'string') return { error: parsed };
     questions = parsed;
   } else if (Array.isArray(r.options) && typeof r.prompt === 'string' && r.prompt.trim()) {
@@ -169,7 +155,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     const opts: AskOption[] = [];
     const seen = new Set<string>();
     for (const o of r.options) {
-      const parsed = parseOption(o);
+      const parsed = parseOption(o, { clampDescription: originKind === 'hook' });
       if (typeof parsed === 'string') return { error: parsed };
       if (seen.has(parsed.key)) return { error: 'duplicate_option_key' };
       seen.add(parsed.key);
@@ -194,14 +180,11 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     chatId: r.chatId,
     larkAppId: r.larkAppId,
     rootMessageId: r.rootMessageId as string | null,
-    ...(requestedRootMessageId !== undefined ? { requestedRootMessageId } : {}),
     questions,
     timeoutMs: r.timeoutMs,
     ...(requestId !== undefined ? { requestId } : {}),
     ...(originKind !== undefined ? { originKind } : {}),
     ...(mentionedOpenId !== undefined ? { mentionedOpenId } : {}),
-    ...(r.originWorkerGeneration !== undefined
-      ? { originWorkerGeneration: r.originWorkerGeneration as number } : {}),
     ...(r.acknowledge !== undefined ? { acknowledge: r.acknowledge as boolean } : {}),
     ...(asyncUserInput ? { asyncUserInput } : {}),
     ...(r.asyncFailure ? { asyncFailure: r.asyncFailure as 'limit' | 'invalid_questions' } : {}),
@@ -210,10 +193,98 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
   // a different kind of Ask. Identity claims remain on the raw body for the
   // route's authorization checks; options/prompt are normalized above.
   const routeFields = new Set(['prompt', 'options', 'originCapability', 'originTurnId', 'originDispatchAttempt']);
-  if (Object.keys(r).some(key => r[key] !== undefined && r[key] !== null && !Object.hasOwn(parsed, key) && !routeFields.has(key))) {
+  if (Object.keys(r).some(key => r[key] !== undefined && !Object.hasOwn(parsed, key) && !routeFields.has(key))) {
     return { error: 'unsupported_fields' };
   }
   return parsed;
+}
+
+/** The requested mention, or undefined when it may not be drawn. A card that mentions a bot is
+ *  rejected whole (100290) and bot open_ids share the `ou_` format, so only an id the contact
+ *  lookup confirms as a human of this app is kept. Any doubt drops just the mention: the card
+ *  itself must still go out. */
+export async function verifiedAskMention(openId: string | undefined, deps: {
+  isPeerBot(openId: string): boolean;
+  isHuman(openId: string): Promise<boolean>;
+}): Promise<string | undefined> {
+  if (!openId) return undefined;
+  try {
+    if (deps.isPeerBot(openId)) return undefined;
+    return await deps.isHuman(openId) ? openId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Body of `POST /api/asks/cli-resolved`: which hook ask (by its per-invocation
+ *  requestId) the asking CLI ended itself, and how. Session ownership is proven
+ *  by the route's auth, not by these fields. */
+export function parseCliResolvedBody(raw: unknown):
+  { sessionId: string; requestId: string; outcome: CliPermissionOutcome } | { error: 'bad_body' } {
+  const body = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+  const { sessionId, requestId, outcome } = body;
+  if (typeof sessionId !== 'string' || !sessionId || typeof requestId !== 'string' || !requestId
+    || !isCliPermissionOutcome(outcome)) {
+    return { error: 'bad_body' };
+  }
+  return { sessionId, requestId, outcome };
+}
+
+/** The daemon session a `cli-resolved` report names, as the route sees it. */
+export interface CliResolvedSession {
+  larkAppId: string;
+  sessionId: string;
+  receiverSession: boolean;
+  liveOrigin?: VcMeetingLiveManagedOrigin;
+}
+
+/**
+ * `POST /api/asks/cli-resolved`. Gated in the same order as `/api/asks`: the
+ * startup window first, then host HMAC or the named session's live origin
+ * capability, and only after that is a missing session revealed. The ask is
+ * looked up under the authenticated session, never a caller-supplied app id.
+ * An ask the daemon doesn't know (yet) answers 409 so the hook can retry while
+ * the card's own POST is still registering.
+ */
+export function handleCliResolvedRequest(raw: unknown, ctx: {
+  trustedHost: boolean;
+  sessionsRestored: boolean;
+  findSession: (sessionId: string) => CliResolvedSession | undefined;
+}): { status: number; body: Record<string, unknown> } {
+  const parsed = parseCliResolvedBody(raw);
+  if ('error' in parsed) return { status: 400, body: { ok: false, error: parsed.error } };
+  const claims = raw as Record<string, unknown>;
+  const session = ctx.findSession(parsed.sessionId);
+  if (shouldReturnAskStartupNotReady({ hasSession: !!session, sessionsRestored: ctx.sessionsRestored })) {
+    return { status: 503, body: { ok: false, error: 'startup_not_ready' } };
+  }
+  if (!ctx.trustedHost) {
+    const claimedAttempt = typeof claims.originDispatchAttempt === 'number'
+      && Number.isSafeInteger(claims.originDispatchAttempt) && claims.originDispatchAttempt > 0
+      ? claims.originDispatchAttempt
+      : undefined;
+    const verified = authorizeSessionScopedIpc({
+      trustedHost: false,
+      sessionExists: !!session,
+      receiverSession: !!session?.receiverSession,
+      allowReceiver: false,
+      sessionId: parsed.sessionId,
+      liveOrigin: session?.liveOrigin,
+      claimedCapability: typeof claims.originCapability === 'string' ? claims.originCapability : undefined,
+      claimedTurnId: typeof claims.originTurnId === 'string' ? claims.originTurnId : undefined,
+      claimedDispatchAttempt: claimedAttempt,
+    });
+    if (!verified.ok) return { status: 403, body: { ok: false, error: verified.error } };
+  }
+  if (!session) return { status: 404, body: { ok: false, error: 'session_not_found' } };
+  const outcome = resolveHookAskFromCli({
+    larkAppId: session.larkAppId,
+    sessionId: session.sessionId,
+    requestId: parsed.requestId,
+    outcome: parsed.outcome,
+  });
+  if (outcome === 'not_found') return { status: 409, body: { ok: false, error: 'ask_not_found' } };
+  return { status: 200, body: { ok: true, outcome } };
 }
 
 /** The response, not IncomingMessage.close, tracks the long-poll lifetime:

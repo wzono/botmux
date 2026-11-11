@@ -81,7 +81,7 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
   /** Compact overflow menu (terminal/model/close) on ordinary reply cards.
    *  Default false; only an explicit true enables it. */
   replyCardActions: boolean;
-  /** Bot-level master switch for the native CoT (thinking process) message.
+  /** In-card activity in unified replies, native CoT in legacy replies.
    *  Default TRUE (absent = on; only explicit false persists). Per-chat
    *  opt-out lives in noCotChats (`/cot off`), not here. */
   cotEnabled: boolean;
@@ -90,6 +90,8 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
    *  Default TRUE (absent = show; only explicit false persists). Only takes
    *  effect with replyCardMode 'unified'; the value survives mode switches. */
   replyCardShowTools: boolean;
+  /** Native CoT alongside unified replies; default false, independent of cotEnabled. */
+  replyCardNativeCot: boolean;
   /** Whether each forwarded turn carries a `<sender …/>` tag naming the speaker.
    *  Default TRUE (absent = on; only an explicit false persists), same
    *  convention as cotEnabled. Off also drops the cursor anti-echo note (it is
@@ -118,6 +120,10 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
   autoStartOnNewTopic: boolean;
   /** 群负责人（默认接待者）开关，默认关。 */
   chatManagerEnabled: boolean;
+  /** 共享回复模式下，群负责人免 @ 接的顶层消息也开话题，默认关。 */
+  chatManagerSharedTopic: boolean;
+  /** 群秘书（/secretary）开关，默认关。 */
+  groupSecretaryEnabled: boolean;
   autoStartExcludedChats: string[];
   /** 主动开工 — 入群执行命令开关（不经 LLM，见 BotConfig.groupJoinCommandEnabled）。 */
   groupJoinCommandEnabled: boolean;
@@ -154,6 +160,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       codexBrowserAutoApproveOrigins: c.codexBrowser?.autoApproveOrigins === true,
       thinkingCardToolResult: c.thinkingCardToolResult !== false,
       replyCardShowTools: c.replyCardShowTools !== false,
+      replyCardNativeCot: c.replyCardNativeCot === true,
       writableTerminalLinkInCard: c.writableTerminalLinkInCard === true,
       privateCard: c.privateCard === true,
       replyCardActions: c.replyCardActions === true,
@@ -168,6 +175,8 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       autoStartOnGroupJoinSeed: typeof c.autoStartOnGroupJoinSeed === 'string' ? c.autoStartOnGroupJoinSeed : '',
       autoStartOnNewTopic: c.autoStartOnNewTopic === true,
       chatManagerEnabled: c.chatManagerEnabled === true,
+      chatManagerSharedTopic: c.chatManagerSharedTopic === true,
+      groupSecretaryEnabled: c.groupSecretaryEnabled === true,
       autoStartExcludedChats: c.autoStartExcludedChats ?? [],
       groupJoinCommandEnabled: c.groupJoinCommandEnabled === true,
       groupJoinCommand: typeof c.groupJoinCommand === 'string' ? c.groupJoinCommand : '',
@@ -193,6 +202,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       codexBrowserAutoApproveOrigins: false,
       thinkingCardToolResult: true,
       replyCardShowTools: true,
+      replyCardNativeCot: false,
       writableTerminalLinkInCard: false,
       privateCard: false,
       replyCardActions: false,
@@ -207,6 +217,8 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       autoStartOnGroupJoinSeed: '',
       autoStartOnNewTopic: false,
       chatManagerEnabled: false,
+      chatManagerSharedTopic: false,
+      groupSecretaryEnabled: false,
       autoStartExcludedChats: [],
       groupJoinCommandEnabled: false,
       groupJoinCommand: '',
@@ -329,6 +341,7 @@ async function updateBotCardPrefsInternal(
     }
     applyDefaultTrue(entry, 'thinkingCardToolResult', patch.thinkingCardToolResult);
     applyDefaultTrue(entry, 'replyCardShowTools', patch.replyCardShowTools);
+    apply(entry, 'replyCardNativeCot', patch.replyCardNativeCot);
     apply(entry, 'writableTerminalLinkInCard', patch.writableTerminalLinkInCard);
     apply(entry, 'privateCard', patch.privateCard);
     apply(entry, 'replyCardActions', patch.replyCardActions);
@@ -345,6 +358,8 @@ async function updateBotCardPrefsInternal(
     applyStr(entry, 'autoStartOnGroupJoinSeed', patch.autoStartOnGroupJoinSeed);
     apply(entry, 'autoStartOnNewTopic', patch.autoStartOnNewTopic);
     apply(entry, 'chatManagerEnabled', patch.chatManagerEnabled);
+    apply(entry, 'chatManagerSharedTopic', patch.chatManagerSharedTopic);
+    apply(entry, 'groupSecretaryEnabled', patch.groupSecretaryEnabled);
     if (patch.autoStartExcludedChats !== undefined) {
       if (patch.autoStartExcludedChats.length) entry.autoStartExcludedChats = patch.autoStartExcludedChats;
       else delete entry.autoStartExcludedChats;
@@ -373,6 +388,7 @@ async function updateBotCardPrefsInternal(
         codexBrowserAutoApproveOrigins: entry.codexBrowser?.autoApproveOrigins === true,
         thinkingCardToolResult: entry.thinkingCardToolResult !== false,
         replyCardShowTools: entry.replyCardShowTools !== false,
+        replyCardNativeCot: entry.replyCardNativeCot === true,
         writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true,
         privateCard: entry.privateCard === true,
         replyCardActions: entry.replyCardActions === true,
@@ -387,6 +403,8 @@ async function updateBotCardPrefsInternal(
         autoStartOnGroupJoinSeed: typeof entry.autoStartOnGroupJoinSeed === 'string' ? entry.autoStartOnGroupJoinSeed : '',
         autoStartOnNewTopic: entry.autoStartOnNewTopic === true,
         chatManagerEnabled: entry.chatManagerEnabled === true,
+        chatManagerSharedTopic: entry.chatManagerSharedTopic === true,
+        groupSecretaryEnabled: entry.groupSecretaryEnabled === true,
         autoStartExcludedChats: entry.autoStartExcludedChats ?? [],
         groupJoinCommandEnabled: entry.groupJoinCommandEnabled === true,
         groupJoinCommand: typeof entry.groupJoinCommand === 'string' ? entry.groupJoinCommand : '',
@@ -451,6 +469,9 @@ async function updateBotCardPrefsInternal(
   if (patch.thinkingCardToolResult !== undefined) {
     bot.config.thinkingCardToolResult = patch.thinkingCardToolResult === false ? false : undefined;
   }
+  if (patch.replyCardNativeCot !== undefined) {
+    bot.config.replyCardNativeCot = patch.replyCardNativeCot || undefined;
+  }
   if (patch.replyCardShowTools !== undefined) {
     // Default true: store false explicitly, clear (→ default show) when true.
     bot.config.replyCardShowTools = patch.replyCardShowTools === false ? false : undefined;
@@ -492,6 +513,12 @@ async function updateBotCardPrefsInternal(
   }
   if (patch.chatManagerEnabled !== undefined) {
     bot.config.chatManagerEnabled = patch.chatManagerEnabled || undefined;
+  }
+  if (patch.chatManagerSharedTopic !== undefined) {
+    bot.config.chatManagerSharedTopic = patch.chatManagerSharedTopic || undefined;
+  }
+  if (patch.groupSecretaryEnabled !== undefined) {
+    bot.config.groupSecretaryEnabled = patch.groupSecretaryEnabled || undefined;
   }
   if (patch.groupJoinCommandEnabled !== undefined) {
     bot.config.groupJoinCommandEnabled = patch.groupJoinCommandEnabled || undefined;

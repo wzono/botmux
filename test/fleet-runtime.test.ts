@@ -19,10 +19,7 @@ const dirs: string[] = [];
 function tmp(): string { const d = mkdtempSync(join(tmpdir(), 'fleet-runtime-')); dirs.push(d); return d; }
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
 
-const online = (name: string, pid: number): ReturnType<typeof freshProc> => ({
-  ...freshProc(name, `cli_${name}`, pid, 'T'),
-  processStart: `boot:${pid}`,
-});
+const online = (name: string, pid: number): ReturnType<typeof freshProc> => freshProc(name, `cli_${name}`, pid, 'T');
 
 describe('projectFleetStatus', () => {
   it('reports supervisor + rows, cross-checking liveness with the injected probe', () => {

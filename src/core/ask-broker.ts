@@ -24,11 +24,13 @@ import type {
   AskCardDispatcher,
   AskClickOutcome,
   AskResult,
+  CliPermissionOutcome,
   CreateAskInput,
   PendingAsk,
 } from './ask-types.js';
 import { AskDispatchError } from './ask-types.js';
 import { supportsAskCustomInput, parseAskCustomFields } from './ask-custom-input.js';
+import { isHookPermissionAsk } from './ask-hook/types.js';
 
 /** Origins for which restart-resume + durable handoff are enabled. Only a
  *  caller that has a reconnecting claimant after a daemon restart may persist:
@@ -64,11 +66,10 @@ interface InternalPending extends Omit<PendingAsk, 'selections'> {
    *  waiter here so all callers get the one result — no second ask/card
    *  (codex P1-1 active-replay). */
   waiters: Array<(result: AskResult) => void>;
-  deliveryWaiters: Array<(delivery: { askId: string; messageId: string }) => void>;
   timeoutHandle?: NodeJS.Timeout;
   /** Relative timeout retained so host-owned asks can start the human action
    *  window only after the card is confirmed delivered. */
-  timeoutMs: number | null;
+  timeoutMs: number;
   timeoutStartsAfterDelivery: boolean;
   timeoutStartedAt?: number;
   /** epoch ms when settle ran; undefined while still pending. */
@@ -107,6 +108,11 @@ let dispatcher: AskCardDispatcher | null = null;
  *  a no-op (unit tests that don't exercise restart-resume需要绑定各自 temp
  *  store，绝不回落到全局目录). */
 let persistStore: AskPersistStore | null = null;
+let explicitAskSessionChecker: ((ask: PendingAsk) => boolean) | null = null;
+
+export function setExplicitAskSessionChecker(checker: (ask: PendingAsk) => boolean): void {
+  explicitAskSessionChecker = checker;
+}
 
 /** Effective handoff-retention window. Defaults to the durable-store constant;
  *  a test may shrink it via `_setHandoffRetentionForTest` so the absolute-expiry
@@ -189,10 +195,19 @@ function isAuthorizedToAnswer(ask: InternalPending, by: string, actor?: AskAnswe
   return canTalkChecker?.(ask.larkAppId, ask.chatId, by, ask.deliveryTarget ? 'p2p' : ask.chatType, actor) ?? false;
 }
 
+function invalidateClosedExplicitAsk(ask: InternalPending | undefined): void {
+  if (ask && !ask.settled && ask.originKind === 'host_explicit' && ask.timeoutMs === 0
+    && explicitAskSessionChecker && !explicitAskSessionChecker(snapshot(ask))) {
+    settle(ask.askId, { kind: 'invalidated', reason: 'explicit Ask session closed or binding changed',
+      selected: null, by: null, comment: null, timedOut: false });
+  }
+}
+
 function gateAskDecision(
   ask: InternalPending | undefined,
   input: { nonce?: string; by: string; actor?: AskAnswerActor },
 ): Exclude<AskClickOutcome, 'accepted' | 'toggled' | 'needs_empty_confirm'> | 'ready' {
+  invalidateClosedExplicitAsk(ask);
   const gate = gateHumanDecisionAttempt({
     exists: !!ask,
     nonceMatches: !!ask && (input.nonce === undefined || ask.nonce === input.nonce),
@@ -243,15 +258,6 @@ export function registerHostAsk(input: CreateAskInput): Promise<AskResult> {
   return registerAskInternal(input, true);
 }
 
-/** Resolve once the daemon-owned Ask card is durably registered and delivered. */
-export async function waitForAskDelivery(input: CreateAskInput): Promise<{ askId: string; messageId: string }> {
-  const askKey = askKeyFor(input.larkAppId, input.sessionId, input.originKind ?? 'hook', input.requestId!);
-  const ask = findByKey(askKey);
-  if (!ask) throw new Error('ask delivery registration missing');
-  if (ask.cardMessageId) return { askId: ask.askId, messageId: ask.cardMessageId };
-  return new Promise(resolve => ask.deliveryWaiters.push(resolve));
-}
-
 function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal?: AbortSignal): Promise<AskResult> {
   if (signal?.aborted) return Promise.resolve(disconnectedResult());
   if (!dispatcher) {
@@ -259,6 +265,9 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
   }
 
   const originKind = input.originKind ?? 'hook';
+  if (input.timeoutMs === 0 && !(hostManaged && originKind === 'host_explicit' && input.requestId?.trim())) {
+    throw new Error('ask-broker: no deadline requires a managed explicit Ask with a stable requestId');
+  }
   // CLI-origin resumability is gated by TWO independent facts (codex P1-4):
   //  1. the origin has a reconnecting claimant (only 'hook' re-POSTs after a
   //     restart; an explicit `botmux ask buttons` process exits), AND
@@ -326,7 +335,7 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
   const askId = randomUUID();
   const nonce = randomUUID().slice(0, 8);
   const createdAt = Date.now();
-  const deadlineAt = input.timeoutMs === null ? null : createdAt + input.timeoutMs;
+  const deadlineAt = input.timeoutMs === 0 ? 0 : createdAt + input.timeoutMs;
 
   return new Promise<AskResult>((resolve) => {
     const selections = new Map<number, Set<string>>();
@@ -342,8 +351,8 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
       larkAppId: input.larkAppId,
       chatId: input.chatId,
       rootMessageId: input.rootMessageId,
+      cardRootMessageId: input.cardRootMessageId,
       sessionId: input.sessionId,
-      controlWait: input.controlWait ? structuredClone(input.controlWait) : undefined,
       chatType: input.chatType,
       answererOpenId: input.answererOpenId,
       mentionedOpenId: input.mentionedOpenId,
@@ -354,12 +363,11 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
       deadlineAt,
       settled: false,
       waiters: [],
-      deliveryWaiters: [],
       timeoutMs: input.timeoutMs,
       timeoutStartsAfterDelivery: hostManaged,
       selections,
     };
-    if (!hostManaged && input.timeoutMs !== null) armAskTimeout(ask, input.timeoutMs, createdAt);
+    if (!hostManaged) armAskTimeout(ask, input.timeoutMs, createdAt);
     pending.set(askId, ask);
     attachWaiter(ask, resolve, signal);
     // Persist ONLY resumable origins (codex P1-4). A restart before the card
@@ -421,8 +429,8 @@ function sameIdentity(ask: InternalPending, input: CreateAskInput): boolean {
     ask.chatId === input.chatId &&
     ask.rootMessageId === input.rootMessageId &&
     ask.originKind === (input.originKind ?? 'hook') &&
+    (ask.timeoutMs === 0) === (input.timeoutMs === 0) &&
     ask.answererOpenId === input.answererOpenId &&
-    JSON.stringify(ask.controlWait) === JSON.stringify(input.controlWait) &&
     JSON.stringify(ask.deliveryTarget) === JSON.stringify(input.deliveryTarget) &&
     questionsShape(ask.questions) === questionsShape(input.questions)
   );
@@ -478,14 +486,13 @@ function sendCardForAsk(ask: InternalPending): void {
         // The displayed deadline is a best estimate made immediately before
         // dispatch. Correctness does not depend on it: the broker clock below
         // starts only after the Lark API confirms delivery.
-        if (live.timeoutStartsAfterDelivery && live.timeoutMs !== null && live.timeoutStartedAt === undefined) {
+        if (live.timeoutMs !== 0 && live.timeoutStartsAfterDelivery && live.timeoutStartedAt === undefined) {
           live.deadlineAt = Date.now() + live.timeoutMs;
         }
         const { messageId } = await dispatcher!.send(snapshot(ask));
         const cur = pending.get(ask.askId);
         if (cur) {
           cur.cardMessageId = messageId;
-          for (const resolve of cur.deliveryWaiters.splice(0)) resolve({ askId: cur.askId, messageId });
           // The caller can disconnect while send is in flight. The earlier
           // standalone-card notification had no messageId to patch; update it
           // now. Reply-card settlement does not need that id and is idempotent.
@@ -493,7 +500,7 @@ function sendCardForAsk(ask: InternalPending): void {
             notifyOnSettle(cur, cur.terminalResult);
             return;
           }
-          if (cur.timeoutStartsAfterDelivery && cur.timeoutMs !== null && cur.timeoutStartedAt === undefined) {
+          if (cur.timeoutStartsAfterDelivery && cur.timeoutStartedAt === undefined) {
             armAskTimeout(cur, cur.timeoutMs, Date.now());
           }
           if (cur.resumable) persistFromInternal(cur);
@@ -528,6 +535,7 @@ function sendCardForAsk(ask: InternalPending): void {
 
 function armAskTimeout(ask: InternalPending, timeoutMs: number, startedAt: number): void {
   clearTimeout(ask.timeoutHandle);
+  if (ask.timeoutMs === 0) return;
   ask.timeoutStartedAt = startedAt;
   ask.deadlineAt = startedAt + timeoutMs;
   ask.timeoutHandle = setTimeout(() => {
@@ -578,13 +586,12 @@ function reattachByRequest(ask: InternalPending, signal?: AbortSignal): Promise<
     ask.dormant = false;
     attachWaiter(ask, resolve, signal);
     clearTimeout(ask.timeoutHandle);
-    const permanent = ask.timeoutMs === null && ask.deadlineAt === null;
-    const awaitsDelivery = !permanent && ask.timeoutStartsAfterDelivery && !ask.cardMessageId;
-    const remaining = permanent ? null : awaitsDelivery ? ask.timeoutMs : Math.max(0, (ask.deadlineAt ?? Date.now()) - Date.now());
-    if (!awaitsDelivery && remaining !== null) armAskTimeout(ask, remaining, Date.now());
+    const awaitsDelivery = ask.timeoutStartsAfterDelivery && !ask.cardMessageId;
+    const remaining = ask.timeoutMs === 0 ? 0 : awaitsDelivery ? ask.timeoutMs : Math.max(0, ask.deadlineAt - Date.now());
+    if (!awaitsDelivery) armAskTimeout(ask, remaining, Date.now());
     logger.info?.(
       `ask-broker: re-attached hook to restored ask ${ask.askId} (key=${ask.askKey}, ` +
-      `${remaining === null ? 'no deadline' : `${Math.round(remaining / 1000)}s left`}, card=${ask.cardMessageId ? 'live' : 'MISSING→resend'})`,
+      `${ask.timeoutMs === 0 ? 'no deadline' : `${Math.round(remaining / 1000)}s left`}, card=${ask.cardMessageId ? 'live' : 'MISSING→resend'})`,
     );
     if (!ask.cardMessageId) sendCardForAsk(ask);
   });
@@ -608,7 +615,6 @@ function persistFromInternal(ask: InternalPending, strict = false): void {
     chatId: ask.chatId,
     rootMessageId: ask.rootMessageId,
     sessionId: ask.sessionId,
-    controlWait: ask.controlWait ? structuredClone(ask.controlWait) : undefined,
     chatType: ask.chatType,
     answererOpenId: ask.answererOpenId,
     mentionedOpenId: ask.mentionedOpenId,
@@ -1045,14 +1051,12 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
     // hook's claim — it must NOT arm a deadline timer (there's nothing left to
     // time out). A still-awaiting-click restore arms the ORIGINAL absolute
     // deadline so it can't linger forever if the CLI never returns.
-    const permanent = p.timeoutMs === null && p.deadlineAt === null;
-    const awaitsDelivery = !permanent && p.timeoutStartsAfterDelivery === true && !p.cardMessageId;
-    const remaining = permanent
-      ? null
-      : awaitsDelivery
-        ? (p.timeoutMs ?? Math.max(1, (p.deadlineAt ?? p.createdAt + 1) - p.createdAt))
-        : Math.max(0, (p.deadlineAt ?? now) - now);
-    const timeoutHandle = hasStashedAnswer || awaitsDelivery || remaining === null
+    const awaitsDelivery = p.timeoutStartsAfterDelivery === true && !p.cardMessageId;
+    const noDeadline = p.timeoutMs === 0;
+    const remaining = noDeadline ? 0 : awaitsDelivery
+      ? (p.timeoutMs ?? Math.max(1, p.deadlineAt - p.createdAt))
+      : Math.max(0, p.deadlineAt - now);
+    const timeoutHandle = hasStashedAnswer || awaitsDelivery || noDeadline
       ? undefined
       : setTimeout(() => {
           settle(p.askId, {
@@ -1072,7 +1076,6 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       chatId: p.chatId,
       rootMessageId: p.rootMessageId,
       sessionId: p.sessionId,
-      controlWait: p.controlWait ? structuredClone(p.controlWait) : undefined,
       chatType: p.chatType,
       answererOpenId: p.answererOpenId,
       mentionedOpenId: p.mentionedOpenId,
@@ -1082,7 +1085,7 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       customRevision: p.customRevision,
       createdAt: p.createdAt,
       deadlineAt: p.deadlineAt,
-      timeoutMs: permanent ? null : (p.timeoutMs ?? Math.max(1, (p.deadlineAt ?? p.createdAt + 1) - p.createdAt)),
+      timeoutMs: p.timeoutMs ?? Math.max(1, p.deadlineAt - p.createdAt),
       timeoutStartsAfterDelivery: p.timeoutStartsAfterDelivery === true,
       timeoutStartedAt: p.timeoutStartedAt,
       cardMessageId: p.cardMessageId,
@@ -1094,16 +1097,12 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       settledAt: hasStashedAnswer ? (p.answeredAt ?? now) : undefined,
       dormant: true,
       waiters: [], // attached when the reconnecting hook re-registers
-      deliveryWaiters: [],
       // Carry a stashed answer forward (user answered before restart): the
       // reconnecting hook claims it via reattachByRequest.
       ...(p.answeredResult ? { answeredResult: p.answeredResult, terminalResult: p.answeredResult } : {}),
-      // timeoutHandle is only meaningful for the awaiting-click case; a stashed
-      // restore uses a no-op cleared handle so clearTimeout calls stay safe.
-      timeoutHandle: timeoutHandle ?? setTimeout(() => {}, 0),
+      timeoutHandle,
       selections,
     };
-    if (timeoutHandle === undefined) { clearTimeout(ask.timeoutHandle); }
     pending.set(p.askId, ask);
     // Re-arm the absolute handoff-expiry reaper for a restored stash (codex
     // P1-4): a SECOND restart before the hook claims must still reap memory +
@@ -1113,7 +1112,7 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
     restored++;
     logger.info?.(
       `ask-broker: restored pending ask ${p.askId} (key=${p.askKey}, session=${p.sessionId}, ` +
-      `dormant${p.answeredResult ? '+answered' : ''}, ${p.deadlineAt === null ? 'no deadline' : `${Math.round((p.deadlineAt - now) / 1000)}s left`}) — awaiting hook re-attach`,
+      `dormant${p.answeredResult ? '+answered' : ''}, ${noDeadline ? 'no deadline' : `${Math.round((p.deadlineAt - now) / 1000)}s left`}) — awaiting claimant re-attach`,
     );
   }
   // Always log the boot sweep outcome (even 0) so a live restart test can
@@ -1199,6 +1198,45 @@ function abandonUnclaimedHookAsk(askId: string): void {
   }, result);
 }
 
+/**
+ * The asking CLI ended a hook permission confirmation itself (its built-in
+ * timeout, a terminal choice, an interrupt), so nothing is waiting on this card
+ * any more: settle it with that outcome now instead of at its own deadline.
+ * Only a hook permission ask of this exact session/request matches. An answer
+ * stashed while dormant was never delivered, so it yields to the CLI outcome.
+ */
+export function resolveHookAskFromCli(args: {
+  larkAppId: string;
+  sessionId: string;
+  requestId: string;
+  outcome: CliPermissionOutcome;
+}): 'settled' | 'already_settled' | 'not_found' {
+  const ask = findByKey(askKeyFor(args.larkAppId, args.sessionId, 'hook', args.requestId));
+  if (!ask || !isHookPermissionAsk(ask)) return 'not_found';
+  const result: AskResult = {
+    kind: 'invalidated',
+    reason: `the asking CLI ended this permission confirmation itself (${args.outcome})`,
+    failureCode: 'cli_resolved',
+    cliOutcome: args.outcome,
+    selected: null, by: null, comment: null, timedOut: false,
+  };
+  if (ask.settled) {
+    if (!ask.dormant || ask.answeredResult === undefined || ask.waiters.length > 0) return 'already_settled';
+    clearTimeout(ask.timeoutHandle);
+    clearTimeout(ask.handoffExpiryHandle);
+    clearTimeout(ask.reclaimHandle);
+    pending.delete(ask.askId);
+    persistStore?.remove(ask.askKey);
+    notifyOnSettle({
+      ...ask, settledAt: Date.now(), dormant: false, answeredResult: undefined, terminalResult: result,
+    }, result);
+    return 'settled';
+  }
+  logger.info?.(`ask-broker: ${ask.askId} ended by the asking CLI (${args.outcome}) (key=${ask.askKey})`);
+  settle(ask.askId, result);
+  return 'settled';
+}
+
 /** Internal — settle an ask exactly once and notify the dispatcher's onSettle
  *  hook (best-effort, never blocks broker state transitions). The settled
  *  entry stays in the map for `SETTLED_RETENTION_MS` so late race-losers get
@@ -1279,6 +1317,14 @@ function settle(askId: string, result: AskResult): void {
 export function hasExplicitAskHandoff(input: CreateAskInput): boolean {
   const key = askKeyFor(input.larkAppId, input.sessionId, 'host_explicit', input.requestId!);
   return !!findByKey(key) || !!persistStore?.list().some(ask => ask.askKey === key);
+}
+
+export function invalidateExplicitAsk(input: CreateAskInput, reason: string): void {
+  const key = askKeyFor(input.larkAppId, input.sessionId, 'host_explicit', input.requestId!);
+  const ask = findByKey(key);
+  if (ask?.originKind === 'host_explicit' && sameIdentity(ask, input)) {
+    settle(ask.askId, { kind: 'invalidated', reason, selected: null, by: null, comment: null, timedOut: false });
+  }
 }
 
 export function releaseExplicitAskHandoff(input: CreateAskInput): void {
@@ -1421,6 +1467,7 @@ export function submitAskFromDesktop(args: {
 }): AskClickOutcome {
   gcSettled();
   const ask = pending.get(args.askId);
+  invalidateClosedExplicitAsk(ask);
   if (!ask) return 'stale';
   if (ask.settled) return 'already_settled';
 
@@ -1460,30 +1507,6 @@ export function _getPending(askId: string): PendingAsk | undefined {
   return getAskSnapshot(askId);
 }
 
-export function originalControlWaitState(input: {
-  sessionId: string; originalTurnId: string; askId: string;
-}): 'needs_user' | 'terminal' | undefined {
-  for (const ask of pending.values()) {
-    const wait = ask.controlWait;
-    if (ask.sessionId === input.sessionId && wait?.originalTurnId === input.originalTurnId
-      && wait.wait.askId === input.askId) return ask.settled ? 'terminal' : wait.state;
-  }
-  return undefined;
-}
-
-
-export function originalControlWaitAcceptedAnswer(input: {
-  sessionId: string; originalTurnId: string; askId: string;
-}): boolean {
-  for (const ask of pending.values()) {
-    const wait = ask.controlWait;
-    if (ask.sessionId === input.sessionId && wait?.originalTurnId === input.originalTurnId
-      && wait.wait.askId === input.askId) return ask.settled && ask.terminalResult?.kind === 'answered';
-  }
-  return false;
-}
-
-
 /** 返回当前 pending map 中所有 askId 列表（含 settled 但仍在 retention 内的条目）。
  *  仅供测试使用。 */
 export function _allAskIds(): string[] {
@@ -1501,6 +1524,7 @@ export function _resetForTest(): void {
   pending.clear();
   dispatcher = null;
   canTalkChecker = null;
+  explicitAskSessionChecker = null;
   handoffRetentionMs = HANDOFF_RETENTION_MS; // restore default retention
   hookReclaimGraceMs = HOOK_RECLAIM_GRACE_MS;
   reclaimClockStarted = false;

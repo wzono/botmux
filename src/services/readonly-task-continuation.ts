@@ -1,5 +1,4 @@
 import type { TrustedCaller } from '../types.js';
-import type { WorkspaceIdentity } from '../core/turn-admission.js';
 
 export const READONLY_TASK_CONTINUATION_OUTPUT_LIMIT_CODE = 'codex_output_limit_exceeded';
 export const TASK_CONTINUATION_RATE_LIMIT_CODE = 'codex_rate_limited';
@@ -45,8 +44,6 @@ export interface ReadonlyTaskContinuationState {
   currentTurnId: string;
   currentDispatchAttempt?: number;
   currentWorkerGeneration?: number;
-  workspaceIdentity?: WorkspaceIdentity;
-  groupRevision?: number;
   createdAt: number;
   expiresAt: number;
   maxContinuations: number;
@@ -93,7 +90,6 @@ export interface ReadonlyTaskContinuationTerminal {
 }
 
 export interface ReadonlyTaskContinuationDispatch {
-  leaseId: string;
   logicalTurnId: string;
   turnId: string;
   dispatchAttempt: number;
@@ -102,13 +98,13 @@ export interface ReadonlyTaskContinuationDispatch {
 }
 
 export interface ReadonlyTaskContinuationDeps<TTimer = unknown> {
-  schedule: (delayMs: number, run: () => void | Promise<void>) => TTimer;
+  schedule: (delayMs: number, run: () => void) => TTimer;
   cancel: (timer: TTimer) => void;
   persist: (state: ReadonlyTaskContinuationState) => void;
   /** A restored lease may outlive its worker. Keep the durable backoff pending
    * until the exact worker/RPC proof is ready instead of consuming an attempt. */
   canEnqueue?: () => boolean;
-  enqueue: (dispatch: ReadonlyTaskContinuationDispatch) => number | false | Promise<number | false>;
+  enqueue: (dispatch: ReadonlyTaskContinuationDispatch) => number | false;
   /** Deliver one already-persisted warning with a stable provider key. */
   warn: (state: ReadonlyTaskContinuationState) => void;
   /** Restore daemon-local attention independently from provider delivery. */
@@ -133,8 +129,6 @@ export interface ReadonlyTaskContinuationSession {
 export interface StartReadonlyTaskContinuationInput {
   turnId: string;
   workerGeneration: number;
-  workspaceIdentity?: WorkspaceIdentity;
-  groupRevision?: number;
   authorizationMode: 'inherited';
   startMode?: 'automatic' | 'explicit';
   trustedCaller: TrustedCaller;
@@ -423,8 +417,6 @@ export class ReadonlyTaskContinuationCoordinator<TTimer = unknown> {
       logicalTurnId: input.turnId,
       currentTurnId: input.turnId,
       currentWorkerGeneration: input.workerGeneration,
-      ...(input.workspaceIdentity ? { workspaceIdentity: { ...input.workspaceIdentity } } : {}),
-      ...(input.groupRevision === undefined ? {} : { groupRevision: input.groupRevision }),
       createdAt,
       expiresAt: createdAt + ttlMs,
       maxContinuations,
@@ -750,7 +742,7 @@ export class ReadonlyTaskContinuationCoordinator<TTimer = unknown> {
     if (!current || current.status !== 'backoff') return;
     this.cancelTimer();
     const delayMs = Math.max(0, (current.nextAttemptAt ?? this.now()) - this.now());
-    this.timer = this.deps.schedule(delayMs, async () => {
+    this.timer = this.deps.schedule(delayMs, () => {
       this.timer = undefined;
       const live = this.state;
       if (!live || live.status !== 'backoff') return;
@@ -809,39 +801,27 @@ export class ReadonlyTaskContinuationCoordinator<TTimer = unknown> {
       }
       let enqueued: number | false = false;
       try {
-        enqueued = await this.deps.enqueue({
-          leaseId: dispatching.leaseId,
+        enqueued = this.deps.enqueue({
           logicalTurnId: dispatching.logicalTurnId,
           turnId,
           dispatchAttempt: continuation,
           prompt: READONLY_TASK_CONTINUATION_PROMPT,
           continuation,
         });
-
       } catch {
         enqueued = false;
       }
-      const afterEnqueue = this.state;
-      if (!afterEnqueue || afterEnqueue.leaseId !== dispatching.leaseId
-        || afterEnqueue.status !== 'dispatching' || afterEnqueue.currentTurnId !== turnId
-        || afterEnqueue.currentDispatchAttempt !== continuation) return;
       if (!enqueued) {
-        const retryable = {
-          ...live,
-          status: 'backoff' as const,
-          nextAttemptAt: this.now() + this.nextDelayMs(live),
+        this.warnOnce({
+          ...dispatching,
+          status: 'failed',
           lastErrorCode: 'readonly_continuation_enqueue_failed',
-        };
-        try { this.commit(retryable); } catch { this.retain(retryable); }
-        this.armBackoff();
+        });
         return;
       }
       try {
-        const liveBeforeActivate = this.state;
-        if (liveBeforeActivate?.status === 'failed'
-          && liveBeforeActivate.lastErrorCode === 'readonly_continuation_workspace_ambiguous_after_submit') return;
         this.commit({
-          ...afterEnqueue,
+          ...dispatching,
           status: 'active',
           currentWorkerGeneration: enqueued,
         });
@@ -859,7 +839,7 @@ export class ReadonlyTaskContinuationCoordinator<TTimer = unknown> {
         this.retain(failed);
         this.warnOnce(failed);
       }
-    });;
+    });
   }
 
   private nextDelayMs(state: ReadonlyTaskContinuationState): number {

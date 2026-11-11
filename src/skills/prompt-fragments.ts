@@ -148,6 +148,11 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   // <botmux_routing> — system-prompt path (claude-family / genius / grok)
   { key: 'ai.routing.intro', block: 'routing_system', stage: 'new', label: '开场说明（标准 send 模式）', kind: 'editable' },
   {
+    key: 'ai.routing.no_local_addresses', block: 'routing_system', stage: 'new', kind: 'editable',
+    label: '飞书回复：用户可访问的地址',
+    gateLabel: '完整规则，每个会话一次：系统提示，或无系统提示 CLI 的首轮 Shell 提示',
+  },
+  {
     key: 'ai.routing.intro_transcript', block: 'routing_system', stage: 'new', kind: 'editable',
     label: '开场说明（transcript 自动转发模式）',
     gateLabel: '仅 replyDelivery=transcript（daemon 自动转发最终回复）时替代上面的标准版',
@@ -236,16 +241,6 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
 
   // <botmux_credentials> — trigger-user-auth sessions only
   {
-    key: 'ai.credentials.acting_identity', block: 'credentials', stage: 'new',
-    kind: 'placeholder', placeholders: ['tools'],
-    label: '凭证：当前授权身份说明', gateLabel: '仅该 bot 开启 trigger-user CLI 鉴权时注入',
-  },
-  {
-    key: 'ai.credentials.git_identity', block: 'credentials', stage: 'new',
-    kind: 'placeholder', placeholders: ['host'],
-    label: '凭证：git 鉴权身份说明', gateLabel: '仅当 bytedcli 在 tools 内且配置了 gitHost 时注入',
-  },
-  {
     key: 'ai.credentials.never_read_others', block: 'credentials', stage: 'new', kind: 'editable',
     label: '凭证：不得读取他人登录态', gateLabel: '仅 trigger-user 鉴权会话',
   },
@@ -255,19 +250,15 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   },
   {
     key: 'ai.credentials.on_auth_failure', block: 'credentials', stage: 'new', kind: 'editable',
-    label: '凭证：飞书鉴权失败处理流程', gateLabel: '仅当 lark-cli 在 triggerUserAuth.tools 内时注入',
-  },
-  {
-    key: 'ai.credentials.on_bytedcli_auth_failure', block: 'credentials', stage: 'new', kind: 'editable',
-    label: '凭证：ByteCloud 鉴权失败处理流程', gateLabel: '仅当 bytedcli 在 triggerUserAuth.tools 内时注入',
+    label: '凭证：飞书鉴权失败处理流程', gateLabel: '仅当 lark-cli 在 triggerUserAuth.tools 内、且会话未启用飞书托管绑定时注入',
   },
   {
     key: 'ai.credentials.on_auth_link', block: 'credentials', stage: 'new', kind: 'editable',
-    label: '凭证：stderr 已附授权链接时', gateLabel: '仅 trigger-user 鉴权会话',
+    label: '凭证：stderr 已附授权链接时', gateLabel: '仅当 lark-cli 在 triggerUserAuth.tools 内、且会话未启用飞书托管绑定时注入',
   },
   {
     key: 'ai.credentials.on_missing_scope', block: 'credentials', stage: 'new', kind: 'editable',
-    label: '凭证：missing_scope 补授权流程', gateLabel: '仅当 lark-cli 在 triggerUserAuth.tools 内时注入',
+    label: '凭证：missing_scope 补授权流程', gateLabel: '仅当 lark-cli 在 triggerUserAuth.tools 内、且会话未启用飞书托管绑定时注入',
   },
 
   // ───────── cross-listed: 会话开始 + 每条新消息 (new + followup) ──────────
@@ -332,6 +323,16 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
     gateLabel: '白板开启且绑定白板时',
   },
   {
+    key: 'ai.whiteboard.block_read_lead_only', block: 'whiteboard_block', stage: 'new', stages: ['followup'], kind: 'editable',
+    label: '白板：读取指令（lead-only 负责人会话，不带 --id）',
+    gateLabel: '白板开启、绑定白板且为 lead-only 负责人会话时（替换通用读取指令）',
+  },
+  {
+    key: 'ai.whiteboard.block_update_lead_only', block: 'whiteboard_block', stage: 'new', stages: ['followup'], kind: 'editable',
+    label: '白板：更新指令（lead-only 负责人会话，不带 --id）',
+    gateLabel: '白板开启、绑定白板且为 lead-only 负责人会话时（替换通用更新指令）',
+  },
+  {
     key: 'ai.whiteboard.block_rewrite', block: 'whiteboard_block', stage: 'new', stages: ['followup'], kind: 'editable',
     label: '白板：融合重写规则', gateLabel: '白板开启且绑定白板时',
   },
@@ -378,6 +379,11 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
     label: '全局自适应回复规则', kind: 'editable',
   },
   { key: 'ai.followup.feishu_safe_emphasis', block: 'followup', stage: 'followup', label: '飞书安全强调格式', kind: 'editable' },
+  {
+    key: 'ai.followup.no_local_addresses', block: 'followup', stage: 'followup', kind: 'editable',
+    label: '飞书回复：用户可访问的地址（每轮一句）',
+    gateLabel: '随每轮飞书格式提示；完整规则在会话开始阶段',
+  },
   {
     key: 'ai.followup.reminder_hook', block: 'followup', stage: 'followup', kind: 'editable',
     label: '续轮提醒（Claude Code hook 离带注入版）',

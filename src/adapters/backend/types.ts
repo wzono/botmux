@@ -125,6 +125,7 @@ export function herdrConfigForChatType(
 }
 
 export interface BackendTurnInput {
+  sessionOrigin?: import('../../services/session-event-scope.js').CapturedSessionOrigin;
   content: string;
   turnId: string;
   replyTurnId?: string;
@@ -136,6 +137,7 @@ export interface BackendTurnInput {
 /** Host-owned state frozen beside a Remote Runner turn. Providers never send
  * or receive this context; it exists only on the backend → worker callbacks. */
 export interface RemoteRunnerTurnHostContext {
+  sessionOrigin?: import('../../services/session-event-scope.js').CapturedSessionOrigin;
   linkRefMode?: 'observe' | 'enabled';
 }
 
@@ -147,6 +149,7 @@ export interface BackendTurnSubmission {
 }
 
 export interface BackendTurnFailure {
+  sessionOrigin?: import('../../services/session-event-scope.js').CapturedSessionOrigin;
   turnId: string;
   code: string;
   message: string;
@@ -198,10 +201,6 @@ export type SessionProbe = 'exists' | 'missing' | 'unknown';
 
 export interface SpawnOpts {
   cwd: string;
-  /** Immutable host path identity for a group-bound launch. Local-process
-   * backends are verified through their child cwd; deferred/remote backends
-   * retain this contract and validate it at the business-input boundary. */
-  expectedWorkingDirIdentity?: { dev: string; ino: string };
   cols: number;
   rows: number;
   env: Record<string, string>;
@@ -222,6 +221,11 @@ export interface SpawnOpts {
    * global env have been applied, so those sources cannot re-add them.
    */
   unsetEnv?: string[];
+  /**
+   * Host-authorized protected-MCP removals. Unlike user/session `unsetEnv`,
+   * these may name reserved BOTMUX_* controls and must still run after rcfiles.
+   */
+  protectedUnsetEnv?: string[];
   /**
    * The git `-c` pairs (config KEY/VALUE contents) botmux authored for THIS
    * turn, e.g. the trigger-user credential helper + URL rewrites from
@@ -272,6 +276,11 @@ export interface SpawnOpts {
   modelBackendVariant?: 'standard' | 'max';
   /** Provider-neutral reasoning effort for structured remote runners. */
   reasoningEffort?: string;
+  /** Herdr facade only: retry a launch Herdr never recognises once in a fresh
+   *  pane. Set for a worker's first CLI start unless its init carries a
+   *  restartAttemptId: restarts must finish inside the restart coordinator's
+   *  deadline, and a wake-up from suspend (resume attempt id) is left off too. */
+  retryPaneAgentStart?: boolean;
 }
 
 export type AmbiguousSubmissionRecoveryFailure =
@@ -288,12 +297,8 @@ export class AmbiguousSubmissionBlockedError extends Error {
   }
 }
 
-export type EffectiveWorkspaceProof =
-  | { kind: 'riff-repository'; hostPath: string; identity: { dev: string; ino: string }; repository: { repoName: string; repoBranch?: string } }
-  | { kind: 'mojo-isolation'; hostPath: string; identity: { dev: string; ino: string }; repositoryPath: string; executionPath: string };
-
 export interface SessionBackend {
-  effectiveWorkspaceProof?(): EffectiveWorkspaceProof | undefined;
+  getRuntimeIdentity?(): import('../../services/session-contract.js').RuntimeIdentity | undefined;
   spawn(bin: string, args: string[], opts: SpawnOpts): void;
   /** Returns false only when the backend can prove the write was not accepted.
    * Legacy implementations may return void on success. */
@@ -336,23 +341,14 @@ export interface SessionBackend {
    */
   onScreenResync?(cb: (snapshot: string) => void): void;
   onExit(cb: (code: number | null, signal: string | null) => void): void;
+  /** After onExit: true when the exit was the multiplexer server being lost
+   *  (another server now answers on the socket), not the CLI exiting. A
+   *  restart for that exit must not spend the fresh-session fallback budget. */
+  exitedBecauseServerReplaced?(): boolean;
   kill(): void;
   /** Permanently destroy the backing session (e.g. kill tmux session).
    *  Called only on explicit /close. Default: same as kill(). */
   getAttachInfo?(): { type: 'tmux'; sessionName: string } | null;
-  /** Validate a deferred/remote backend's authoritative host-side contract
-   * before the worker dequeues business input. Omitted means startup requires
-   * proof from a real child process cwd. */
-  validateWorkingDirBeforeBusinessInput?(): boolean;
-  /** Queue one business input and resolve only when its serialized dispatch edge
-   * either begins remote I/O or rejects before dispatch. */
-  writeBusinessInput?(data: string): Promise<'submitted' | 'retryable_pre_dispatch_rejection'>;
-  /** Exact host contract proof, freshly validated for worker readiness. Remote
-   * backends use this instead of a child cwd; absence never proves readiness. */
-  validatedHostWorkingDirContract?(): {
-    workingDir: string;
-    identity: { dev: string; ino: string };
-  } | undefined;
   /** PID of the CLI process running inside the backend. */
   getChildPid?(): number | null;
   captureCurrentScreen?(): string;
@@ -435,7 +431,7 @@ export interface SessionBackend {
    * executing anything on the host; schedule mutations still cross daemon
    * authorization. */
   onSessionTool?(
-    cb: (operation: RemoteRunnerSessionToolOperation) => Promise<RemoteRunnerSessionToolResult>,
+    cb: (operation: RemoteRunnerSessionToolOperation, hostContext?: RemoteRunnerTurnHostContext) => Promise<RemoteRunnerSessionToolResult>,
   ): void;
   /** A provider-owned turn survived the host/worker process and is now being
    * observed without resubmitting its prompt. */

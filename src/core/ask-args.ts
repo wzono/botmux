@@ -19,9 +19,7 @@ export class AskArgsError extends Error {
       | 'options_duplicate_key'
       | 'timeout_out_of_range'
       | 'timeout_not_number'
-      | 'timeout_mode_conflict'
-      | 'mention_not_open_id'
-      | 'into_not_root_message_id',
+      | 'mention_not_open_id',
     message: string,
   ) {
     super(message);
@@ -88,23 +86,10 @@ export function parseAskOptions(raw: string | undefined): AskOption[] {
   return out;
 }
 
-/** Select the explicit ask lifetime. `null` is an intentional permanent ask. */
-export function parseAskTimeoutMode(input: {
-  timeoutRaw: string | undefined;
-  noTimeout: boolean;
-}): number | null {
-  if (input.noTimeout && input.timeoutRaw !== undefined) {
-    throw new AskArgsError(
-      'timeout_mode_conflict',
-      '--no-timeout 不能与 --timeout 同时使用',
-    );
-  }
-  return input.noTimeout ? null : parseAskTimeoutSeconds(input.timeoutRaw);
-}
-
 /** Parse `--timeout <seconds>` → milliseconds. Bounds match §7:
  *   - lower bound: 10s (sub-10s asks are almost always a bug)
- *   - upper bound: 3600s (1h — past that, recovery should kick in v0.1.8)
+ *   - upper bound: 3600s (1h)
+ *   - explicit 0: no deadline for a managed explicit Ask
  *   - default: 300s (caller passes `undefined` to use it) */
 export function parseAskTimeoutSeconds(
   raw: string | undefined,
@@ -124,26 +109,13 @@ export function parseAskTimeoutSeconds(
       `--timeout 必须是整数秒数，收到 "${raw}"`,
     );
   }
-  if (n < defaults.min || n > defaults.max) {
+  if (n !== 0 && (n < defaults.min || n > defaults.max)) {
     throw new AskArgsError(
       'timeout_out_of_range',
-      `--timeout 范围 [${defaults.min}, ${defaults.max}] 秒，收到 ${n}`,
+      `--timeout 范围 [${defaults.min}, ${defaults.max}] 秒，或 0 表示无限等待，收到 ${n}`,
     );
   }
   return n * 1000;
-}
-
-/** Parse `--into <om_root>` without mixing it with the ambient session root. */
-export function parseAskInto(raw: string | undefined): string | undefined {
-  if (raw === undefined) return undefined;
-  const value = raw.trim();
-  if (!/^om_[A-Za-z0-9_-]{1,128}$/.test(value)) {
-    throw new AskArgsError(
-      'into_not_root_message_id',
-      `--into 只接受话题根消息 ID（om_ 开头），收到 "${value}"`,
-    );
-  }
-  return value;
 }
 
 /** Parse `--mention <value>` → a human open_id.
@@ -160,10 +132,10 @@ export function parseAskMention(raw: string | undefined): string | undefined {
   }
   // 第一个冒号前是 open_id（与 send 的 "open_id:Display Name" 约定一致）。
   const openId = (value.includes(':') ? value.slice(0, value.indexOf(':')) : value).trim();
-  if (!/^ou_[A-Za-z0-9]{6,64}$/.test(openId)) {
+  if (!/^ou_[A-Za-z0-9_-]{1,128}$/.test(openId)) {
     throw new AskArgsError(
       'mention_not_open_id',
-      `--mention 只接受人类成员的 open_id（ou_ 开头），收到 "${value}"`,
+      `--mention 只接受成员的 open_id（ou_ 开头），收到 "${value}"`,
     );
   }
   return openId;

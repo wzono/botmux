@@ -90,6 +90,7 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
   const released = Symbol('released');
   const release = vi.fn(() => { throw released; });
   const scope = {
+    workerSessionEventScope: undefined,
     lastInitConfig: { cliId }, codexBridgeQueue: queue, isStructuredBridgeLifecycleBlockingCli, isCodexAppCliId,
     rpcTurnsAwaitingActivation: new Set(), rpcLifecycleFailClosedOwners: new Set(), rpcTerminalHydrationOwners: new Set(),
     idleDetector: { isStartupPending: () => false, reset: vi.fn(), isReadyEvidenceWeak: () => false },
@@ -97,7 +98,7 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
     traexQuotaPending: quotaPending,
     bareShellLaunchBlocked: false, currentInputDeliveryQuarantine: () => false,
     currentPostTerminalInputFence: () => false, isPromptReady: false,
-    stopStructuredStartGraceRecheck: vi.fn(), cliRestartInProgress: false,
+    stopStructuredStartGraceRecheck: vi.fn(), cliRestartInProgress: false, cliSubmissionInFlight: null,
     // This fixture exercises lifecycle/delegation, not a live process tree.
     // Root refresh and publication are covered by worker-codex-execution-root.
     currentCodexObservedPid: vi.fn(),
@@ -105,6 +106,7 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
     awaitingPostSessionStartPromptEvidence: false, isSettlingFirstFlush: false,
     freshnessInputQueue: { onPromptReady: () => 'continue' }, spawnArgvTurnStartGateHolds: () => false,
     spawnArgvInitialPromptBusy: false, ptyOutputGeneration: { snapshot: () => 1 },
+    backgroundTaskTracker: { pendingTurnAgents: () => 0 },
     structuredRejectedReadyEvidenceGeneration: undefined, log: vi.fn(),
     scheduleStructuredStartGraceRecheck: vi.fn(), flushQueuedInputAfterTurnStartEvidence: vi.fn(),
     // These cases all run AFTER the first prompt was admitted

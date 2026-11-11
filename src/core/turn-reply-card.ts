@@ -1,3 +1,5 @@
+import { attachOncallGroupButton, prepareNativeOncallCard, recordOncallGroupDelivery } from '../im/lark/oncall-group.js';
+import { OncallGroupStore } from '../services/oncall-group-store.js';
 import { join } from 'node:path';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
@@ -5,13 +7,20 @@ import { config } from '../config.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import { sandboxBoolValue } from '../adapters/cli/sandbox-mode.js';
 import { getBot } from '../bot-registry.js';
+import { handleCotThinkingUpdate, finalizeCotMessage, hasCotMessageForTurn, prepareCotMessageBeforeReply } from '../im/lark/cot-message.js';
 import { normalizeUsageDisplay } from '../bot-registry.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { withCardRuntimeIdentity } from './card-runtime-identity.js';
+import { controllerForSession } from './session-controller.js';
 import { resolvePricingConfig } from '../services/model-pricing.js';
-import { localeForBot } from '../i18n/index.js';
+import { localeForBot, t as tr } from '../i18n/index.js';
+import { LocalAddressOutboundError, prepareLocalAddressContent, sanitizeLocalAddressText } from '../im/lark/local-address-policy.js';
+import { localAddressContextForBot, replayVettedBody } from '../im/lark/local-address-context.js';
+import { isLarkContentAuditError } from '../im/lark/content-audit.js';
+import { sendWithContentAuditRedaction } from '../im/lark/content-audit-redaction.js';
 import { logger } from '../utils/logger.js';
 import { getAskSnapshot, invalidateReplyCardAsks } from './ask-broker.js';
+import { getSession } from '../services/session-store.js';
 import { MessageWithdrawnError, uploadFile, replyMessage, sendMessage } from '../im/lark/client.js';
 import { observeAcknowledgedGroupPublication, patchPublishedGroupCard, readGroupContextAuthorOrigin } from '../services/group-context-publication.js';
 import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools, replyCardPresentation } from '../im/lark/turn-reply-card.js';
@@ -81,12 +90,67 @@ export function replyCardModeFor(ds: DaemonSession, turnId = ds.currentTurnId): 
   if (mode !== 'legacy') {
     const record = new TurnReplyCardStore(config.session.dataDir).prepareSync(replyCardKey(ds, turnId), {
       mode, chatId: ds.chatId, rootId: sessionAnchorId(ds),
+      nativeCot: cfg.replyCardNativeCot === true && (ds.cotForced === true || !cfg.noCotChats?.includes(ds.chatId)),
     });
     mode = record.mode;
   }
   snapshot.set(turnId, mode);
   if (snapshot.size > 512) snapshot.delete(snapshot.keys().next().value!);
   return mode;
+}
+
+/** Admission fixes the channel order. Enabling native CoT after an answer is
+ * already visible applies next turn, instead of inserting thinking below it. */
+function nativeThinkingOwner(ds: DaemonSession, owns?: () => boolean): () => boolean {
+  const session = ds.session;
+  const worker = ds.worker;
+  const generation = ds.workerGeneration;
+  const controller = controllerForSession(ds);
+  const currentRuntime = () => controller?.currentRuntime() ?? session.sessionRuntimeContract?.session.activeRuntime;
+  const runtime = currentRuntime();
+  return () => ds.session === session && ds.worker === worker && ds.workerGeneration === generation
+    && session.status !== 'closed'
+    && currentRuntime()?.runtimeId === runtime?.runtimeId
+    && currentRuntime()?.epoch === runtime?.epoch
+    && owns?.() !== false;
+}
+
+export function updateReplyCardNativeThinking(ds: DaemonSession, msg: ToolsUpdate, owns?: () => boolean): void {
+  const record = new TurnReplyCardStore(config.session.dataDir).read(replyCardKey(ds, msg.turnId, msg.dispatchAttempt))
+    ?? new TurnReplyCardStore(config.session.dataDir).read(replyCardKey(ds, msg.turnId));
+  if (record?.nativeCot && ((!record.nativeCotReady && !record.messageId) || hasCotMessageForTurn(ds, msg))) {
+    handleCotThinkingUpdate(ds, { type: 'thinking_update', ...msg }, record.mode, nativeThinkingOwner(ds, owns));
+  }
+}
+
+export function replyCardDispatchAttempt(ds: DaemonSession, turnId: string): number | undefined {
+  if (ds.managedTurnOrigin?.turnId === turnId) return ds.managedTurnOrigin.dispatchAttempt;
+  if (ds.turnDispatchAttemptHighWater?.turnId === turnId) return ds.turnDispatchAttemptHighWater.dispatchAttempt;
+  if (ds.session.readonlyTaskContinuation?.currentTurnId === turnId) return ds.session.readonlyTaskContinuation.currentDispatchAttempt;
+  return ds.lastThinkingUpdate?.turnId === turnId ? ds.lastThinkingUpdate.dispatchAttempt : undefined;
+}
+
+export async function prepareReplyCardNativeThinking(ds: DaemonSession, turnId: string, dispatchAttempt?: number, owns?: () => boolean): Promise<void> {
+  const store = new TurnReplyCardStore(config.session.dataDir);
+  const record = store.read(replyCardKey(ds, turnId, dispatchAttempt)) ?? store.read(replyCardKey(ds, turnId));
+  const binding = { turnId, dispatchAttempt: dispatchAttempt ?? replyCardDispatchAttempt(ds, turnId) };
+  if (record?.nativeCot && ((!record.nativeCotReady && !record.messageId) || hasCotMessageForTurn(ds, binding))) {
+    await prepareCotMessageBeforeReply(ds, binding, nativeThinkingOwner(ds, owns));
+  }
+}
+
+/**
+ * 统一回复卡片的所有 PATCH 都走这里：卡片里一旦写进最终回复，之后每次重绘（终态、
+ * 恢复、提问）都会再带上原文，被内容安全审计拒收时同样打码副本重发一次。
+ */
+export function patchReplyCardWithAuditRedaction(
+  larkAppId: string, card: string, label: string, patch: (body: string) => Promise<void>,
+): Promise<void> {
+  return sendWithContentAuditRedaction({
+    content: card, msgType: 'interactive', send: patch,
+    note: tr('worker.final_output_content_audit_redacted_note', undefined, localeForBot(larkAppId)),
+    log: line => logger.warn(`[reply-card] patch ${label} ${line}`),
+  });
 }
 
 export async function updateTurnReplyCard(
@@ -127,9 +191,21 @@ export async function updateTurnReplyCard(
     }
   };
   beforeEffect();
-  if (event.kind === 'terminal' && !event.disconnected) invalidateReplyCardAsks(key, 'Turn finished');
-  await store.prepare(key, { mode, chatId: ds.chatId, rootId: sessionAnchorId(ds) });
+  if (event.kind === 'display_retired' || (event.kind === 'terminal' && !event.disconnected)) invalidateReplyCardAsks(key, 'Turn finished');
+  await store.prepare(key, { mode, chatId: ds.chatId, rootId: sessionAnchorId(ds),
+    nativeCot: store.read(replyCardKey(ds, turnId))?.nativeCot });
   const cfg = getBot(ds.larkAppId).config;
+  const oncallEnabled = ds.chatType !== 'p2p' && ((cfg.oncallGroup?.enabled === true && cfg.oncallGroup.chatIds.includes(ds.chatId))
+    || new OncallGroupStore(config.session.dataDir).getRequest({ appId: ds.larkAppId, sessionId: session.sessionId,
+      chatId: ds.chatId, messageId: '', questionId: turnId, answer: '' })?.status === 'succeeded');
+  const oncallTurn = oncallEnabled ? new OncallGroupStore(config.session.dataDir).registerTurn(ds.larkAppId, session.sessionId, turnId, { chatId: ds.chatId, rootId: anchor }) : undefined;
+  const nativeOncallLink = oncallEnabled ? await prepareNativeOncallCard(ds.larkAppId, ds.chatId, turnId, session.sessionId) : undefined;
+  const indexOncall = (messageId: string, body: string) => {
+    if (!oncallEnabled || !messageId) return;
+    recordOncallGroupDelivery(config.session.dataDir, { appId: ds.larkAppId, chatId: ds.chatId, messageId,
+      sessionId: session.sessionId, rootId: sessionAnchorId(ds), questionId: turnId, turnNumber: oncallTurn, dispatchAttempt: key.dispatchAttempt,
+      answer: event.kind === 'final' ? event.text : '', card: JSON.parse(body), nativeLink: nativeOncallLink });
+  };
   const groupContextAuthorOrigin = event.kind === 'final' ? readGroupContextAuthorOrigin({
     appId: ds.larkAppId, chatId: ds.chatId, sessionId: session.sessionId, turnId,
     nativeSessionId: session.cliSessionId, cliId: session.cliLaunchSnapshot?.cliId ?? session.cliId ?? cfg.cliId,
@@ -149,32 +225,41 @@ export async function updateTurnReplyCard(
   const transport = {
     usage: withCardRuntimeIdentity(ds, usage ?? { context: null, tokens: null }, ds.session.cliId ?? cfg.cliId),
     beforeEffect,
+    beforeCreate: () => prepareReplyCardNativeThinking(ds, turnId, options.dispatchAttempt, options.owns),
     send: async (body, uuid) => {
+      body = prepareLocalAddressContent(body, 'interactive', localAddressContextForBot(ds.larkAppId, ds.workingDir ?? ds.session.workingDir));
       const messageId = await send(body, 'interactive', uuid, beforeEffect);
-      if (messageId) acknowledged.set(messageId, 'primary');
+      if (messageId) { acknowledged.set(messageId, 'primary'); indexOncall(messageId, body); }
       if (messageId && groupContextAuthorOrigin) await observeAcknowledgedGroupPublication(ds.larkAppId, {
         message_id: messageId, chat_id: ds.chatId, root_id: sessionAnchorId(ds), msg_type: 'interactive', body: { content: body },
       }, groupContextAuthorOrigin);
       return messageId;
     },
     patch: async (messageId, card) => {
-      await patchPublishedGroupCard(ds.larkAppId, ds.chatId, messageId, card, sessionAnchorId(ds),
-        groupContextAuthorOrigin, beforeEffect);
-      acknowledged.set(messageId, 'primary');
+      card = prepareLocalAddressContent(card, 'interactive', localAddressContextForBot(ds.larkAppId, ds.workingDir ?? ds.session.workingDir));
+      await patchReplyCardWithAuditRedaction(ds.larkAppId, card, `${event.kind} turn=${turnId.substring(0, 8)}`,
+        body => patchPublishedGroupCard(ds.larkAppId, ds.chatId, messageId, body, sessionAnchorId(ds),
+          groupContextAuthorOrigin, beforeEffect));
+      acknowledged.set(messageId, 'primary'); indexOncall(messageId, card);
     },
     isWithdrawn: error => error instanceof MessageWithdrawnError,
     forceVisible: options.forceVisible || ds.cotForced,
     render: (record: import('../services/turn-reply-card.js').TurnReplyCardRecord) => {
       const cfg = getBot(ds.larkAppId).config;
       const presentation = replyCardPresentation(cfg, ds.chatId);
-      return buildTurnReplyCard(record, {
+      const raw = buildTurnReplyCard(record, {
         ...presentation, locale: localeForBot(ds.larkAppId), workingDir: ds.workingDir,
         showProcess: options.forceVisible || ds.cotForced || presentation.showProcess,
         showLiveUsage: normalizeUsageDisplay(cfg) === 'streaming',
         canStop: presentation.canStop && ds.initConfig?.codexRpcInput !== true,
       });
+      return prepareLocalAddressContent(attachOncallGroupButton(raw, cfg.oncallGroup, ds.chatId, ds.chatType, {
+        appId: ds.larkAppId, sessionId: session.sessionId, questionId: turnId,
+        phase: record.finalCard || replyCardIsTerminal(record) ? 'final' : 'first', nativeLink: nativeOncallLink, messageId: record.messageId,
+      }), 'interactive', localAddressContextForBot(ds.larkAppId, ds.workingDir ?? ds.session.workingDir));
     },
     sendOverflow: async (text: string, uuid: string) => {
+      text = sanitizeLocalAddressText(text, localAddressContextForBot(ds.larkAppId, ds.workingDir ?? ds.session.workingDir));
       const file = join(store.directory, `${store.id(key)}-reply.md`);
       atomicWriteFileSync(file, text, { mode: 0o600, followTargetSymlink: false });
       const fileKey = await uploadFile(ds.larkAppId, file);
@@ -212,7 +297,9 @@ export async function updateTurnReplyCard(
     catch (error) {
       publication({ status: 'unavailable', reason: 'delivery_unknown' },
         acknowledged.size ? 'partial' : 'unknown', 'delivery_unknown');
-      if (attempt >= 2 || error instanceof MessageWithdrawnError || store.read(key)?.withdrawn) throw error;
+      // 内容安全审计拒收和本机跳转地址拒发都是确定性的（打码重发已在 transport 里做过一次），原样重试无用。
+      if (attempt >= 2 || error instanceof MessageWithdrawnError || isLarkContentAuditError(error)
+        || error instanceof LocalAddressOutboundError || store.read(key)?.withdrawn) throw error;
       await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 800 : 2000));
       beforeEffect();
     }
@@ -268,6 +355,30 @@ export async function flushTurnReplyTools(ds: DaemonSession, turnId: string, dis
   try { await work; } finally { if (running.get(key) === work) running.delete(key); }
 }
 
+/** UI retirement never asserts native task failure or changes task settlement. */
+export async function retireReplyCardDisplay(
+  ds: DaemonSession, msg: { turnId: string; dispatchAttempt?: number; message: string },
+  send: ReplyCardSender, owns: () => boolean,
+): Promise<boolean> {
+  if (replyCardModeFor(ds, msg.turnId) === 'legacy') {
+    finalizeCotMessage(ds, msg.turnId, 'ambiguous', msg.dispatchAttempt);
+    return false;
+  }
+  try {
+    if (ds.replyCardRunningTurnId === msg.turnId) ds.replyCardRunningTurnId = undefined;
+    await flushTurnReplyTools(ds, msg.turnId, msg.dispatchAttempt).catch(error => {
+      // A failed cosmetic PATCH must not prevent persisting the terminal notice.
+      logger.warn(`[reply-card] retirement tool flush: ${error.message}`);
+    });
+    const retired = await updateTurnReplyCard(ds, msg.turnId, { kind: 'display_retired', notice: msg.message }, send,
+      { dispatchAttempt: msg.dispatchAttempt, owns });
+    return retired !== undefined;
+  } finally {
+    const record = new TurnReplyCardStore(config.session.dataDir).read(replyCardKey(ds, msg.turnId, msg.dispatchAttempt));
+    finalizeCotMessage(ds, msg.turnId, record?.finalDelivered && record.phase === 'completed' ? 'completed' : 'ambiguous', msg.dispatchAttempt);
+  }
+}
+
 /** A confirmed merged input retires the old display, not the native task.
  * Only an already-admitted exact attempt may own a reply card here. */
 export async function supersedeTurnReplyCard(
@@ -300,23 +411,28 @@ export async function settleTurnReplyCards(ds: DaemonSession): Promise<void> {
     if (mode === 'legacy') continue;
     const record = store.read(replyCardKey(ds, turnId));
     if (!record?.messageId || replyCardIsTerminal(record)) continue;
-    await settleDisconnectedReplyCard(store, record);
+    await settleDisconnectedReplyCard(store, record, undefined, ds.workingDir ?? ds.session.workingDir);
   }
   ds.replyCardRunningTurnId = undefined;
 }
 
-async function settleDisconnectedReplyCard(store: TurnReplyCardStore, record: import('../services/turn-reply-card.js').TurnReplyCardRecord, beforeMs?: number): Promise<void> {
+async function settleDisconnectedReplyCard(store: TurnReplyCardStore, record: import('../services/turn-reply-card.js').TurnReplyCardRecord, beforeMs?: number, workingDir?: string): Promise<void> {
   // Resumable asks have already been restored by the broker at startup.
   const orphanAskIds = (record.asks ?? []).filter(entry => !entry.result && !getAskSnapshot(entry.ask.askId))
     .map(entry => entry.ask.askId);
   const beforeEffect = () => {
     if (getBot(record.larkAppId).config.apiOnly) throw new Error('Reply-card transport disabled');
   };
+  // The record keeps the agent's raw text; a re-render is model output entering again.
+  const localContext = localAddressContextForBot(record.larkAppId, workingDir);
   await store.update(record, { kind: 'recover', beforeMs, orphanAskIds }, {
     beforeEffect,
     send: async () => { throw new Error('Recovery may only update an existing reply card'); },
-    patch: (id, card) => patchPublishedGroupCard(record.larkAppId, record.chatId, id, card, record.rootId),
+    // The persisted pendingPatch was vetted before this restart.
+    patch: (id, card) => replayVettedBody(card, 'interactive', () => patchReplyCardWithAuditRedaction(record.larkAppId, card,
+      `recover turn=${record.turnId.substring(0, 8)}`, body => patchPublishedGroupCard(record.larkAppId, record.chatId, id, body, record.rootId))),
     sendOverflow: async (text, uuid) => {
+      text = sanitizeLocalAddressText(text, localContext);
       const file = join(store.directory, `${store.id(record)}-reply.md`);
       atomicWriteFileSync(file, text, { mode: 0o600, followTargetSymlink: false });
       beforeEffect();
@@ -328,14 +444,20 @@ async function settleDisconnectedReplyCard(store: TurnReplyCardStore, record: im
         : sendMessage(record.larkAppId, record.chatId, content, 'file', uuid, undefined, { beforeWrite: beforeEffect });
     },
     isWithdrawn: error => error instanceof MessageWithdrawnError,
-    render: state => buildTurnReplyCard(state, {
+    render: state => prepareLocalAddressContent(buildTurnReplyCard(state, {
       ...replyCardPresentation(getBot(record.larkAppId).config, record.chatId),
       locale: localeForBot(record.larkAppId), canStop: false,
-    }),
+    }), 'interactive', localContext),
   });
 }
 
 /** Like the CoT orphan sweep: recover only this bot's previously visible cards. */
+/** Without the session row a re-render loses only workspace-relative paths;
+ * the policy still replaces paths under known roots. */
+function sessionWorkingDir(sessionId: string): string | undefined {
+  try { return getSession(sessionId)?.workingDir; } catch { return undefined; }
+}
+
 export async function sweepInterruptedReplyCards(larkAppId: string): Promise<void> {
   const store = new TurnReplyCardStore(config.session.dataDir);
   if (!existsSync(store.directory)) return;
@@ -347,7 +469,7 @@ export async function sweepInterruptedReplyCards(larkAppId: string): Promise<voi
       const record = store.read(key);
       if (!record?.messageId || (record.updatedAtMs ?? record.createdAtMs) >= processStartedAtMs || record.withdrawn
         || (replyCardIsTerminal(record) && record.phase !== 'ambiguous' && !record.pendingPatch && !record.publishPending)) continue;
-      await settleDisconnectedReplyCard(store, record, processStartedAtMs);
+      await settleDisconnectedReplyCard(store, record, processStartedAtMs, sessionWorkingDir(record.sessionId));
     } catch (error) {
       logger.warn(`[reply-card] recovery: ${error instanceof Error ? error.message : String(error)}`);
     }

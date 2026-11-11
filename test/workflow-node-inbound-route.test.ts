@@ -103,22 +103,6 @@ vi.mock('../src/core/worker-pool.js', async () => {
   };
 });
 
-vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
-  const actual = await vi.importActual<any>('../src/core/admitted-turn-dispatch.js');
-  return {
-    ...actual,
-    dispatchAdmittedBusinessTurn: vi.fn(async (input: any) => {
-      if (!input.ds.session.workingDir && input.ds.workingDir) input.ds.session.workingDir = input.ds.workingDir;
-      if (input.resource?.markAttempting && !await input.resource.markAttempting()) return false;
-      if (input.ds.worker && !input.ds.worker.killed) {
-        return mocks.sendWorkerInput(input.ds, input.payload, input.turnId, input.options);
-      }
-      mocks.forkWorker(input.ds, input.payload, { resume: input.options.resume, turnId: input.turnId });
-      return true;
-    }),
-  };
-});
-
 vi.mock('../src/core/session-manager.js', async () => {
   const actual = await vi.importActual<any>('../src/core/session-manager.js');
   return { ...actual, downloadResources: (...args: any[]) => mocks.downloadResources(...args) };

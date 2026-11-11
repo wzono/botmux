@@ -19,6 +19,7 @@ import {
   registerHostAsk,
   setCardDispatcher,
   setCanTalkChecker,
+  setExplicitAskSessionChecker,
   submitAsk,
   submitAskFromDesktop,
   submitCustomReply,
@@ -92,38 +93,51 @@ afterEach(() => {
 });
 
 describe('registerAsk happy path', () => {
-  it('keeps a no-timeout host ask active until it is answered', async () => {
-    const d = mockDispatcher();
-    setCardDispatcher(d);
-    const settled = vi.fn();
-    void registerHostAsk(makeInput({ timeoutMs: null })).then(settled);
-    await Promise.resolve();
-    await Promise.resolve();
-    await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000);
-    expect(settled).not.toHaveBeenCalled();
-    expect(d.settleCalls).toHaveLength(0);
-    const ask = d.sendCalls[0];
-    expect(tryResolveAsk({ askId: ask.askId, nonce: ask.nonce, selected: 'yes', by: 'ou_owner' })).toBe('accepted');
-    await Promise.resolve();
-    expect(settled).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ kind: 'answered' }));
+  it('rejects an answer immediately after a no-deadline session closes, before the recovery sweep', async () => {
+    const dispatcher = mockDispatcher();
+    setCardDispatcher(dispatcher);
+    let live = true;
+    setExplicitAskSessionChecker(() => live);
+    const waiting = registerHostAsk(makeInput({ originKind: 'host_explicit', requestId: 'closed', timeoutMs: 0 }));
+    const card = dispatcher.sendCalls[0]!;
+    live = false;
+    expect(tryResolveAsk({ askId: card.askId, nonce: card.nonce, selected: 'yes', by: 'ou_owner' })).toBe('already_settled');
+    await expect(waiting).resolves.toMatchObject({ kind: 'invalidated' });
   });
 
-  it('keeps callback and timeout lifecycle rooted at a validated --into target', async () => {
-    const d = mockDispatcher();
-    setCardDispatcher(d);
-    const p = registerAsk(makeInput({ rootMessageId: 'om_validated_into' }));
+  it('keeps a managed explicit Ask pending without timers until an authorized winner or manual revocation', async () => {
+    const dispatcher = mockDispatcher();
+    setCardDispatcher(dispatcher);
+    const input = makeInput({ originKind: 'host_explicit', requestId: 'indefinite', timeoutMs: 0,
+      answererOpenId: 'ou_owner' });
+    const waiting = registerHostAsk(input);
     await Promise.resolve();
-    await Promise.resolve();
-    const [dispatched] = d.sendCalls;
-    expect(dispatched.rootMessageId).toBe('om_validated_into');
-    expect(findPendingAskByAnchor({
-      larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'om_validated_into',
-    })?.askId).toBe(dispatched.askId);
-    await vi.advanceTimersByTimeAsync(5_000);
-    await expect(p).resolves.toMatchObject({ kind: 'timedOut', timedOut: true });
-    expect(d.settleCalls[0]).toMatchObject({
-      ask: { rootMessageId: 'om_validated_into' }, result: { kind: 'timedOut' },
-    });
+    const card = dispatcher.sendCalls[0]!;
+    expect(_getPending(card.askId)?.deadlineAt).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(30 * 24 * 3600_000);
+    expect(_pendingCount()).toBe(1);
+    await expect(registerHostAsk({ ...input, timeoutMs: 5000 })).resolves.toMatchObject({ kind: 'invalidated' });
+    expect(tryResolveAsk({ askId: card.askId, nonce: card.nonce, selected: 'yes', by: 'ou_a' })).toBe('unauthorized');
+    expect(tryResolveAsk({ askId: card.askId, nonce: 'old-nonce', selected: 'yes', by: 'ou_owner' })).toBe('stale');
+    expect(tryResolveAsk({ askId: card.askId, nonce: card.nonce, selected: 'yes', by: 'ou_owner' })).toBe('accepted');
+    expect(tryResolveAsk({ askId: card.askId, nonce: card.nonce, selected: 'no', by: 'ou_owner' })).toBe('already_settled');
+    await expect(waiting).resolves.toMatchObject({ kind: 'answered', answers: [['yes']], by: 'ou_owner' });
+    const revoked = registerHostAsk({ ...input, requestId: 'revoked' });
+    await vi.advanceTimersByTimeAsync(30 * 24 * 3600_000);
+    expect(invalidateAll('manually revoked')).toBe(1);
+    await expect(revoked).resolves.toMatchObject({ kind: 'invalidated', reason: 'manually revoked' });
+  });
+
+  it.each(['hook', 'explicit', 'host_cross_principal_classification', 'host_explicit'])
+  ('rejects unmanaged zero timeout from %s before creating a card', async originKind => {
+    const dispatcher = mockDispatcher();
+    setCardDispatcher(dispatcher);
+    const input = makeInput({ originKind, requestId: 'unmanaged', timeoutMs: 0 });
+    expect(() => originKind.startsWith('host_')
+      ? registerHostAsk({ ...input, requestId: originKind === 'host_explicit' ? undefined : input.requestId })
+      : registerAsk(input)).toThrow();
+    expect(dispatcher.sendCalls).toHaveLength(0);
   });
 
   it('register → tryResolveAsk("yes") resolves with kind:answered', async () => {

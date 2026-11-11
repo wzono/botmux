@@ -67,16 +67,18 @@ prompt 是到点时会被执行的内容，就像用户新开一个话题向你�
 botmux schedule list
 \`\`\`
 
-### 修改提示词
+### 修改任务（频率 / 提示词 / 日历）
 
-修改已有任务的 prompt 必须原地更新，不要先删除再创建：
+修改已有任务必须原地更新，不要先删除再创建（删了重建会丢掉任务 ID、执行记录和前置条件）：
 
 \`\`\`
+botmux schedule update <id> --schedule "every 4h"          # 改执行频率，写法同 schedule add
 botmux schedule update <id> --prompt-file <UTF-8 文件路径>
 botmux schedule update <id> --prompt "新的完整提示词"
+botmux schedule update <id> --schedule "0 9 * * 1-5" --prompt-file <文件>   # 可组合
 \`\`\`
 
-两种输入方式只能选一种。更新成功保留任务 ID、执行时间、启停状态、每次新话题设置和运行记录；已开始的执行沿用原 prompt，后续执行使用新版，不会自动补跑。文件读取、身份验证或写入失败时保留旧任务，先排查错误，不要通过删除任务重试。旧版本没有 update 时先升级，不要把修改降级为先删后建。若提示任务绑定了守护前置条件（precondition），说明该任务只能在 Dashboard 修改，不要删除重建，告知用户去 Dashboard 的定时任务页编辑。
+\`--schedule\` 的写法与 \`schedule add\` 完全相同（上面的表格）；改频率后按新频率从现在起重新计算下次执行时间，不补跑、不立即触发，输出里会显示新规则和下次执行时间；任务正在执行时改频率会被拒绝（schedule_run_in_flight），等这次执行结束再改即可，不要删除重建。\`--prompt\` 与 \`--prompt-file\` 只能选一种。更新成功保留任务 ID、静默设置、执行位置、前置条件（precondition）、日历规则、创建人身份、启停状态和运行记录；已开始的执行沿用原配置，后续执行使用新版。频率解析失败、文件读取、身份验证或写入失败时保留旧任务，先排查错误，不要通过删除任务重试。旧版本没有 update 或不认 \`--schedule\` 时先升级，不要把修改降级为先删后建。完整字段见 \`botmux schedule update --help\`。
 
 ### 管理
 
@@ -387,7 +389,6 @@ description: 向飞书话题发送消息。用户在飞书上阅读看不到终�
 
 短消息保持轻，只有信息确实需要层级时才使用结构化 Markdown。
 短进度优先直接写纯文本。需要强调时，强调只包住短词或不含中文标点的短语；中文标点和后续正文放在 \`**\` 外，并在结束标记后留出清晰边界。例如：\`**范围已锁定**：只处理 watcher 的静默问题。下一步先止血。\`
- 
 
 ## 修改已有文档：\`--diff\`
 
@@ -713,6 +714,8 @@ botmux send --mention ou_xxx "帮忙看下这段代码"
 
 ### @ 决策硬门（必读）
 
+定时任务等没有本轮发送者的自动回合，有明确收件人时用 --mention，没有明确收件人时用 --no-mention；不要使用 --mention-back，也不要从会话 owner 或历史发送者推断收件人。
+
 每条回复**必须显式做出 @ 决策**，否则 \`botmux send\` 报错（exit 2）不发送。三选一：
 
 | flag | 何时用 |
@@ -795,6 +798,9 @@ sandbox 内也可以用 \`--into <om_话题根消息id>\` 往已有话题追加�
 重新查询该根消息实际所在的群，必须与目标群（默认当前会话群，或
 \`--chat-id\` 指定的群）一致才会投递，否则返回 \`dispatch_chat_mismatch\`。
 
+往话题追加时，该话题里已关闭的会话默认会自动接上（上下文都在）；人手动关闭的（\`/close\`、卡片关闭、dashboard 关闭、\`botmux delete\`）除外，会另开新会话。
+想强制另开新会话（不相干的事、或不想继承之前思路的独立评审）加 \`--session-mode fresh\`，\`--session-mode resume\` 为默认行为。
+
 \`--top-level\` 模式下不会附加"发送给：@xxx / cc：xxx" 那行 footer（顶层广播没有特定收件人）。oncall 寻址也会跳过。
 
 ## 参数
@@ -814,9 +820,10 @@ sandbox 内也可以用 \`--into <om_话题根消息id>\` 往已有话题追加�
 | \`--schedule-remove-self\` | 仅 scheduled turn + 标准 final；投递成功并落账后删除当前精确任务 |
 | \`--completion-proposal-file <path>\` | 仅与标准 final 同用；附一个 requester-only、24h 有效的二选一可选后续 |
 | \`--mention <open_id[:name]>\` | @mention，可重复。带 \`:name\` 时文本里的 \`@name\` 会被替换成 \<at\> 标签；只传 open_id 则在消息末尾追加 @。用 \`botmux bots list\` 查 open_id |
-| \`--mention-back\` | @ 回本轮触发消息的发送者（open_id 自动从会话取）。满足 @ 硬门 |
+| \`--mention-back\` | @ 回本次回复目标消息的发送者（open_id 自动从会话取，保留多参与者歧义检查）。满足 @ 硬门 |
 | \`--no-mention\` | 明确声明本条不 @ 任何人。满足 @ 硬门 |
-| \`--quote <message_id>\` | 引用指定消息（普通群）。默认引用本轮触发消息 |
+| \`--quote <message_id>\` | 引用指定消息（普通群）。默认跟随最近已注入消息的位置；需要回复较早消息时用 --reply-to |
+| \`--reply-to <message_id>\` | 按当前会话已接收消息的位置回复；不改变 final 归属。不能与显式 --quote / --top-level / --chat-id / --into 混用 |
 | \`--no-quote\` | 不引用，发独立消息（普通群） |
 | \`--urgent[=app\\|sms\\|phone]\` | 加急本轮触发者，必须与 \`--mention-back\` 同用；默认应用内加急 |
 | \`--top-level\` | 发顶层消息（不回复进当前话题）；自动跳过"发送给/cc" footer |
@@ -851,6 +858,7 @@ botmux bots list
 
 每个机器人一行，关键字段：
 - \`name\` / \`openId\` / \`isSelf\`
+  - \`name\` 只用于展示：以飞书开放平台当前应用名为准，Bot 在开放平台改名后，它的 daemon 在线时 10–12 分钟内跟着更新，**不要把它存下来当身份**；要引用某个 bot 时用 \`openId\` / \`larkAppId\`。
 - \`larkAppId\`：本机托管的机器人才有（可用作 workflow 的 bot id）
 - \`capability\`：团队能力标签（它擅长什么）——挑选交棒/协作对象的依据
 - \`hasTeamRole\`：是否配置了团队级角色
@@ -1495,7 +1503,9 @@ stdout 为一行 JSON。注意：\`--json\` 覆盖所有结果类型；超时 / 
 - 不使用 \`--questions-file\` 时 \`--options\` 必填，至少 2 项，逗号分隔
 - 推荐 \`key=label\`，key 用稳定英文短词，label 给用户看
 - \`--multi\` 开启多选；\`--json\` 的 \`answers[0]\` 保留完整 key 数组，且 \`selected\` 恒为 \`null\`（多选不要读 \`selected\`）
-- 默认超时 300 秒，可用 \`--timeout <seconds>\` 调整
+- 省略 \`--timeout\` 仍默认 300 秒；正数范围为 10–3600 秒。只有显式 \`botmux ask buttons --timeout 0\` 表示无截止时间，直到真人回答或宿主正式关闭/撤销
+- \`--timeout 0\` 要求 CLI 和 daemon 同时支持，使用版本化入口；旧 daemon 会明确拒绝，不自动降级成有限超时。此选项不改变 hook 或权限确认的有限超时策略
+- 无期限不代表永久批准：答题人、原请求身份、nonce、首个有效答案、当前方案版本与授权范围仍须校验。连接丢失后复用同一 requestId 和原卡片，不能用超时或重复提问代替人工决定
 
 ## @ 点名（--mention）
 
@@ -1505,7 +1515,7 @@ ask 卡片是**独立卡片，不像 \`botmux send\` 的回复那样天然 @ 触
 botmux ask buttons --mention ou_xxx --options "yes=继续,no=回滚" "继续发版吗？"
 \`\`\`
 
-- 只接受人类成员的 open_id（\`ou_\` 前缀，也兼容 \`ou_xxx:显示名\` 形态）；@ 机器人会被 daemon 静默剔除（飞书卡片禁止 at bot，违者整卡 100290）
+- 只接受 open_id（\`ou_\` 前缀，也兼容 \`ou_xxx:显示名\` 形态）；只有本应用通讯录查得到的真人会被 @，否则（如机器人）只丢掉 @，卡片照发
 - 需要点选者作答后再 @ 他：先用 \`--json\` 拿到 \`by\`，再 \`botmux send --mention <by>\`（ask 本身不回发结论）
 - prompt 位置参数就是卡片上「问题 N」下展示的**完整问题正文**，必须自成上下文（背景 + 在问什么），不要写「（选项确认）」这类占位文案——选项 label 不能替代问题本身
 `;
@@ -1814,7 +1824,7 @@ run 开跑后要调整流程（加/删/改节点、改依赖、改派、重做�
 1. \`botmux workflow status <runId> --json\` 读当前版本（\`revision\`）、各节点状态、尝试次数和待确认的修改。
 2. 写 patch 文件（一组操作，整体生效或整体拒绝）：\`{"ops":[...],"note":"为什么改"}\`。操作：
    - \`{"op":"addNode","node":{...完整节点，同 dag.json}}\` · \`{"op":"removeNode","nodeId":"x"}\`
-   - \`{"op":"updateNode","nodeId":"x","set":{"goal":"…","timeoutSec":600,"humanGate":null}}\`（\`null\` 删除字段；depends/bot 不在这里改；\`"checkpoint":true\` 标检查点：节点完成后依赖它的节点先暂停、唤醒你看结果；不作废正在跑的执行）
+   - \`{"op":"updateNode","nodeId":"x","set":{"goal":"…","timeoutSec":600,"humanGate":null}}\`（\`null\` 删除字段；depends/bot 不在这里改；\`"checkpoint":true\` 标检查点：节点完成后依赖它的节点先暂停、唤醒你看结果；不作废正在跑的执行；检查点必须有节点依赖它，没有下游的检查点会被拒绝）
    - \`{"op":"setDepends","nodeId":"x","depends":[...],"inputs":[...]}\` · \`{"op":"reassign","nodeId":"x","bot":"<larkAppId>"}\` · \`{"op":"rerunNode","nodeId":"x"}\`
 3. \`botmux workflow edit <runId> --patch-file <文件> --base <revision> [--reason "<为什么改>"]\`。版本冲突就重新 status 再改，不要硬重试。
 

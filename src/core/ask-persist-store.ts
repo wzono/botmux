@@ -66,22 +66,22 @@ export interface PersistedAsk {
   chatId: string;
   rootMessageId: string | null;
   sessionId: string;
-  controlWait?: CreateAskInput['controlWait'];
   chatType?: 'group' | 'p2p';
   /** Optional app-scoped responder lock for host-owned approval asks. */
   answererOpenId?: string;
-  /** 显式 ask 要 @ 的人类 open_id，跨重启保留以保证重发卡片仍带通知。 */
+  /** 显式 ask 要 @ 的人（daemon 已核实），跨重启保留以保证重发卡片仍带通知。 */
   mentionedOpenId?: string;
   deliveryTarget?: CreateAskInput['deliveryTarget'];
   questions: ReadonlyArray<AskQuestion>;
   customAnswers?: ReadonlyArray<string | null>;
   customRevision?: number;
   createdAt: number;
-  deadlineAt: number | null;
+  /** Absolute epoch milliseconds; paired with timeoutMs=0 for no deadline. */
+  deadlineAt: number;
   /** Original relative timeout. Host-owned asks defer this clock until the
    *  interaction card is confirmed delivered; ordinary CLI asks start it at
    *  registration as before. Optional for backward-compatible v2 records. */
-  timeoutMs?: number | null;
+  timeoutMs?: number;
   /** True only for daemon-hosted asks whose responder cannot act before the
    *  card exists. An undelivered record must not expire during restore. */
   timeoutStartsAfterDelivery?: boolean;
@@ -212,6 +212,11 @@ export function createAskPersistStore(dir: string): AskPersistStore {
         const parsed = raw as unknown as PersistedAsk;
         if (!parsed || parsed.v !== 2 || !parsed.askKey || !parsed.requestId || !Array.isArray(parsed.questions)) {
           if (parsed?.askKey) decisions.remove(parsed.askKey);
+          continue;
+        }
+        if ((parsed.timeoutMs === 0 || parsed.deadlineAt === 0)
+          && !(parsed.originKind === 'host_explicit' && parsed.timeoutMs === 0 && parsed.deadlineAt === 0)) {
+          decisions.remove(parsed.askKey);
           continue;
         }
         // Reap rules:

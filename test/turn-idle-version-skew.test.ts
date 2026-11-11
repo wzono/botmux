@@ -433,9 +433,8 @@ describe('turn-idle version skew (v2 plugin → v1 CLI)', () => {
         port,
       });
       expect(run.done, run.output).toBe(true);
-      // The idle edge produced no turn-idle report — B can never be settled
-      // early. A newer CLI may independently publish session readiness.
-      expect(received.filter(request => request.url !== '/api/session-ready')).toEqual([]);
+      // The idle edge produced no report at all — B can never be settled early.
+      expect(received).toEqual([]);
     });
   }, 30_000);
 
@@ -449,7 +448,7 @@ describe('turn-idle version skew (v2 plugin → v1 CLI)', () => {
       // Proves the wiring above is live (the plugin really execs the command and
       // the snapshot really posts): only the subcommand name separates "no
       // request" from "claim the live generation".
-      expect(received.filter(request => request.url !== '/api/session-ready').map(r => r.body)).toEqual([expect.objectContaining({
+      expect(received.map(r => r.body)).toEqual([expect.objectContaining({
         sessionId: SESSION_ID,
         originCapability: LIVE_TOKEN,
         originTurnId: LIVE_TURN,

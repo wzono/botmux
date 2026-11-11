@@ -150,24 +150,12 @@ fill('advanceTimersToNextTimerAsync', async () => {
   return vi;
 });
 
-// Timer callbacks can finish one async receipt and schedule the next timer in
-// its `finally` continuation. Drain microtasks and repeat until no timers remain,
-// matching Vitest's recursive async form rather than Bun's one synchronous pass.
+// Same sync-to-async relationship as advanceTimersByTimeAsync.
 fill('runAllTimersAsync', async () => {
-  for (let rounds = 0; rounds < 10_000; rounds++) {
-    jest.runAllTimers();
-    await Promise.resolve();
-    await Promise.resolve();
-    if (vi.getTimerCount() === 0) return vi;
-  }
-  throw new Error('vi.runAllTimersAsync exceeded 10000 timer/microtask rounds');
+  jest.runAllTimers();
+  await Promise.resolve();
+  return vi;
 });
-
-// Bun exposes `expect.soft` as undefined while Vitest supports it. Softness only
-// affects aggregation after a failed assertion; matcher semantics stay the same,
-// so an ordinary expect chain preserves the Bun leg's pass/fail signal.
-const expectWithSoft = expect as typeof expect & { soft?: typeof expect };
-if (typeof expectWithSoft.soft !== 'function') expectWithSoft.soft = expect;
 
 // ---------------------------------------------------------------------------
 // `clearAllTimers` when fake timers were never installed.

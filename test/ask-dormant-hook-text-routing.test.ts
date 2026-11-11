@@ -63,18 +63,6 @@ vi.mock('../src/core/worker-pool.js', async () => {
   return { ...actual, forkWorker: (...args: any[]) => mocks.forkWorker(...args) };
 });
 
-vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
-  const actual = await vi.importActual<any>('../src/core/admitted-turn-dispatch.js');
-  return { ...actual, dispatchAdmittedBusinessTurn: vi.fn(async (input: any) => {
-    if (input.ds.worker && !input.ds.worker.killed) {
-      input.ds.worker.send({ type: 'message', ...input.payload, turnId: input.turnId });
-      return true;
-    }
-    mocks.forkWorker(input.ds, input.payload, { ...input.options, turnId: input.turnId });
-    return true;
-  }) };
-});
-
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

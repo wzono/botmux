@@ -126,7 +126,7 @@ export interface ReplyCardV2 {
   schema: '2.0';
   config: { update_multi: true; width_mode: 'fill' };
   header?: ReplyCardHeader;
-  body: { direction: 'vertical'; elements: any[] };
+  body: { direction: 'vertical'; padding?: string; vertical_spacing?: string; elements: any[] };
 }
 
 /** Single envelope shared by direct sends and fallback reply-card builders. */
@@ -400,6 +400,7 @@ export type LocalHomeLinkMode = 'filesystem' | 'lexical' | 'disabled';
  * latest context-window measurement; tokens are cumulative for the Session.
  * Missing facts are omitted independently and must never be estimated. */
 export interface CardUsageSnapshot {
+  modelPin?: ReturnType<typeof import('../../core/model-pin.js').modelPinView>;
   context: {
     usedTokens: number;
     windowTokens?: number;

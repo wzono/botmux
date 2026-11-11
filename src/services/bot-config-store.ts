@@ -1,6 +1,7 @@
 import { botAcceptsLaunchModel } from '../core/launch-model-capability.js';
 import { parseGroupCreationDefaults } from './group-creation-options.js';
 import { normalizeStewardConfig } from '../core/decision-board/model.js';
+import { normalizeIdleSpinSuspendConfig } from '../core/idle-spin-config.js';
 import { formatZcodeModelChoice, resolveZcodeModelReference, zcodeAmbiguousModelIds } from './zcode-models.js';
 import { parseSandboxNetworkPolicy, networkPolicySupportError } from '../core/sandbox-network-policy.js';
 /**
@@ -30,7 +31,6 @@ import { config } from '../config.js';
 import { resolvePairedBackendId } from '../core/remote-cli-ids.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { rmwBotEntry } from './config-store.js';
-import { withBotAdminIdentityPublication } from './bot-admin-unions-store.js';
 import { resolveAllowedUsersWithMap } from '../im/lark/client.js';
 import { detectUnusableOwnerEntries } from '../setup/owner-identity.js';
 import { CLI_SELECT_OPTIONS, resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
@@ -153,11 +153,12 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'groupCreation', configKey: 'groupCreation', kind: 'json', effect: 'immediate', clearable: true, hint: '/g 默认配置 JSON：agents 名称/app ID 数组、tag 个人消息分组名、avatar=logo(默认)|name|off；unset 恢复默认' },
   { key: 'oncallGroup', configKey: 'oncallGroup', kind: 'json', effect: 'immediate', clearable: true, hint: '拉起 Oncall 群按钮：enabled 开关及 chatIds 生效群，默认关闭' },
   { key: 'disableStreamingCard', configKey: 'disableStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭实时流式卡片 on|off' },
-  { key: 'replyCardMode', configKey: 'replyCardMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['legacy', 'unified'], hint: '回答展示方式（下一轮生效）：legacy=默认模式｜unified=动态单卡模式；动态单卡限 Claude Code/Codex/Grok/TraeX/Pi 普通飞书对话' },
-  { key: 'hiddenStreamingCardButtons', configKey: 'hiddenStreamingCardButtons', kind: 'stringList', effect: 'immediate', clearable: true, parseList: parseHiddenStreamingCardButtonsInput, hint: '隐藏实时卡片按钮，逗号/空格分隔：output terminal writeLink compact stop close；unset 恢复全部' },
+  { key: 'replyCardMode', configKey: 'replyCardMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['legacy', 'unified'], hint: '回答展示方式（下一轮生效）：legacy=默认模式｜unified=动态单卡模式；动态单卡限 Claude Code/Codex/Grok/TraeX/Pi/Kimi 普通飞书对话' },
+  { key: 'hiddenStreamingCardButtons', configKey: 'hiddenStreamingCardButtons', kind: 'stringList', effect: 'immediate', clearable: true, parseList: parseHiddenStreamingCardButtonsInput, hint: '隐藏实时卡片按钮，逗号/空格分隔：output terminal writeLink compact stop close substitute；unset 恢复全部' },
   { key: 'pinStreamingCard', configKey: 'pinStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '置顶当前公开实时卡片 on|off（失败不影响会话）' },
-  { key: 'cotEnabled', configKey: 'cotEnabled', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '思考过程消息 on|off（默认 on）：turn 进行中把模型思考过程以飞书原生 CoT 消息（message_cot）流式展示（客户端需 PC ≥7.70 / 移动端 ≥7.74；支持 claude-code / codex / traex / pi 等适配器）。这是 bot 级总开关，单个群可用 /cot off 关闭' },
+  { key: 'cotEnabled', configKey: 'cotEnabled', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '思考过程消息 on|off（默认 on）：turn 进行中把模型思考过程以飞书原生 CoT 消息（message_cot）流式展示（客户端需 PC ≥7.70 / 移动端 ≥7.74；支持 claude-code / codex / traex / pi 等适配器）。动态单卡中控制卡内执行过程，默认模式中控制原生 CoT；单个群可用 /cot off 关闭' },
   { key: 'thinkingCardToolResult', configKey: 'thinkingCardToolResult', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '思考气泡是否贴工具输出 on|off（默认 on）：off 时气泡只保留思考段落与工具节点标题（工具名 · 命令/路径），不再附带命令输出/文件内容代码块，与 Claude Code 自身界面一致' },
+  { key: 'replyCardNativeCot', configKey: 'replyCardNativeCot', kind: 'boolean', effect: 'immediate', clearable: false, hint: '动态单卡的 CoT 思考与工具过程 on|off（默认 off）：在答案卡外显示飞书原生 CoT，与卡内展示执行过程独立；/cot off 同时暂停两处过程展示，切换回答模式保留该值' },
   { key: 'replyCardShowTools', configKey: 'replyCardShowTools', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '动态单卡是否显示工具调用 on|off（默认 on）：仅 replyCardMode=unified 时生效，legacy 模式无效（切换模式保留该值）；off 时卡片隐藏工具节点、命令、结果与工具次数，思考摘要和公开进度仍显示；不影响原生思考气泡，/cot show 也不会显示被隐藏的工具' },
   { key: 'silentTurnReactions', configKey: 'silentTurnReactions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭无卡片模式下的 GoGoGo/DONE reaction 和 Codex App 追加指令确认回执 on|off' },
   { key: 'writableTerminalLinkInCard', configKey: 'writableTerminalLinkInCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '卡片内嵌可写终端链接 on|off' },
@@ -168,8 +169,10 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'autoStartOnGroupJoin', configKey: 'autoStartOnGroupJoin', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被拉进新群即主动开工 on|off' },
   { key: 'autoInviteOwnerOnGroupAdd', configKey: 'autoInviteOwnerOnGroupAdd', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: 'bot 被拉进新群时自动把 owner 拉进群 on|off（默认 on）；off 适用于告警/oncall 批量事件群' },
   { key: 'autoStartOnNewTopic', configKey: 'autoStartOnNewTopic', kind: 'boolean', effect: 'immediate', clearable: false, hint: '话题群每个新话题自动开工 on|off' },
-  { key: 'steward', configKey: 'steward', kind: 'json', effect: 'immediate', clearable: true, hint: '管家（决策看板）JSON：{"enabled":true,"chatId":"oc_…","guideMode":"append|replace","guideText":"自定义规则","autoJoinNewGroups":false,"autoJoinSoloGroups":true,"closeHints":true}；默认关闭；autoJoinNewGroups=拉新群时带上管家，默认开，只在关掉时写 false；autoJoinSoloGroups=只有你和一个 bot 的新群也带，默认关；closeHints=后台巡检提示可以关 / 可以推进 / 过了复查时间的事项（只提示不改状态），默认关；unset 关闭（看板数据保留）' },
+  { key: 'steward', configKey: 'steward', kind: 'json', effect: 'immediate', clearable: true, hint: '管家（决策看板）JSON：{"enabled":true,"chatId":"oc_…","guideMode":"append|replace","guideText":"自定义规则","autoJoinNewGroups":false,"autoJoinSoloGroups":true,"closeHints":true,"decisionCards":false,"taskHints":true}；默认关闭；autoJoinNewGroups=拉新群时带上管家，默认开，只在关掉时写 false；autoJoinSoloGroups=只有你和一个 bot 的新群也带，默认关；closeHints=后台巡检提示可以关 / 可以推进 / 过了复查时间的事项（只提示不改状态），默认关；decisionCards=待拍板时往管家群发拍板卡片，默认开，只在关掉时写 false；taskHints=关联群里一轮交付、举手或中断时提醒管家（只提示不改状态），默认关，只在打开时写 true；unset 关闭（看板数据保留）' },
   { key: 'chatManagerEnabled', configKey: 'chatManagerEnabled', kind: 'boolean', effect: 'immediate', clearable: false, hint: '允许本 bot 被设为普通群负责人（默认接待者）on|off（默认 off）：开启后才提供会话内群负责人工具并允许 set，关闭后不免 @ 接话；clear/status 不受影响' },
+  { key: 'chatManagerSharedTopic', configKey: 'chatManagerSharedTopic', kind: 'boolean', effect: 'immediate', clearable: false, hint: '群负责人免 @ 接的顶层消息也开话题 on|off（默认 off）：仅在共享回复模式（/reply-mode shared）的普通群生效，回复挂到那条消息下面、和 @ 本 bot 一样，仍是群级同一个会话；需同时开 chatManagerEnabled' },
+  { key: 'groupSecretaryEnabled', configKey: 'groupSecretaryEnabled', kind: 'boolean', effect: 'immediate', clearable: false, hint: '允许本 bot 在群里用 /secretary on 当群秘书 on|off（默认 off）：关闭时 /secretary on|takeover 提示未开放、后台不旁听不巡检；off/status 不受影响' },
   { key: 'worktreeMultiPicker', configKey: 'worktreeMultiPicker', kind: 'boolean', effect: 'immediate', clearable: false, hint: 'repo 卡片 worktree 选择器默认多仓库模式 on|off（卡片「切换多仓库选择器」按钮同款）' },
   { key: 'disableCliBypass', configKey: 'disableCliBypass', kind: 'boolean', effect: 'next-session', clearable: false, hint: '不加 CLI 审批/sandbox 绕过参数 on|off' },
   { key: 'codexAppCleanInput', configKey: 'codexAppCleanInput', kind: 'boolean', effect: 'immediate', clearable: false, hint: '实验性：Codex App 用户气泡只保留真实输入，Botmux 元数据走隐藏上下文；默认 off，从下一次 turn 派发生效，不改已有历史' },
@@ -192,13 +195,12 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'cardActionAckTimeoutMs', configKey: 'cardActionAckTimeoutMs', kind: 'number', effect: 'immediate', clearable: true, min: MIN_CARD_ACTION_ACK_TIMEOUT_MS, max: MAX_CARD_ACTION_ACK_TIMEOUT_MS, hint: '本 bot 所有卡片动作的同步 ACK 等待时长（500–2500ms，默认 2500ms）；超时先提示后台处理，插件可继续执行；unset 回默认' },
   { key: 'maxLiveWorkers', configKey: 'maxLiveWorkers', kind: 'number', effect: 'immediate', clearable: true, hint: '最大常驻会话数；超过后最久未用的会话自动休眠（退出后台进程和 CLI、回收内存，下条消息冷恢复）；unset=默认 30' },
   { key: 'idleSuspendMinutes', configKey: 'idleSuspendMinutes', kind: 'number', effect: 'immediate', clearable: true, hint: '空闲会话自动休眠超时（分钟，正整数）；会话持续空闲超过该时长即自动休眠回收内存，与最大常驻会话数互不影响；unset=关闭（默认，空闲不超时，仅受数量上限约束）' },
-  { key: 'capacityInteractiveReminderMinutes', configKey: 'capacityInteractiveReminderMinutes', kind: 'number', effect: 'immediate', clearable: true, min: 1, max: 60, hint: '交互任务连续等待模型容量多久后原地更新工作卡（分钟，默认 2；1–60；unset 恢复默认）' },
-  { key: 'capacityBackgroundReminderMinutes', configKey: 'capacityBackgroundReminderMinutes', kind: 'number', effect: 'immediate', clearable: true, min: 1, max: 240, hint: '定时/后台任务连续等待模型容量多久后原地更新工作卡（分钟，默认 10；1–240；unset 恢复默认）' },
+  { key: 'idleSpinSuspend', configKey: 'idleSpinSuspend', kind: 'json', effect: 'immediate', clearable: true, hint: 'CPU 空闲自旋回收 JSON：{"enabled":true,"cliIds":["traex"],"cpuPercent":20,"consecutiveSamples":3,"sampleIntervalSeconds":30,"minIdleMinutes":5,"maxSuspendsPerSample":8,"hostPressure":{"enabled":true,"afterSamples":3,"cooldownMinutes":10,"maxSuspendsPerPass":16,"enterCpuPercent":85,"exitCpuPercent":70}}；cpuPercent 是单核百分比（20=0.2 核）；两层都只作用于 cliIds 内的 CLI（默认只有 traex），CLI 下仍有后台任务等子进程的会话不会被挂起；unset 用保守默认值' },
   { key: 'customPassthroughCommands', configKey: 'customPassthroughCommands', kind: 'stringList', effect: 'immediate', clearable: true, hint: '额外放行透传给 CLI 的 slash 命令（逗号/换行分隔，或“空格+/”分隔，如 /goal /export；名字内空格归一为连字符，/Ultra Goal → /ultra-goal）；unset 回仅内置白名单' },
   { key: 'canTalkDaemonCommands', configKey: 'canTalkDaemonCommands', kind: 'stringList', effect: 'immediate', clearable: true, parseList: parseCanTalkDaemonCommandsInput, hint: '把列出的 daemon 命令权限从 canOperate（仅管理员）降到 canTalk（对话放行即可用），如 /status /help；仅认 daemon 命令，透传命令无效；unset 回全部仅管理员' },
   { key: 'startupCommands', configKey: 'startupCommands', kind: 'stringList', effect: 'next-session', clearable: true, parseList: parseStartupCommandsInput, hint: '开会话后、首条消息前自动发给 CLI 的命令（逗号/换行分隔，可带参数，如 /effort ultracode）；unset 回不发' },
   { key: 'envPolicy', configKey: 'envPolicy', kind: 'json', effect: 'next-session', clearable: true, hint: '进程环境继承策略 JSON：{"mode":"strict","inherit":["HTTPS_PROXY"]}；默认 inherit 兼容旧行为。仅变量名，不填值；下次 worker 冷启动生效，旧 pane 策略不匹配时拒绝复用；unset 恢复默认' },
-  { key: 'sandboxNetworkPolicy', configKey: 'sandboxNetworkPolicy', kind: 'json', effect: 'next-session', clearable: true, hint: 'Linux 本地 PTY oncall 沙箱的公网/内网目标 IP 策略；version=1，public/private 各含 mode: allow|block|allowlist|denylist 和 rules[{cidr,protocol?,ports?}]；不支持域名或宿主 MCP/Unix IPC；下个新会话生效，unset 恢复 sandboxNetwork' },
+  { key: 'sandboxNetworkPolicy', configKey: 'sandboxNetworkPolicy', kind: 'json', effect: 'next-session', clearable: true, hint: 'Linux 本地 PTY oncall 沙箱的公网/内网目标 IP 策略；version=1，public/private 各含 mode: allow|block|allowlist|denylist 和 rules[{cidr,protocol?,ports?}]；不支持域名，宿主 MCP 仅可通过显式挂载的会话 socket；下个新会话生效，unset 恢复 sandboxNetwork' },
   { key: 'env', configKey: 'env', kind: 'json', effect: 'next-session', clearable: true, hint: 'per-bot 环境变量，接受 JSON（如 {"ANTHROPIC_BASE_URL":"…","ANTHROPIC_AUTH_TOKEN":"…"}）、{"env":{…}} settings 片段、.env / export KEY=… 行或 exec env 启动脚本（让本 bot 走 GLM/第三方服务商，或设 HTTPS_PROXY；保留键如 CLAUDE_CONFIG_DIR 会被拒绝）；注入到本 bot 的 CLI 进程，下个会话生效；值不显示（脱敏）；unset 清除' },
   { key: 'envUnset', configKey: 'envUnset', kind: 'stringList', effect: 'next-session', clearable: true, parseList: parseEnvUnsetInput, hint: '在本 bot 的会话里去掉的继承环境变量名（逗号/空格/换行分隔，如 BYTECLOUD_AUTH_AS HTTPS_PROXY）；只对新会话生效，运行中的会话重启后生效；botmux 保留变量与 PATH/HOME 不能去掉；与 Dashboard「Bot 配置 → 运行环境 → 会话环境变量」同一份配置；unset 清除' },
   { key: 'codexAuthSync', configKey: 'codexAuthSync', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['shared', 'isolated'], hint: 'Codex 鉴权策略：shared=保持旧行为（非沙箱直接使用全局 ~/.codex；沙箱冷启动同步全局 auth 到 per-bot CODEX_HOME）｜isolated=无论是否启用沙箱都使用 per-bot CODEX_HOME，绝不复制全局凭证，需在该目录单独执行 codex login --with-api-key' },
@@ -835,16 +837,6 @@ export async function setBotAllowedUsers(
   rawEntries: string[],
   senderOpenId: string | undefined,
 ): Promise<SetAllowedUsersResult> {
-  return withBotAdminIdentityPublication(config.session.dataDir, () => setBotAllowedUsersUnderPublicationLease(
-    larkAppId, rawEntries, senderOpenId,
-  ));
-}
-
-async function setBotAllowedUsersUnderPublicationLease(
-  larkAppId: string,
-  rawEntries: string[],
-  senderOpenId: string | undefined,
-): Promise<SetAllowedUsersResult> {
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
 
@@ -1067,7 +1059,7 @@ export type CoerceResult =
   | { ok: true; value: unknown }
   // A few reasons carry detail (e.g. which keys were rejected), so this is a
   // union of literals plus those prefixed forms rather than a closed literal set.
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'invalid_env' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_herdr_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` | `invalid_prompt_cache: ${string}` | `invalid_steward: ${string}` | `invalid_feedback_presentation: ${string}` };
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'invalid_env' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_herdr_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` | `invalid_prompt_cache: ${string}` | `invalid_steward: ${string}` | `invalid_feedback_presentation: ${string}` | 'invalid_idle_spin_suspend' };
 
 /** herdr 块全部可写字段；与 normalizeHerdrBackendConfig 接受的键必须一致（有 parity 测试）。 */
 export const HERDR_FIELD_NAMES = ['sessionName', 'placement', 'workspace', 'tab', 'splitDirection', 'chatTypes'] as const;
@@ -1204,6 +1196,12 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
           try { return { ok: true, value: normalizeNoProgressNotifyPolicy(parsed) }; }
           catch (error) { return { ok: false, reason: `invalid_no_progress_notify: ${error instanceof Error ? error.message : String(error)}` }; }
         }
+        if (spec.configKey === 'idleSpinSuspend') {
+          const normalized = normalizeIdleSpinSuspendConfig(parsed);
+          return normalized
+            ? { ok: true, value: normalized }
+            : { ok: false, reason: 'invalid_idle_spin_suspend' };
+        }
         if (spec.configKey === 'skills') {
           const policy = readBotSkillPolicy(parsed);
           return policy ? { ok: true, value: policy } : { ok: false, reason: 'invalid_json' };
@@ -1215,7 +1213,12 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
         if (spec.configKey === 'feedback') {
           if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ok: false, reason: 'invalid_json' };
           if ((parsed as { enabled?: unknown }).enabled !== true) return { ok: true, value: { enabled: false } };
-          try { return { ok: true, value: normalizeFeedbackPolicy(parsed) }; }
+          try {
+            const policy = normalizeFeedbackPolicy(parsed);
+            // The full normalizer drops `left` (it is the default), but this value is stored as
+            // the bot layer: an explicit `left` must survive so it can override a team-level `right`.
+            return { ok: true, value: (parsed as { buttonAlign?: unknown }).buttonAlign === 'left' ? { ...policy, buttonAlign: 'left' } : policy };
+          }
           catch { return { ok: false, reason: 'invalid_json' }; }
         }
         if (spec.configKey === 'envPolicy') return { ok: true, value: normalizeEnvPolicy(parsed) };

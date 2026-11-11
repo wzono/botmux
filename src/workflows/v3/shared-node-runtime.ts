@@ -789,7 +789,10 @@ export async function runWorkflow(
     );
   }
 
-  // First run only: stamp runStarted (idempotent on resume).
+  // First run only: stamp runStarted (idempotent on resume). A daemon-started
+  // run arrives with the journal already rooted by its start intent, which
+  // stamps `nodeExecutor` from the same run.json (start-intent.ts); a root
+  // written before that is never rewritten — readers fall back to run.json.
   if (readJournal(journalPath).length === 0) {
     appendEvent(journalPath, {
       type: 'runStarted',
@@ -3548,6 +3551,7 @@ export async function runWorkflow(
           }
           appendWorkerOutcome({
             type: 'nodeSucceeded', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId, manifestPath: result.manifestPath,
+            ...(result.runtime ? { runtime: result.runtime } : {}),
           });
           return;
         }
@@ -3557,7 +3561,11 @@ export async function runWorkflow(
         let errorCode: string | undefined;
         let selfReportedFail = false;
         let retryable: boolean | undefined;
-        if (!verdict.ok) {
+        if (result.status === 'fail' && result.error) {
+          errorClass = 'workerError';
+          errorCode = result.error.code;
+          message = result.error.message;
+        } else if (!verdict.ok) {
           // Manifest missing / malformed.  If the process itself also failed,
           // the worker crash is the root cause; otherwise it's a bad manifest.
           errorClass = result.status === 'ok' ? 'manifestInvalid' : 'workerError';
@@ -3597,11 +3605,13 @@ export async function runWorkflow(
             type: 'nodeBlocked',
             nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId, errorClass, errorCode, message,
             ...(ask ? { ask } : {}),
+            ...(result.runtime ? { runtime: result.runtime } : {}),
           });
         } else {
           appendWorkerOutcome({
             type: 'nodeFailed',
             nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId, errorClass, errorCode, message,
+            ...(result.runtime ? { runtime: result.runtime } : {}),
           });
         }
       })

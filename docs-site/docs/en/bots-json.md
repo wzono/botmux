@@ -75,6 +75,7 @@ Two bots, one on Claude Code and one on Codex:
 | The live card is too noisy | `disableStreamingCard`, `hiddenStreamingCardButtons` |
 | One card per turn for both progress and answer | `replyCardMode: "unified"` |
 | Start working without being @-mentioned | `autoStartOnNewTopic`, `autoStartOnGroupJoin` |
+| DM the owner a welcome message when the bot first comes online | `welcomeMessage` (see [Welcome message](#welcome-message)) |
 | Watch an alert group and handle every alert | Group message listener (see [Group message listener](#message-listener)) |
 | Hand off to another bot when quota runs out | `quotaFallbackBot` |
 | Stop botmux from adding anything to the prompt | `promptInjection: "none"` |
@@ -278,7 +279,7 @@ Full form:
 | Field | Description |
 |------|------|
 | `family` | `chrome` or `edge` |
-| `pluginRoot` | Custom plugin directory (absolute path). Usually not needed; by default the newest complete version is picked from the official plugin cache under `CODEX_HOME` (or `~/.codex`) |
+| `pluginRoot` | Custom plugin directory (absolute path); when set, only this one is used. Usually not needed; by default the newest complete version is picked from the official plugin cache under `CODEX_HOME` (or `~/.codex`) and the plugin bundled with the Codex / ChatGPT desktop app |
 | `autoApproveOrigins` | Stop asking for approval site by site when visiting HTTP/HTTPS sites. Off by default; login credentials, uploads/downloads, browsing history and full devtools access are not covered, and nothing is saved as "always allow" |
 
 Requirements and limits:
@@ -318,6 +319,14 @@ Requirements and limits:
 | `noProgressNotify` | Post a reminder in Feishu when a turn shows no confirmed progress for a long time. On by default for Codex App (90 seconds); Codex CLI must opt in. See below |
 
 ### Waiting and no-progress reminders {#reminders}
+
+**`longTaskReminder`** sends an independent status card to the original chat or topic while an executing task remains unfinished. Configure it in **Bot Defaults → Message cards → Long-running task cards**; saves apply immediately.
+
+```json
+{"longTaskReminder": {"enabled": true, "thresholdMinutes": 10, "intervalMinutes": 10}}
+```
+
+Disabled by default. Both windows default to 10 minutes and accept integers from 1 to 10080. Timing starts at the observed native execution write, excluding queued and idle time. Progress and follow-up messages do not reset the running turn. Scans run every 30 seconds; repeats start at the previous successful delivery and missed cycles are not replayed. Failed sends retry after one minute using the same delivery ID. Completion, cancellation, worker exit or session closure stops reminders. Chat, DM and topic sessions are supported; document comments and headless sessions are excluded. Silent, meeting-driven and suppressed replay turns keep their auxiliary-UI restrictions; reminder cards do not invoke `outbound.send` hooks. Preferences persist, but execution timing requires a current worker observation and is never inferred across daemon restarts.
 
 **`sessionOwnerReminder`**: when a session sits in a state that needs a person and nothing changes, it @-mentions the session owner in the original topic at a fixed interval.
 
@@ -400,6 +409,63 @@ Details in [File sandbox](/en/sandbox).
 
 > The ZMX backend can't enforce the file sandbox; sandboxed combinations are refused at startup. See [ZMX backend](/en/zmx).
 
+### Protected local MCP capabilities
+
+A local stdio MCP server can request one optional protected capability in its plugin-private `mcp/index.json`. The capability ID is opaque to Botmux; use a non-business-specific fixture such as:
+
+```json
+{
+  "transport": "stdio",
+  "command": ["node", "./mcp/server.js"],
+  "protectedCapability": "fixture.secret.v1"
+}
+```
+
+`protectedCapability` is not supported for streamable HTTP MCP servers; a plugin descriptor that combines them is rejected. The descriptor does not supply the secret source, principal policy, or containment rules; those bindings come only from machine-level configuration.
+
+Within `bots.json`, the `plugins` array only enables installed plugins for that bot:
+
+```json
+{
+  "plugins": ["fixture-plugin"]
+}
+```
+
+Do not put protected capability bindings, secret sources, secret values, or rollout state in `bots.json`. Operators bind the opaque capability ID in the machine-level `~/.botmux/config.json`:
+
+```json
+{
+  "protectedMcpCapabilities": {
+    "fixture.secret.v1": {
+      "enabled": false,
+      "allowedPluginIds": ["fixture-plugin"],
+      "secret": {
+        "source": "file",
+        "path": ".botmux/secrets/fixture-protected-secret"
+      },
+      "principal": "verified-human-email",
+      "containmentProfile": "local-stdio-secret-v1",
+      "isolation": {
+        "protectedHomePaths": [".fixture-credential"],
+        "redactEnv": ["FIXTURE_AUTH_TOKEN"]
+      }
+    }
+  }
+}
+```
+
+Missing `enabled` defaults to disabled; only JSON boolean `true` enables the binding. Non-boolean values such as `"true"` or `1` reject the entire record. Secrets support only `{ "source": "file", "path": "<Home-relative path>" }`, rooted at the daemon account's trusted Home. Absolute paths, `.`/`..` components, and symlinks are rejected. Operators must preprovision a nonempty regular file owned by the current user with exact mode `0600`, at most 64 KiB. Botmux never repairs unsafe files and never captures or caches secrets at daemon startup. It reads the file before each new worker fork, pinning directory fds and opening each component without following symlinks so an intermediate replacement cannot redirect the read.
+
+The secret reaches an authorized MCP only through the one-shot fd channel, never argv, generic environments, or logs. Rotation takes effect on the next worker fork; an existing MCP retains its startup secret until that session is recreated. Every valid configured secret file is automatically denied in all relevant session sandboxes, including bots without the matching plugin and disabled capabilities. Additional `protectedHomePaths` remain scoped to matching plugins. Current configuration supplies the `redactEnv` names and recognizable valid names from rejected legacy `source: "env"` records for worker, model, and generic plugin environment redaction; legacy environment sources grant no write capability. Machine configuration changes follow the global configuration's short cache refresh rules.
+
+At MCP process startup, Botmux uses the ordinary stdio transport without a protected secret file descriptor if the capability is disabled or not provisioned, the plugin is outside `allowedPluginIds`, the configured containment prerequisites are not satisfied, or the daemon cannot provide the one-shot channel. The server can still start and expose read-only tools. A `tools/call` on that connection receives neither `botmuxTrustedPrincipal` nor `botmuxGrantedCapabilities`; the plugin must fail closed for protected writes.
+
+`principal` is evaluated for each `tools/call`, not when the MCP process starts. If the global binding, plugin allowlist, containment prerequisites, and daemon channel all succeeded at startup, the long-lived process may already hold the one-shot secret even when a later call lacks its required verified human principal or other call-time grant condition. Botmux omits `botmuxTrustedPrincipal` and `botmuxGrantedCapabilities` from that call, and the plugin must reject the protected write. For **every** protected write, the plugin must freshly validate `botmuxTrustedPrincipal` and confirm that `botmuxGrantedCapabilities` contains the exact capability ID. It must never cache or reuse a principal, capability, or authorization result from an earlier call; any missing, mismatched, or stale field must fail closed. Isolation paths and environment redaction remain active for a matching enabled plugin even while the capability itself is disabled.
+
+To migrate legacy environment secrets, provision the safe file and change the configuration to `source: "file"`, then remove the old variable from the daemon launch source and restart the daemon. Deleting `process.env` cannot erase an old process's `/proc/<pid>/environ`. Before adding or changing secret paths, terminate and recreate old CLI sessions so their file denies cover the new paths; a hot update cannot revoke access already granted to old processes. Prefer rotation via atomic replacement at a fixed protected path. Protected files or other isolation requirements disable bare-host one-shot title generation and retain placeholder titles; ordinary session reads are unaffected.
+
+A restarted stdio MCP process currently cannot receive the one-shot secret again and falls back to read-only; recreate the session to restore protected capabilities. User-visible errors from the different policy collection entry points remain a follow-up.
+
 ### Run CLI calls as the message sender (`triggerUserAuth`) {#trigger-user-auth}
 
 **Off by default.** When on, `lark-cli` / `bytedcli` in this bot's sessions run with the authorization of whoever sent the current message, not whatever is logged in on the machine. Useful when several people share one bot: each message reads docs, checks calendars or calls internal platforms as its own sender.
@@ -433,7 +499,7 @@ What the cards look like and what each switch does: see [Live streaming cards](/
 
 | Field | Description |
 |------|------|
-| `replyCardMode` | `legacy` (default): progress and answer are sent separately; `unified`: a turn's progress, tool calls and final answer all update one card. Works for non-sandboxed Claude Code / Codex / Grok / TraeX / Pi sessions, from the next turn |
+| `replyCardMode` | `legacy` (default): progress and answer are sent separately; `unified`: a turn's progress, tool calls and final answer all update one card. Works for non-sandboxed Claude Code / Codex / Grok / TraeX / Pi / Kimi sessions, from the next turn |
 | `replyCardShowTools` | `unified` only: `false` hides tool calls on the card; thinking summaries and progress still show |
 | `disableStreamingCard` | `true` stops sending the live terminal status card. The web terminal still runs and final answers are still sent |
 | `hiddenStreamingCardButtons` | Hide buttons on the live card: `output`, `terminal`, `writeLink`, `compact`, `stop`, `close`. E.g. `["terminal", "writeLink", "close"]`. Also `/botconfig set hiddenStreamingCardButtons terminal,close` |
@@ -573,6 +639,7 @@ By default a bot only starts working when @-mentioned. These fields make it more
 | `autoStartOnGroupJoinPrompt` | First task when auto-starting on group join. If empty, the bot looks at the group's context first and reports that it's ready if nobody has assigned anything |
 | `autoStartOnGroupJoinSeed` | Text of the opening message posted on join; a built-in text is used if empty |
 | `autoStartOnGroupJoinGateRequired` | `true`: auto-start on join also needs a matching `chat.bot_added` sync [hook](/en/hooks) to explicitly allow it, otherwise nothing happens. Useful when only specific groups should auto-start |
+| `autoStartOnGroupJoinAnchor` | Where the join session lives in a regular group. Default `"reply-mode"` follows the group's reply mode; `"latest-message"` skips the opening message and starts the session in the thread of the newest existing message (system events, recalled messages and this bot's own messages are skipped). Useful when another platform posts a context message and then adds the bot. Falls back to the default when there is no usable message or the read fails. Topic groups and `new-topic` mode are unaffected. Anchoring on a message sent by another bot (e.g. a platform card) also requires the `im:message.group_msg.include_bot:read` scope; without it only user messages are listed |
 | `autoStartExcludedChats` | Groups where auto-start (join and new topic) never happens; @-mentions still work |
 | `groupJoinCommandEnabled` / `groupJoinCommand` | When the bot is added to any group, run a command on this machine directly: no session, no model. Independent of `autoStartOnGroupJoin`, and no admin needs to be in the group. Also needs the `im.chat.member.bot.added_v1` subscription |
 
@@ -581,6 +648,14 @@ By default a bot only starts working when @-mentioned. These fields make it more
 - No shell; for pipes or redirects write `bash -c '…'`. Only a minimal set of environment variables is passed (no app secrets).
 - stdin receives JSON `{event:"chat.bot_added", larkAppId, chatId, operatorOpenId, emittedAt}`; the environment variables `BOTMUX_JOIN_CHAT_ID` / `BOTMUX_JOIN_LARK_APP_ID` / `BOTMUX_JOIN_OPERATOR_OPEN_ID` are also set.
 - It's killed if it hasn't finished after 10 minutes.
+
+### Welcome message (`welcomeMessage`) {#welcome-message}
+
+Set it to some text and the bot DMs its primary admin (see `ownerOpenId`) once after it first comes online. Set it with `--welcome-message "…"` or `--welcome-message-file <file>` on `botmux setup add` / `botmux setup edit`; `--welcome-message -` on edit clears it. It can't be edited in the Dashboard yet. The value of `--welcome-message` is always sent as written, so text starting with `@` is never treated as a file path.
+
+- Delivery is recorded in `welcome-sent/<AppID>.json` under the daemon data dir. Once sent, restarts don't resend it, and neither does changing the text. Deleting that file makes it send again, but Feishu dedupes a resend less than 1 hour after the previous one.
+- A failed send, or an admin who can't be resolved yet, doesn't block startup; the next start retries.
+- Core-only (`apiOnly`) bots and multi-replica deployments (`BOTMUX_COORDINATION_MODE=primary`, where replicas don't share the delivery record) don't send it; the daemon log says why.
 
 ## Group message listener {#message-listener}
 
@@ -849,6 +924,10 @@ Bad formats, unknown fields and reserved names are rejected outright, never sile
 | `proxyMode` unset and either zone is `block` / `allowlist` / `denylist` | Any non-empty proxy value refuses to start |
 | `proxyMode: "reject"` | Any non-empty proxy value refuses to start |
 | `proxyMode: "trusted-egress"` | Explicitly allowed proxies may stay; network rules must allow the proxy's IP and port, and the final targets are governed by the proxy's own ACL |
+
+General proxy delegation in this table applies only to ordinary sessions. A frozen protected HTTP egress policy explicitly rejects `trusted-egress` and task proxy variables; adding that mode repeatedly cannot resolve the error. Model connections must use the protected model bridge, currently supported only by Codex. See [network sandbox documentation](sandbox.md).
+
+`trusted-egress` neither creates a proxy, grants environment variables nor guarantees the CLI uses it. Authorizing an exit does not restrict destinations behind it. If a model requires a proxy, do not simply remove its `inherit` grant to pass validation: explicitly trust the exit and configure endpoint rules plus deployment-layer ACLs, or first establish direct model authentication, permitted destination CIDRs/ports and DNS. Persistent backends such as tmux, adopt and external App Servers remain rejected regardless of `trusted-egress` or `envPolicy`.
 
 The network policy itself requires Linux, the local PTY backend and `sandbox: "oncall"`. See [File and network sandbox](/en/sandbox).
 

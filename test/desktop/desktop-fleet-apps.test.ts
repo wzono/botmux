@@ -26,10 +26,8 @@ describe('desktop fleet app listing', () => {
     writeFileSync(join(paths.botmuxHome, 'fleet-state.json'), JSON.stringify({
       supervisorEntry: '/runtime/dist/index-supervisor.js',
       procs: [
-        { name: 'botmux-dashboard', appId: '', pid: process.pid, generation: 1, status: 'online',
-          processStart: 'test-dashboard', restarts: 0, lastExitCode: null, startedAt: 'now' },
-        { name: 'botmux-0', appId: 'cli_a', pid: 0, generation: 1, status: 'stopped',
-          restarts: 0, lastExitCode: null, startedAt: null },
+        { name: 'botmux-dashboard', appId: '', pid: process.pid, status: 'online' },
+        { name: 'botmux-0', appId: 'cli_a', pid: 0, status: 'online' },
       ],
     }));
     expect(await listFleetApps(paths)).toEqual([

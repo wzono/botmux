@@ -12,6 +12,7 @@ import { parseTriggerUserAuthConfig, type TriggerUserAuthConfig } from '../servi
 import type { NativeSubagentRuntimePolicy } from '../services/native-subagent-runtime-policy.js';
 import type { CodexServiceTier } from '../services/codex-service-tier.js';
 import { normalizeQuotaFallbackBotConfig } from '../services/quota-fallback.js';
+import { normalizeLongTaskReminderConfig } from '../services/long-task-reminder-policy.js';
 import { normalizeEnvPolicy, type EnvPolicy } from '../core/env-policy.js';
 import type { TraexAutoModelConfig } from '../services/traex-auto-model.js';
 import { readGlobalConfig } from '../global-config.js';
@@ -167,6 +168,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     allowedChatGroupsCount: typeof j?.allowedChatGroupsCount === 'number' ? j.allowedChatGroupsCount : null,
     localSandboxApplies: typeof j?.localSandboxApplies === 'boolean' ? j.localSandboxApplies : null,
     sandboxCapable: typeof j?.sandboxCapable === 'boolean' ? j.sandboxCapable : null,
+    sandboxEnvForce: j?.sandboxEnvForce === 'oncall' || j?.sandboxEnvForce === 'scratch' ? j.sandboxEnvForce : null,
     effectiveSandboxMode: j?.effectiveSandboxMode === 'off' || j?.effectiveSandboxMode === 'oncall' || j?.effectiveSandboxMode === 'scratch'
       ? j.effectiveSandboxMode
       : null,
@@ -231,6 +233,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     replyCardActions: j?.replyCardActions === true,
     cotEnabled: normalizeCotEnabled(j),
     replyCardShowTools: j?.replyCardShowTools !== false,
+    replyCardNativeCot: j?.replyCardNativeCot === true,
     senderTag: j?.senderTag !== false,
     senderTagHideEmail: j?.senderTagHideEmail === true,
     overloadAlert: j?.overloadAlert === true,
@@ -245,6 +248,8 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     groupJoinCommand: typeof j?.groupJoinCommand === 'string' ? j.groupJoinCommand : '',
     autoStartOnNewTopic: j?.autoStartOnNewTopic === true,
     chatManagerEnabled: j?.chatManagerEnabled === true,
+    chatManagerSharedTopic: j?.chatManagerSharedTopic === true,
+    groupSecretaryEnabled: j?.groupSecretaryEnabled === true,
     autoStartExcludedChats: Array.isArray(j?.autoStartExcludedChats) ? j.autoStartExcludedChats : [],
     summaryRange: j?.summaryRange
       ?? summaryRangeFromLegacyContentTriggers(j?.contentTriggers)
@@ -303,6 +308,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     sessionOwnerReminder: j?.sessionOwnerReminder && typeof j.sessionOwnerReminder === 'object'
       ? j.sessionOwnerReminder
       : null,
+    longTaskReminder: normalizeLongTaskReminderConfig(j?.longTaskReminder) ?? null,
     startupCommands: typeof j?.startupCommands === 'string' ? j.startupCommands : '',
     customPassthroughCommands: typeof j?.customPassthroughCommands === 'string' ? j.customPassthroughCommands : '',
     canTalkDaemonCommands: typeof j?.canTalkDaemonCommands === 'string' ? j.canTalkDaemonCommands : '',

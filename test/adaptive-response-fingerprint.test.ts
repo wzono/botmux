@@ -1,3 +1,4 @@
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 vi.mock('node:fs', () => require('memfs').fs);

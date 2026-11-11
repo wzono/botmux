@@ -45,7 +45,8 @@ import type { TriggerUserAuthConfig, TriggerUserAuthTool } from '../services/tri
 import { isUsableOpenId } from '../utils/user-token.js';
 import { logger } from '../utils/logger.js';
 import { ensureSessionTempLayout, sessionTempDir, sessionTempDirWithoutAlias } from './session-temp.js';
-import { ensureBackgroundJobHome } from '../services/bytedcli-home.js';
+import { ensureBackgroundJobHome, ensureMeegoStore, MEEGO_ENV_CREDENTIALS, MEEGO_STORE_DIR } from '../services/bytedcli-home.js';
+import { resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 
 export type { IdentityStorageModel };
 
@@ -541,6 +542,13 @@ export interface BytedCliIdentity extends TurnBound {
    * {@link writeSessionIdentity}; see {@link bytedcliTurnHome}.
    */
   home?: string;
+  /**
+   * This person's Meego login home (services/meego-auth.ts), outside every
+   * session. The wrapper links `home`/.meegle to its `.meegle`, so a Meego
+   * login made from any session is the one every session uses. Filled in by
+   * {@link writeSessionIdentity} for an identity with an open_id.
+   */
+  meegoHome?: string;
 }
 
 /**
@@ -606,6 +614,8 @@ const OPEN_ID_VAR = 'BOTMUX_IDENTITY_OPEN_ID';
 /** Per-person HOME for the device-code lark-cli identity. Scoped to the child
  *  exec only — the wrapper sets it inline, never inheriting a parent value. */
 const HOME_VAR = 'BOTMUX_IDENTITY_HOME';
+/** See {@link BytedCliIdentity.meegoHome}. */
+const MEEGO_HOME_VAR = 'BOTMUX_MEEGO_HOME';
 
 /**
  * ByteCloud JWTs are partition-scoped: a cn token is refused by i18n services
@@ -624,14 +634,33 @@ const BYTEDCLI_REGIONAL_JWT_VARS: Record<BytedcliRegion, string> = {
 const BYTEDCLI_SITE_REGIONS: Record<BytedcliRegion, readonly string[]> = {
   // The site `i18n` belongs to i18nbd; the i18n region uses i18n-tt.
   i18n: ['i18n-tt', 'eu-ttp', 'eu-ttp-limited', 'eu-ttp-full'],
-  i18nbd: ['i18n', 'i18n-bd'],
-  tx: ['us-ttp', 'us-ttp-bdee', 'us-ttp-usts', 'us-ttpbd'],
+  // us-ttpbd cannot be minted (auth commands reject it): it is scoped to
+  // bmq / apm argos log / cloud-ticket, which all request an i18n-bd JWT.
+  i18nbd: ['i18n', 'i18n-bd', 'us-ttpbd'],
+  tx: ['us-ttp', 'us-ttp-bdee', 'us-ttp-usts'],
 };
+/** bytedcli's CLOUD_SITE_ALIAS_MAP (identical in 0.173–0.187). Aliases of a
+ *  site without a regional token need no entry in the case below. */
+const BYTEDCLI_SITE_ALIASES: Readonly<Record<string, string>> = {
+  prod: 'cn', online: 'cn', 'sinf-cn': 'cn', boei18n: 'boe', 'boe-i18n': 'boe',
+  row: 'i18n-tt', i18ntt: 'i18n-tt', 'tiktok-row': 'i18n-tt',
+  usttp: 'us-ttp', 'tx-ttp': 'us-ttp', 'ttp-us': 'us-ttp', 'ttp-us-limited': 'us-ttp',
+  usttpbdee: 'us-ttp-bdee', usttpusts: 'us-ttp-usts',
+  euttp: 'eu-ttp', 'ttp-eu': 'eu-ttp',
+};
+
+/** Case pattern matching `site` in any letter case. */
+function anyCaseGlob(site: string): string {
+  return site.replace(/[a-z]/g, c => `[${c}${c.toUpperCase()}]`);
+}
 
 /** Shell lines selecting the regional ByteCloud JWT for this call's site. */
 function bytedcliRegionalSelection(): string[] {
-  const cases = (Object.keys(BYTEDCLI_SITE_REGIONS) as BytedcliRegion[]).map(region =>
-    `    ${BYTEDCLI_SITE_REGIONS[region].join('|')}) __botmux_regional=$${BYTEDCLI_REGIONAL_JWT_VARS[region]} ;;`);
+  const cases = (Object.keys(BYTEDCLI_SITE_REGIONS) as BytedcliRegion[]).map(region => {
+    const sites = BYTEDCLI_SITE_REGIONS[region];
+    const aliases = Object.keys(BYTEDCLI_SITE_ALIASES).filter(alias => sites.includes(BYTEDCLI_SITE_ALIASES[alias]));
+    return `    ${[...sites, ...aliases].map(anyCaseGlob).join('|')}) __botmux_regional=$${BYTEDCLI_REGIONAL_JWT_VARS[region]} ;;`;
+  });
   return [
     '  __botmux_site=${BYTEDCLI_CLOUD_SITE:-}',
     '  __botmux_next=',
@@ -645,6 +674,9 @@ function bytedcliRegionalSelection(): string[] {
     '      --site=*) __botmux_site=${__botmux_arg#--site=} ;;',
     '    esac',
     '  done',
+    // bytedcli trims and lowercases the site before resolving it.
+    '  __botmux_site=${__botmux_site#"${__botmux_site%%[![:space:]]*}"}',
+    '  __botmux_site=${__botmux_site%"${__botmux_site##*[![:space:]]}"}',
     '  __botmux_regional=',
     '  case "$__botmux_site" in',
     ...cases,
@@ -705,6 +737,7 @@ export function renderIdentityEnv(identity: CliIdentity): string {
     // Same variable the lark-cli device-code identity uses: the wrapper scopes
     // HOME to this exec only (see renderIdentityWrapper).
     if (identity.home) pairs.push([HOME_VAR, identity.home]);
+    if (identity.meegoHome) pairs.push([MEEGO_HOME_VAR, identity.meegoHome]);
   }
   if (identity.turnId) pairs.push([TURN_VAR, identity.turnId]);
   if ('openId' in identity && identity.openId) pairs.push([OPEN_ID_VAR, identity.openId]);
@@ -829,12 +862,28 @@ function bytedcliHomeRoot(sessionDataDir: string, sessionId: string): string {
  *  computes the path, so the published HOME is the short one and the executor is
  *  never the first writer of the layout. See {@link bytedcliHomeRoot}. */
 export function publishedIdentityShape(sessionDataDir: string, sessionId: string, identity: CliIdentity): CliIdentity {
-  if (identity.tool !== 'bytedcli' || 'mode' in identity || identity.home) return identity;
+  if (identity.tool !== 'bytedcli' || 'mode' in identity) return identity;
+  const withMeego = identity.meegoHome ? identity : { ...identity, ...meegoStoreShape(identity.openId) };
+  if (withMeego.home) return withMeego;
   if (identity.turnId?.startsWith('background:')) {
-    return { ...identity, home: ensureBackgroundJobHome(identity.turnId.slice('background:'.length)) };
+    return { ...withMeego, home: ensureBackgroundJobHome(identity.turnId.slice('background:'.length)) };
   }
   const base = bytedcliHomeRoot(sessionDataDir, sessionId);
-  return { ...identity, home: bytedcliHomeFromBase(base, sessionId, identity) };
+  return { ...withMeego, home: bytedcliHomeFromBase(base, sessionId, identity) };
+}
+
+/** Created here, on the host, so a session that can see the directory can use
+ *  it and one that cannot (a sandbox masks it) is told so by its absence. A
+ *  failure only costs this turn the shared Meego login, never the identity. */
+function meegoStoreShape(openId: string | undefined): Pick<BytedCliIdentity, 'meegoHome'> {
+  if (!isUsableOpenId(openId)) return {};
+  try {
+    return { meegoHome: ensureMeegoStore(openId) };
+  } catch (error) {
+    logger.warn(`[cli-identity] Meego store unavailable, publishing without it: ${
+      error instanceof Error ? error.message : String(error)}`);
+    return {};
+  }
 }
 
 /**
@@ -1130,6 +1179,143 @@ const BYTEDCLI_LOGIN_GUARD_FN: readonly string[] = [
   '}',
 ];
 
+/**
+ * Meego (the official meegle CLI under bytedcli) keeps its login in
+ * `$HOME/.meegle`. With the per-exec scratch HOME that store used to live and
+ * die with one session, so a login finished in the DM never reached the group
+ * topic that asked for it. The wrapper links the scratch `.meegle` to the
+ * person's store ({@link BytedCliIdentity.meegoHome}) on every exec, and
+ * leaves logging in to botmux: `bytedcli meego login` and a Meego command with
+ * no login yet ask the daemon, which sends the link to the person privately.
+ * The device link never reaches the agent, so it cannot end up in a group.
+ */
+const BYTEDCLI_MEEGO_FN: readonly string[] = [
+  // Prints the Meego subcommand that needs a login (`login` when argv holds a
+  // meego→login operand pair anywhere, like the login guard above); fails for
+  // every other call and for help/status/logout/config, which never need one.
+  '__botmux_meego_sub() {',
+  '  __botmux_mg_w1=; __botmux_mg_w2=; __botmux_mg_prev=; __botmux_mg_skip=; __botmux_mg_login=; __botmux_mg_help=',
+  '  for __botmux_mg_a in "$@"; do',
+  '    if [ -n "$__botmux_mg_skip" ]; then __botmux_mg_skip=; continue; fi',
+  '    case "$__botmux_mg_a" in',
+  '      --jq|--site|--auth-site|--as|--profile|--vregion|--vdc|--tenant) __botmux_mg_skip=1 ;;',
+  '      -h|--help) __botmux_mg_help=1 ;;',
+  '      -*) ;;',
+  '      *)',
+  '        [ "$__botmux_mg_prev" = meego ] && [ "$__botmux_mg_a" = login ] && __botmux_mg_login=1',
+  '        if [ -z "$__botmux_mg_w1" ]; then __botmux_mg_w1=$__botmux_mg_a; elif [ -z "$__botmux_mg_w2" ]; then __botmux_mg_w2=$__botmux_mg_a; fi',
+  '        __botmux_mg_prev=$__botmux_mg_a',
+  '        ;;',
+  '    esac',
+  '  done',
+  '  [ -z "$__botmux_mg_help" ] || return 1',
+  `  if [ -n "$__botmux_mg_login" ]; then printf '%s' login; return 0; fi`,
+  '  [ "$__botmux_mg_w1" = meego ] || return 1',
+  '  case "$__botmux_mg_w2" in ""|status|logout|config|help) return 1 ;; esac',
+  `  printf '%s' "$__botmux_mg_w2"`,
+  '}',
+  // The Meego tenant this call runs under, in bytedcli's order: the
+  // `--tenant` flag, BYTEDCLI_MEEGO_TENANT, the tenant saved in this HOME ($1).
+  // Sets __botmux_mg_tenant (`dcar`, or empty for the default) and
+  // __botmux_mg_tset when the flag was given; fails on a flag bytedcli rejects.
+  '__botmux_meego_tenant() {',
+  '  __botmux_mg_tenant=; __botmux_mg_tset=; __botmux_mg_tval=; __botmux_mg_tnext=; __botmux_mg_thome=$1; shift',
+  '  for __botmux_mg_a in "$@"; do',
+  '    if [ -n "$__botmux_mg_tnext" ]; then __botmux_mg_tval=$__botmux_mg_a; __botmux_mg_tnext=; continue; fi',
+  '    case "$__botmux_mg_a" in',
+  '      --tenant) __botmux_mg_tset=1; __botmux_mg_tnext=1; __botmux_mg_tval= ;;',
+  '      --tenant=*) __botmux_mg_tset=1; __botmux_mg_tval=${__botmux_mg_a#--tenant=} ;;',
+  '    esac',
+  '  done',
+  '  if [ -n "$__botmux_mg_tset" ]; then',
+  '    case "$__botmux_mg_tval" in [Dd][Cc][Aa][Rr]) __botmux_mg_tenant=dcar; return 0 ;; esac',
+  '    return 1',
+  '  fi',
+  '  case "$BYTEDCLI_MEEGO_TENANT" in [Dd][Cc][Aa][Rr]) __botmux_mg_tenant=dcar; return 0 ;; esac',
+  `  if grep -Eqs '"(tenant|site)"[[:space:]]*:[[:space:]]*"[Dd][Cc][Aa][Rr]"' \\`,
+  '    "$__botmux_mg_thome/.local/share/bytedcli/data/meego_config.json"; then __botmux_mg_tenant=dcar; fi',
+  '  return 0',
+  '}',
+  // Asks the daemon to authorize the person this turn acts for. Exit status is
+  // botmux's: 0 authorized now, 3 not yet (the link went to the person, or
+  // could not), 4 provider unavailable, anything else botmux unreachable. Its
+  // message lands in __botmux_ar_out for the caller to print.
+  '__botmux_auth_request() {',
+  '  __botmux_ar_out=',
+  '  command -v botmux >/dev/null 2>&1 || return 1',
+  '  __botmux_ar_out=$(botmux auth request "$@" 2>/dev/null)',
+  '}',
+];
+
+const MEEGO_LOGIN_UNREACHABLE_MSG = 'botmux: Meego 登录由 botmux 发起，授权链接只私下发给你本人；但现在联系不上 botmux，命令未执行。请稍后重试。';
+const MEEGO_SANDBOX_LOGIN_MSG = 'botmux: 这个会话在沙盒里，看不到你在本机器人里的 Meego 登录，也不能在这里登录（授权链接不会经过会话转发）。请在和我的私聊里完成 Meego 操作。';
+
+const MEEGO_TENANT_INVALID_MSG = 'botmux: Meego 的 --tenant 只能是 dcar（不写即默认租户），命令未执行。';
+
+/** Runs inside the `[ -n HOME_VAR ]` block, after `__botmux_home` exists. */
+function bytedcliMeegoBlock(realBinaryPath: string): string[] {
+  return [
+    `  if [ -n "$${MEEGO_HOME_VAR}" ]; then`,
+    // Inherited from the host, these are the operator's Meego credentials,
+    // and bytedcli would use them ahead of this person's login.
+    `    unset ${MEEGO_ENV_CREDENTIALS.join(' ')}`,
+    `    __botmux_mg_store="$${MEEGO_HOME_VAR}/${MEEGO_STORE_DIR}"`,
+    '    __botmux_mg_sub=$(__botmux_meego_sub "$@") || __botmux_mg_sub=',
+    // A sandbox masks the store, so `-d` is also the "can this session use
+    // it" check. Linking replaces a session-local store (a login made here
+    // before this existed) and a link into a revoked epoch. `-n` matters when
+    // two calls race here: without it, `ln` onto the other's fresh link to a
+    // directory would create a link inside the person's store instead.
+    '    if [ -d "$__botmux_mg_store" ]; then',
+    '      __botmux_mg_link="$__botmux_home/.meegle"',
+    '      if [ "$(readlink "$__botmux_mg_link" 2>/dev/null)" != "$__botmux_mg_store" ]; then',
+    '        [ -L "$__botmux_mg_link" ] || rm -rf "$__botmux_mg_link"',
+    '        ln -sfn "$__botmux_mg_store" "$__botmux_mg_link" 2>/dev/null || true',
+    '      fi',
+    '      __botmux_mg_tok=1',
+    '      __botmux_meego_tenant "$__botmux_home" "$@" || __botmux_mg_tok=',
+    // Never exec the real login, not even when authorized: the store already
+    // holds the login every session uses, and the real one would print a
+    // device link to the agent. A `--tenant` it would have saved is saved.
+    '      if [ "$__botmux_mg_sub" = login ]; then',
+    '        if [ -z "$__botmux_mg_tok" ]; then',
+    `          printf '%s\\n' ${shellSingleQuote(MEEGO_TENANT_INVALID_MSG)} >&2`,
+    '          exit 2',
+    '        fi',
+    '        if [ -n "$__botmux_mg_tset" ]; then',
+    `          HOME="$__botmux_home" ${shellSingleQuote(realBinaryPath)} meego config --tenant "$__botmux_mg_tenant" >/dev/null 2>&1 || true`,
+    '        fi',
+    '        __botmux_auth_request --provider meego ${__botmux_mg_tenant:+--tenant "$__botmux_mg_tenant"}',
+    '        case $? in',
+    `          0) printf '%s\\n' "$__botmux_ar_out" >&2; exit 0 ;;`,
+    `          3|4) printf '%s\\n' "$__botmux_ar_out" >&2 ;;`,
+    `          *) printf '%s\\n' ${shellSingleQuote(MEEGO_LOGIN_UNREACHABLE_MSG)} >&2 ;;`,
+    '        esac',
+    `        exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    '      fi',
+    // Any login file (meegle keeps one per profile, i.e. per tenant) lets the
+    // call run; with only the other tenant's, meegle fails as before and
+    // `meego login` above then asks for this one. botmux unreachable or the
+    // provider down (4): the command runs and fails as it would have.
+    '      __botmux_mg_has=',
+    '      for __botmux_mg_f in "$__botmux_mg_store"/credentials*.enc; do',
+    '        if [ -s "$__botmux_mg_f" ]; then __botmux_mg_has=1; fi',
+    '      done',
+    '      if [ -n "$__botmux_mg_sub" ] && [ -n "$__botmux_mg_tok" ] && [ -z "$__botmux_mg_has" ]; then',
+    '        __botmux_auth_request --provider meego ${__botmux_mg_tenant:+--tenant "$__botmux_mg_tenant"}',
+    `        if [ $? -eq 3 ]; then printf '%s\\n' "$__botmux_ar_out" >&2; exit ${IDENTITY_DENIED_EXIT_CODE}; fi`,
+    '      fi',
+    // Store not visible here (sandbox). In the person's own DM the session-
+    // local login prints its link where only they can see it, as before.
+    '    elif [ "$__botmux_mg_sub" = login ] && [ "$BOTMUX_CHAT_TYPE" != p2p ]; then',
+    `      printf '%s\\n' ${shellSingleQuote(MEEGO_SANDBOX_LOGIN_MSG)} >&2`,
+    `      exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    '    fi',
+    '    unset __botmux_mg_store __botmux_mg_sub __botmux_mg_link __botmux_mg_tok __botmux_mg_has __botmux_mg_f __botmux_ar_out',
+    '  fi',
+  ];
+}
+
 export function renderIdentityWrapper(
   tool: IdentityTool,
   realBinaryPath: string,
@@ -1204,11 +1390,13 @@ export function renderIdentityWrapper(
     // Same for the per-exec HOME: an inherited value must not redirect an
     // identity that does not carry one.
     `${HOME_VAR}=`,
+    ...(tool === 'bytedcli' ? [`${MEEGO_HOME_VAR}=`] : []),
     '__botmux_live=',
     '__botmux_live_caller=',
     // Function only; it runs AFTER identity resolution at each exec site, with
     // the HOME that exec will use (per-person scratch HOME or machine HOME).
     ...(tool === 'bytedcli' ? BYTEDCLI_LOGIN_GUARD_FN : []),
+    ...(tool === 'bytedcli' ? BYTEDCLI_MEEGO_FN : []),
     ...resolveBlock,
     '',
     `case "$${MODE_VAR}" in`,
@@ -1237,6 +1425,15 @@ export function renderIdentityWrapper(
     // Guidance, not just refusal: whoever reads this needs to know it was a
     // permission decision and what to do next, or they retry the same command.
     `    if [ -n "$${DENY_MSG_VAR}" ]; then`,
+    // Not logged in yet: botmux hands the link to the person privately and
+    // says so; the published text stays the fallback when it cannot be asked.
+    ...(tool === 'bytedcli' ? [
+      `      case "$${DENY_MSG_VAR}" in *'[reason=not_authorized]'*)`,
+      '        __botmux_auth_request --provider bytedcli',
+      `        case $? in 0|3|4) printf '%s\\n' "$__botmux_ar_out" >&2; exit ${IDENTITY_DENIED_EXIT_CODE} ;; esac`,
+      '        ;;',
+      '      esac',
+    ] : []),
     `      printf '%s\\n' "$${DENY_MSG_VAR}" >&2`,
     '    else',
     // Nothing was published for this call (no refusal text either): the turn's
@@ -1273,10 +1470,11 @@ export function renderIdentityWrapper(
     `    printf '%s\\n' 'botmux: ${tool} 的按人目录无法创建，命令未执行。' >&2`,
     `    exit ${IDENTITY_DENIED_EXIT_CODE}`,
     '  fi',
-    `  unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${OPEN_ID_VAR} ${HOME_VAR}`,
+    ...(tool === 'bytedcli' ? bytedcliMeegoBlock(realBinaryPath) : []),
+    `  unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${OPEN_ID_VAR} ${HOME_VAR}${tool === 'bytedcli' ? ` ${MEEGO_HOME_VAR}` : ''}`,
     `  HOME="$__botmux_home" exec ${shellSingleQuote(realBinaryPath)} "$@"`,
     'fi',
-    `unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${OPEN_ID_VAR} ${HOME_VAR}`,
+    `unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${OPEN_ID_VAR} ${HOME_VAR}${tool === 'bytedcli' ? ` ${MEEGO_HOME_VAR}` : ''}`,
     `exec ${shellSingleQuote(realBinaryPath)} "$@"`,
     '',
   ].join('\n');
@@ -1433,8 +1631,14 @@ export function installLoginShellPathShim(binDir: string): { zdotdir: string; ba
   const reprepend = [
     '# botmux trigger-user identity — generated, do not edit.',
     '# Re-prepend the wrapper dir AFTER path_helper has rebuilt PATH.',
+    'if [ -n "${BOTMUX_WRAPPER_BIN:-}" ]; then',
+    '  case "$PATH:" in',
+    '    "$BOTMUX_WRAPPER_BIN":*) ;;',
+    '    *) PATH="$BOTMUX_WRAPPER_BIN${PATH:+:$PATH}"; export PATH ;;',
+    '  esac',
+    'fi',
     'if [ -n "$BOTMUX_IDENTITY_BIN" ]; then',
-    '  case ":$PATH:" in',
+    '  case "$PATH:" in',
     '    "$BOTMUX_IDENTITY_BIN":*) ;;',
     '    *) PATH="$BOTMUX_IDENTITY_BIN${PATH:+:$PATH}"; export PATH ;;',
     '  esac',
@@ -1846,6 +2050,7 @@ export function prepareTriggerUserCliEnv(
     try {
       const { zdotdir, bashEnv } = installLoginShellPathShim(wrapperDir);
       childEnv.BOTMUX_IDENTITY_BIN = wrapperDir;
+      childEnv.BOTMUX_WRAPPER_BIN = resolveBotmuxWrapperBinDir(childEnv);
       childEnv.ZDOTDIR = zdotdir;
       childEnv.BASH_ENV = bashEnv;
     } catch (e) {

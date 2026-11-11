@@ -1,20 +1,23 @@
 import { guardSessionDirectoryWrites, reserveManagedDirectories } from './managed-directory-retention.js';
 import { resolveCodexProfileHome } from './codex-profiles.js';
+import { sessionContractStore } from './session-contract-store.js';
+import { sessionContractsEnabled, type ControlKind } from './session-contract.js';
 import { readFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync, realpathSync } from 'node:fs';
 import { join, dirname, basename, resolve, relative, isAbsolute } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { pidExistsEpermAlive } from '../utils/process-alive.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { DAEMON_HEARTBEAT_STALE_MS } from '../utils/daemon-heartbeat.js';
 import { cleanupMaterializedDashboardImages } from '../core/dashboard-images.js';
-import { setSessionWorkingDirMetadata } from '../core/session-cwd.js';
 import { getSessionTokenUsage } from '../core/cost-calculator.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
 import { removePromptContextDir } from './prompt-context-store.js';
 import { removeStatuslineDir } from './statusline-snapshot.js';
 import { removePaneLaunchDir } from '../adapters/backend/pane-launch.js';
+import { removeCodexModelLaunchReceipt } from './codex-model-selection.js';
 import { removeSessionSkillRuntime } from '../core/skills/snapshot.js';
 import {
   applySessionRowCommand,
@@ -28,8 +31,7 @@ import {
   type DatabaseSyncLike,
   type StatementLike,
 } from './sqlite-compat.js';
-import { assertWorkspaceWriterFence, WorkspaceMigrationFenceError } from './workspace-schema-migrator.js';
-import { WORKSPACE_SCHEMA_VERSION, type
+import type {
   HumanLaneIdentityEvidence,
   HumanLanePrincipal,
   InboundPrincipal,
@@ -494,7 +496,6 @@ export function assertSqliteSupported(): void {
  *  busy_timeout, schema ensured). Durability matches the previous JSON
  *  tmp+rename (no fsync) — deliberately not upgraded in this step. */
 function openDbForOwnStore(path: string): SqliteDatabaseLike {
-  assertWorkspaceSqliteAdmission();
   requireSqliteEngine(`会话存储 ${basename(path)} `);
   const db = openDatabaseSyncOrThrow(path);
   // Neither engine validates the file in the constructor. `busy_timeout` is
@@ -508,30 +509,7 @@ function openDbForOwnStore(path: string): SqliteDatabaseLike {
   ensurePrincipalLaneWorktreeCommonDirColumns(db);
   ensureMessageProvenanceTrustFenceIdentityColumns(db);
   db.exec(OCCUPANCY_SCHEMA_SQL);
-  const rawPrepare = db.prepare.bind(db);
-  const rawExec = db.exec.bind(db);
-  return guardSessionDirectoryWrites({
-    exec(sql: string): void {
-      assertWorkspaceSqliteAdmission();
-      if (/^\s*(?:BEGIN|INSERT|UPDATE|DELETE|REPLACE|CREATE|ALTER|DROP|VACUUM|REINDEX)\b/i.test(sql)) {
-        assertWorkspaceWriterFence(config.session.dataDir);
-      }
-      rawExec(sql);
-    },
-    prepare(sql: string): SqliteStatementLike {
-      const statement = rawPrepare(sql);
-      return {
-        get: (...params) => { assertWorkspaceSqliteAdmission(); return statement.get(...params); },
-        all: (...params) => { assertWorkspaceSqliteAdmission(); return statement.all(...params); },
-        run: (...params) => {
-          assertWorkspaceSqliteAdmission();
-          assertWorkspaceWriterFence(config.session.dataDir);
-          return statement.run(...params);
-        },
-      };
-    },
-    close: () => db.close(),
-  });
+  return guardSessionDirectoryWrites(db);
 }
 
 /** `0d6ab50d1` could create this sidecar before the common-dir proof columns
@@ -615,17 +593,6 @@ interface OwnSqliteStore {
 }
 type SqliteReadStore = Pick<OwnSqliteStore, 'db'>;
 let ownStore: OwnSqliteStore | undefined;
-let workspaceWriterCount = 0;
-let workspaceInflightCount = 0;
-let workspaceWriteAdmissionBlocked = false;
-let workspaceQuiescedEpoch: number | undefined;
-let workspaceMigrationInternalSqlite = false;
-
-function assertWorkspaceSqliteAdmission(): void {
-  if (!workspaceMigrationInternalSqlite && (workspaceWriteAdmissionBlocked || workspaceQuiescedEpoch !== undefined)) {
-    throw new WorkspaceMigrationFenceError(`session store is quiesced at epoch ${workspaceQuiescedEpoch ?? 'pending'}`);
-  }
-}
 
 /** Lock/busy contention is retryable. Swallowing it into loadFailure would let
  *  the daemon start with an empty cache while the durable store is healthy. */
@@ -645,12 +612,8 @@ function runOwnedWriteTransaction<T>(
   nonblocking: boolean,
   operation: () => T,
 ): T {
-  assertWorkspaceWriterFence(config.session.dataDir);
-  assertWorkspaceSqliteAdmission();
-  workspaceInflightCount++;
   if (nonblocking) store.db.exec('PRAGMA busy_timeout = 0;');
   try {
-    workspaceWriterCount++;
     let committed = false;
     store.db.exec('BEGIN IMMEDIATE');
     try {
@@ -669,8 +632,6 @@ function runOwnedWriteTransaction<T>(
     }
     throw error;
   } finally {
-    workspaceWriterCount--;
-    workspaceInflightCount--;
     if (nonblocking) store.db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
   }
 }
@@ -838,7 +799,6 @@ function sessionStatusText(value: unknown): string {
 }
 
 let testOnlyBeforeRowPersist: ((sessionId: string) => void) | undefined;
-let testOnlyBeforeQuarantineRepairCas: ((sessionId: string, rawRow: string) => string | undefined) | undefined;
 let testOnlyBeforePrincipalLaneCreateTransaction: (() => void) | undefined;
 let testOnlyBeforePrincipalLaneWorktreeCommit: (() => void) | undefined;
 let testOnlyAfterPrincipalLaneWorktreeCommit: (() => void) | undefined;
@@ -847,9 +807,6 @@ let testOnlyAfterPrincipalLaneWorktreeCommit: (() => void) | undefined;
 export function __testOnly_setBeforeRowPersist(hook: ((sessionId: string) => void) | undefined): void {
   testOnlyBeforeRowPersist = hook;
 }
-export function __testOnly_setBeforeQuarantineRepairCas(
-  hook: ((sessionId: string, rawRow: string) => string | undefined) | undefined,
-): void { testOnlyBeforeQuarantineRepairCas = hook; }
 
 /** Failure/race injection between the authority snapshot and the write
  * transaction. Production code never assigns this hook. */
@@ -964,7 +921,7 @@ function readStoreEntries(ref: StoreFileRef, strict = false): [string, Session][
     const rows = db.prepare('SELECT session_id, row FROM sessions').all() as { session_id: string; row: string }[];
     const entries: [string, Session][] = [];
     for (const r of rows) {
-      try { entries.push([r.session_id, parseSessionRow(r.row)]); }
+      try { entries.push([r.session_id, JSON.parse(r.row) as Session]); }
       catch (error) { if (strict) throw error; /* display readers skip unparseable rows */ }
     }
     return entries;
@@ -979,12 +936,12 @@ function readStoreRowByKey(ref: StoreFileRef, sessionId: string): Session | unde
   // connection instead of opening one per call.
   if (ownStore && loaded && ref.appId === currentAppId && ref.path === getDbPath()) {
     const hit = ownStore.selectRow.get(sessionId) as { row: string } | undefined;
-    return hit ? parseSessionRow(hit.row) : undefined;
+    return hit ? JSON.parse(hit.row) as Session : undefined;
   }
   const db = openDbForRead(ref.path);
   try {
     const hit = db.prepare('SELECT row FROM sessions WHERE session_id = ?').get(sessionId) as { row: string } | undefined;
-    return hit ? parseSessionRow(hit.row) : undefined;
+    return hit ? JSON.parse(hit.row) as Session : undefined;
   } finally {
     db.close();
   }
@@ -1091,7 +1048,7 @@ function readStoreActiveRows(
     const out: Session[] = [];
     for (const r of rows) {
       try {
-        const session = parseSessionRow(r.row);
+        const session = JSON.parse(r.row) as Session;
         if (!session || typeof session !== 'object' || typeof session.sessionId !== 'string') {
           throw new Error('invalid session object');
         }
@@ -1169,64 +1126,6 @@ function remoteOwnersEqual(left: RemoteDurableOwner, right: RemoteDurableOwner):
  * imports the SQLite store. Only the owning daemon may create the on-disk
  * engine.
  */
-export interface WorkspaceSqliteQuiescenceStatus {
-  open: boolean;
-  writers: number;
-  inflight: number;
-  checkpointed: boolean;
-}
-
-/** Close the owning SQLite connection for a host migration. JavaScript writes
- * are synchronous, so reaching this function means no transaction callback is
- * in flight; WAL checkpoint must report no busy writer before close. */
-export function quiesceForWorkspaceMigration(epoch?: number): WorkspaceSqliteQuiescenceStatus {
-  workspaceWriteAdmissionBlocked = true;
-  if (workspaceWriterCount !== 0 || workspaceInflightCount !== 0) {
-    return { open: !!ownStore, writers: workspaceWriterCount, inflight: workspaceInflightCount, checkpointed: false };
-  }
-  if (!ownStore) return { open: false, writers: 0, inflight: 0, checkpointed: true };
-  workspaceMigrationInternalSqlite = true;
-  let checkpoint: { busy?: number | bigint } | undefined;
-  try {
-    checkpoint = ownStore.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as { busy?: number | bigint } | undefined;
-  } finally { workspaceMigrationInternalSqlite = false; }
-  if (Number(checkpoint?.busy ?? 0) !== 0) return { open: true, writers: 0, inflight: 0, checkpointed: false };
-  ownStore.db.close();
-  ownStore = undefined;
-  loaded = false;
-  if (epoch !== undefined) workspaceQuiescedEpoch = epoch;
-  return { open: false, writers: 0, inflight: 0, checkpointed: true };
-}
-
-/** Reopen lazily from the current SQLite file after the supervisor releases the
- * migration block; no stale connection or WAL handle is retained. */
-export function reopenAfterWorkspaceMigration(epoch?: number): void {
-  if (workspaceQuiescedEpoch !== undefined && epoch !== workspaceQuiescedEpoch) {
-    throw new WorkspaceMigrationFenceError('session store release epoch mismatch');
-  }
-  loaded = false;
-  loadFailure = undefined;
-  sessions = new Map();
-  // Temporarily allow only this exact reopen attempt. If attach/parse fails,
-  // restore the durable quiescence guard before propagating the failure.
-  workspaceMigrationInternalSqlite = true;
-  try {
-    if (sqliteBootstrapAllowed) loadForWrite();
-  } catch (error) {
-    workspaceWriteAdmissionBlocked = true;
-    throw error;
-  } finally {
-    workspaceMigrationInternalSqlite = false;
-  }
-  workspaceQuiescedEpoch = undefined;
-  workspaceWriteAdmissionBlocked = false;
-}
-
-export function workspaceSqliteStatus(): WorkspaceSqliteQuiescenceStatus {
-  return { open: !!ownStore, writers: workspaceWriterCount, inflight: workspaceInflightCount,
-    checkpointed: !ownStore && workspaceWriterCount === 0 && workspaceInflightCount === 0 };
-}
-
 export function init(appId: string, opts: {
   owner?: boolean;
   occupancy?: OccupancyHolder;
@@ -1629,7 +1528,7 @@ function readStrandedImportRows(dbFp: string): {
       let beyondBaseline = 0;
       for (const r of rows) {
         if (baselineRows.get(r.session_id) !== r.row) beyondBaseline++;
-        try { entries.push([r.session_id, parseSessionRow(r.row)]); } catch { unparseable++; }
+        try { entries.push([r.session_id, JSON.parse(r.row) as Session]); } catch { unparseable++; }
       }
       // "The orphan demonstrably replayed": SQLite accepted frames from it AND
       // it contributed rows the shell did not already have, with nothing corrupt.
@@ -1846,7 +1745,6 @@ function recoverPoisonedSqliteStore(dbFp: string, jsonFp: string): {
 
 // Sessions persisted before 2026-04-29 lack `cliId`; consumers must fall back to 'unknown' at the render boundary.
 function load(): void {
-  assertWorkspaceSqliteAdmission();
   if (loaded) return;
   if (!currentAppId) {
     sessions = new Map();
@@ -2052,7 +1950,7 @@ function readOwnStoreAllRows(store: OwnSqliteStore): [string, Session][] {
   const rows = store.selectAll.all() as { session_id: string; row: string }[];
   const entries: [string, Session][] = [];
   for (const r of rows) {
-    try { entries.push([r.session_id, parseSessionRow(r.row)]); } catch { /* skip unparseable row */ }
+    try { entries.push([r.session_id, JSON.parse(r.row) as Session]); } catch { /* skip unparseable row */ }
   }
   return entries;
 }
@@ -2102,7 +2000,7 @@ export function getActiveRemoteShutdownSnapshotsBatch(
         const fresh = new Map<string, Session | undefined>();
         for (const sessionId of sessionIds) {
           const hit = select.get(sessionId) as { row: string } | undefined;
-          fresh.set(sessionId, hit ? parseSessionRow(hit.row) : undefined);
+          fresh.set(sessionId, hit ? JSON.parse(hit.row) as Session : undefined);
         }
         const invalid = sessionIds.filter((sessionId) => {
           const session = fresh.get(sessionId);
@@ -2171,7 +2069,7 @@ export function persistActiveRemoteLineagesExactBatch(
         const freshRows = new Map<string, { session: Session; raw: string } | undefined>();
         for (const sessionId of sessionIds) {
           const hit = select.get(sessionId) as { row: string } | undefined;
-          freshRows.set(sessionId, hit ? { session: parseSessionRow(hit.row), raw: hit.row } : undefined);
+          freshRows.set(sessionId, hit ? { session: JSON.parse(hit.row) as Session, raw: hit.row } : undefined);
         }
         const conflicts: string[] = [];
         for (const u of updates) {
@@ -2217,7 +2115,7 @@ export function persistActiveRemoteLineagesExactBatch(
       const verifiedRows = new Map<string, Session | undefined>();
       for (const sessionId of sessionIds) {
         const hit = select.get(sessionId) as { row: string } | undefined;
-        verifiedRows.set(sessionId, hit ? parseSessionRow(hit.row) : undefined);
+        verifiedRows.set(sessionId, hit ? JSON.parse(hit.row) as Session : undefined);
       }
       const ambiguous = updates.filter((u) => {
         const durable = verifiedRows.get(u.sessionId);
@@ -2261,97 +2159,7 @@ export function persistActiveRemoteLineagesExactBatch(
  *  the serialized row identical skips the write — the daemon fires several
  *  updateSession() calls per inbound message (activity bump, pid, stream-card
  *  state, …) and many of them change nothing. */
-const SESSION_WORKING_DIR_SOURCES = new Set<Session['workingDirSource']>([
-  'explicit', 'oncall-explicit', 'oncall-default-auto', 'group',
-  'bot-default', 'worktree', 'legacy-unknown',
-]);
-
-export function normalizeSessionWorkingDirProvenance<T extends Session>(session: T): T {
-  if (session.workingDirSource === undefined) {
-    // Legacy rows may carry group-looking revision/identity fields from older
-    // partial rollouts, but without provenance they cannot prove that the cwd
-    // was inherited rather than explicitly pinned. Quarantine conservatively.
-    session.workingDirSource = 'legacy-unknown';
-    delete session.groupWorkspaceRevision;
-    delete session.groupWorkspaceIdentity;
-    delete session.groupWorkspaceDirectoryIdentity;
-  }
-  if (!SESSION_WORKING_DIR_SOURCES.has(session.workingDirSource)) {
-    throw new Error('invalid workingDirSource');
-  }
-  if (session.workingDirSource !== 'legacy-unknown'
-    && (typeof session.workingDir !== 'string' || !session.workingDir.trim())) {
-    throw new Error('cwd provenance requires a non-empty workingDir');
-  }
-  if (session.workingDirSource === 'group') {
-    if (!Number.isSafeInteger(session.groupWorkspaceRevision) || session.groupWorkspaceRevision! < 0) {
-      throw new Error('group cwd provenance requires a safe non-negative revision');
-    }
-    if (!session.groupWorkspaceQuarantine && (session.workspaceSchemaVersion !== WORKSPACE_SCHEMA_VERSION
-      || !session.groupWorkspaceIdentity
-      || session.groupWorkspaceIdentity.path !== session.workingDir)) {
-      throw new Error('group cwd provenance requires workspace identity v2');
-    }
-  } else if (session.groupWorkspaceRevision !== undefined) {
-    throw new Error('non-group cwd provenance must not carry a group revision');
-  }
-  const repair = session.groupWorkspaceRepairReceipt;
-  if (repair !== undefined) {
-    const prior = repair.priorQuarantine;
-    const validRepair = !session.groupWorkspaceQuarantine
-      && typeof repair.operationId === 'string' && !!repair.operationId.trim()
-      && Number.isSafeInteger(repair.repairedAt) && repair.repairedAt > 0
-      && typeof repair.actor?.tenantKey === 'string' && !!repair.actor.tenantKey
-      && typeof repair.actor?.unionId === 'string' && !!repair.actor.unionId
-      && repair.chatId === session.chatId
-      && Number.isSafeInteger(repair.revision) && repair.revision! >= 1
-      && repair.revision === session.groupWorkspaceRevision
-      && repair.identity?.path === session.workingDir
-      && repair.identity?.path === session.groupWorkspaceIdentity?.path
-      && repair.identity?.dev === session.groupWorkspaceIdentity?.dev
-      && repair.identity?.ino === session.groupWorkspaceIdentity?.ino
-      && prior?.kind === 'known_group_identity_unprovable'
-      && typeof prior.detail === 'string' && !!prior.detail;
-    if (!validRepair) throw new Error('invalid groupWorkspaceRepairReceipt');
-  }
-  const follow = session.groupWorkspaceFollow;
-  if (follow !== undefined) {
-    if (follow.schemaVersion !== WORKSPACE_SCHEMA_VERSION
-      || !Number.isSafeInteger(follow.journalRevision) || follow.journalRevision! < 0
-      || !follow.targetWorkspaceIdentity
-      || follow.targetWorkspaceIdentity.path !== follow.targetWorkingDir) {
-      throw new Error('invalid groupWorkspaceFollow v2 journal');
-    }
-    const validIdentity = follow.targetDirectoryIdentity === undefined
-      || (typeof follow.targetDirectoryIdentity.dev === 'string'
-        && !!follow.targetDirectoryIdentity.dev
-        && typeof follow.targetDirectoryIdentity.ino === 'string'
-        && !!follow.targetDirectoryIdentity.ino);
-    const valid = session.workingDirSource === 'group'
-      && typeof follow.targetWorkingDir === 'string'
-      && follow.targetWorkingDir.startsWith('/')
-      && Number.isSafeInteger(follow.targetRevision) && follow.targetRevision >= 0
-      && Number.isSafeInteger(follow.previousRevision) && follow.previousRevision >= -1
-      && Number.isSafeInteger(follow.previousGeneration) && follow.previousGeneration >= 0
-      && Number.isSafeInteger(follow.nextGeneration)
-      && follow.nextGeneration === follow.previousGeneration + 1
-      && ['prepared', 'old_exited', 'persisted', 'spawned'].includes(follow.phase)
-      && validIdentity;
-    if (!valid) throw new Error('invalid groupWorkspaceFollow journal');
-  }
-  return session;
-}
-
-function parseSessionRow(row: string): Session {
-  return normalizeSessionWorkingDirProvenance(JSON.parse(row) as Session);
-}
-
-function persistRow(session: Session): void {
-  assertWorkspaceWriterFence(config.session.dataDir);
-  assertWorkspaceSqliteAdmission();
-  workspaceInflightCount++;
-  try {
-  normalizeSessionWorkingDirProvenance(session);
+function persistRow(session: Session, modelPinWrite = false): void {
   if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
   if (!ownStore) {
     throw new SessionStoreUnavailableError(
@@ -2363,25 +2171,15 @@ function persistRow(session: Session): void {
   testOnlyBeforeRowPersist?.(session.sessionId);
   const existing = ownStore.selectRow.get(session.sessionId) as { row: string } | undefined;
   if (existing) {
-    const durable = parseSessionRow(existing.row);
+    const durable = JSON.parse(existing.row) as Session;
+    // Only explicit pin writers may change intent. Late metadata copies cannot
+    // resurrect a cleared pin or erase a newer choice.
+    if (!modelPinWrite) session = { ...session, modelPin: durable.modelPin };
     if (durable.workspaceRetirement) {
       if (session.status !== 'closed') throw new Error('workspace_retired');
       // Late whole-row writers may hold a pre-close copy. Retirement cannot
       // be erased by a stale metadata write or by changing workingDir.
       session = { ...session, workspaceRetirement: durable.workspaceRetirement };
-    }
-    // Quarantine repair has one exact-CAS authority writer. A stale Session
-    // object must neither erase its receipt nor resurrect the superseded quarantine.
-    if (durable.groupWorkspaceRepairReceipt) {
-      session = { ...session,
-        groupWorkspaceRepairReceipt: durable.groupWorkspaceRepairReceipt,
-        groupWorkspaceQuarantine: undefined,
-        workspaceSchemaVersion: durable.workspaceSchemaVersion,
-        workingDirSource: durable.workingDirSource,
-        groupWorkspaceRevision: durable.groupWorkspaceRevision,
-        groupWorkspaceIdentity: durable.groupWorkspaceIdentity,
-        groupWorkspaceDirectoryIdentity: durable.groupWorkspaceDirectoryIdentity,
-      };
     }
     // Task continuation has its own compare-and-set writer. Metadata writers
     // holding an old row must neither erase a live task nor resurrect a stop.
@@ -2396,6 +2194,22 @@ function persistRow(session: Session): void {
     if (session.serviceTier === undefined && durable.serviceTier !== undefined) {
       session = { ...session, serviceTier: durable.serviceTier };
     }
+    if (durable.protectedHttpEgressPolicy !== undefined) {
+      if (session.protectedHttpEgressPolicy !== undefined
+        && !isDeepStrictEqual(
+          session.protectedHttpEgressPolicy,
+          durable.protectedHttpEgressPolicy,
+        )) {
+        throw new Error('Protected HTTP egress policy is immutable');
+      }
+      // The first successful freeze owns this field permanently. Whole-row
+      // metadata writers created before that freeze must carry it forward,
+      // while later writers may only replay the exact durable value.
+      session = {
+        ...session,
+        protectedHttpEgressPolicy: durable.protectedHttpEgressPolicy,
+      };
+    }
     if (durable.cliInstanceBinding) {
       if (session.cliInstanceBinding && JSON.stringify(session.cliInstanceBinding) !== JSON.stringify(durable.cliInstanceBinding)) {
         throw new Error('Codex instance binding is immutable');
@@ -2407,6 +2221,15 @@ function persistRow(session: Session): void {
         wrapperCli: durable.wrapperCli, cliLaunchMode: durable.cliLaunchMode, agentFrozen: durable.agentFrozen };
     }
   }
+  if (ownStore.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='contracts'").get()) {
+    const hit = ownStore.db.prepare('SELECT value,revision FROM contracts WHERE session_key=?').get(JSON.stringify([currentAppId, session.sessionId])) as { value: string; revision: number } | undefined;
+    if (hit) {
+      const canonical = JSON.parse(hit.value);
+      if ((canonical.lifecycle === 'closed' && session.status !== 'closed')
+        || (session.status === 'closed' && !['closing', 'closed'].includes(canonical.lifecycle))) throw new Error('session_lifecycle_requires_control_operation');
+      session = { ...session, sessionLifecycle: canonical.lifecycle, sessionContractRevision: hit.revision };
+    }
+  }
   const json = JSON.stringify(session);
   if (existing?.row === json) return;
   // Compare-and-set across the read/merge/write boundary. An offline writer
@@ -2415,7 +2238,6 @@ function persistRow(session: Session): void {
     ? ownStore.updateExact.run(sessionStatusText(session), json, session.sessionId, existing.row)
     : ownStore.insertNew.run(session.sessionId, sessionStatusText(session), json);
   if (Number(result.changes) !== 1) throw new Error('Session changed concurrently; routing write refused');
-  } finally { workspaceInflightCount--; }
 }
 
 function buildNewSession(
@@ -2424,7 +2246,7 @@ function buildNewSession(
   title: string,
   chatType?: 'group' | 'p2p',
   scope?: 'thread' | 'chat',
-  intent: { source?: SessionCreationSource; inherit?: Session } = {},
+  intent: { source?: SessionCreationSource; inherit?: Session; messageListenerRun?: Session['messageListenerRun'] } = {},
 ): Session {
   const bot = configuredCodexInstanceBot(currentAppId);
   const source = intent.source ?? 'other';
@@ -2435,6 +2257,7 @@ function buildNewSession(
   } : bot ? newSessionCodexInstanceState(bot, source) : {};
   const session: Session = {
     sessionId: randomUUID(),
+    ...(intent.messageListenerRun ? { messageListenerRun: { ...intent.messageListenerRun } } : {}),
     chatId,
     chatType,
     rootMessageId,
@@ -2467,7 +2290,7 @@ export function createSession(
   title: string,
   chatType?: 'group' | 'p2p',
   scope?: 'thread' | 'chat',
-  intent: { source?: SessionCreationSource; inherit?: Session } = {},
+  intent: { source?: SessionCreationSource; inherit?: Session; messageListenerRun?: Session['messageListenerRun'] } = {},
 ): Session {
   loadForWrite();
   const session = buildNewSession(chatId, rootMessageId, title, chatType, scope, intent);
@@ -2523,7 +2346,7 @@ export function createSessionWithOwnedMutation<T>(
     for (const sessionId of unique) {
       const hit = store.selectRow.get(sessionId) as { row: string } | undefined;
       if (!hit) throw new Error(`atomic session creation cannot find ${sessionId}`);
-      fresh.set(sessionId, structuredClone(parseSessionRow(hit.row)));
+      fresh.set(sessionId, structuredClone(JSON.parse(hit.row) as Session));
     }
     result = mutate(fresh, created);
     for (const row of fresh.values()) persistRow(row);
@@ -2612,17 +2435,6 @@ export function registerSessionBridgeSendMarkerCleanupFence(
 export function getOwnedSession(sessionId: string): Session | undefined {
   load();
   return sessions.get(sessionId);
-}
-
-/**
- * Return whether this exact live object is backed by the currently attached
- * writable store. A matching id alone is insufficient: compatibility ingress
- * and test harnesses can carry detached snapshots with the same id, and a
- * read-only/synthetic process can expose a row without an owned SQLite handle.
- */
-export function ownsSessionForMutation(session: Session): boolean {
-  load();
-  return ownStore !== undefined && sessions.get(session.sessionId) === session;
 }
 
 /** Cross-process fresh read. SQLite: a point SELECT observes the last committed
@@ -2967,6 +2779,21 @@ export function markMojoCloseUnresolved(
   });
 }
 
+function commitContractLifecycle(session: Session, kind: ControlKind, write: () => void): void {
+  const appId = currentAppId;
+  if (!sessionContractsEnabled() || !appId || !ownStore) { write(); return; }
+  const contract = sessionContractStore(config.session.dataDir, appId);
+  const ref = { appId, sessionId: session.sessionId };
+  runOwnedWriteTransaction(ownStore, false, () => contract.usingDatabase(ownStore!.db, () => {
+    contract.ensure(ref, { closed: session.status === 'closed', suspended: session.suspendedColdResume });
+    if (kind === 'close' && contract.read(ref)?.lifecycle === 'closed') { write(); return; }
+    const { operation } = contract.beginOperation(ref, kind);
+    contract.apply(ref, { type: 'control_started', operationId: operation.operationId });
+    write();
+    contract.apply(ref, { type: 'control_result', operationId: operation.operationId, phase: 'confirmed' });
+  }));
+}
+
 export function closeSession(
   sessionId: string,
   opts: {
@@ -3003,8 +2830,11 @@ export function closeSession(
     // only when the row carries no snapshot yet. An already-closed row does
     // not take a new snapshot — re-close must not pin a later `null` over a
     // live dashboard read, and must not spend the scan when apply will ignore it.
+    const durableHit = ownStore?.selectRow.get(sessionId) as { row: string } | undefined;
+    const durable = durableHit ? JSON.parse(durableHit.row) as Session : undefined;
+    const basis = durable?.status === 'closed' ? { ...session, ...durable, tokenUsage: durable.tokenUsage } : session;
     let tokenUsage: NonNullable<Session['tokenUsage']> | null | undefined;
-    if (session.status !== 'closed') {
+    if (basis.status !== 'closed') {
       tokenUsage = null;
       try {
         tokenUsage = getSessionTokenUsage({
@@ -3026,7 +2856,7 @@ export function closeSession(
     // store close, reached after its explicit prepare, so it alone names the
     // journal wipe. Persist only on `applied` — a no-op re-close must not
     // rewrite the row.
-    const next: Session = { ...session };
+    const next: Session = { ...basis };
     const applied = applySessionRowCommand(next, {
       type: 'close',
       ...(opts.backgroundExecutionCleanup ? { backgroundExecutionCleanup: true } : {}),
@@ -3038,7 +2868,15 @@ export function closeSession(
       ...(opts.clearRiffParentTaskId ? { clearRiffParentTaskId: true } : {}),
     }, { now: new Date() });
     if (applied.outcome === 'applied') {
-      persistRow(next);
+      commitContractLifecycle(basis, 'close', () => {
+        const latest = ownStore?.selectRow.get(sessionId) as { row: string } | undefined;
+        const closed = latest ? JSON.parse(latest.row) as Session : undefined;
+        if (closed?.status === 'closed') { next.closedAt = closed.closedAt; next.tokenUsage = closed.tokenUsage; }
+        persistRow(next);
+      });
+      const committed = ownStore?.selectRow.get(sessionId) as { row: string } | undefined;
+      Object.assign(session, next, committed ? JSON.parse(committed.row) : {});
+    } else if (durable?.status === 'closed') {
       Object.assign(session, next);
     }
     const released = applied.outcome === 'applied' ? applied.released.dashboardAttachments : undefined;
@@ -3062,6 +2900,9 @@ export function closeSession(
     // tmux 启动文件目录（pane-launch.ts）：正常情况下 pane 读完即删，这里兜住
     // 一个 shell 没来得及读的文件——它带着该 bot 注入的环境变量值。
     removePaneLaunchDir(config.session.dataDir, sessionId);
+    // Codex 启动回执（codex-model-selection.ts）：每会话一份，仅服务恢复时的
+    // 启动基线确认，关会话一并删除（best-effort，内部吞错）。
+    removeCodexModelLaunchReceipt(config.session.dataDir, sessionId);
     // 本会话的 skill manifest 与 runtime-skills/<sid>/（skill 快照 + 原生投递副本）
     // 同生命周期：快照只服务这个会话的 CLI 进程，关会话即清（best-effort）。
     removeSessionSkillRuntime(sessionId, config.session.dataDir);
@@ -3098,6 +2939,7 @@ export function reactivateClosedSession(
   const next: Session = { ...session };
   next.status = 'active';
   next.closedAt = undefined;
+  next.userClosedAt = undefined;
   next.backgroundExecutionCleanupClosedAt = undefined;
   next.lastMessageAt = new Date().toISOString();
   next.codexAppDispatchLedger = undefined;
@@ -3121,8 +2963,9 @@ export function reactivateClosedSession(
   next.mojoCloseJournal = undefined;
   next.tokenUsage = undefined;
 
-  persistRow(next);
-  Object.assign(session, next);
+  commitContractLifecycle(session, 'resume', () => persistRow(next));
+  const committed = ownStore?.selectRow.get(sessionId) as { row: string } | undefined;
+  Object.assign(session, next, committed ? JSON.parse(committed.row) : {});
   return { ok: true, session };
 }
 
@@ -3164,13 +3007,13 @@ export function clearSessionPidsIfUnchanged(
   return targets.length;
 }
 
-export function updateSession(session: Session): void {
+export function updateSession(session: Session, options: { modelPinWrite?: true } = {}): void {
   loadForWrite();
-  try { persistRow(session); }
+  try { persistRow(session, options.modelPinWrite); }
   catch (error) {
     const row = ownStore?.selectRow.get(session.sessionId) as { row: string } | undefined;
     if (row) {
-      const durable = parseSessionRow(row.row);
+      const durable = JSON.parse(row.row) as Session;
       const cached = sessions.get(session.sessionId);
       for (const target of new Set([session, cached].filter((s): s is Session => !!s))) {
         for (const key of Object.keys(target)) delete (target as unknown as Record<string, unknown>)[key];
@@ -3180,77 +3023,15 @@ export function updateSession(session: Session): void {
     throw error;
   }
   const durable = ownStore?.selectRow.get(session.sessionId) as { row: string } | undefined;
-  if (durable) Object.assign(session, JSON.parse(durable.row));
+  if (durable) {
+    const row = JSON.parse(durable.row) as Session;
+    Object.assign(session, row);
+    // Object.assign does not remove a key the durable row lacks; drop an
+    // in-memory pin explicitly instead of leaving a lingering own `undefined`.
+    if (row.modelPin === undefined) delete session.modelPin;
+    else session.modelPin = row.modelPin;
+  }
   sessions.set(session.sessionId, session);
-}
-
-/** Persist one immutable group-follow transition iff the durable journal still
- * has the revision observed by its runner. */
-export function updateGroupWorkspaceFollowSession(
-  next: Session,
-  expectedJournalRevision: number | null,
-): boolean {
-  loadForWrite();
-  const db = ownStore;
-  if (!db) throw new SessionStoreUnavailableError(new Error('owned session store is not attached'));
-  const hit = db.selectRow.get(next.sessionId) as { row: string } | undefined;
-  if (!hit) throw new Error('group workspace follow session is missing');
-  const durable = parseSessionRow(hit.row);
-  const currentRevision = durable.groupWorkspaceFollow?.journalRevision ?? null;
-  if (currentRevision !== expectedJournalRevision) return false;
-  durable.workingDir = next.workingDir;
-  durable.workingDirSource = next.workingDirSource;
-  durable.groupWorkspaceRevision = next.groupWorkspaceRevision;
-  durable.workspaceSchemaVersion = next.workspaceSchemaVersion;
-  durable.groupWorkspaceIdentity = structuredClone(next.groupWorkspaceIdentity);
-  durable.groupWorkspaceDirectoryIdentity = structuredClone(next.groupWorkspaceDirectoryIdentity);
-  durable.riffRepoDirs = next.riffRepoDirs;
-  durable.groupWorkspaceFollow = structuredClone(next.groupWorkspaceFollow);
-  const result = db.updateExact.run(sessionStatusText(durable), JSON.stringify(durable), next.sessionId, hit.row);
-  if (Number(result.changes) !== 1) return false;
-  sessions.set(next.sessionId, durable);
-  return true;
-}
-
-/** Durable quarantine repair with exact old-row CAS. Authority, record revision,
- * and path identity are re-probed by the production coordinator before entry. */
-export function repairGroupWorkspaceQuarantineExact(input: {
-  sessionId: string;
-  operationId: string;
-  repairedAt: number;
-  actor: { tenantKey: string; unionId: string };
-  chatId: string;
-  revision: number;
-  identity: import('../types.js').WorkspaceIdentity;
-}): { status: 'repaired'; session: Session } | { status: 'not_quarantined' | 'proof_mismatch' | 'conflict' } {
-  loadForWrite();
-  const store = ownStore;
-  if (!store) throw new SessionStoreUnavailableError(new Error('owned session store is not attached'));
-  return runOwnedWriteTransaction(store, false, () => {
-    const hit = store.selectRow.get(input.sessionId) as { row: string } | undefined;
-    if (!hit) return { status: 'conflict' as const };
-    const durable = parseSessionRow(hit.row);
-    const prior = durable.groupWorkspaceQuarantine;
-    if (!prior) return { status: 'not_quarantined' as const };
-    if (durable.chatId !== input.chatId || durable.workingDir !== input.identity.path
-      || input.revision < 1 || !input.operationId.trim()) return { status: 'proof_mismatch' as const };
-    durable.workspaceSchemaVersion = WORKSPACE_SCHEMA_VERSION;
-    durable.workingDirSource = 'group';
-    durable.groupWorkspaceRevision = input.revision;
-    durable.groupWorkspaceIdentity = structuredClone(input.identity);
-    durable.groupWorkspaceDirectoryIdentity = { dev: input.identity.dev, ino: input.identity.ino };
-    durable.groupWorkspaceRepairReceipt = {
-      operationId: input.operationId, repairedAt: input.repairedAt, actor: structuredClone(input.actor),
-      chatId: input.chatId, revision: input.revision, identity: structuredClone(input.identity),
-      priorQuarantine: structuredClone(prior),
-    };
-    delete durable.groupWorkspaceQuarantine;
-    const expectedRaw = testOnlyBeforeQuarantineRepairCas?.(input.sessionId, hit.row) ?? hit.row;
-    const updated = store.updateExact.run(sessionStatusText(durable), JSON.stringify(durable), input.sessionId, expectedRaw);
-    if (Number(updated.changes) !== 1) return { status: 'conflict' as const };
-    sessions.set(input.sessionId, durable);
-    return { status: 'repaired' as const, session: structuredClone(durable) };
-  });
 }
 
 /** Exact task authority mutation; ordinary metadata updates cannot write it. */
@@ -3263,7 +3044,7 @@ export function updateDeploymentContinuation(
   if (!db) throw new SessionStoreUnavailableError(new Error('owned session store is not attached'));
   const hit = db.selectRow.get(session.sessionId) as { row: string } | undefined;
   if (!hit) throw new Error('continuation session is missing');
-  const durable = parseSessionRow(hit.row);
+  const durable = JSON.parse(hit.row) as Session;
   if (durable.status !== 'active'
     || JSON.stringify(durable.deploymentContinuation) !== JSON.stringify(expected)) {
     throw new Error('continuation authority changed');
@@ -3289,6 +3070,8 @@ export function mutateOwnedSessionsAtomically<T>(
     /** Fail fast with SessionStoreBusyError instead of blocking the daemon's
      * event loop behind the connection's normal busy_timeout. */
     nonblocking?: boolean;
+    /** Explicit pin writer, never ordinary metadata. */
+    modelPinWrite?: true;
   } = {},
 ): { result: T; rows: Map<string, Session> } {
   loadForWrite();
@@ -3306,10 +3089,10 @@ export function mutateOwnedSessionsAtomically<T>(
     for (const sessionId of unique) {
       const hit = store.selectRow.get(sessionId) as { row: string } | undefined;
       if (!hit) throw new Error(`atomic session mutation cannot find ${sessionId}`);
-      fresh.set(sessionId, structuredClone(parseSessionRow(hit.row)));
+      fresh.set(sessionId, structuredClone(JSON.parse(hit.row) as Session));
     }
     result = mutate(fresh);
-    for (const row of fresh.values()) persistRow(row);
+    for (const row of fresh.values()) persistRow(row, options.modelPinWrite);
   });
   for (const [sessionId, row] of fresh) {
     const cached = sessions.get(sessionId);
@@ -3728,7 +3511,7 @@ export function ensurePrincipalLaneSource(args: {
   const result = runOwnedWriteTransaction(store, false, (): EnsurePrincipalLaneSourceResult => {
     const hit = store.selectRow.get(args.sourceSessionId) as { row: string } | undefined;
     if (!hit) throw new Error(`principal-lane source session not found: ${args.sourceSessionId}`);
-    const sourceSession = parseSessionRow(hit.row);
+    const sourceSession = JSON.parse(hit.row) as Session;
     if (sourceSession.status !== 'active') throw new Error('principal-lane source session is not active');
     if (sourceSession.principalLaneDisabledReason) {
       return { status: 'disabled', reason: sourceSession.principalLaneDisabledReason };
@@ -3955,7 +3738,7 @@ export function bootstrapPrincipalLaneSourceForIngress(args: {
     const hit = store.selectRow.get(args.sourceSessionId) as { row: string } | undefined;
     if (!hit) throw new Error(`principal-lane source session not found: ${args.sourceSessionId}`);
     let session: Session;
-    try { session = parseSessionRow(hit.row); }
+    try { session = JSON.parse(hit.row) as Session; }
     catch { return { status: 'retry', reason: 'source_owner_mismatch' }; }
     if (decideLegacySourceMigration({
       session,
@@ -4219,10 +4002,11 @@ function shadowRoutingAnchor(sourceSessionId: string, laneId: string): string {
 
 const PRINCIPAL_LANE_RUNTIME_KEYS = [
   'cliId', 'promptInjection', 'cliLaunchSnapshot', 'cliInstanceBinding', 'cliRuntime', 'cliPathOverride',
-  'codexProfile', 'codexProfileHome', 'cliConfigDir', 'wrapperCli', 'agentFrozen', 'model', 'reasoningEffort', 'modelBackendVariant',
+  'codexProfile', 'codexProfileHome', 'cliConfigDir', 'wrapperCli', 'agentFrozen', 'model', 'modelPin', 'reasoningEffort', 'modelBackendVariant',
   'backendType', 'mojoIdentity', 'mojoIdentityHostDefault',
   'sandbox', 'sandboxPaths', 'sandboxHidePaths',
   'sandboxReadonlyPaths', 'sandboxNetwork', 'sandboxNetworkPolicy',
+  'protectedHttpEgressPolicy',
 ] as const satisfies readonly (keyof Session)[];
 
 function copyPrincipalLaneRuntimeConfig(source: Session, target: Session): void {
@@ -4941,7 +4725,7 @@ export function ensureShadowPrincipalLane(args: {
           sessionId: child.sessionId,
           now,
         });
-        setSessionWorkingDirMetadata(child, { workingDir: worktree.workingDir, source: 'worktree' });
+        child.workingDir = worktree.workingDir;
         child.principalLaneWorktree = worktree;
         persistRow(child);
         insertPrincipalLaneWorktreeProof(store, worktree);
@@ -4989,7 +4773,7 @@ export function ensureShadowPrincipalLane(args: {
         sessionId: child.sessionId,
         now,
       });
-      setSessionWorkingDirMetadata(child, { workingDir: worktree.workingDir, source: 'worktree' });
+      child.workingDir = worktree.workingDir;
       child.principalLaneWorktree = worktree;
     }
     persistRow(child);
@@ -5960,7 +5744,7 @@ export function persistActiveRemoteLineageExact(
       db.exec('BEGIN IMMEDIATE');
       inTxn = true;
       const hit = select.get(sessionId) as { row: string } | undefined;
-      const next = applyChecksAndBuildNext(hit ? parseSessionRow(hit.row) : undefined);
+      const next = applyChecksAndBuildNext(hit ? JSON.parse(hit.row) as Session : undefined);
       const json = JSON.stringify(next);
       if (json !== hit!.row) {
         testOnlyBeforeRowPersist?.(sessionId);
@@ -6461,9 +6245,10 @@ function runUnownedRowTxn<T>(
 
   const dbPath = storeDbPath(target.larkAppId, dataDir);
   let lease: OccupancyLease | undefined;
+  let hasContract = false;
   try {
     const readDb = openDbForRead(dbPath);
-    try { lease = readOccupancyInTxn(readDb); }
+    try { lease = readOccupancyInTxn(readDb); hasContract = !!readDb.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='contracts'").get(); }
     finally { readDb.close(); }
   } catch (err) {
     if (isTransientStoreContentionError(err)) return { outcome: 'contended' };
@@ -6475,6 +6260,7 @@ function runUnownedRowTxn<T>(
 
   let db: SqliteDatabaseLike | undefined;
   let inTxn = false;
+  const contract = hasContract ? sessionContractStore(dataDir, target.larkAppId) : undefined;
   try {
     db = openDbForOwnStore(dbPath);
     db.exec('BEGIN IMMEDIATE');
@@ -6485,11 +6271,23 @@ function runUnownedRowTxn<T>(
     const hit = db.prepare('SELECT row FROM sessions WHERE session_id = ?')
       .get(target.sessionId) as { row: string } | undefined;
     if (!hit) return { outcome: 'missing' };
-    const current = parseSessionRow(hit.row);
+    const current = JSON.parse(hit.row) as Session;
+    const previousStatus = current.status;
     const { publish, result } = step(current);
     if (!publish) return result;
-    db.prepare('UPDATE sessions SET status = ?, row = ? WHERE session_id = ?')
+    const write = () => db!.prepare('UPDATE sessions SET status = ?, row = ? WHERE session_id = ?')
       .run(sessionStatusText(current), JSON.stringify(current), target.sessionId);
+    if (contract && current.status !== previousStatus) contract.usingDatabase(db, () => {
+      const ref = { appId: target.larkAppId, sessionId: target.sessionId };
+      contract.ensure(ref, { closed: previousStatus === 'closed' });
+      const { operation } = contract.beginOperation(ref, current.status === 'closed' ? 'close' : 'resume');
+      contract.apply(ref, { type: 'control_started', operationId: operation.operationId });
+      write();
+      contract.apply(ref, { type: 'control_result', operationId: operation.operationId, phase: 'confirmed' });
+      const updated = db!.prepare('SELECT row FROM sessions WHERE session_id=?').get(target.sessionId) as { row: string };
+      Object.assign(current, JSON.parse(updated.row));
+    });
+    else write();
     db.exec('COMMIT');
     inTxn = false;
     return result;
@@ -6545,6 +6343,14 @@ export function applySessionCommandUnowned(
     }
     const applied = applySessionRowCommand(current, command, { now: new Date() });
     if (applied.outcome === 'applied') {
+      // A host-side close only ever comes from a human `botmux delete` while the
+      // owning daemon is unreachable (session-command-host boundary). Record that
+      // human intent exactly like the daemon IPC close route's userClosed stamp,
+      // so topic continuity starts a fresh session instead of auto-resuming this
+      // row. Host `prune` is ledger cleanup, not a human close, and stays out.
+      if (command.type === 'close' && !current.userClosedAt) {
+        current.userClosedAt = new Date().toISOString();
+      }
       return { publish: true, result: { outcome: 'applied', row: current, released: applied.released } };
     }
     return { publish: false, result: { ...applied, row: current } };

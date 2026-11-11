@@ -10,6 +10,17 @@ export type ProjectWorkstreamStatus = 'pending' | 'in_progress' | 'blocked' | 'c
 
 export interface ProjectWorkstream {
   dispatchRoot: string;
+  /** Imported association metadata, not business completion. Missing on legacy
+   * dispatch rows; never turn a closed/moved CLI into a completed task. */
+  attachment?: {
+    sourceSessionId: string;
+    sourceLarkAppId: string;
+    revision: number;
+    routeRevision?: number;
+    source?: 'relay' | 'bind' | 'adopt' | 'resume_import' | 'fork' | 'manual';
+    state: 'pending' | 'active' | 'moved' | 'closed' | 'unknown';
+    reportCapability: 'verified' | 'manual' | 'unavailable';
+  };
   threadId?: string;
   title: string;
   purpose: string;
@@ -123,6 +134,14 @@ export function projectOverallProgress(project: ProjectGroupState): number {
   if (project.workstreams.length === 0) return project.status === 'completed' ? 100 : 0;
   const total = project.workstreams.reduce((sum, item) => sum + item.progress, 0);
   return Math.round(total / project.workstreams.length);
+}
+
+const TASK_TITLE_MARKER_RE = /\s*\[task:[a-f0-9]{32}\]\s*$/i;
+
+/** The title as shown in the group: without the trailing `[task:<32 hex>]` id
+ *  some coordinators append. The stored title keeps it. */
+export function projectTitleWithoutTaskMarker(title: string): string {
+  return title.replace(TASK_TITLE_MARKER_RE, '').trim();
 }
 
 export function projectRemainingSummary(project: ProjectGroupState): string {

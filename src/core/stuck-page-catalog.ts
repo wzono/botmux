@@ -11,7 +11,8 @@
  * only recognises screens captured from real CLI builds.
  *
  * Safety model:
- *  - `initiator` keys only ever DECLINE or SKIP: they leave the page without
+ *  - `initiator` keys only ever DECLINE, SKIP or RETRY lock acquisition:
+ *    retry never terminates the owner or removes a lock; the other keys leave the page without
  *    persisting a decision (Esc on the Codex-family hook review = "continue
  *    without trusting", hooks simply do not run this session; Esc on the TRAE
  *    migration picker = "Skip for now", asked again next start). They may be
@@ -29,7 +30,7 @@
 import type { StuckPageType } from '../utils/stuck-detector.js';
 
 export type StuckKeyAudience = 'initiator' | 'admin';
-export type StuckKey = 'Escape' | 'Enter' | 't';
+export type StuckKey = 'Escape' | 'Enter' | 't' | 'r';
 
 export interface StuckPageOption {
   key: StuckKey;
@@ -70,6 +71,12 @@ export const STUCK_PAGE_CATALOG: Readonly<Record<StuckPageType, StuckPageSpec>> 
     descriptionKey: 'card.stuck.page.migration_menu',
     options: [
       { key: 'Escape', labelKey: 'card.stuck.key.skip_migration', audience: 'initiator' },
+    ],
+  },
+  'session lock': {
+    descriptionKey: 'card.stuck.page.session_lock',
+    options: [
+      { key: 'r', labelKey: 'card.stuck.key.retry_session_lock', audience: 'initiator' },
     ],
   },
 };
@@ -149,7 +156,9 @@ export function stuckScreenTail(
     .replace(/\x1b[@-_]/g, '')
     .replace(/\r/g, '')
     .split('\n')
-    .map(row => row.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '').replace(/\s+$/, ''));
+    // trimEnd, not /\s+$/: V8 retries that from every blank of a long blank
+    // run, quadratic over one row of a raw (cursor-addressed) TUI stream.
+    .map(row => row.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '').trimEnd());
   let end = rows.length;
   while (end > 0 && rows[end - 1] === '') end--;
   const collapsed: string[] = [];
@@ -207,12 +216,21 @@ export function redactStuckPageTail(tail: string): string {
         return `${/^\s*/.exec(row)![0]}${HIDDEN}`;
       }
       inFreeForm = false;
-      let out = row.replace(/(\/(?:home|Users)\/)[^/\s]+/g, '$1~');
-      for (const shape of SECRET_SHAPES) {
-        out = out.replace(shape, (match, keep?: string) =>
-          typeof keep === 'string' && match.startsWith(keep) ? `${keep}${HIDDEN}` : HIDDEN);
-      }
-      return out;
+      return maskCredentialShapes(row);
     })
     .join('\n');
+}
+
+/**
+ * Mask credential-shaped values (SECRET_SHAPES: Bearer / token / api key /
+ * secret / password shapes, URL userinfo) and the user name in home-directory
+ * paths.
+ */
+export function maskCredentialShapes(text: string): string {
+  let out = text.replace(/(\/(?:home|Users)\/)[^/\s]+/g, '$1~');
+  for (const shape of SECRET_SHAPES) {
+    out = out.replace(shape, (match, keep?: string) =>
+      typeof keep === 'string' && match.startsWith(keep) ? `${keep}${HIDDEN}` : HIDDEN);
+  }
+  return out;
 }

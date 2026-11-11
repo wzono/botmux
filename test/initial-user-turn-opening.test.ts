@@ -110,23 +110,6 @@ vi.mock('../src/core/worker-pool.js', async () => {
   };
 });
 
-vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
-  const actual = await vi.importActual<any>('../src/core/admitted-turn-dispatch.js');
-  return {
-    ...actual,
-    // This route fixture deliberately uses synthetic live workers without a
-    // filesystem identity / ready handshake. Stop the central workspace
-    // admission adapter at its worker boundary; permit semantics are covered by
-    // their own suites, while this file keeps asserting the exact opening bytes.
-    dispatchAdmittedBusinessTurn: vi.fn(async (input: any) => {
-      if (input.ds.worker && !input.ds.worker.killed) {
-        return mocks.sendWorkerInput(input.ds, input.payload, input.turnId, input.options);
-      }
-      return mocks.forkWorker(input.ds, input.payload, { ...input.options, turnId: input.turnId });
-    }),
-  };
-});
-
 // hook 注入的 preflight：默认 false（不影响现有 codex 测试），特定用例置 true。
 const preflightMock = vi.fn(() => false);
 vi.mock('../src/adapters/hook-installer.js', () => ({
@@ -378,7 +361,8 @@ describe('empty-started session — first real business turn must use the new-to
 
     const opening = liveInputs()[0]!.content;
     expect(opening).not.toContain('<botmux_lark_tool>');
-    expect(opening).toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
+    expect(opening).toContain('<botmux_credentials>');
+    expect(opening).not.toContain('启用按当前消息发起人身份注入授权');
   });
 
   it('live resumed worker receives current Feishu emphasis guidance on its next turn', async () => {
@@ -392,9 +376,6 @@ describe('empty-started session — first real business turn must use the new-to
 
     const followUp = liveInputs()[0]!.content;
     expect(followUp).toContain('<botmux_reminder>');
-    expect(followUp).toContain('短进度优先纯文本');
-    expect(followUp).toContain('强调仅包短词或无中文标点的短语');
-    expect(followUp).toContain('标点和后文放在 `**` 外');
     expect(followUp).toContain(t('ai.followup.feishu_safe_emphasis', undefined, 'zh'));
   });
 
@@ -419,6 +400,7 @@ describe('empty-started session — first real business turn must use the new-to
     );
 
     const followUp = liveInputs()[0]!.content;
+    // Host metadata rides the hook envelope; the composer keeps only the user text.
     expect(followUp).toBe('继续');
     const envelope = claimPromptContext(
       ds.session.sessionId,
@@ -426,9 +408,7 @@ describe('empty-started session — first real business turn must use the new-to
       fingerprintPromptText(followUp),
       prefixOf(followUp),
     );
-    expect(envelope).toContain('短进度优先纯文本');
-    expect(envelope).toContain('强调仅包短词或无中文标点的短语');
-    expect(envelope).toContain('标点和后文放在 `**` 外');
+    expect(envelope).toContain('<message_location message_id="om_live_resumed_hook_emphasis" placement="thread" root_message_id="om_live_resumed_hook_emphasis_root" />');
     expect(envelope).toContain(t('ai.followup.feishu_safe_emphasis', undefined, 'zh'));
   });
 
@@ -454,6 +434,7 @@ describe('empty-started session — first real business turn must use the new-to
     );
 
     const followUp = liveInputs()[0]!.content;
+    // Host metadata rides the hook envelope; the composer keeps only the user text.
     expect(followUp).toBe('继续');
     const envelope = claimPromptContext(
       ds.session.sessionId,
@@ -461,8 +442,8 @@ describe('empty-started session — first real business turn must use the new-to
       fingerprintPromptText(followUp),
       prefixOf(followUp),
     );
+    expect(envelope).toContain('<message_location message_id="om_live_resumed_transcript_hook_emphasis" placement="thread" root_message_id="om_live_resumed_transcript_hook_emphasis_root" />');
     expect(envelope).toContain('<botmux_formatting>');
-    expect(envelope).toContain('短进度优先纯文本');
     expect(envelope).toContain(t('ai.followup.feishu_safe_emphasis', undefined, 'zh'));
     expect(envelope).not.toContain('botmux send');
     expect(envelope).not.toContain('BOTMUX_NOTHING_TO_SEND');

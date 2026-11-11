@@ -7,9 +7,6 @@ import { FleetSupervisor, pidAlive, type FleetBotSpec } from '../src/core/fleet-
 import { fleetProcessIdentityRuntime } from '../src/core/fleet-process-identity.js';
 import { readDurableProcessIdentity } from '../src/utils/process-identity.js';
 import { readFleetState, mutateFleetState } from '../src/core/fleet-state-store.js';
-import { WorkspaceMigrationSupervisorFence, publishWorkspaceFenceAck, publishWorkspaceFenceHeartbeat,
-  readWorkspaceFenceCommand } from '../src/core/workspace-migration-supervisor.js';
-import { WorkspaceSchemaMigrator } from '../src/services/workspace-schema-migrator.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 
 const dirs: string[] = [];
@@ -99,59 +96,6 @@ async function waitFor(fn: () => boolean, timeoutMs = 5000): Promise<boolean> {
 }
 
 describe('FleetSupervisor (live, integration)', () => {
-  it('resumes a migrating lease after its proven daemon dies', async () => {
-    const root = tmp(); const statePath = join(root, 'fleet.json');
-    const target = { larkAppId: 'cli_a', pid: 321, processStart: 'birth-1', generation: 7 };
-    mutateFleetState(statePath, state => ({ ...state, supervisorPid: 0, supervisorProcessStart: undefined,
-      procs: [{ name: 'botmux-0', appId: target.larkAppId, pid: target.pid, processStart: target.processStart,
-        generation: target.generation, status: 'online', restarts: 0, lastExitCode: null, startedAt: null }] }));
-    publishWorkspaceFenceHeartbeat(root, { ...target, protocol: 'workspace-fence-v1', schemaVersion: 1,
-      sqlite: { open: true, writers: 0, inflight: 0, checkpointed: false }, at: Date.now() });
-    const first = new WorkspaceMigrationSupervisorFence(root, 99);
-    const acquired = await first.acquire(1, () => [target], { alive: () => true, signal: () => {
-      const command = readWorkspaceFenceCommand(root, target.larkAppId)!;
-      publishWorkspaceFenceAck(root, target.larkAppId, { ...command, pid: target.pid, processStart: target.processStart,
-        sqlite: { open: false, writers: 0, inflight: 0, checkpointed: true }, at: Date.now() });
-    } });
-    first.markMigrating(acquired.proofToken);
-    await new WorkspaceSchemaMigrator(root, { ownerId: `supervisor:99:${acquired.lease.leaseId}`,
-      supervisorProofToken: acquired.proofToken }).migrateOrRecover({ stopAfter: 'prepared' });
-    mutateFleetState(statePath, state => ({ ...state, supervisorPid: 0, supervisorProcessStart: undefined,
-      procs: state.procs.map(proc => ({ ...proc, pid: 0, status: 'errored' as const })) }));
-    const identityRuntime = { ...fleetProcessIdentityRuntime,
-      readIdentity: (pid: number) => pid === target.pid ? undefined : fleetProcessIdentityRuntime.readIdentity(pid) };
-    const supervisor = new FleetSupervisor({ statePath, distDir: '', daemonEnv: { SESSION_DATA_DIR: root }, cwd: root,
-      log: () => {}, processIdentityRuntime: identityRuntime });
-
-    await expect(supervisor.migrateWorkspaceSchema({ timeoutMs: 100 })).resolves.toMatchObject({ status: 'complete', epoch: 1 });
-  });
-
-  it('keeps a PID-bearing child readable when its durable identity disappears before persistence', async () => {
-    const root = tmp();
-    const statePath = join(root, 'fleet.json');
-    const identityRuntime = {
-      ...fleetProcessIdentityRuntime,
-      readIdentity: (pid: number) => pid === process.pid
-        ? fleetProcessIdentityRuntime.readIdentity(pid)
-        : undefined,
-    };
-    const spec: FleetBotSpec = {
-      name: 'botmux-plugin-unverified-start', appId: '', botIndex: -1,
-      external: { command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'] },
-    };
-    const sup = new FleetSupervisor({
-      statePath, distDir: '', daemonEnv: {}, cwd: root, log: () => {}, processIdentityRuntime: identityRuntime,
-    });
-    sup.start([]);
-    await sup.upsertExternal(spec);
-    const row = readFleetState(statePath)!.procs[0];
-    killLater(row.pid);
-    expect(row).toMatchObject({ status: 'launching' });
-    expect(row.pid).toBeGreaterThan(1);
-    expect(row.processStart).toBeUndefined();
-    await sup.stopAll();
-  });
-
   it('does not forget a live external member when signalling fails', async () => {
     const root = tmp();
     const statePath = join(root, 'fleet.json');
@@ -543,7 +487,7 @@ setInterval(() => {}, 1000);
     expect(pidAlive(startBotPid)).toBe(false);
   });
 
-  it('REGRESSION #3: a new supervisor safely reclaims a live-but-unowned fleet', async () => {
+  it('REGRESSION #3: a new supervisor safely reclaims a legacy live-but-unowned fleet', async () => {
     // A prior supervisor died hard (SIGKILL/OOM) while its daemon kept running.
     // The state still says that proc is 'online' with a live pid. A new supervisor
     // must NOT trust that and skip it — if it spawned nothing it would hold no
@@ -560,7 +504,9 @@ setInterval(() => {}, 1000);
       supervisorPid: 999_999, supervisorStartedAt: 'T-prior',
       procs: [{
         name: 'botmux-0', appId: 'cli_a', pid: orphan.pid!, generation: 1, status: 'online',
-        processStart: readDurableProcessIdentity(orphan.pid!),
+        // Deliberately legacy: old releases did not persist processStart. The
+        // new supervisor must migrate this row using a stable sampled identity
+        // plus the expected daemon command, rather than fail the takeover.
         restarts: 0, lastExitCode: null, startedAt: 'T',
       }],
     }));
@@ -729,7 +675,6 @@ setInterval(() => {}, 1000);
       supervisorPid: 999_999, supervisorStartedAt: 'T-prior',
       procs: [{
         name: 'botmux-0', appId: 'cli_a', pid: orphan.pid!, generation: 1, status: 'online',
-        processStart: readDurableProcessIdentity(orphan.pid!),
         restarts: 0, lastExitCode: null, startedAt: 'T',
       }],
     }));
@@ -769,7 +714,6 @@ setInterval(() => {}, 1000);
       supervisorPid: 999_999, supervisorStartedAt: 'T-prior',
       procs: [{
         name: 'botmux-0', appId: 'cli_a', pid: unrelated.pid!, generation: 1, status: 'online',
-        processStart: readDurableProcessIdentity(unrelated.pid!),
         restarts: 0, lastExitCode: null, startedAt: 'T',
       }],
     }));

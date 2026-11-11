@@ -3,6 +3,7 @@ import { threadAppLink, type Brand } from './lark-hosts.js';
 import { TABLE_AUTO_ROW_HEIGHT } from './table-style.js';
 import {
   projectRemainingSummary,
+  projectTitleWithoutTaskMarker,
   type ProjectGroupState,
   type ProjectWorkstream,
   type ProjectWorkstreamStatus,
@@ -38,10 +39,8 @@ function truncate(value: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`;
 }
 
-const TASK_TITLE_MARKER_RE = /\s*\[task:[a-f0-9]{32}\]\s*$/i;
-
 function displayProjectTitle(value: string): string {
-  const title = value.replace(TASK_TITLE_MARKER_RE, '').trim();
+  const title = projectTitleWithoutTaskMarker(value);
   return truncate(title || '项目进度', 42);
 }
 
@@ -63,7 +62,12 @@ function displayWorkstreams(project: ProjectGroupState): ProjectWorkstream[] {
 
 function workstreamTitle(item: ProjectWorkstream): string {
   const title = item.title.trim();
-  return title && title !== '子任务' && title !== '子项目' ? truncate(title, 32) : '待命名任务';
+  const label = title && title !== '子任务' && title !== '子项目' ? truncate(title, 32) : '待命名任务';
+  const attachment = item.attachment;
+  const state = attachment?.state;
+  return label + (state === 'moved' ? '（已迁出）' : state === 'closed' ? '（连接已关闭）'
+    : state === 'unknown' ? '（连接待核对）' : state === 'pending' ? '（登记待完成）'
+      : attachment?.reportCapability === 'manual' ? '（手工跟踪）' : '');
 }
 
 function workstreamPlanItem(project: ProjectGroupState, item: ProjectWorkstream, brand: Brand): string {

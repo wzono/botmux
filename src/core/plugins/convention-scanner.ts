@@ -12,10 +12,14 @@ import type {
   PluginCommandEntry,
   PluginCommandsContribution,
   PluginMcpServer,
-  PluginServiceHttpContribution,
   PluginServiceMode,
   ScannedPluginContributions,
 } from './types.js';
+import {
+  isValidProtectedMcpCapabilityId,
+  PROTECTED_MCP_SECRET_FD_ENV,
+} from '../protected-mcp-capabilities.js';
+import { normalizeProtectedHttpEgressPolicy } from '../protected-http-egress.js';
 
 function isFile(path: string): boolean {
   try {
@@ -84,6 +88,12 @@ function readMcpServer(raw: unknown, source: string, runtimeDir: string, name: s
   const record = optionalRecord(raw, `mcp_${source}`);
   const transport = record.transport === undefined ? 'stdio' : record.transport;
   if (transport === 'streamable-http') {
+    if (record.protectedCapability !== undefined) {
+      throw new Error(`protected_capability_requires_stdio:${name}`);
+    }
+    if (record.protectedEgressPolicy !== undefined) {
+      throw new Error(`protected_egress_policy_requires_stdio:${name}`);
+    }
     const url = optionalString(record.url);
     if (!url) throw new Error(`invalid_plugin_mcp_url:${name}`);
     let parsed: URL;
@@ -97,6 +107,19 @@ function readMcpServer(raw: unknown, source: string, runtimeDir: string, name: s
   if (transport !== 'stdio') throw new Error(`invalid_plugin_mcp_transport:${name}`);
   const command = readCommand(record.command, `mcp_command_${name}`);
   const env = readEnv(record.env, `mcp_env_${name}`);
+  if (env?.[PROTECTED_MCP_SECRET_FD_ENV] !== undefined) {
+    throw new Error(`reserved_plugin_mcp_env:${PROTECTED_MCP_SECRET_FD_ENV}`);
+  }
+  const protectedCapability = record.protectedCapability;
+  if (protectedCapability !== undefined && !isValidProtectedMcpCapabilityId(protectedCapability)) {
+    throw new Error(`invalid_plugin_mcp_protected_capability:${name}`);
+  }
+  const protectedEgressPolicy = record.protectedEgressPolicy === undefined
+    ? undefined
+    : normalizeProtectedHttpEgressPolicy(record.protectedEgressPolicy);
+  if (record.protectedEgressPolicy !== undefined && !protectedEgressPolicy) {
+    throw new Error(`invalid_plugin_mcp_protected_egress_policy:${name}`);
+  }
   const templated = [...command, ...Object.values(env ?? {})].find(value => /\$\{[^}]+\}/.test(value));
   if (templated) throw new Error(`unsupported_plugin_mcp_runtime_template:${name}`);
   for (const part of command) {
@@ -104,7 +127,14 @@ function readMcpServer(raw: unknown, source: string, runtimeDir: string, name: s
     const target = resolvePluginPath(runtimeDir, part, `mcp_command_${name}`);
     if (!existsSync(target)) throw new Error(`plugin_mcp_command_path_not_found:${name}:${part}`);
   }
-  return { name, transport, command, ...(env ? { env } : {}) };
+  return {
+    name,
+    transport,
+    command,
+    ...(env ? { env } : {}),
+    ...(protectedCapability ? { protectedCapability } : {}),
+    ...(protectedEgressPolicy ? { protectedEgressPolicy } : {}),
+  };
 }
 
 function readCliCommands(raw: unknown): PluginCliCommandIndexEntry[] {
@@ -174,62 +204,6 @@ function scanService(runtimeDir: string, mode: PluginServiceMode | undefined): S
   if (!exists && mode) throw new Error('plugin_service_entry_not_found');
   return { entry, mode: mode! };
 }
-
-const readServiceHttpPath = (raw: unknown): string => {
-  if (
-    typeof raw !== 'string'
-    || raw !== raw.trim()
-    || !raw.startsWith('/')
-    || raw.startsWith('//')
-    || raw.includes('\\')
-    || raw.includes('?')
-    || raw.includes('#')
-    || /[\u0000-\u001f\u007f]/.test(raw)
-  ) {
-    throw new Error('invalid_plugin_service_http_path');
-  }
-  let decoded: string;
-  try {
-    decoded = decodeURIComponent(raw);
-  } catch {
-    throw new Error('invalid_plugin_service_http_path');
-  }
-  if (decoded.startsWith('//') || decoded.includes('\\') || decoded.split('/').some(part => part === '..')) {
-    throw new Error('plugin_service_http_path_escapes_root');
-  }
-  return raw;
-};
-
-const scanServiceHttp = (
-  runtimeDir: string,
-  service: ScannedPluginContributions['service'],
-): PluginServiceHttpContribution | undefined => {
-  const rel = 'service-http/index.json';
-  if (!isFile(join(runtimeDir, rel))) return undefined;
-  if (!service) throw new Error('plugin_service_http_service_required');
-  const record = optionalRecord(JSON.parse(readFileSync(join(runtimeDir, rel), 'utf-8')), 'plugin_service_http');
-  if (record.schemaVersion !== 1) throw new Error('invalid_plugin_service_http_schema');
-  if (Object.keys(record).some(key => key !== 'schemaVersion' && key !== 'routes')) {
-    throw new Error('invalid_plugin_service_http_fields');
-  }
-  if (!Array.isArray(record.routes) || record.routes.length === 0 || record.routes.length > 16) {
-    throw new Error('invalid_plugin_service_http_routes');
-  }
-  const routes: PluginServiceHttpContribution['routes'] = record.routes.map((rawRoute) => {
-    const route = optionalRecord(rawRoute, 'plugin_service_http_route');
-    if (Object.keys(route).some(key => key !== 'method' && key !== 'path')) {
-      throw new Error('invalid_plugin_service_http_route_fields');
-    }
-    const method = route.method;
-    if (method !== 'GET' && method !== 'POST') {
-      throw new Error('invalid_plugin_service_http_method');
-    }
-    return { method, path: readServiceHttpPath(route.path) };
-  });
-  const keys = routes.map(route => `${route.method} ${route.path}`);
-  if (new Set(keys).size !== keys.length) throw new Error('duplicate_plugin_service_http_route');
-  return { schemaVersion: 1, routes };
-};
 
 const isCardActionSelector = (value: unknown): value is string => {
   return typeof value === 'string'
@@ -360,7 +334,9 @@ const scanCommands = (
   } catch {
     throw new Error('invalid_plugin_commands_endpoint');
   }
-  return { schemaVersion: 1, endpoint, commands };
+  if (record.afterClose !== undefined && record.afterClose !== true) throw new Error('invalid_plugin_after_close');
+  if (record.replacesCloseTag !== undefined && (record.replacesCloseTag !== true || record.afterClose !== true)) throw new Error('invalid_plugin_close_tag_override');
+  return { schemaVersion: 1, endpoint, commands, ...(record.afterClose === true ? { afterClose: true } : {}), ...(record.replacesCloseTag === true ? { replacesCloseTag: true } : {}) };
 };
 
 export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPluginManifest): ScannedPluginContributions | undefined {
@@ -369,7 +345,6 @@ export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPlug
   const dashboard = scanDashboard(runtimeDir, manifest.id);
   const cli = scanCli(runtimeDir);
   const service = scanService(runtimeDir, manifest.service?.mode);
-  const serviceHttp = scanServiceHttp(runtimeDir, service);
   const cardActions = scanCardActions(runtimeDir, service);
   const commands = scanCommands(runtimeDir, service);
   const contributions: ScannedPluginContributions = {
@@ -378,7 +353,6 @@ export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPlug
     ...(dashboard ? { dashboard } : {}),
     ...(cli ? { cli } : {}),
     ...(service ? { service } : {}),
-    ...(serviceHttp ? { serviceHttp } : {}),
   };
   if (cardActions) contributions.cardActions = cardActions;
   if (commands) contributions.commands = commands;

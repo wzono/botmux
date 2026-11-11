@@ -3,7 +3,7 @@
  *
  * 跑的是真实的 `handleNewTopic`（只替身飞书外部副作用、下载、fork 这三处），断言一条
  * 消息之后**会话上真的落了什么**：workingDir、title（来源 user）、启动参数里的模型、
- * 持久化的 reasoningEffort；以及拒绝路径真的零副作用。
+ * 持久化的 modelPin/推理强度；以及拒绝路径真的零副作用。
  *
  * 模型那一项刻意断言 `sessionAgentConfig` 的解析结果而不是 `ds.spawnModelOverride`：
  * 前者才是 worker 真正拿去拼启动参数的值，后者只是它的一个输入。
@@ -35,10 +35,7 @@ const mocks = vi.hoisted(() => {
     resolveSender: vi.fn(async (_appId: string, openId?: string) => (
       openId ? { openId, type: 'user' as const } : undefined
     )),
-    forkWorker: vi.fn((ds: any, ..._args: any[]) => {
-      ds.worker = { killed: false, send: vi.fn() };
-      return true;
-    }),
+    forkWorker: vi.fn((..._args: any[]) => undefined),
     sendWorkerInput: vi.fn((..._args: any[]) => true),
     downloadResources: vi.fn(async (..._args: any[]) => ({ attachments: [] as unknown[], needLogin: false })),
     createdSessions: [] as any[],
@@ -99,47 +96,6 @@ vi.mock('../src/services/session-store.js', async () => {
 vi.mock('../src/im/lark/identity-cache.js', async () => {
   const actual = await vi.importActual<any>('../src/im/lark/identity-cache.js');
   return { ...actual, resolveSender: (...args: any[]) => mocks.resolveSender(...args) };
-});
-
-vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
-  const actual = await vi.importActual<any>('../src/core/admitted-turn-dispatch.js');
-  return {
-    ...actual,
-    // This suite exercises topic-header routing, not central workspace permits.
-    // Keep its historical worker seam while preserving the admitted dispatcher contract.
-    dispatchAdmittedBusinessTurn: async (input: any) => {
-      if (!input.ds.worker || input.ds.worker.killed) {
-        let terminal: 'accepted' | 'rejected' | 'deferred' | undefined;
-        let release!: () => void;
-        const settled = new Promise<void>(resolve => { release = resolve; });
-        const options = {
-          ...input.options,
-          onAdmission: (state: 'accepted' | 'rejected' | 'deferred') => {
-            terminal = state;
-            if (state !== 'deferred') release();
-          },
-          onAdmissionBlocked: (notice: any) => input.options.onAdmissionBlocked?.(notice),
-        };
-        const forked = mocks.forkWorker(input.ds, input.payload, input.turnId, options);
-        if (forked === false) return false;
-        if (!terminal) { terminal = 'accepted'; release(); }
-        if (terminal === 'deferred') await settled;
-        return terminal === 'accepted';
-      }
-      const permit = {
-        permitId: `fixture-${input.turnId}`,
-        bootstrapPermitId: 'fixture-bootstrap',
-        sessionId: input.ds.session.sessionId,
-        turnId: input.turnId,
-        workerGeneration: input.ds.session.workerGeneration ?? input.ds.workerGeneration ?? 0,
-        workspace: actual.frozenSessionWorkspace(input.ds)?.workspace,
-        expiresAt: Date.now() + 60_000,
-      };
-      if (input.resource?.acquire && !await input.resource.acquire(permit)) return false;
-      if (input.resource?.markAttempting && !await input.resource.markAttempting(permit)) return false;
-      return mocks.sendWorkerInput(input.ds, input.payload, input.turnId, input.options);
-    },
-  };
 });
 
 vi.mock('../src/core/worker-pool.js', async () => {
@@ -255,10 +211,6 @@ beforeEach(() => {
   mocks.getChatMode.mockResolvedValue('group');
   mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
   mocks.sendWorkerInput.mockReturnValue(true);
-  mocks.forkWorker.mockImplementation((ds: any) => {
-    ds.worker = { killed: false, send: vi.fn() };
-    return true;
-  });
   registerAppBot();
 });
 
@@ -284,8 +236,9 @@ describe('指令头：一条消息完成开话题、选仓、选模型与首轮�
     expect(ds.session.nativeSessionTitle).toBe('日常运维');
     // 模型：worker 真正拿去拼启动参数的那个值。
     expect(sessionAgentConfig(ds, getBot(APP).config).model).toBe('sonnet');
-    // 推理强度：持久化在会话上。
-    expect(ds.session.reasoningEffort).toBe('high');
+    // 显式模型和推理强度共同持久化，worker 解析到相同的启动档位。
+    expect(ds.session.modelPin).toMatchObject({ model: 'sonnet', effort: 'high', source: 'topic-header', setBy: OWNER });
+    expect(sessionAgentConfig(ds, getBot(APP).config).reasoningEffort).toBe('high');
     // 首轮任务进了开场，句尾对本 bot 的 @ 已被剥掉。
     const opening = mocks.forkWorker.mock.calls[0][1];
     const openingText = typeof opening === 'string' ? opening : opening.content;
@@ -335,7 +288,8 @@ describe('指令头：一条消息完成开话题、选仓、选模型与首轮�
     expect(mocks.runAutoWorktreeCommit.mock.calls[0][0]).toMatchObject({ baseDir: botmuxRepo });
     // 模型/标题挂在会话上，等 worktree 建好后由 commitRepoSelection 带进 fork。
     const ds = mocks.runAutoWorktreeCommit.mock.calls[0][0].ds;
-    expect(ds.spawnModelOverride).toBe('sonnet');
+    expect(ds.session.modelPin).toMatchObject({ model: 'sonnet', source: 'topic-header' });
+    expect(sessionAgentConfig(ds, getBot(APP).config).model).toBe('sonnet');
     expect(ds.session.title).toBe('日常运维');
   });
 });
@@ -486,89 +440,6 @@ describe('指令头：向后兼容（D9）', () => {
     expect(sentContents().join('\n')).toContain('话题已就绪');
   });
 
-  it.each([
-    { name: 'pinned raw', bot: () => registerAppBot({ defaultWorkingDir: botmuxRepo }), opening: '/t /goal ship the fix', raw: true },
-    { name: 'no-project raw', bot: () => registerAppBot({ workingDirs: [] }), opening: '/t /goal ship the fix', raw: true },
-    { name: 'pinned idle', bot: () => registerAppBot({ defaultWorkingDir: botmuxRepo }), opening: '/t /repo botmux', raw: false },
-    { name: 'no-project idle', bot: () => registerAppBot({ workingDirs: [] }), opening: '标题 /t /model sonnet', raw: false },
-  ])('$name guarded rejection stays retryable and admits only after repaired resend', async ({ bot, opening, raw }) => {
-    bot();
-    const rootId = `om_retry_${raw ? 'raw' : 'idle'}_${mocks.createdSessions.length}`;
-    mocks.forkWorker.mockReturnValueOnce(false);
-    const firstCtx = groupCtx(rootId);
-
-    await handleNewTopic(groupEvent(opening, rootId), firstCtx);
-
-    const ds = mocks.forkWorker.mock.calls[0][0];
-    expect(ds.worker).toBeNull();
-    expect(ds.initialStartPending).toBe(true);
-    expect(ds.initialGuardedLaunchRetry).toBe(raw ? 'raw' : 'idle');
-    expect(firstCtx.ingressAdmission?.admitted).not.toBe(true);
-    if (raw) expect(ds.pendingRawInput).toBe('/goal ship the fix');
-    else expect(ds.session.initialUserTurnPending).toBeUndefined();
-
-    // Simulate repairing the guarded workspace/backend between attempts. The
-    // next same-topic message is both the retry probe and the ordered follower.
-    const retryCtx = threadCtxAt(rootId, `${rootId}_retry`);
-    await handleThreadReply(
-      threadEventAt(rootId, 'retry after repair', retryCtx.messageId),
-      retryCtx,
-    );
-
-    expect(mocks.forkWorker).toHaveBeenCalledTimes(2);
-    expect(ds.worker).toBeTruthy();
-    expect(ds.initialGuardedLaunchRetry).toBeUndefined();
-    expect(retryCtx.ingressAdmission?.admitted).toBe(true);
-    if (raw) {
-      expect(ds.pendingRawInput).toBe('/goal ship the fix');
-      expect(ds.pendingFollowUpInput?.cliInput).toContain('retry after repair');
-    } else {
-      const retriedOpening = mocks.forkWorker.mock.calls[1][1];
-      expect(typeof retriedOpening === 'string' ? retriedOpening : retriedOpening.content)
-        .toContain('retry after repair');
-    }
-  });
-
-  it('serializes concurrent repaired resends into one successful retry start', async () => {
-    registerAppBot({ defaultWorkingDir: botmuxRepo });
-    const rootId = 'om_retry_concurrent';
-    mocks.forkWorker.mockReturnValueOnce(false);
-    await handleNewTopic(groupEvent('/t /goal ship the fix', rootId), groupCtx(rootId));
-
-    await Promise.all([
-      handleThreadReply(threadEventAt(rootId, 'retry one', 'om_retry_one'), threadCtxAt(rootId, 'om_retry_one')),
-      handleThreadReply(threadEventAt(rootId, 'retry two', 'om_retry_two'), threadCtxAt(rootId, 'om_retry_two')),
-    ]);
-
-    expect(mocks.forkWorker).toHaveBeenCalledTimes(2);
-    expect(mocks.sendWorkerInput).toHaveBeenCalledTimes(1);
-    const ds = mocks.forkWorker.mock.calls[0][0];
-    expect(ds.pendingFollowUpInput?.cliInput).toContain('retry one');
-    expect(JSON.stringify(mocks.sendWorkerInput.mock.calls[0])).toContain('retry two');
-  });
-
-  it('keeps a repeatedly rejected guarded opening retryable without duplicating it', async () => {
-    registerAppBot({ defaultWorkingDir: botmuxRepo });
-    const rootId = 'om_retry_rejected_twice';
-    mocks.forkWorker.mockReturnValueOnce(false).mockReturnValueOnce(false);
-    await handleNewTopic(groupEvent('/t /goal ship the fix', rootId), groupCtx(rootId));
-
-    const secondCtx = threadCtxAt(rootId, 'om_retry_second');
-    await handleThreadReply(threadEventAt(rootId, 'retry one', secondCtx.messageId), secondCtx);
-    const ds = mocks.forkWorker.mock.calls[0][0];
-    expect(ds.initialGuardedLaunchRetry).toBe('raw');
-    expect(secondCtx.ingressAdmission?.admitted).not.toBe(true);
-
-    const thirdCtx = threadCtxAt(rootId, 'om_retry_third');
-    await handleThreadReply(threadEventAt(rootId, 'retry two', thirdCtx.messageId), thirdCtx);
-
-    expect(mocks.forkWorker).toHaveBeenCalledTimes(3);
-    expect(ds.pendingRawInput).toBe('/goal ship the fix');
-    expect(ds.pendingFollowUpInput?.cliInput).not.toContain('retry one');
-    expect(ds.pendingFollowUpInput?.cliInput.match(/retry two/g)).toHaveLength(1);
-    expect(thirdCtx.ingressAdmission?.admitted).toBe(true);
-  });
-
   it('/t /goal … 这类既有冷启动用法不被解析器提前拒掉', async () => {
     await handleNewTopic(groupEvent('/t /goal 修一下登录', 'om_legacy_goal'), groupCtx('om_legacy_goal'));
     // 未被指令头拒绝：要么走 passthrough 冷启动、要么当普通文案 spawn，总之有会话产生。
@@ -599,7 +470,8 @@ describe('指令头：共用层在非 Claude 的 CLI 上同样生效', () => {
     const ds = forkedSession();
     expect(ds.workingDir).toBe(homelabRepo);
     expect(ds.session.title).toBe('线上排查');
-    expect(ds.session.reasoningEffort).toBe('ultra');
+    expect(ds.session.modelPin).toMatchObject({ model: 'gpt-5.6-sol', effort: 'ultra', source: 'topic-header', setBy: OWNER });
+    expect(sessionAgentConfig(ds, getBot(APP).config).reasoningEffort).toBe('ultra');
     // codex 的 ultra 只有部分模型支持——启动参数里要拿到头部钉的模型，而不是 bot 配的。
     expect(sessionAgentConfig(ds, getBot(APP).config).model).toBe('gpt-5.6-sol');
   });
@@ -676,22 +548,12 @@ function threadEvent(text: string, messageId: string): any {
 }
 
 function threadCtx(messageId: string): RoutingContext {
-  return threadCtxAt(THREAD_ROOT, messageId);
-}
-
-function threadEventAt(rootId: string, text: string, messageId: string): any {
-  const event = threadEvent(text, messageId);
-  event.message.root_id = rootId;
-  return event;
-}
-
-function threadCtxAt(rootId: string, messageId: string): RoutingContext {
   return {
     chatId: GROUP,
     messageId,
     chatType: 'group',
     scope: 'thread',
-    anchor: rootId,
+    anchor: THREAD_ROOT,
     larkAppId: APP,
   } as RoutingContext;
 }
@@ -1100,7 +962,8 @@ describe('指令头：/repo wt 建 worktree 再开会话', () => {
     expect(ds.session.pendingRepoSetup).toMatchObject({
       mode: 'auto_worktree', baseDir: botmuxRepo, force: true, branch: 'ci/temp_split', worktreePath: expectedWorktreePath,
     });
-    expect(ds.spawnModelOverride).toBe('sonnet');
+    expect(ds.session.modelPin).toMatchObject({ model: 'sonnet', source: 'topic-header' });
+    expect(sessionAgentConfig(ds, getBot(APP).config).model).toBe('sonnet');
     expect(ds.session.title).toBe('日常运维');
     expect(ds.scope).toBe('thread');
     expect(sentCardCount()).toBe(0);

@@ -93,41 +93,6 @@ afterEach(() => {
 
 // ─── 首启确定性自动导入 ──────────────────────────────────────────────────────
 
-describe('legacy SQLite provenance migration', () => {
-  it('normalizes a real legacy row without provenance conservatively on load and persists the quarantine on update', () => {
-    const sessionId = 'legacy-group-looking';
-    const legacy = row(sessionId, {
-      workingDir: '/same-as-current-group',
-      groupWorkspaceRevision: 9,
-    });
-    const dbPath = join(tempDir, 'session-stores', 'legacy-app', 'sessions.db');
-    mkdirSync(join(tempDir, 'session-stores', 'legacy-app'), { recursive: true });
-    const db = new DatabaseSync(dbPath);
-    db.exec(`CREATE TABLE sessions (
-      session_id TEXT PRIMARY KEY, status TEXT NOT NULL, row TEXT NOT NULL,
-      chat_id TEXT GENERATED ALWAYS AS (json_extract(row, '$.chatId')) VIRTUAL,
-      root_message_id TEXT GENERATED ALWAYS AS (json_extract(row, '$.rootMessageId')) VIRTUAL,
-      scope TEXT GENERATED ALWAYS AS (json_extract(row, '$.scope')) VIRTUAL
-    )`);
-    db.prepare('INSERT INTO sessions (session_id, status, row) VALUES (?, ?, ?)')
-      .run(sessionId, 'active', JSON.stringify(legacy));
-    db.close();
-    init('legacy-app');
-
-    const loaded = getSession(sessionId)!;
-    expect(loaded.workingDirSource).toBe('legacy-unknown');
-    expect(loaded.groupWorkspaceRevision).toBeUndefined();
-    updateSession(loaded);
-
-    const reopened = new DatabaseSync(dbPath, { readOnly: true });
-    const persisted = JSON.parse((reopened.prepare('SELECT row FROM sessions WHERE session_id = ?')
-      .get(sessionId) as { row: string }).row);
-    reopened.close();
-    expect(persisted).toMatchObject({ workingDir: '/same-as-current-group', workingDirSource: 'legacy-unknown' });
-    expect(persisted).not.toHaveProperty('groupWorkspaceRevision');
-  });
-});
-
 describe('first-start JSON import', () => {
   it('imports per-bot JSON rows — closed rows included — and freezes the JSON in place', () => {
     const jsonFp = seedJson('sessions-appA.json', {

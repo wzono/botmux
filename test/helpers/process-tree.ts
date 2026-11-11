@@ -40,7 +40,7 @@ function signal(pid: number, sig: NodeJS.Signals): void {
 }
 
 /** Every process below `root` that is in the tree now. */
-export function descendantPids(root: number): number[] {
+function descendantPids(root: number): number[] {
   const byParent = childrenByParent();
   const found: number[] = [];
   const queue = [...(byParent.get(root) ?? [])];

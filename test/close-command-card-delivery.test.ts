@@ -1,3 +1,5 @@
+import * as feedGroupTagger from '../src/services/feed-group-tagger.js';
+import { pluginCommandGateway } from '../src/core/plugins/commands/runtime.js';
 import { nativeReleaseWorker } from './helpers/codex-cleanup-release.js';
 import { EventEmitter } from 'node:events';
 import * as globalConfig from '../src/global-config.js';
@@ -189,11 +191,11 @@ describe('/close card delivery through the real session lifecycle', () => {
     await workerPool.closeSession(f.ds.session.sessionId);
     expect(setCodexAppThreadArchived).not.toHaveBeenCalled();
   });
-  it('patches a thread live card once without posting a second closed card', async () => {
+  it('patches a thread live card and also confirms below the /close message', async () => {
     const f = fixture({ streamCardId: 'om_live' });
     await f.close();
     expect(f.patch).toHaveBeenCalledExactlyOnceWith('app-close-command', 'om_live', expect.stringContaining('会话已关闭'), { beforeWrite: expect.any(Function) });
-    expect(f.reply).not.toHaveBeenCalled();
+    expect(f.reply).toHaveBeenCalledExactlyOnceWith('om_root', expect.stringContaining('会话已关闭'), 'interactive', 'app-close-command', 'om_command');
     expect(f.ephemeral).not.toHaveBeenCalled();
     expect(sessionStore.getSession(f.ds.session.sessionId)?.status).toBe('closed');
   });
@@ -229,7 +231,7 @@ describe('/close card delivery through the real session lifecycle', () => {
     expect(f.reply).not.toHaveBeenCalled();
   });
 
-  it('does not post a duplicate while the closing patch waits behind an in-flight update', async () => {
+  it('confirms once while the closing patch waits behind an in-flight update', async () => {
     const f = fixture({ streamCardId: 'om_live' });
     let release!: () => void;
     f.patch.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }) as any);
@@ -237,7 +239,7 @@ describe('/close card delivery through the real session lifecycle', () => {
       workerPool.scheduleCardPatch(f.ds, 'working');
       await f.close();
       expect(f.patch).toHaveBeenCalledTimes(1);
-      expect(f.reply).not.toHaveBeenCalled();
+      expect(f.reply).toHaveBeenCalledTimes(1);
       release();
       await vi.waitFor(() => expect(f.patch).toHaveBeenCalledTimes(2));
       expect(f.patch).toHaveBeenLastCalledWith('app-close-command', 'om_live', expect.stringContaining('会话已关闭'), { beforeWrite: expect.any(Function) });
@@ -246,4 +248,37 @@ describe('/close card delivery through the real session lifecycle', () => {
       release?.();
     }
   });
+});
+
+
+it('runs close plugin notifications only after the session is closed', async () => {
+  const f = fixture();
+  const notified = vi.spyOn(pluginCommandGateway, 'afterClose').mockImplementation(async invocation => {
+    expect(sessionStore.getSession(f.ds.session.sessionId)?.status).toBe('closed');
+    expect(invocation).toMatchObject({ command: '/close', eventId: 'om_command',
+      chat: { chatId: 'oc_close', chatType: 'group' }, sender: { openId: 'ou_operator' } });
+    return [];
+  });
+  await f.close();
+  await vi.waitFor(() => expect(notified).toHaveBeenCalledOnce());
+});
+
+
+it('lets an explicit plugin cleanup replace the legacy closed-name migration', async () => {
+  const f = fixture();
+  vi.spyOn(pluginCommandGateway, 'replacesCloseTag').mockReturnValue(true);
+  const nativeTags = vi.spyOn(feedGroupTagger, 'tagClosedSessionGroup').mockResolvedValue({ status: 'updated', name: 'closed' });
+  const notified = vi.spyOn(pluginCommandGateway, 'afterClose').mockResolvedValue([]);
+  await f.close();
+  await vi.waitFor(() => expect(notified).toHaveBeenCalledOnce());
+  expect(nativeTags).not.toHaveBeenCalled();
+});
+
+it('does not block plugin cleanup when the old classification receipt cannot be delivered', async () => {
+  const f = fixture();
+  vi.spyOn(feedGroupTagger, 'tagClosedSessionGroup').mockResolvedValue({ status: 'failed' });
+  f.reply.mockRejectedValue(new Error('receipt unavailable'));
+  const notified = vi.spyOn(pluginCommandGateway, 'afterClose').mockResolvedValue([]);
+  await f.close();
+  await vi.waitFor(() => expect(notified).toHaveBeenCalledOnce());
 });

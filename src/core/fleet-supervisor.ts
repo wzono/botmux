@@ -14,17 +14,12 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { feedbackMaintenanceActive } from '../services/feedback-maintenance.js';
 import { resolveBotmuxDataDir } from './data-dir.js';
-import {
-  WorkspaceMigrationSupervisorFence,
-  workspaceRestartBlocked,
-  type WorkspaceRestartBlockLease,
-} from './workspace-migration-supervisor.js';
-import { WorkspaceSchemaMigrator } from '../services/workspace-schema-migrator.js';
-import { closeSync, mkdirSync, readFileSync } from 'node:fs';
+import { closeSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { openRotatedAppendLog } from '../utils/log-rotate.js';
 import { isStandaloneBinary, resolveEntrySpawn, type BotmuxEntry } from './self-spawn.js';
 import { scrubExternalMemberEnv } from '../utils/child-env.js';
+import { readDurableProcessIdentity } from '../utils/process-identity.js';
 import {
   builtinFleetEntryMatches,
   inspectFleetProcess,
@@ -166,10 +161,6 @@ export class FleetSupervisor {
    *  Returns false — having touched nothing — when fleet-state names ANOTHER
    *  live, identity-verified supervisor: that one owns the fleet. */
   start(bots: readonly FleetBotSpec[]): boolean {
-    if (workspaceRestartBlocked(this.opts.daemonEnv.SESSION_DATA_DIR ?? this.opts.cwd)) {
-      this.log('workspace migration restart block is held; refusing fleet start');
-      return false;
-    }
     const identityRuntime = this.opts.processIdentityRuntime ?? fleetProcessIdentityRuntime;
     const owner = this.claimFleetOwnership(identityRuntime);
     if (owner !== undefined) {
@@ -342,7 +333,7 @@ export class FleetSupervisor {
    *  Registers the spec so a later exit is handled with the right identity, and
    *  clears any explicit-stop mark (an explicit start overrides a prior stop). */
   startOneBot(spec: FleetBotSpec): void {
-    if (this.stopping || workspaceRestartBlocked(this.opts.daemonEnv.SESSION_DATA_DIR ?? this.opts.cwd)) return;
+    if (this.stopping) return;
     this.knownSpecs.set(spec.name, spec);
     this.explicitStop.delete(spec.name);
     // Cancel any pending crash-restart timer FIRST (mirrors stopOneBot). A bot
@@ -419,56 +410,6 @@ export class FleetSupervisor {
   /** Drain + execute queued single-bot commands (SIGHUP handler). Each command is
    *  resolved to a spec (queue carries name/appId/botIndex, so no config re-read
    *  is required) and applied via startOneBot/stopOneBot. */
-  /** Host migration entrypoint. The supervisor owns the restart-block lease,
-   * addresses the exact active daemon generations, and releases only after the
-   * coordinator returns a completed durable epoch. */
-  async migrateWorkspaceSchema(options: { timeoutMs?: number } = {}): Promise<
-    { status: 'complete'; epoch: number } | { status: 'owned_elsewhere'; supervisorPid: number }
-  > {
-    const owner = this.claimFleetOwnership(this.opts.processIdentityRuntime ?? fleetProcessIdentityRuntime);
-    if (owner !== undefined) return { status: 'owned_elsewhere', supervisorPid: owner };
-    const dataDir = this.opts.daemonEnv.SESSION_DATA_DIR ?? this.opts.cwd;
-    const currentEpoch = (() => {
-      try { return JSON.parse(readFileSync(join(dataDir, 'workspace-migration-manifest.json'), 'utf8')).epoch as number; }
-      catch { return 0; }
-    })();
-    const enumerateActive = (): WorkspaceRestartBlockLease['targets'] => {
-      const online = (readFleetState(this.opts.statePath)?.procs ?? [])
-        .filter(proc => proc.status === 'online' && proc.name !== 'botmux-dashboard');
-      if (online.some(proc => proc.pid <= 1 || !proc.appId || !proc.processStart || proc.generation < 1)) {
-        throw new Error('online daemon identity is incomplete');
-      }
-      return online.map(proc => ({ larkAppId: proc.appId, pid: proc.pid,
-        processStart: proc.processStart!, generation: proc.generation }));
-    };
-    const signal = (pid: number) => { try { process.kill(pid, 'SIGUSR2'); } catch { /* timeout fails closed */ } };
-    const identityRuntime = this.opts.processIdentityRuntime ?? fleetProcessIdentityRuntime;
-    const gate = new WorkspaceMigrationSupervisorFence(dataDir);
-    const proof = await gate.acquire(currentEpoch + 1, enumerateActive, {
-      timeoutMs: options.timeoutMs, signal, readIdentity: pid => identityRuntime.readIdentity(pid),
-    });
-    if (proof.lease.phase === 'quiesced') {
-      // Re-read the exact fleet set after every quiescence ACK and before the first
-      // migration publish. The restart block forbids additions; any removal or
-      // identity drift means the proof no longer describes the active fleet.
-      const beforePublish = enumerateActive();
-      if (JSON.stringify(beforePublish) !== JSON.stringify(proof.lease.targets)) {
-        throw new Error('active daemon set changed after quiescence');
-      }
-    }
-    if (proof.lease.phase === 'quiesced') gate.markMigrating(proof.proofToken);
-    const result = await new WorkspaceSchemaMigrator(dataDir, {
-      ownerId: `supervisor:${process.pid}:${proof.lease.leaseId}`,
-      supervisorProofToken: proof.proofToken,
-    }).migrateOrRecover();
-    if (result.status !== 'complete') throw new Error('workspace migration did not complete');
-    await gate.release(proof.proofToken, { timeoutMs: options.timeoutMs, signal,
-      readIdentity: pid => identityRuntime.readIdentity(pid),
-      dead: target => identityRuntime.readIdentity(target.pid) !== target.processStart,
-    });
-    return { status: 'complete', epoch: result.epoch };
-  }
-
   async drainCommands(commands: readonly FleetCommand[]): Promise<void> {
     for (const cmd of commands) {
       // PREFER THE KNOWN SPEC over the command payload. The queue carries only
@@ -489,7 +430,7 @@ export class FleetSupervisor {
   }
 
   private spawnBot(spec: FleetBotSpec, isRestart: boolean): void {
-    if (this.stopping || workspaceRestartBlocked(this.opts.daemonEnv.SESSION_DATA_DIR ?? this.opts.cwd)) return;
+    if (this.stopping) return;
     const entry = spec.entry ?? 'daemon';
     if (!spec.external && entry === 'daemon' && feedbackMaintenanceActive(resolveBotmuxDataDir({ env: this.opts.daemonEnv }))) {
       this.log(`feedback maintenance: deferred ${spec.name}`);
@@ -563,12 +504,7 @@ export class FleetSupervisor {
       childEnv = { ...this.opts.daemonEnv, ...(spec.external.env ?? {}) };
       scrubExternalMemberEnv(childEnv);
     } else if (entry === 'daemon') {
-      const priorGeneration = readFleetState(this.opts.statePath)?.procs.find(proc => proc.name === spec.name)?.generation ?? 0;
-      childEnv = {
-        ...this.opts.daemonEnv,
-        BOTMUX_BOT_INDEX: String(spec.botIndex),
-        BOTMUX_FLEET_GENERATION: String(priorGeneration + 1),
-      };
+      childEnv = { ...this.opts.daemonEnv, BOTMUX_BOT_INDEX: String(spec.botIndex) };
     } else {
       childEnv = { ...this.opts.daemonEnv };
     }
@@ -591,9 +527,6 @@ export class FleetSupervisor {
     if (outFd !== undefined) { try { closeSync(outFd); } catch { /* */ } }
     if (errFd !== undefined) { try { closeSync(errFd); } catch { /* */ } }
     const now = new Date().toISOString();
-    const childProcessStart = child.pid
-      ? (this.opts.processIdentityRuntime ?? fleetProcessIdentityRuntime).readIdentity(child.pid)
-      : undefined;
 
     // Persist the new generation + pid atomically, bumping generation on restart.
     const generation = mutateFleetState(this.opts.statePath, (cur) => {
@@ -601,11 +534,7 @@ export class FleetSupervisor {
       if (existing) {
         existing.pid = child.pid ?? 0;
         existing.generation += 1;
-        // spawn() may return a ChildProcess before exec fails with ENOENT/EACCES.
-        // Neither a pid-less generation nor a PID whose durable birth identity
-        // disappeared before /proc could be sampled is online evidence. Keep the
-        // row parseable as launching until the child exit/error path records it.
-        existing.status = child.pid && childProcessStart ? 'online' : 'launching';
+        existing.status = 'online';
         existing.startedAt = now;
         existing.lastExitCode = null;
         // A crash-driven respawn (isRestart) must PRESERVE restarts — that's the
@@ -620,13 +549,10 @@ export class FleetSupervisor {
         // "running and current". Only external members have one.
         if (spec.external?.configHash !== undefined) existing.configHash = spec.external.configHash;
         else delete existing.configHash;
-        if (childProcessStart) existing.processStart = childProcessStart;
-        else delete existing.processStart;
+        if (child.pid) existing.processStart = readDurableProcessIdentity(child.pid);
       } else {
-        const fresh = freshProc(spec.name, spec.appId, child.pid ?? 0, now, spec.external?.configHash);
-        if (!child.pid || !childProcessStart) fresh.status = 'launching';
-        if (childProcessStart) fresh.processStart = childProcessStart;
-        cur.procs.push(fresh);
+        cur.procs.push({ ...freshProc(spec.name, spec.appId, child.pid ?? 0, now, spec.external?.configHash) });
+        if (child.pid) cur.procs[cur.procs.length - 1].processStart = readDurableProcessIdentity(child.pid);
       }
       return cur;
     }).procs.find((p) => p.name === spec.name)!.generation;

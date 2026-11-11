@@ -16,7 +16,6 @@ export interface RawCommandWriteOptions {
   pasteSettleMs?: number;
   submitBeatMs?: number;
   delay?: (ms: number) => Promise<void>;
-  isCurrent?: () => boolean;
 }
 
 /** Type one literal input line WITHOUT submitting it.
@@ -84,27 +83,27 @@ export async function writeRawCommandLine(
       const cmd = content.trim();
       const typed = cmd.includes(' ') ? cmd : `${cmd} `;
       for (const ch of typed) {
-        if (opts.isCurrent?.() === false || sendText(ch) === false) return false;
+        if (sendText(ch) === false) return false;
         await delay(opts.cocoThrottleMs ?? 40);
       }
       await delay(beatMs);
-      return opts.isCurrent?.() !== false && sendSpecialKeys('Enter') !== false;
+      return sendSpecialKeys('Enter') !== false;
     }
     if (opts.pasteLine && backend.supportsRawCommandPasteLine && pasteText) {
-      if (opts.isCurrent?.() === false || pasteText(content) === false) return false;
+      if (pasteText(content) === false) return false;
       await delay(opts.pasteSettleMs ?? beatMs);
-      return opts.isCurrent?.() !== false && sendSpecialKeys('Enter') !== false;
+      return sendSpecialKeys('Enter') !== false;
     }
     if (sendText) {
-      if (opts.isCurrent?.() === false || sendText(content) === false) return false;
+      if (sendText(content) === false) return false;
       await delay(beatMs);
-      return opts.isCurrent?.() !== false && sendSpecialKeys('Enter') !== false;
+      return sendSpecialKeys('Enter') !== false;
     }
   }
 
-  if (opts.isCurrent?.() === false || backend.write(content) === false) return false;
+  if (backend.write(content) === false) return false;
   await delay(beatMs);
-  return opts.isCurrent?.() !== false && backend.write('\r') !== false;
+  return backend.write('\r') !== false;
 }
 
 export interface RawCommandDeliveryFinalizer {

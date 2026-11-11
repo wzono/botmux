@@ -1,5 +1,5 @@
-import { execFileSync, type ChildProcess } from 'node:child_process';
-import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { type ChildProcess } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import type { Socket } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -11,15 +11,6 @@ import {
   RELAY_ORIGIN_CAPABILITY_BASENAME,
   replaceManagedOriginCapabilityFile,
 } from '../src/core/managed-origin-capability.js';
-
-async function waitFor(predicate: () => boolean, timeoutMs: number, failure: () => string): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (predicate()) return;
-    await new Promise<void>(resolvePromise => setTimeout(resolvePromise, 50));
-  }
-  throw new Error(failure());
-}
 
 function rmTree(root: string): void {
   for (let attempt = 0; attempt < 8; attempt++) {
@@ -182,7 +173,7 @@ describe('Riff worker session environment', () => {
     }
   }, 25_000);
 
-  it('forwards reply-card usage and the effective feedback policy into the remote sandbox', async () => {
+  it.each(['om_riff_env', 'ml:om_riff_env'])('forwards reply-card usage and frozen session policies into the remote sandbox (%s)', async rootMessageId => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-riff-env-'));
     const sockets = new Set<Socket>();
     let child: ChildProcess | undefined;
@@ -282,7 +273,7 @@ describe('Riff worker session environment', () => {
         type: 'init',
         sessionId: 'sid-riff-env',
         chatId: 'oc_riff_env',
-        rootMessageId: 'om_riff_env',
+        rootMessageId,
         workingDir: root,
         cliId: 'riff',
         backendType: 'riff',
@@ -299,6 +290,7 @@ describe('Riff worker session environment', () => {
             // pane's CLI-side gate from the daemon's authoritative decision.
             BOTMUX_WORKFLOW_ENABLED: 'false',
             BOTMUX_REPLY_STYLE: JSON.stringify({ layout: true, theme: 'vivid' }),
+            ...(rootMessageId.startsWith('ml:') ? { BOTMUX_ROOT_MESSAGE_ID: 'om_wrong', BOTMUX_CHAT_ID: 'oc_wrong', BOTMUX_SESSION_SCOPE: 'chat' } : {}),
           },
         },
         prompt: 'verify remote session environment',
@@ -336,6 +328,9 @@ describe('Riff worker session environment', () => {
         }),
       ]);
       expect(request.config?.env?.BOTMUX_USAGE_DISPLAY).toBe('footer');
+      expect(request.config?.env?.BOTMUX_ROOT_MESSAGE_ID).toBe(rootMessageId);
+      expect(request.config?.env?.BOTMUX_CHAT_ID).toBe('oc_riff_env');
+      expect(request.config?.env?.BOTMUX_SESSION_SCOPE).toBe('thread');
       expect(request.config?.userPrompt).not.toContain('<botmux_host_tools>');
       expect(request.config?.env?.BOTMUX_OWNER_OPEN_ID).toBe('ou_authenticated_owner');
       expect(request.config?.env?.__OWNER_OPEN_ID).toBe('ou_authenticated_owner');
@@ -363,73 +358,4 @@ describe('Riff worker session environment', () => {
       rmTree(root);
     }
   }, 25_000);
-
-  it('starts a group-bound Riff task only while the host repository identity still matches', async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-worker-riff-group-bound-')));
-    const replacement = `${root}-replacement`;
-    let child: ChildProcess | undefined;
-    let taskRequests = 0;
-    const bodies: Record<string, any>[] = [];
-    const messages: WorkerToDaemon[] = [];
-    const workerLogs: string[] = [];
-    const server = createServer(async (req, res) => {
-      if (req.url === '/api/task-execute' && req.method === 'POST') {
-        taskRequests++;
-        bodies.push(JSON.parse(await readRequestBody(req)));
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ success: true, data: { id: `task-${taskRequests}`, status: 'running' } }));
-        return;
-      }
-      if (req.url?.startsWith('/api2/task-stream')) {
-        res.writeHead(200, { 'content-type': 'text/event-stream' });
-        res.end('event: done\ndata: {"status":"completed"}\n\n');
-        return;
-      }
-      res.writeHead(404); res.end();
-    });
-    try {
-      execFileSync('git', ['init', '-q', '-b', 'group-branch'], { cwd: root });
-      execFileSync('git', ['remote', 'add', 'origin', 'https://git.example.com/g/group-bound.git'], { cwd: root });
-      writeFileSync(join(root, 'README'), 'group-bound');
-      execFileSync('git', ['add', '.'], { cwd: root });
-      execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '-m', 'seed'], { cwd: root });
-      execFileSync('git', ['update-ref', 'refs/remotes/origin/group-branch', 'HEAD'], { cwd: root });
-      const stat = statSync(root, { bigint: true });
-      const identity = { dev: stat.dev.toString(), ino: stat.ino.toString() };
-      const port = await listen(server);
-      const appId = 'app_riff_group_bound';
-      const botsPath = join(root, 'bots.json');
-      writeFileSync(botsPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'riff', backendType: 'riff', riff: { baseUrl: `http://127.0.0.1:${port}` } }]));
-      child = spawnTsScript(resolve('src/worker.ts'), [], { cwd: resolve('.'), env: { ...process.env, HOME: root, SESSION_DATA_DIR: root, BOTS_CONFIG: botsPath, BOTMUX_SESSION_ID: 'sid-riff-group-bound', LARK_APP_ID: appId, LARK_APP_SECRET: 'secret' }, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
-      child.on('message', raw => messages.push(raw as WorkerToDaemon));
-      child.stdout?.on('data', chunk => workerLogs.push(chunk.toString()));
-      child.stderr?.on('data', chunk => workerLogs.push(chunk.toString()));
-      child.send({ type: 'init', sessionId: 'sid-riff-group-bound', chatId: 'oc_group', rootMessageId: 'om_group', workingDir: root, expectedWorkingDirIdentity: identity, cliId: 'riff', backendType: 'riff', backendConfig: { baseUrl: `http://127.0.0.1:${port}`, jwt: 'test-jwt', injectStatusLines: false }, prompt: 'first business prompt', turnId: 'turn-valid', larkAppId: appId, larkAppSecret: 'secret' } satisfies DaemonToWorker);
-      await waitFor(() => taskRequests === 1, 30_000,
-        () => `valid Riff task did not start; requests=${taskRequests} messages=${JSON.stringify(messages)} logs=${workerLogs.join('')}`);
-      expect(bodies[0]?.config?.userPrompt).toContain('first business prompt');
-      await waitFor(
-        () => messages.filter(message => message.type === 'prompt_ready').length >= 2,
-        10_000,
-        () => 'Riff first task did not return to ready',
-      );
-
-      renameSync(root, replacement);
-      mkdirSync(root);
-      child.send({ type: 'message', content: 'must stay pending', turnId: 'turn-replaced' } satisfies DaemonToWorker);
-      await new Promise(resolvePromise => setTimeout(resolvePromise, 500));
-      expect(taskRequests).toBe(1);
-      await waitFor(
-        () => messages.some(message => message.type === 'user_notify'
-          && message.message.includes('原消息已保留')),
-        10_000,
-        () => `blocked input retention notice missing: ${JSON.stringify(messages)}`,
-      );
-    } finally {
-      if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-      await new Promise<void>(resolvePromise => server.close(() => resolvePromise()));
-      rmTree(root); rmTree(replacement);
-    }
-  }, 60_000);
-
 });

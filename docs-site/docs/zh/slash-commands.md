@@ -8,13 +8,12 @@
 |------|------|
 | `/repo` | 仓库待选时用默认 workingDir 启动；会话进行中则弹项目选择卡片 |
 | `/repo <N>` | 切换到上次扫描的第 N 个项目 |
-| `/repo <路径\|项目名>` | 直接指定路径或 workingDir 下的一级项目名；在普通群顶层还会把目录绑定为本机所有 Bot 共享的群目录 |
+| `/repo <路径\|项目名>` | 直接指定路径或 workingDir 下的一级项目名 |
 | `/repo wt <编号\|项目名\|路径> [分支]` | 基于远端默认分支新建 worktree 并在里面打开会话；不写分支时自动按语义命名 |
-| `/repo show` | 查看会话、显式 oncall、自动 defaultOncall、群目录、Bot 默认目录的优先级与群 revision/健康状态 |
-| `/repo unbind` | 普通群顶层解除本机群目录绑定；保留 revision、历史收据与群目录管理名单 |
-| `/cd <路径>` | 显式切换当前会话目录并重启 CLI；该会话不再自动跟随之后的群目录更新 |
+| `/cd <路径>` | 切换工作目录并重启 CLI 进程 |
 | `/status` | 查看会话信息（运行时间、终端地址等） |
-| `/models` | 顶层消息直接选择机器人的默认模型及思考强度，新会话生效（仅管理员）；强度选项随模型变化，可恢复 CLI 默认。模型/强度不兼容时保留旧设置并提示先恢复默认强度。已有话题内选择当前会话模型，切换时需空闲。 本地托管 TraeX 话题还可保存当前模型的会话思考强度；选择后点击“应用并重载会话”，空闲时恢复原生会话上下文，不改机器人或 CLI 默认配置。重载会停止该会话的后台终端任务。 模型下拉框为每个候选标注负载：本地原生 TRAE CLI 使用模型目录返回的百分比，支持超过 100%；没有数据、读取失败或其它 CLI 显示“负载未知”。负载只反映读取时的快照，重新打开 /models 刷新；数值不参与模型切换或思考强度的校验。 |
+| `/models` | 顶层消息直接选择机器人的默认模型及思考强度，新会话生效（仅管理员）；强度选项随模型变化，可恢复 CLI 默认。模型/强度不兼容时保留旧设置并提示先恢复默认强度。已有话题内选择模型会显式固定到本话题（来源 card），切换时需空闲；没有高优先级覆盖时透传后重启 CLI；有覆盖时只保存并显示实际启动选择，不承诺重启必应用 pin。adopt、远端后端及正在迁移/重启的会话拒绝应用。 本地托管 TraeX 话题还可保存当前模型的会话思考强度；选择后点击“应用并重载会话”，空闲时恢复原生会话上下文，不改机器人或 CLI 默认配置。重载会停止该会话的后台终端任务。 模型下拉框为每个候选标注负载：本地原生 TRAE CLI 使用模型目录返回的百分比，支持超过 100%；没有数据、读取失败或其它 CLI 显示“负载未知”。负载只反映读取时的快照，重新打开 /models 刷新；数值不参与模型切换或思考强度的校验。 |
+| `/modelpin <model> [effort]` / `/modelpin --follow-bot` | 显式固定当前话题的模型与可选推理强度，或解除固定。仅有命令操作权限的人可修改；不创建会话。固定参与恢复、重启及 Codex `/clear` 的启动配置；dispatch/trigger 覆盖仍有更高优先级，界面显示被覆盖及实际启动模型/强度。空闲时设置会重启 CLI 应用；忙碌时保存为下次启动设置。解除后恢复原有的群默认快照 → bot 默认模型解析顺序。同模型省略 effort 保留原 pin effort，换模型不复制旧 pin effort；匹配模型的后续会话强度修改会同步更新 pin。无 pin 解除无副作用。Dashboard 可单清或按 bot 原子批清（含关闭会话），忙碌时列出阻塞会话及原因，整批不提交，可稍后重试。 |
 | `/lane status` | 查看本人的独立 principal lane，包括分支、worktree、脏状态和未推送提交数（打开 [XPI 实验开关](/global-settings#xpi)后可用） |
 | `/lane close` | 安全关闭本人的独立 principal lane：有运行中/排队任务或未提交文件时拒绝，回收前先推送未发布提交，且不会自动合并或删除分支 |
 | `/retry` | 重试最近一个失败或被中断的 turn（10s 冷却） |
@@ -25,7 +24,7 @@
 | `/restart` | 重启 CLI 进程（保留 session 上下文） |
 | `/close` | 关闭会话并发送可恢复卡片（含 CLI 自身 resume 命令）。关闭后再发消息会开新会话 |
 | `/resume [会话id]` | 本话题/本群**没有会话**时恢复已关闭的会话：不带参数恢复这里最近关闭的一个；带别处的会话 id 时像 `/fork` 一样复制到这里继续（继承完整上下文，原会话不动；仅支持可 fork 的 CLI；Codex / TraeX 的已关闭会话无法确认启动形态，需到原处恢复）。**有会话时**原样交给 CLI 自带的 `/resume`。有对话权限即可使用；跨位置复制凭会话 id（只在原聊天可见、不可猜），信任级别同 `/fork` |
-| `/dismiss` | 专属会话群顶层专用：卡片确认后关闭群内本机 Bot 的全部会话，再解散整个群（仅建群者本人且具备操作权限；代码与 worktree 保留；私聊、普通群、子话题、adopt 会话不支持）。只想关闭会话、保留群聊请用 `/close` |
+| `/dismiss` | 卡片确认后关闭群内本机 Bot 的全部会话，再解散整个群。专属会话群：只能在顶层发，仅建群者本人且具备操作权限；普通群和话题群：需要操作权限，并且 Bot 是群主、是群里唯一的 Bot，否则直接回复没有权限、不关任何会话。代码与 worktree 保留；私聊、adopt 会话不支持。只想关闭会话、保留群聊请用 `/close` |
 | `/cleanup-wt <ID>` | worktree 最终删除失败后重试已持久化的清理任务；删除前会重新校验权限、活动会话、worktree 身份和安全状态 |
 | `/fork <任务>` | 继承当前会话的完整上下文，新建一个并行的分身话题（私聊、话题群、普通群的会话话题内都能用）；源会话原样继续（Claude 系 / Codex 或 TraeX 终端模式） |
 | `/forklist` | 重发当前会话的分身任务面板，显示运行/结束状态和子话题链接 |
@@ -49,7 +48,7 @@
 | `/introduce` | 让本群机器人互相登记 `open_id`，用于协作时精确 @ 对方 |
 | `@机器人 /summary` | 读取当前话题（或普通群配置范围内）的历史消息并生成总结（默认最近 50 条 / 24 小时）。若该 bot 开启了 `summaryMemory`，总结会追加写入配置的记忆文件（`summaryMemoryPath`，默认 `summary.md`），且 `/summary` 后跟随的文字会作为「只总结从这条起」的硬边界；未开启记忆时，后随文字仅作为本次总结的侧重提示 |
 | `[标题] /t [/repo <仓库> \| /repo wt <仓库> [分支]] [/model <模型>] [/effort <档位>] [<首轮任务>]`（别名 `/topic`） | 普通群内强制新开话题，一条消息把标题、仓库（或在仓库上新建 worktree）、模型、推理强度、首轮任务一次交代完。换行等价于空格；标题写在 `/t` **之前**（飞书话题列表显示的是原消息，机器人改不了）；带空格的路径用双引号；任一项写错整条不生效并回一句用法错误。裸 `/t` 进入话题设置 |
-| `/th [<首轮任务>]`、`/tw [<首轮任务>]`（等价 `/t here …` / `/t worktree …`） | 生命周期变体：`/th` 在**当前群会话的工作目录**里开新话题；`/tw` 先从该目录建一个按话题确定性命名、可被多 bot 共享的 worktree 再开话题。可与标题、`/model`、`/effort` 同用，但**不与 `/repo` 同用**（一个说用当前目录、一个点名仓库，相斥即拒） |
+| `/th [<首轮任务>]`、`/tw [<首轮任务>]`（等价 `/t here …` / `/t worktree …`） | 生命周期变体：`/th` 在**当前群会话的工作目录**里开新话题；`/tw` 先从该目录建一个按话题确定性命名、可被多 bot 共享的 worktree 再开话题。可与标题、`/model`、`/effort` 同用，但**不与 `/repo` 同用**（一个说用当前目录、一个点名仓库，相斥即拒）。首轮任务也可以是技能或斜杠命令（`/th /goal …`、`/th /status` 等），与 `/t` 后跟命令同样处理，只是目录换成当前群会话目录；`/tw` 后不能直接跟 daemon 命令（`/status` `/cd` `/close` `/help` 等，worktree 还没建好，会直接回提示）。写了标题或 `/model` `/effort` 时，后面的 `/xxx` 仍按头部指令校验，与 `/t` 相同 |
 | `/issue` | 打开 Issue Board 看板卡片，直接在卡片上领取 botmux 平台任务：选好仓库后自动建群、拉你进去、绑定平台任务并开工。需要本机已绑定平台，且发起人在该 bot 的 `allowedUsers` 里；卡片只有发起人能操作 |
 | `/issue status` | 在任务群里发，查这个群绑着哪条平台任务、现在什么状态：平台状态 / 领取人 / 本机绑定 / 有没有回写还堵在发件箱里。只读，同样限该 bot 的 `allowedUsers` |
 | `/issue done` | 在任务群里发，**验收通过**，把任务推到平台终态。agent 交付只能到「待验收」，标完成是人的决策。完成后 claim 被平台清掉，这条领取不能再释放。同样限该 bot 的 `allowedUsers` |
@@ -60,19 +59,6 @@
 ![当前群活跃话题会话卡片](/img/sessions-command-card.png)
 
 裸 `/t` 的选仓/固定目录分支见[会话与话题模型](/session-model)。
-
-### 普通群共享工作目录
-
-普通群顶层的 `/repo <路径|项目名|编号>` 在当前会话安全切换成功后，会把规范化目录写入当前宿主机的群级绑定。同一 `SESSION_DATA_DIR` 下的其他 Bot 以及 daemon 重启后新建的群会话、`/th` 都会使用它；该绝对路径不会同步到其他机器。目录优先级是：当前会话/指令显式目录 > 人工 `oncallChats` 覆盖 > 群目录 > 自动 `defaultOncall` 或 Bot 默认目录 > 选仓卡。自动生成的 `defaultOncall` 仍提供 oncall 授权，但不会遮蔽群目录；历史无来源的 oncall 配置按人工覆盖兼容。
-
-- `/repo show` 展示各层来源、最终选择、群 revision、健康状态与管理名单；`/repo unbind` 只解除普通群顶层绑定，不切当前会话，也不重置 revision、收据或管理名单。
-- 管理权限按同租户 `union_id` 在本机各 Bot 间归一化。配置了非空 `workspaceManagers` 时，它完全替代默认 Bot 管理员并在解绑后保留；身份、租户或最新配置指纹无法验证时拒绝写入，不降级为接收 Bot 的普通选仓。
-- 每条顶层 `/repo` 用原始飞书消息建立持久收据。跨 Bot 重投、重启恢复或不同 delivery attempt 会返回同一结果，不会重复切会话或增加 revision；同一原始消息被改成不同选仓意图会拒绝。
-- 话题内 `/repo` 仅影响该话题；`/repo wt` 创建的 worktree 与 `/repo here` 都不会改群绑定。群绑定目录失效、不可进入或启动前发生替换时会 fail closed，不回退到默认目录；用新的顶层 `/repo` 修复或 `/repo unbind` 解除。
-- 只有来源仍为 `group` 的普通群本地 PTY 会话会在下一条业务消息的安全空闲边界跟随新 revision：先停止并确认旧 worker 退出，再在新目录启动且校验 ready cwd。繁忙、等待输入、远程/adopt、显式 `/cd`、oncall、worktree 与历史未知来源不会被强切。
-- 普通消息、`/th`、trigger、Dashboard 启动、listener、定时任务、`/queue`、principal lane 与 XPI 在业务输入进入 worker 前都经过同一套目录/ready 准入。存储不可读、revision 或目录身份过期、配置权限撤销、迁移未完成时会拒绝或延后，不会静默换到其他目录。
-- 工作目录 schema v2 按宿主机整体迁移并支持重启恢复：分阶段暂存、校验全部存储时会围栏普通写入；首个发布点之后只向前恢复；原文件与校验和保留用于回滚/导出。遇到未来 schema 会原样 fail closed；降级只生成独立副本，不改在线 v2 状态。
-- 远程群会话必须提供机械可验证的有效目录证明。Riff 在 ready 和每次提交时都要重新证明精确 Git 仓库及远端分支；Mojo/云端 provider 若不能证明宿主目录到执行目录的映射则标记为不支持，仅在 prompt 里要求远端 agent 使用某目录不算证明。
 
 指令头的几条指令：
 
@@ -112,9 +98,7 @@ Codex 容量不足自动续跑**默认关闭**。管理员可用 `/botconfig set
 两条命令都默认可用，需要操作权限（管理员 / `allowedUsers`，或用 `canTalkDaemonCommands` 放开）。
 
 - **`/rename <标题>`**：在已有会话里发，改 Botmux 会话名（Dashboard、`/sessions` 列表跟着变），运行中的 Codex / Claude Code 会同步改原生会话名。飞书群名、话题名不变。
-- **`/cli <cliId>`**：只给**还没启动 CLI** 的会话选 CLI，例如在新话题里第一条就发 `/cli codex`，再发任务，这个会话就用 Codex 跑，Bot 的默认 CLI 不变。`cliId` 取值见[支持的 CLI](/adapters#支持的-cli--agent)。以下情况会被拒绝：会话已有历史或 CLI 已经起来、接管（adopt）的会话、排队中的会话、Bot 配了 `env`、用 Riff 后端、选的是 `riff`，以及所选 CLI 和 Bot 的零注入（`promptInjection: "none"`）或 `codexRpcInput` 不兼容。`/cli` 不在 `/help` 里显示。
-
-容量反馈与上述“自动续跑”相互独立。TraeX 只依据当前 viewport 的原生排队 UI；Codex/Claude Proxy 只依据签名的 `capacity-wait.v3` sideband，不能从普通文本或静默猜测。反馈状态和表情意图成功写入 SessionStore 后可在 daemon 重启后继续收敛；provider 结果不确定时先 LIST 自身表情，再决定删除或创建。首次终态反馈提交失败只跳过反馈表情，不阻断或重放 Botmux 原有终态流程。全量发布使用同一版本并分阶段启用；无权威信号的 provider 显示 unsupported。
+- **`/cli <cliId>`**：只给**还没启动 CLI** 的会话选 CLI，例如在新话题里第一条就发 `/cli codex`，再发任务，这个会话就用 Codex 跑，Bot 的默认 CLI 不变。`cliId` 取值见[支持的 CLI](/adapters#支持的-cli--agent)。也可以写程序名或简写，不区分大小写：`/cli cc` 或 `/cli claude` 选 Claude Code，`/cli omp` 选 Oh My Pi，`/cli agy` 选 Antigravity；完整 `cliId` 优先，所以 `/cli codex` 选的是 Codex 而不是同样跑 `codex` 的 Codex App。一个简写对应多个 CLI（如 `trae` 同时是 TRAE CLI 的新旧两代）时不替你选，会列出候选让你改发完整 ID。只发 `/cli` 列出全部可选 CLI 和简写。以下情况会被拒绝：会话已有历史或 CLI 已经起来、接管（adopt）的会话、排队中的会话、Bot 配了 `env`、用 Riff 后端、选的是 `riff`，以及所选 CLI 和 Bot 的零注入（`promptInjection: "none"`）或 `codexRpcInput` 不兼容。`/cli` 不在 `/help` 里显示。
 
 ## 群负责人（Agent 工具）
 
@@ -125,6 +109,10 @@ Codex 容量不足自动续跑**默认关闭**。管理员可用 `/botconfig set
 设置/取消要求当前轮真实发送者明确命中该机器人的管理员名单。会话 owner、其他机器人、定时任务和过期轮次不能代替真人授权。只作用于当前普通群，不支持跨群指定目标，也不接管自动管理的会话群。
 
 负责人接有对话权限的人的群顶层未 @ 消息；只点名其他成员时让路，@all 不算转交。群名追加机器人名，取消时保留人工改名。原有 ambient、never 和 reply-mode 独立生效；负责人是群级身份与交接，不是新的响应模式，也不保证全群只有一个机器人回复。
+
+**负责人接的消息开不开话题**：默认不开，免 @ 接下的顶层消息照旧平铺回复。回复模式为 `shared` 的普通群里，想让它像 @ 本机器人那样把回复挂到那条消息下面的话题，在 Dashboard 同一处打开「群负责人接的消息也开话题」（或 `/botconfig set chatManagerSharedTopic on`）。会话仍是群里同一个；要先打开「群负责人」；其它回复模式不受影响。话题里继续说话要不要 @，仍按本群的「群聊 @ 策略」：默认「必须 @」时话题内续话也要 @，配成「话题内免 @」、`never` 或 `ambient` 后才可免 @ 续话。
+
+![Dashboard 中「群负责人接的消息也开话题」开关](/img/chat-manager-shared-topic-dashboard.png)
 
 切换时先让旧负责人 clear，成功后再让新负责人 set。每次负责人免 @ 放行都核对群描述标记，读取失败不沿用旧状态；必须同时存在本地管理员启用记录。描述超长拒绝，不截断人写的说明。
 
@@ -212,7 +200,9 @@ Claude Code 等其它 CLI 的 `/effort` 仍按下面的透传规则处理。
 
 `/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` —— 字面送达底层 CLI，交给它的内置命令处理（Codex CLI / App 的 `/effort` 例外，见上文）。
 
-`/fast` 仅对 Codex 生效：切换 Codex 原生的 service tier 档位，流式卡片会显示只读的 `⚡ <档位>` 徽标，如实反映 Codex 实际运行的档位。在 RPC 输入模式或 Riff 后端上，按键到不了 Codex 执行器，因此 `/fast` 在这些后端会 fail-closed 给出明确提示，而非静默失效。
+**Riff 后端无透传面**：Riff 没有本地 CLI，上述斜杠命令不会以按键方式送达，而是按普通消息封装成**一次远端任务**，命令文本也不会进入任何斜杠解析器。因此在 Riff 会话里发 `/compact`、`/model` 等（含 `customPassthroughCommands` 自定义项）等价于发一条普通对话文本，不会被拆成多次远端任务。
+
+`/fast` 仅对 Codex 生效：切换 Codex 原生的 service tier 档位，流式卡片会显示只读的 `⚡ <档位>` 徽标，如实反映 Codex 实际运行的档位。在 RPC 输入模式或 Mojo 后端上，`/fast` 仍走透传分支，会被 fail-closed 明确拒绝、给出提示，而不会静默生效。Riff 后端则按上一段处理：`/fast` 不进透传，而是作为普通消息封装成一次远端任务，同样不会切换档位。
 
 部分 CLI 还有 adapter 默认放行的命令：Claude Code / Codex 默认放行 `/goal`，因此新话题第一条发 `/goal ...` 也会先启动/选择仓库，再把 `/goal ...` 原样投给 CLI。
 
@@ -422,9 +412,3 @@ Dashboard 的「Bot 配置 → 权限与安全 → Slash 命令」还有一个�
 ## ⏰ 定时 & ❓帮助
 
 `/schedule ...`（见 [定时任务](/schedule)）· `/help`（话题内显示完整清单）
-
-### 容量反馈
-
-- `/capacity status`：查看容量反馈分批阶段，以及已持久禁用的机器人 × adapter。
-- 宿主 CLI：`botmux capacity status --json`、`phase <shadow|traex|proxy|full|off>`、`disable <appId> <adapter> --reason <原因>`、`enable <appId> <adapter>`。
-- 等待只由 TraeX 当前视口或签名 `capacity-wait.v3` 触发；不从静默、普通文本或引用内容猜测。

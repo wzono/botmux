@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
+import { isCriticalInterruptKey } from '../src/adapters/backend/critical-control-key.js';
 import { hasEmptyCodexComposer, parseCodexEffortMenu } from '../src/utils/codex-effort-menu.js';
 import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
 
@@ -19,8 +20,14 @@ function evaluate<T>(name: string, state: Record<string, any>): T {
 }
 
 describe('Codex effort menu input ownership', () => {
-  it.each(['handleTuiKeys', 'handleTuiTextInput', 'handleTermAction'])(
-    '%s never forwards input to a CLI replaced during menu cancellation', async name => {
+  it.each([
+    { name: 'handleTuiKeys', args: [['Enter'], true] },
+    { name: 'handleTuiTextInput', args: [['Enter'], 'user input'] },
+    { name: 'handleTermAction', args: ['enter'] },
+    { name: 'handleTermAction', args: ['ctrlc'] },
+    { name: 'handleTermAction', args: ['esc'] },
+  ])(
+    '$name ($args) never forwards input to a CLI replaced during menu cancellation', async ({ name, args }) => {
       let release!: () => void;
       const cancelled = new Promise<void>(resolve => { release = resolve; });
       const state = {
@@ -28,9 +35,10 @@ describe('Codex effort menu input ownership', () => {
         backend: {}, cliAdapter: {}, cliLifetimeNonce: 1,
         codexCliEffortOperation: {}, cancelCodexCliEffort: vi.fn(() => cancelled),
         effectiveBackendType: 'pty', isRemoteBackendType: () => false,
+        isCriticalInterruptKey, traexQuotaPending: undefined, traexAutoModelController: null,
       };
       const handler = evaluate<(...args: any[]) => Promise<unknown>>(name, state);
-      const result = handler(...(name === 'handleTermAction' ? ['enter'] : [['Enter'], 'user input']));
+      const result = handler(...args);
       expect(state.cancelCodexCliEffort).toHaveBeenCalledOnce();
       // No replacement write functions are supplied: reaching one fails the test.
       state.backend = {};
@@ -38,71 +46,6 @@ describe('Codex effort menu input ownership', () => {
       expect(await result).toBe(name === 'handleTermAction' ? undefined : false);
     },
   );
-
-  it('rechecks the terminal workspace fence after async effort cancellation', async () => {
-    let release!: () => void;
-    const cancelled = new Promise<void>(resolve => { release = resolve; });
-    let current = true;
-    const write = vi.fn(() => true);
-    const state = {
-      lastInitConfig: null, backend: { write }, cliAdapter: {}, cliLifetimeNonce: 1,
-      codexCliEffortOperation: {}, cancelCodexCliEffort: vi.fn(() => cancelled),
-      effectiveBackendType: 'pty', isRemoteBackendType: () => false,
-      canWriteTerminalBytes: () => current,
-      isCriticalInterruptKey: () => false,
-      runAfterAmbiguousSubmissionWrites: async (_backend: unknown, submit: () => unknown) => submit(),
-      sendTermActionOnce: (target: { write(data: string): boolean }) => target.write('\r'),
-      scheduleOneShotAfterAction: vi.fn(), tmuxScrolledHalfPages: 0, tuiPromptBlocking: false, log: vi.fn(),
-    };
-    const action = evaluate<(key: string) => Promise<void>>('handleTermAction', state);
-    const pending = action('enter');
-    current = false; release(); await pending;
-    expect(write).not.toHaveBeenCalled();
-  });
-
-  it('does not send a queued non-critical key into a new CLI lifetime on the same backend', async () => {
-    let release!: () => void;
-    const tail = new Promise<void>(resolve => { release = resolve; });
-    const writes: string[] = [];
-    const backend = { write: (data: string) => { writes.push(data); return true; } };
-    const state: Record<string, any> = {
-      lastInitConfig: null, backend, cliAdapter: {}, cliLifetimeNonce: 1,
-      effectiveBackendType: 'pty', isRemoteBackendType: () => false, codexCliEffortOperation: undefined,
-      canWriteTerminalBytes: () => true, isCriticalInterruptKey: () => false,
-      runAfterAmbiguousSubmissionWrites: async (_backend: unknown, submit: () => unknown) => { await tail; return submit(); },
-      sendTermActionOnce: (target: typeof backend) => target.write('\r'),
-      scheduleOneShotAfterAction: vi.fn(), tmuxScrolledHalfPages: 0, tuiPromptBlocking: true,
-      log: vi.fn(), send: vi.fn(), t: vi.fn(), flushPending: vi.fn(), currentBotmuxTurnId: undefined,
-    };
-    const action = evaluate<(key: string) => Promise<void>>('handleTermAction', state);
-    const pending = action('enter');
-    state.cliLifetimeNonce = 2; release(); await pending;
-    expect(writes).toEqual([]);
-    expect(state.tuiPromptBlocking).toBe(true);
-  });
-
-  it('does not retry a critical key into a new CLI lifetime on the same backend', async () => {
-    const writes: string[] = [];
-    const backend = { write: (data: string) => { writes.push(data); return writes.length > 1; } };
-    const state: Record<string, any> = {
-      lastInitConfig: null, backend, cliAdapter: {}, cliLifetimeNonce: 1,
-      effectiveBackendType: 'pty', isRemoteBackendType: () => false, codexCliEffortOperation: undefined,
-      canWriteTerminalBytes: () => true, isCriticalInterruptKey: () => true,
-      runAfterAmbiguousSubmissionWrites: async (_backend: unknown, submit: () => unknown) => submit(),
-      sendTermActionOnce: (target: typeof backend) => target.write('\x03'),
-      sendCriticalControlKey: async (_key: string, submit: () => boolean) => {
-        expect(submit()).toBe(false);
-        state.cliLifetimeNonce = 2;
-        return submit();
-      },
-      scheduleOneShotAfterAction: vi.fn(), tmuxScrolledHalfPages: 0, tuiPromptBlocking: true,
-      log: vi.fn(), send: vi.fn(), t: vi.fn(), flushPending: vi.fn(), currentBotmuxTurnId: undefined,
-    };
-    const action = evaluate<(key: string) => Promise<void>>('handleTermAction', state);
-    await action('ctrlc');
-    expect(writes).toEqual(['\x03']);
-    expect(state.tuiPromptBlocking).toBe(true);
-  });
 
   it('fences an in-place CLI restart even when the backend object stays the same', async () => {
     const state: Record<string, any> = {

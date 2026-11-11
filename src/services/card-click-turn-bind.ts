@@ -26,7 +26,6 @@ import { sendMessage } from '../im/lark/client.js';
 import { extractLarkBusinessCode } from '../im/lark/lark-errors.js';
 import { beginReplyTargetTurn } from '../core/reply-target.js';
 import { sessionKey, type DaemonSession } from '../core/types.js';
-import { applySessionWorkingDir, setSessionWorkingDirMetadata } from '../core/session-cwd.js';
 import { sessionPromptInjection } from '../core/prompt-injection.js';
 import { markSessionActivity } from '../core/session-activity.js';
 import { buildFollowUpCliInput, buildNewTopicCliInput, rememberLastCliInput } from '../core/session-manager.js';
@@ -163,7 +162,7 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
       session.scope = 'chat';
       session.ownerOpenId = senderOpenId;
       session.creatorOpenId = senderOpenId;
-      setSessionWorkingDirMetadata(session, { workingDir: claims.workingDir!, source: 'explicit' });
+      session.workingDir = claims.workingDir;
       session.lastMessageAt = new Date(now).toISOString();
       sessionStore.updateSession(session);
       ensureQueue(claims.chatId!);
@@ -316,7 +315,9 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
     workingDirReady: directoryReady,
     setWorkingDir: (session, dir) => {
       const ds = liveSession(session);
-      applySessionWorkingDir(ds, { workingDir: dir, source: 'explicit' });
+      ds.workingDir = dir;
+      ds.session.workingDir = dir;
+      sessionStore.updateSession(ds.session);
     },
     sessionBlockedShape: (session) => {
       if (session && liveSession(session).session.principalLane) return 'principal_lane';

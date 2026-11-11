@@ -1,3 +1,5 @@
+import type { ProtectedHttpEgressPolicy } from '../protected-http-egress.js';
+
 export type PluginRuntime = 'cli' | 'service';
 export type PluginServiceMode = 'manual' | 'auto';
 
@@ -17,6 +19,8 @@ export interface PluginStdioMcpServer {
   transport: 'stdio';
   command: string[];
   env?: Record<string, string>;
+  protectedCapability?: string;
+  protectedEgressPolicy?: ProtectedHttpEgressPolicy;
 }
 
 export interface PluginStreamableHttpMcpServer {
@@ -59,19 +63,6 @@ export interface PluginServiceContribution extends PluginRuntimeEntrypoint {
   mode: PluginServiceMode;
 }
 
-export interface PluginServiceHttpRoute {
-  method: 'GET' | 'POST';
-  path: string;
-}
-
-/** Public allowlist for authenticated Dashboard requests forwarded to the
- * plugin-owned loopback service. Hosts and credentials are never declared by
- * plugins or copied into this contribution. */
-export interface PluginServiceHttpContribution {
-  schemaVersion: 1;
-  routes: PluginServiceHttpRoute[];
-}
-
 /** Public, install-time allowlist for card actions handled by a plugin service. */
 export interface PluginCardActionsContribution {
   schemaVersion: 1;
@@ -88,6 +79,10 @@ export interface PluginCommandEntry {
 
 /** Public, install-time declaration of Lark slash commands routed to a plugin service. */
 export interface PluginCommandsContribution {
+  /** Receive a host-authenticated /close notification only after a clean explicit close. */
+  afterClose?: true;
+  /** This close hook owns classification, replacing the legacy closed-name migration. */
+  replacesCloseTag?: true;
   schemaVersion: 1;
   endpoint: string;
   commands: PluginCommandEntry[];
@@ -99,7 +94,6 @@ export interface PluginContributions {
   mcp?: PluginMcpContribution;
   cli?: PluginCliContribution;
   service?: PluginServiceContribution;
-  serviceHttp?: PluginServiceHttpContribution;
   cardActions?: PluginCardActionsContribution;
   commands?: PluginCommandsContribution;
 }
@@ -114,6 +108,7 @@ export interface BotmuxPluginManifest {
   schemaVersion: 1;
   id: string;
   displayName?: string;
+  audience?: string;
   dependencies?: {
     plugins?: string[];
   };
@@ -123,6 +118,7 @@ export interface BotmuxPluginManifest {
 export interface PluginPackageManifest {
   name: string;
   version: string;
+  description?: string;
   type?: string;
   keywords?: string[];
   botmux: BotmuxPluginManifest;
@@ -132,6 +128,7 @@ export interface InstalledPluginRecord {
   id: string;
   packageName: string;
   version: string;
+  description?: string;
   integrity?: string;
   source: {
     type: 'npm' | 'local';
@@ -147,6 +144,11 @@ export interface InstalledPluginRecord {
 export interface PluginRegistryFile {
   schemaVersion: 1;
   plugins: Record<string, InstalledPluginRecord>;
+  /** Monotonic per-file mutation counter, bumped on every atomic rewrite.
+   *  Stat-based identity (inode/mtime) is not safe on ext4: back-to-back
+   *  rewrites of equal-size content reuse the inode and land inside the same
+   *  timestamp tick, so an install/uninstall A→B→A looked unchanged. */
+  revision?: number;
 }
 
 export interface PluginSettingsFile {
@@ -163,8 +165,6 @@ export interface PluginServiceState {
   updatedAt: string;
   status?: string;
   pid?: number;
-  processStart?: string;
-  host?: string;
   port?: number;
   openUrl?: string;
   healthUrl?: string;
@@ -180,7 +180,6 @@ export interface PluginMaterializedFile {
   cli?: Array<{ name: string }>;
   dashboard?: Array<{ id: string; entry: string }>;
   service?: Array<{ name: string }>;
-  serviceHttp?: PluginServiceHttpContribution;
   cardActions?: PluginCardActionsContribution;
   commands?: PluginCommandsContribution;
 }

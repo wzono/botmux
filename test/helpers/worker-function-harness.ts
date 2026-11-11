@@ -20,6 +20,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import ts from 'typescript';
+import { contractTerminalStatus } from '../../src/services/session-contract.js';
+import * as runtimeReservation from '../../src/services/runtime-reservation.js';
 
 let parsed: ts.SourceFile | undefined;
 
@@ -62,9 +64,23 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
   name: string,
   scope: Record<string, unknown>,
 ): T {
+  // Resolve newly split worker dependencies through their real implementations.
+  // An unscoped fixture exercises legacy IPC; a supplied v2 scope still runs
+  // the production metadata and callback fences.
+  const dependencies = new Map<string, unknown>();
+  const resolve = (key: string | symbol): unknown => {
+    if (key in scope) return scope[key as string];
+    if (key === 'contractTerminalStatus') return contractTerminalStatus;
+    if (typeof key === 'string' && Object.hasOwn(runtimeReservation, key)) return (runtimeReservation as Record<string, unknown>)[key];
+    if (typeof key === 'string' && ['codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'spawnCliBody', 'setCaptureIdentity'].includes(key)) {
+      if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
+      return dependencies.get(key);
+    }
+    return (globalThis as any)[key];
+  };
   const proxy = new Proxy(scope, {
     has: (_target, key) => key !== Symbol.unscopables,
-    get: (target, key) => (key in target ? target[key as string] : (globalThis as any)[key]),
+    get: (_target, key) => resolve(key),
     set: (target, key, value) => {
       target[key as string] = value;
       return true;

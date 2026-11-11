@@ -86,6 +86,7 @@ vi.mock('../src/core/worker-pool.js', () => {
   });
   return {
   forkWorker: vi.fn(),
+  recordTurnExplicitMention: vi.fn(),
   killWorker: vi.fn(),
   suspendWorker: vi.fn(() => false),
   teardownAuthoritativePersistentBackingBeforeClose: vi.fn(),
@@ -141,6 +142,7 @@ vi.mock('../src/services/git-worktree.js', () => ({
   removeRepoWorktree: vi.fn(async () => {}),
   pushWorktreeBranch: vi.fn(async () => {}),
   dirSuffixForBranch: (branch: string) => branch.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'branch',
+  worktreeTargetPath: (repo: string, dirName: string) => `${repo.slice(0, repo.lastIndexOf('/'))}/${dirName}`,
 }));
 
 vi.mock('../src/services/worktree-slug-ai.js', () => ({
@@ -244,10 +246,9 @@ function makeDeps(ds: DaemonSession, projects = PROJECTS) {
 
 function makeSelectEvent(key: 'repo_switch' | 'repo_worktree', path: string) {
   return {
-    event_id: 'evt_repo_select',
     operator: { open_id: OWNER },
     action: { option: path, value: { key, root_id: ROOT_ID } },
-    context: { open_message_id: 'om_card', open_chat_id: CHAT_ID },
+    context: { open_message_id: 'om_card' },
   };
 }
 
@@ -323,70 +324,6 @@ afterEach(async () => {
 });
 
 // ─── Tests ────────────────────────────────────────────────────────────────
-
-describe('group workspace production card route', () => {
-  it('routes an exact current card/action/chat with stable actor before the generic repo gate', async () => {
-    const ds = makeDs({ chatType: 'group', scope: 'chat', chatId: CHAT_ID, repoCardMessageId: 'om_card' });
-    ds.session.rootMessageId = CHAT_ID;
-    const activeSessions = new Map([[sessionKey(CHAT_ID, APP_ID), ds]]);
-    const handleRoute = vi.fn(async () => undefined);
-    const resolveAuthority = vi.fn(async () => ({
-      status: 'authorized' as const, actor: { tenantKey: 'tenant-1', unionId: 'on_admin' }, configFingerprint: 'f',
-      freshSnapshot: { configFingerprint: 'f', admins: [{ tenantKey: 'tenant-1', unionId: 'on_admin' }], updatedAt: 1, expiresAt: 2 },
-      canSwitchSession: true,
-    }));
-    const event = {
-      header: { event_id: 'evt_exact', tenant_key: 'tenant-1' },
-      event: {
-        operator: { open_id: 'ou_bot_b', union_id: 'on_admin' },
-        action: { option: '/repos/alpha', value: { key: 'repo_switch', root_id: CHAT_ID } },
-        context: { open_message_id: 'om_card', open_chat_id: CHAT_ID },
-      },
-    };
-    await handleCardAction(event, {
-      activeSessions, sessionReply: vi.fn(async () => 'om_reply'), lastRepoScan: new Map(),
-      resolveGroupWorkspaceRouteAuthority: resolveAuthority,
-      handleGroupWorkspaceRoute: handleRoute,
-    }, APP_ID);
-    expect(resolveAuthority).toHaveBeenCalledWith(expect.objectContaining({
-      chatId: CHAT_ID, callbackChatId: CHAT_ID, actionId: 'evt_exact', operatorUnionId: 'on_admin', tenantKey: 'tenant-1',
-    }));
-    expect(handleRoute).toHaveBeenCalledWith(expect.objectContaining({
-      kind: 'set', source: 'card', chatId: CHAT_ID, selection: '/repos/alpha',
-      actorOpenId: 'ou_bot_b', originMessageId: 'om_card', actionId: 'evt_exact',
-    }));
-    expect(createSession).not.toHaveBeenCalled();
-    expect(forkWorker).not.toHaveBeenCalled();
-  });
-
-  it('recognizes the reserved authenticated unbind action on the exact current card', async () => {
-    const ds = makeDs({ chatType: 'group', scope: 'chat', chatId: CHAT_ID, repoCardMessageId: 'om_card' });
-    ds.session.rootMessageId = CHAT_ID;
-    const handleRoute = vi.fn(async () => undefined);
-    await handleCardAction({
-      header: { event_id: 'evt_unbind', tenant_key: 'tenant-1' },
-      event: {
-        operator: { open_id: 'ou_bot_b', union_id: 'on_admin' },
-        action: { value: { key: 'group_workspace_unbind', root_id: CHAT_ID } },
-        context: { open_message_id: 'om_card', open_chat_id: CHAT_ID },
-      },
-    }, {
-      activeSessions: new Map([[sessionKey(CHAT_ID, APP_ID), ds]]),
-      sessionReply: vi.fn(async () => 'om_reply'), lastRepoScan: new Map(),
-      resolveGroupWorkspaceRouteAuthority: vi.fn(async () => ({
-        status: 'authorized' as const, actor: { tenantKey: 'tenant-1', unionId: 'on_admin' }, configFingerprint: 'f',
-        freshSnapshot: { configFingerprint: 'f', admins: [{ tenantKey: 'tenant-1', unionId: 'on_admin' }], updatedAt: 1, expiresAt: 2 },
-        canSwitchSession: false,
-      })),
-      handleGroupWorkspaceRoute: handleRoute,
-    }, APP_ID);
-    expect(handleRoute).toHaveBeenCalledWith(expect.objectContaining({
-      kind: 'unbind', source: 'card', chatId: CHAT_ID, actionId: 'evt_unbind', originMessageId: 'om_card',
-    }));
-    expect(createSession).not.toHaveBeenCalled();
-    expect(forkWorker).not.toHaveBeenCalled();
-  });
-});
 
 describe('repo select card — plain switch', () => {
   it('refuses a card repo switch over a live Riff generation before teardown or refork', async () => {

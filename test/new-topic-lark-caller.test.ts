@@ -148,12 +148,16 @@ async function runCase(name: string, options: Record<string, any> = {}) {
     },
     localeForBot: () => 'en', runDetachedBotTurnAdmission: async (_app: string, fn: () => any) => fn(),
     join, existsSync: () => !options.missingSubdir, pathBasename: basename,
-    sessionStore: { updateSession: noop }, repinSessionWorkingDir: noop, AutoWorktreeFailClosedError: class extends Error {},
+    sessionStore: { updateSession: noop }, AutoWorktreeFailClosedError: class extends Error {},
     activeSessionKey: () => 'test-key', withBotTurnMutation: async (_app: string, fn: () => any) => fn(),
     sessionCliId: () => ds.session.cliId, getAvailableBots: async () => [], ensureSessionWhiteboard: noop,
     buildNewTopicCliInput: () => ({ content: 'test prompt' }), sessionPromptInjection: () => undefined,
     rememberLastCliInput: noop, publishAttentionPatch: noop, markInitialUserTurnPending: noop,
     markRepoCardConsumed: noop, deferRepoCardWithdraw: noop,
+    // commitRepoSelection 的被 @ 回执记录（#3039）：本 harness 只验证 worktree 调用者身份，
+    // 不校验静默回执；mentions 夹具恒为空，门判 false 即中性语义——把恒 false 换成真实
+    // messageMentionsBot 实现后 12 例仍全绿，证明该桩不掩盖任何分支差异。
+    recordTurnExplicitMention: noop, messageMentionsBot: () => false,
     forkWorker: (_session: any, _prompt: any, turn: any) => {
       events.push('fork');
       if (options.forkError) throw Error('worker fork rejected');

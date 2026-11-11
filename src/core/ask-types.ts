@@ -7,7 +7,6 @@
  */
 
 import type { GroupContextDeliveryBinding } from '../services/group-context-delivery-store.js';
-import type { WorkspaceIdentity } from '../types.js';
 
 /** A single selectable option on an ask card. `key` is the stable identifier
  *  returned via stdout; `label` is the human-facing button text. When the user
@@ -57,6 +56,24 @@ export interface AskQuestion {
   defaultSelectedKeys?: ReadonlyArray<string>;
 }
 
+/** How the asking CLI ended a hook permission confirmation on its own, without
+ *  the card: its built-in confirmation timeout, a terminal choice, or the hook
+ *  being terminated with nothing recorded. */
+export const CLI_PERMISSION_OUTCOMES = [
+  'cli_auto_denied',
+  'terminal_allowed',
+  'terminal_rejected',
+  'allowed_elsewhere',
+  'denied_elsewhere',
+  'resolved_elsewhere',
+  'cli_stopped_waiting',
+] as const;
+export type CliPermissionOutcome = typeof CLI_PERMISSION_OUTCOMES[number];
+
+export function isCliPermissionOutcome(value: unknown): value is CliPermissionOutcome {
+  return typeof value === 'string' && (CLI_PERMISSION_OUTCOMES as readonly string[]).includes(value);
+}
+
 /** Terminal result of an ask, returned to the CLI caller. Discriminated by
  *  `kind` so the CLI can map straight to stdout shape + exit code.
  *
@@ -96,8 +113,10 @@ export type AskResult =
       /** card_delivery_failed: delivery never completed; do not describe this as
        *  a missing answer. claimant_gone / answer_undelivered: the hook never
        *  re-attached, so the asking CLI is no longer waiting (the latter: an
-       *  answer had been given but could not reach it). */
-      failureCode?: 'card_delivery_failed' | 'claimant_gone' | 'answer_undelivered';
+       *  answer had been given but could not reach it). cli_resolved: the asking
+       *  CLI ended this permission confirmation itself; see `cliOutcome`. */
+      failureCode?: 'card_delivery_failed' | 'claimant_gone' | 'answer_undelivered' | 'cli_resolved';
+      cliOutcome?: CliPermissionOutcome;
       selected: null;
       by: null;
       comment: null;
@@ -109,15 +128,6 @@ export type AskResult =
  *  v0.1.8 新增 `answers: string[][] | null`（多问多选完整答案），
  *  保留 `selected: string | null` 做向后兼容（等价于 `toLegacySelected`）。
  *  `comment` 携带用户的自定义回复原文（话题直接打字作答），无则 null。 */
-export interface AskPendingResult {
-  kind: 'pending';
-  requestId: string;
-  askId: string;
-  messageId: string;
-  originWorkerGeneration?: number;
-  pending: true;
-}
-
 export interface AskJsonOutput {
   /** 向后兼容：单问单选时等于 `answers[0][0]`，否则为 null。 */
   selected: string | null;
@@ -137,15 +147,6 @@ export interface AskJsonOutput {
  *
  *  v0.1.8 变更：`options`/`prompt` 字段替换为 `questions: ReadonlyArray<AskQuestion>`。 */
 export interface CreateAskInput {
-  /** Daemon-frozen exact turn authority; never accepted from CLI JSON. */
-  controlWait?: {
-    originalTurnId: string;
-    expectedGeneration: number;
-    workspace: WorkspaceIdentity;
-    groupRevision?: number;
-    wait: { kind: 'ask'; askId: string };
-    state: 'needs_user' | 'terminal';
-  };
   /** Frozen by the daemon from the exact document turn, never CLI-supplied. */
   deliveryTarget?: AskDeliveryTarget;
   /** Daemon-bound presentation target; never accepted directly from CLI JSON. */
@@ -157,6 +158,8 @@ export interface CreateAskInput {
   chatId: string;
   /** thread-scope ask → root message_id; chat-scope ask → null. */
   rootMessageId: string | null;
+  /** chat-scope 下发起 turn 冻结的话题根，只决定卡片发到哪；不属于 ask 身份，也不落盘。 */
+  cardRootMessageId?: string;
   /** Session that issued the ask — used for audit + future replay scoping. */
   sessionId: string;
   /** Per-invocation identity: the hook generates this once and reuses it across
@@ -169,9 +172,6 @@ export interface CreateAskInput {
    *  'explicit' = `botmux ask buttons`, etc.). Namespaces the identity so an
    *  explicit ask can never re-claim a hook ask's card. Defaults to 'hook'. */
   originKind?: string;
-  /** Frozen worker generation that issued this Ask. Host acknowledgements must
-   * carry the same value so a later generation cannot consume its receipt. */
-  originWorkerGeneration?: number;
   /** DAEMON-COMPUTED authoritative persistence gate (codex P1-4): does the
    *  authenticated issuing session's FROZEN backend survive a daemon restart
    *  (tmux/herdr/zellij/zmx = yes; pty = no)? The broker persists + resumes ONLY
@@ -182,19 +182,18 @@ export interface CreateAskInput {
   backendSurvivesRestart?: boolean;
   /** 问题列表，调用方保证每问 `options.length ≥ 2（input 或 inputMode=text 时为空）` 且 key 唯一。 */
   questions: ReadonlyArray<AskQuestion>;
-  /** Absolute deadline; computed by caller from `--timeout`. Broker won't
-   *  re-compute. */
-  timeoutMs: number | null;
+  /** Relative timeout in milliseconds. Zero means no deadline, only for a
+   * daemon-managed explicit Ask with a stable requestId. */
+  timeoutMs: number;
   /** 发起 ask 的会话类型。仅用于点击鉴权时把 chatType 喂给 canTalk（p2pOpen 腿）；
    *  缺省时该腿 fail-closed，鉴权退回原语义。 */
   chatType?: 'group' | 'p2p';
   /** Optional exact responder lock for host-owned approval asks. Ordinary
    * agent asks omit it and retain the existing canTalk-any-member policy. */
   answererOpenId?: string;
-  /** 显式 `botmux ask --mention <open_id>` 要 @ 的人（仅人类 open_id；bot 的
-   *  open_id 在卡片里会触发 100290，daemon 侧会识别并剔除）。daemon 在卡片
-   *  问题正文前注入真实 `<at>`，确保接收者能收到通知——卡片不像回复消息那样
-   *  天然带 @。 */
+  /** 显式 `botmux ask --mention <open_id>` 要 @ 的人。daemon 只在通讯录确认是本应用的
+   *  真人后填入（at 到 bot 会让整卡 100290），卡片在第一问前注入真实 `<at>`。
+   *  带点名的 ask 走独立卡：嵌进回复卡是 PATCH，不会触发通知。 */
   mentionedOpenId?: string;
 }
 
@@ -203,7 +202,6 @@ export interface CreateAskInput {
  *
  *  v0.1.8 变更：`options`/`prompt` 替换为 `questions`。 */
 export interface PendingAsk {
-  controlWait?: CreateAskInput['controlWait'];
   deliveryTarget?: AskDeliveryTarget;
   replyCardTarget?: CreateAskInput['replyCardTarget'];
   result?: AskResult;
@@ -218,6 +216,7 @@ export interface PendingAsk {
   larkAppId: string;
   chatId: string;
   rootMessageId: string | null;
+  cardRootMessageId?: string;
   sessionId: string;
   /** 发起 ask 的会话类型（见 CreateAskInput.chatType）。 */
   chatType?: 'group' | 'p2p';
@@ -233,7 +232,8 @@ export interface PendingAsk {
   customAnswers?: ReadonlyArray<string | null>;
   customRevision?: number;
   createdAt: number;
-  deadlineAt: number | null;
+  /** Absolute epoch milliseconds; 0 means an explicit Ask has no deadline. */
+  deadlineAt: number;
   /** Set after the card dispatch succeeds. Until then, the ask is "registered
    *  but not visible" — clicks can't physically arrive yet. */
   cardMessageId?: string;
@@ -354,19 +354,26 @@ export function isRetryableAskHttpStatus(status: number): boolean {
 
 /**
  * Whether the daemon's `/api/asks` handler must answer a RETRYABLE 503
- * `startup_not_ready` instead of proceeding (executable decision seam). PURE +
- * exported so daemon.ts and its unit test share the SAME predicate rather than
- * asserting against source regex.
+ * `startup_not_ready` instead of proceeding (codex P1-2/P1-4, executable
+ * decision seam). PURE + exported so daemon.ts and its unit test share the SAME
+ * predicate rather than asserting against source regex.
  *
- * True until the exact target bot has completed restore and permit/control
- * reconciliation, regardless of whether its Session row is already visible or
- * how the caller authenticated. A visible row is not readiness: accepting its
- * ask before reconciliation recreates the startup split-brain this gate exists
- * to prevent. Once ready, unknown sessions fall through to normal authorization.
+ * True iff an unknown session hits the route while restore is still in flight —
+ * regardless of how the caller authenticated. The earlier `trustedHost` escape
+ * was WRONG (codex P1-2): a normal unsandbox hook IS the trusted-host path
+ * (`postAsk` loads the host secret and calls the HMAC `fetchDaemonIpc` when
+ * there's no relay), so exempting trusted callers let exactly the reconnecting
+ * hook we must protect slip through during the descriptor-published-but-sessions-
+ * not-yet-restored window — it would then register a NEW ask computed as
+ * `backendSurvivesRestart:false` (session unknown) and be lost on the next
+ * restart. Every `POST /api/asks` caller is a session-scoped ask registration
+ * (the desktop/dashboard ANSWER path is a different route), so gating all
+ * unknown sessions here is safe: once `sessionsRestored` flips true the gate
+ * lifts and unknown sessions fall through to normal authorization.
  */
 export function shouldReturnAskStartupNotReady(args: {
   hasSession: boolean;
-  targetReady: boolean;
+  sessionsRestored: boolean;
 }): boolean {
-  return !args.targetReady;
+  return !args.hasSession && !args.sessionsRestored;
 }

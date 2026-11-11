@@ -30,21 +30,9 @@ export function codexAsyncAnswerSteerable(facts: CodexAsyncAnswerSteerFacts): bo
     && facts.originalAnswerer === facts.answerer;
 }
 
-/** In-turn answer delivery additionally requires its original native target.
- * A proven legacy answer uses a serializable null marker so the worker can keep
- * it serial after Node's JSON IPC boundary. */
-export function codexAsyncAnswerSteerTarget(input: CodexAsyncUserInput, facts: CodexAsyncAnswerSteerFacts): string | null | undefined {
-  if (!codexAsyncAnswerSteerable(facts)) return undefined;
-  return input.nativeTurnId ?? null;
-}
-
-/** Attach the daemon-computed target to the worker sidecar. `null` is deliberate:
- * unlike `undefined`, it survives Node's JSON IPC serializer. */
-export function withCodexAsyncAnswerSteerTarget(
-  input: CodexAppTurnInput,
-  target: string | null,
-): CodexAppTurnInput {
-  return { ...input, steerTargetTurnId: target };
+/** In-turn answer delivery additionally requires its original native target. */
+export function codexAsyncAnswerSteerTarget(input: CodexAsyncUserInput, facts: CodexAsyncAnswerSteerFacts): string | undefined {
+  return codexAsyncAnswerSteerable(facts) ? input.nativeTurnId : undefined;
 }
 
 /** This only narrows an existing daemon steer grant. A synthetic async answer
@@ -53,7 +41,6 @@ export function codexAsyncSteerTargetMatches(
   replyTurnId: string | undefined, input: CodexAppTurnInput | undefined, nativeTurnId: string | undefined,
 ): boolean {
   const target = input?.steerTargetTurnId;
-  if (target === null) return false;
   if (!target) return !replyTurnId?.startsWith('codex-async-answer-');
   return nativeTurnId !== undefined && target === nativeTurnId;
 }

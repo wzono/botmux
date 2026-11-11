@@ -1,6 +1,10 @@
 import { sanitizePerBotEnv, isReservedPerBotEnvKey } from './per-bot-env.js';
 import { BOTMUX_INJECTED_ENV_KEYS, WORKFLOW_WORKER_ENV_KEYS, redactChildEnv } from '../utils/child-env.js';
 import { applySessionEnvUnset } from './session-env.js';
+import {
+  protectedMcpRedactedEnvKeys,
+  type ProtectedMcpWorkerPolicy,
+} from './protected-mcp-capabilities.js';
 
 /** Secret-free per-bot inheritance policy. Missing means historical inheritance. */
 export interface EnvPolicy {
@@ -15,12 +19,12 @@ export const STRICT_ENV_BASELINE = [
   'LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE', 'LC_COLLATE', 'LC_MESSAGES',
   'LC_MONETARY', 'LC_NUMERIC', 'LC_TIME', 'TERM', 'COLORTERM', 'TERMINFO_DIRS',
   'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'XDG_RUNTIME_DIR',
-  // tmux socket placement is non-secret process runtime state. A strict pane's
-  // tmux client must keep the same private/operator-selected socket root as its
-  // worker; otherwise `-L botmux` silently falls back to the host /tmp server.
-  'TMUX_TMPDIR',
   'SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT', 'USERPROFILE',
 ] as const;
+// scripts/fenced-run.ts marks its whole process tree; a strict boundary that
+// dropped the mark would let scope code derive the real user bus again
+// (session-scope.ts userSystemdBusEnv). BOTMUX* names cannot be granted via inherit.
+const FENCE_MARKER_KEYS = ['BOTMUX_FENCED_RUN'] as const;
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const PROCESS_HOME_KEYS = new Set(['GROK_HOME', 'DSH_HOME', 'LARKSUITE_CLI_DATA_DIR']);
 
@@ -47,7 +51,7 @@ export function inheritBotEnv(base: NodeJS.ProcessEnv, policy?: EnvPolicy): Node
   if (normalized?.mode !== 'strict') return { ...base };
   const out: NodeJS.ProcessEnv = {};
   // Revalidate at IPC boundaries: malformed strict config must never widen it.
-  for (const key of [...STRICT_ENV_BASELINE, ...(normalized.inherit ?? [])]) {
+  for (const key of [...STRICT_ENV_BASELINE, ...FENCE_MARKER_KEYS, ...(normalized.inherit ?? [])]) {
     if (base[key] !== undefined) out[key] = base[key];
   }
   return out;
@@ -63,6 +67,7 @@ export function buildSessionChildEnv(
   base: NodeJS.ProcessEnv,
   policy?: EnvPolicy,
   unset?: readonly string[],
+  protectedMcpPolicy?: ProtectedMcpWorkerPolicy,
 ): NodeJS.ProcessEnv {
   const inherited = inheritBotEnv(base, policy);
   if (policy?.mode === 'strict') {
@@ -73,13 +78,17 @@ export function buildSessionChildEnv(
       if (base[key] !== undefined) inherited[key] = base[key];
     }
   }
-  const env = redactChildEnv(inherited);
+  const env = redactChildEnv(inherited, protectedMcpRedactedEnvKeys(protectedMcpPolicy));
   applySessionEnvUnset(env, unset);
   return env;
 }
 
 /** Worker control process retains Botmux control knobs, never business env. */
-export function buildBotWorkerEnv(base: NodeJS.ProcessEnv, policy?: EnvPolicy): NodeJS.ProcessEnv {
+export function buildBotWorkerEnv(
+  base: NodeJS.ProcessEnv,
+  policy?: EnvPolicy,
+  protectedMcpPolicy?: ProtectedMcpWorkerPolicy,
+): NodeJS.ProcessEnv {
   const env = inheritBotEnv(base, policy);
   if (policy?.mode === 'strict') {
     for (const key of [...BOTMUX_INJECTED_ENV_KEYS, ...WORKFLOW_WORKER_ENV_KEYS,
@@ -88,11 +97,6 @@ export function buildBotWorkerEnv(base: NodeJS.ProcessEnv, policy?: EnvPolicy): 
       'BOTMUX_WORKFLOW_ENABLED', 'BOTMUX_REQUIRE_MENTION_DECISION', 'BOTMUX_LANG',
       'BOTMUX_WORKER_HTTP_HOST', 'BOTMUX_WORKER_HOST', 'LARK_APP_ID', 'LARK_APP_SECRET',
       'BOTMUX_PROGRAM_STATUS_RELAY',
-      // Test-only backend fault injection. Strict mode rebuilds the worker env
-      // from this control-plane allowlist; preserve the seam so the lifecycle
-      // suite can exercise rollback after sandbox preparation but before tmux
-      // creates a pane. Production never sets this key.
-      'BOTMUX_TEST_FORCE_TMUX_NEW_SESSION_FAIL',
     ]) {
       if (isReservedPerBotEnvKey(key) && base[key] !== undefined) env[key] = base[key];
     }
@@ -103,14 +107,14 @@ export function buildBotWorkerEnv(base: NodeJS.ProcessEnv, policy?: EnvPolicy): 
     // BOTMUX_TMUX_SOCKET: which tmux server the worker creates managed panes on
     // (tmux-socket.ts) — dropping it would undo an operator's opt-out per bot.
     for (const key of ['WEB_HOST', 'WEB_EXTERNAL_HOST', 'WEB_EXTERNAL_PORT',
-      'STUCK_DETECTOR_ENABLED', 'STUCK_DETECTOR_TIMEOUT_MS', 'BOTMUX_TMUX_SOCKET',
-      // Socket placement is a worker/backend concern, not CLI business env.
-      // Dropping it in strict mode silently redirects managed `-L botmux`
-      // clients from an operator/test-private root back to the host /tmp server.
-      'TMUX_TMPDIR']) {
+      'STUCK_DETECTOR_ENABLED', 'STUCK_DETECTOR_TIMEOUT_MS', 'BOTMUX_TMUX_SOCKET']) {
       if (base[key] !== undefined) env[key] = base[key];
     }
   }
+  // Apply dynamic capability redaction last: a protected source may share a
+  // name with a normally retained worker control key (for example under a
+  // strict policy), and the protected boundary must win that collision.
+  for (const key of protectedMcpRedactedEnvKeys(protectedMcpPolicy)) delete env[key];
   return env;
 }
 
@@ -125,7 +129,12 @@ export function buildBotWorkerEnv(base: NodeJS.ProcessEnv, policy?: EnvPolicy): 
  * env to a direct git-running process without that step are known uncovered
  * one-shot/probe paths (follow-up after #2203).
  */
-export function botInjectedEnv(raw: unknown, policy?: EnvPolicy): Record<string, string> {
-  const env = sanitizePerBotEnv(raw);
+export function botInjectedEnv(
+  raw: unknown,
+  policy?: EnvPolicy,
+  protectedMcpPolicy?: ProtectedMcpWorkerPolicy,
+): Record<string, string> {
+  const protectedKeys = protectedMcpRedactedEnvKeys(protectedMcpPolicy);
+  const env = sanitizePerBotEnv(raw, protectedKeys);
   return (policy?.mode === 'strict' ? redactChildEnv(env) : env) as Record<string, string>;
 }

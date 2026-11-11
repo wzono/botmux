@@ -1,3 +1,0 @@
-The status line says Queued for capacity right now
-
-❯ Ready

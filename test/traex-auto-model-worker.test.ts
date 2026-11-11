@@ -56,6 +56,7 @@ function harness(extra: Record<string, unknown> = {}) {
   const scope: Record<string, any> = {
     traexAutoModelRuntimeEligible: () => true, traexAutoModelSwitching: false,
     cliRestartInProgress: false, isFlushing: false, traexAutoModelTurnReplayForbidden: false,
+    currentInputDeliveryQuarantine: () => null,
     lastInitConfig: { cliId: 'traex', cliSessionId: 'native', model: 'core' },
     activeTurnAuthority: authority, traexAutoModelController: controller,
     inflightInputs: tracker, currentBotmuxCallerOpenId: 'caller', pendingMessages: [],
@@ -329,6 +330,7 @@ describe('auto-model Worker admission and original-input retirement', () => {
 
   it.each([
     { isFlushing: true }, { cliRestartInProgress: true }, { traexAutoModelTurnReplayForbidden: true },
+    { currentInputDeliveryQuarantine: () => ({ generation: 1 }) },
     { lastInitConfig: { cliId: 'traex', model: 'core' } },
     { traexAutoModelRuntimeEligible: () => false },
   ])('does not advance the model or enqueue recovery when the runtime cannot safely resume (%j)', extra => {
@@ -837,7 +839,7 @@ describe('Auto input and shared-setting continuity', () => {
       setCaptureIdentity: vi.fn(() => { expect(h.scope.traexAutoModelTurnReplayForbidden).toBe(true); }),
       markTurnRetired: vi.fn(), markTurnExecutionStart: vi.fn(), stampMojoTurnMark: vi.fn(),
       writeCliPidMarker: vi.fn(), publishSandboxRelayCapability: vi.fn(),
-      isEffortLevelCommand: () => false, claudeBtwQuestion: () => undefined,
+      claudeSwitchKindForCommand: () => null, claudeBtwQuestion: () => undefined,
       finalizeRawCommandDelivery: (input: any) => { if (input.accepted) input.onAccepted(); return input.accepted; },
       idleDetector: { reset: vi.fn() }, flushPending: vi.fn(async () => {}),
     });

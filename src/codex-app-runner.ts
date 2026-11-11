@@ -935,7 +935,6 @@ function handleAsyncUserInput(item: JsonObject, nativeTurnId: string, turn: Acti
   const context = {
     sessionId: args.sessionId, larkAppId: process.env.BOTMUX_LARK_APP_ID ?? '',
     chatId: process.env.BOTMUX_CHAT_ID ?? '', rootMessageId: process.env.BOTMUX_ROOT_MESSAGE_ID, originTurnId,
-    originWorkerGeneration: Number(process.env.BOTMUX_WORKER_GENERATION) || undefined,
   };
   const reportFailure = (reason: 'limit' | 'invalid_questions', questions?: import('./core/ask-types.js').AskQuestion[]) => {
     void postCodexAsk(context, questions ?? [{ prompt: 'Async question could not be displayed', inputMode: 'text',
@@ -996,9 +995,18 @@ function handleNativeUserInput(msg: JsonObject): void {
   }
   const controller = new AbortController();
   const signal = AbortSignal.any([controller.signal, current.lifetime.signal]);
-  const nativeTurnId = typeof params.turnId === 'string' ? params.turnId : undefined;
+  const rawNativeTurnId = params.turnId ?? params.turn?.id;
+  const nativeTurnId = typeof rawNativeTurnId === 'string' ? rawNativeTurnId : undefined;
   userInputRequests.set(msg.id, { turnId: nativeTurnId, controller });
   const turn = activeTurn;
+  // Waiting for the human answer is not stalled model work, and app-server is
+  // silent meanwhile: keep the worker's no-progress window fed until it settles.
+  const waitHeartbeat = turn ? setInterval(() => {
+    if (!signal.aborted && client === current && !generationFenced && activeTurn === turn) {
+      emitTurnActivity(turn, 'progress', true);
+    }
+  }, TURN_ACTIVITY_MARKER_MIN_INTERVAL_MS) : undefined;
+  waitHeartbeat?.unref();
   const onClientDead = () => {
     if (client === current && !generationFenced && userInputRequests.get(msg.id)?.controller === controller) {
       fenceUnknown('turn/start', 'transport', turn);
@@ -1011,7 +1019,6 @@ function handleNativeUserInput(msg: JsonObject): void {
     sessionId: args.sessionId, larkAppId: process.env.BOTMUX_LARK_APP_ID ?? '',
     chatId: process.env.BOTMUX_CHAT_ID ?? '', rootMessageId: process.env.BOTMUX_ROOT_MESSAGE_ID,
     originTurnId,
-    originWorkerGeneration: Number(process.env.BOTMUX_WORKER_GENERATION) || undefined,
   }, params, signal).then(
     result => {
       if (!signal.aborted && client === current && !generationFenced) current.respond(msg.id, result);
@@ -1036,6 +1043,7 @@ function handleNativeUserInput(msg: JsonObject): void {
       }
     },
   ).finally(() => {
+    clearInterval(waitHeartbeat);
     current.lifetime.signal.removeEventListener('abort', onClientDead);
     if (userInputRequests.get(msg.id)?.controller === controller) userInputRequests.delete(msg.id);
   }).catch(error => {

@@ -29,6 +29,11 @@ import { applyEnvOps, envLayerWithinBudget, globalEnvLayer, isEmptyEnvLayer, typ
 import { readPromptCacheConfig, type PromptCacheConfig } from './services/prompt-cache-policy.js';
 import { normalizeMcpGatewayMaxToolTimeoutMs } from './core/plugins/mcp/runtime-options.js';
 import { canonicalScheduleBotGrant, isScheduleBotGrant } from './core/schedule-bot-grant.js';
+import {
+  normalizeProtectedMcpCapabilities,
+  protectedMcpConfiguredEnvKeys,
+  type ProtectedMcpCapabilityConfigMap,
+} from './core/protected-mcp-capabilities.js';
 
 export type RepoPickerMode = 'all' | 'repos';
 export type LocalCliOpenMode = 'attach' | 'resume';
@@ -50,6 +55,13 @@ export function normalizeGroupNamePrefix(raw: unknown): string | undefined {
   // 覆盖 C0(U+0000–001F) + DEL(U+007F) + C1(U+0080–009F) 全部控制字符。
   if (/\p{Cc}/u.test(value)) return undefined;
   return value;
+}
+
+/** A usable `worktreeRoot`: trimmed, absolute or `~`/`~/`-prefixed. */
+export function normalizeWorktreeRoot(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const value = raw.trim();
+  return value && (isAbsolute(value) || value === '~' || value.startsWith('~/')) ? value : undefined;
 }
 
 export interface WhiteboardConfig {
@@ -288,6 +300,10 @@ export interface GlobalConfig {
    *  behavior (repos + linked worktrees). 'repos' lists only main worktrees in
    *  selection cards; explicit /repo /abs/path/to/worktree still works. */
   repoPickerMode?: RepoPickerMode;
+  /** Machine-wide directory botmux creates new worktrees under, e.g. a large
+   *  data disk. Absolute or `~/`-prefixed. Missing keeps worktrees next to the
+   *  main checkout (services/git-worktree.ts `worktreeTargetPath`). */
+  worktreeRoot?: string;
   /** Machine-wide dashboard settings. These are intentionally global rather
    *  than per-bot: they govern the dashboard security boundary and the default
    *  terminal-opening behavior of cards emitted by all daemons on this host. */
@@ -345,6 +361,8 @@ export interface GlobalConfig {
   skills?: GlobalSkillConfig;
   /** Plugin ids enabled for every bot. Per-bot plugin ids are additive. */
   plugins?: string[];
+  /** Operator-owned bindings for optional protected local MCP capabilities. */
+  protectedMcpCapabilities?: ProtectedMcpCapabilityConfigMap;
   /** Host-wide ceiling for per-plugin MCP tool calls. Missing defaults to 10 minutes. */
   mcpGatewayMaxToolTimeoutMs?: number;
   /** 远程访问. When true (and this machine is bound to the central platform),
@@ -470,6 +488,12 @@ export interface DashboardGlobalConfig {
    *  daemon gate (config.ts `reapOrphanTmuxServers`). BOTMUX_DISABLE_ORPHAN_TMUX_REAP=1
    *  remains an independent emergency kill-switch. */
   reapOrphanTmuxServers?: boolean;
+  /** Periodic orphan-tmux SESSION sweep. Default ON but REPORT-ONLY (logs
+   *  displaced servers/panes, never signals). Read live by the daemon timer. */
+  tmuxOrphanSessionSweep?: boolean;
+  /** Destructive arm of the periodic session sweep: signal only a proven
+   *  taken-over bare-wrapper pane. Default OFF. */
+  tmuxOrphanSessionBareWrapperKill?: boolean;
   /** Whether botmux auto-bypasses Codex's interactive hook-trust gate ("Press t
    *  to trust") for Codex-family plain-TUI launches (codex / traex). Codex 0.14x
    *  gates the botmux-installed ~/.codex/hooks.json behind a manual trust prompt,
@@ -663,6 +687,8 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   if (typeof d.codexRpcInput === 'boolean') out.codexRpcInput = d.codexRpcInput;
   if (typeof d.autoUpgradeCodexSessions === 'boolean') out.autoUpgradeCodexSessions = d.autoUpgradeCodexSessions;
   if (typeof d.reapOrphanTmuxServers === 'boolean') out.reapOrphanTmuxServers = d.reapOrphanTmuxServers;
+  if (typeof d.tmuxOrphanSessionSweep === 'boolean') out.tmuxOrphanSessionSweep = d.tmuxOrphanSessionSweep;
+  if (typeof d.tmuxOrphanSessionBareWrapperKill === 'boolean') out.tmuxOrphanSessionBareWrapperKill = d.tmuxOrphanSessionBareWrapperKill;
   // Round-trip an explicit boolean either way. Absent stays absent — the live
   // getter (config.ts `bypassCodexHookTrust`) treats absent as ON, so we must
   // preserve a stored `false` to let an operator disable it.
@@ -1002,6 +1028,11 @@ function readRawConfig(): Record<string, unknown> {
 const READ_CACHE_TTL_MS = 2_000;
 let readCache: { path: string; value: GlobalConfig; at: number } | null = null;
 let vcMeetingAgentLiveCache: { path: string; mtimeMs: number; config: VcMeetingAgentGlobalConfig } | null = null;
+let lastConfiguredProtectedMcpEnvKeys: string[] = [];
+
+export function configuredProtectedMcpEnvKeys(): string[] {
+  return [...lastConfiguredProtectedMcpEnvKeys];
+}
 
 /** Typed view of the global config. Validates `lang` so a malformed file
  *  can't propagate a bad value into the i18n module. */
@@ -1011,6 +1042,7 @@ export function readGlobalConfig(): GlobalConfig {
     return readCache.value;
   }
   const raw = readRawConfig();
+  lastConfiguredProtectedMcpEnvKeys = protectedMcpConfiguredEnvKeys(raw.protectedMcpCapabilities);
   const out: GlobalConfig = {};
   if (isLocale(raw.lang)) out.lang = raw.lang;
   const linkRefs = normalizeLinkRefConfig(raw.linkRefs);
@@ -1019,6 +1051,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (groupNamePrefix) out.groupNamePrefix = groupNamePrefix;
   const repoPickerMode = readRepoPickerMode(raw.repoPickerMode);
   if (repoPickerMode) out.repoPickerMode = repoPickerMode;
+  const worktreeRoot = normalizeWorktreeRoot(raw.worktreeRoot);
+  if (worktreeRoot) out.worktreeRoot = worktreeRoot;
   const dashboard = readDashboard(raw.dashboard);
   if (dashboard) out.dashboard = dashboard;
   const voice = readVoice(raw.voice);
@@ -1052,6 +1086,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (skills) out.skills = skills;
   const plugins = normalizePluginIdList(raw.plugins);
   if (plugins) out.plugins = plugins;
+  const protectedMcpCapabilities = normalizeProtectedMcpCapabilities(raw.protectedMcpCapabilities);
+  if (protectedMcpCapabilities) out.protectedMcpCapabilities = protectedMcpCapabilities;
   const mcpGatewayMaxToolTimeoutMs = normalizeMcpGatewayMaxToolTimeoutMs(raw.mcpGatewayMaxToolTimeoutMs);
   if (mcpGatewayMaxToolTimeoutMs !== undefined) out.mcpGatewayMaxToolTimeoutMs = mcpGatewayMaxToolTimeoutMs;
   if (typeof raw.remoteAccess === 'boolean') out.remoteAccess = raw.remoteAccess;

@@ -24,8 +24,7 @@ describe('plugin supervisor lifecycle evidence', () => {
     rmSync(home, { recursive: true, force: true });
   });
   const write = (path: string, value: unknown) => writeFileSync(path, JSON.stringify(value));
-  const stopped = { name: 'botmux-plugin-demo', appId: '', pid: 0, generation: 1,
-    status: 'stopped', restarts: 0, lastExitCode: null, startedAt: null };
+  const stopped = { name: 'botmux-plugin-demo', appId: '', pid: 0, status: 'stopped' };
 
   it.each([{ value: null }, { value: [] }, { value: { revision: 3 } }, { value: { revision: '', target: '', services: [] } }])(
     'rejects malformed desired state: %j', ({ value }) => {

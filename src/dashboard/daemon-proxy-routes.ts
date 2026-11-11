@@ -92,6 +92,10 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   // launch-shell：`{ launchShell: string }`（shell 名或绝对路径；'' = 清除，回 $SHELL）。
   putBotConfig('launch-shell'),
   { ...putBotConfig('oncall-group'), decodeAppId: 'after-body' },
+  { method: 'GET', path: botPath('oncall-target'), upstream: '/api/bot-oncall-target', body: NO_BODY },
+  putBotConfig('oncall-target', { kind: 'json', maxBytes: 16 * 1024 }),
+  { method: 'POST', path: botPath('oncall-target/choices'), upstream: '/api/bot-oncall-target/choices', body: { kind: 'json', maxBytes: 1024 } },
+  { method: 'POST', path: botPath('oncall-target/check'), upstream: '/api/bot-oncall-target/check', body: NO_BODY },
   // steward：`{ steward: {...} | null }`（管家开关、管家群、提示词追加/替换）。
   putBotConfig('steward', { kind: 'json', maxBytes: 64 * 1024 }),
   // actor-owner-bindings：完整替换 target Bot 的 source Bot 双 ID → Owner 策略。
@@ -229,6 +233,8 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('idle-suspend-minutes'),
   // session-owner-reminder：per-bot 周期性 owner 提醒策略；owning daemon 校验、落盘并热更新。
   putBotConfig('session-owner-reminder'),
+  // Long-running native turns: independent first-reminder and repeat intervals.
+  putBotConfig('long-task-reminder'),
   // 成员授权 / 黑名单 / 整群授权：管理写路径，不在 PUBLIC_READ_PATHS，非 manager 已在
   // resolveDashboardRequestGate 被 deny401。
   {

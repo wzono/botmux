@@ -261,20 +261,14 @@ export function rewriteLoopbackServiceUrl(rawUrl: string | undefined): string | 
   }
 }
 
-export function serviceUrls(record: InstalledPluginRecord, definition: PluginServiceDefinition): Pick<PluginServiceState, 'host' | 'port' | 'openUrl' | 'healthUrl'> {
+export function serviceUrls(record: InstalledPluginRecord, definition: PluginServiceDefinition): Pick<PluginServiceState, 'port' | 'openUrl' | 'healthUrl'> {
   const env = publicDefinitionEnv(record, definition);
   const port = definition.port ?? (env.PORT ? Number(env.PORT) : undefined);
-  const serviceHost = typeof env.HOST === 'string' && env.HOST.trim() ? env.HOST.trim() : undefined;
-  const publicHost = formatUrlHost(config.dashboard.externalHost);
-  const urls = definition.urls?.({ host: publicHost, env, ...(Number.isFinite(port) ? { port } : {}) }) ?? {};
+  const host = formatUrlHost(config.dashboard.externalHost);
+  const urls = definition.urls?.({ host, env, ...(Number.isFinite(port) ? { port } : {}) }) ?? {};
   return {
-    ...(serviceHost ? { host: serviceHost } : {}),
     ...(Number.isFinite(port) ? { port } : {}),
-    ...(urls.openUrl
-      ? { openUrl: rewriteLoopbackServiceUrl(urls.openUrl) }
-      : !definition.urls && Number.isFinite(port)
-        ? { openUrl: `http://${publicHost}:${port}/` }
-        : {}),
+    ...(urls.openUrl ? { openUrl: rewriteLoopbackServiceUrl(urls.openUrl) } : Number.isFinite(port) ? { openUrl: `http://${host}:${port}/` } : {}),
     ...(urls.healthUrl ? { healthUrl: rewriteLoopbackServiceUrl(urls.healthUrl) } : {}),
   };
 }
@@ -292,7 +286,7 @@ export function readPluginServiceState(pluginId: string): PluginServiceState | u
   }
 }
 
-export function writePluginServiceState(record: InstalledPluginRecord, definition: PluginServiceDefinition, app: PluginProcessInfo | undefined): PluginServiceState {
+function writeServiceState(record: InstalledPluginRecord, definition: PluginServiceDefinition, app: PluginProcessInfo | undefined): PluginServiceState {
   const runtimeDir = pluginRuntimeDir(record.id);
   const runtimeRealpath = existsSync(runtimeDir) ? realpathSync(runtimeDir) : undefined;
   const state: PluginServiceState = {
@@ -303,7 +297,6 @@ export function writePluginServiceState(record: InstalledPluginRecord, definitio
     updatedAt: new Date().toISOString(),
     status: app?.status ?? 'stopped',
     ...(typeof app?.pid === 'number' ? { pid: app.pid } : {}),
-    ...(typeof app?.processStart === 'string' ? { processStart: app.processStart } : {}),
     ...serviceUrls(record, definition),
     processName: pluginServiceName(record.id),
     supervisor: 'builtin',
@@ -394,7 +387,7 @@ export async function startPluginServices(
         if (!definition) continue;
         const action = await startService(record, definition);
         const app = findService(pluginServiceName(record.id));
-        const state = writePluginServiceState(record, definition, app);
+        const state = writeServiceState(record, definition, app);
         reports.push(reportFromState(record, action, state));
       } catch (err: any) {
         reports.push(reportFromState(record, 'failed', readPluginServiceState(record.id), err?.message ?? String(err)));
@@ -417,13 +410,13 @@ export async function stopPluginServices(
         const name = pluginServiceName(record.id);
         const before = findService(name);
         if (!before) {
-          const state = writePluginServiceState(record, definition, before);
+          const state = writeServiceState(record, definition, before);
           reports.push(reportFromState(record, 'not-running', state));
           continue;
         }
         await changePluginService(record.id, 'stop');
         const app = findService(name);
-        const state = writePluginServiceState(record, definition, app);
+        const state = writeServiceState(record, definition, app);
         reports.push(reportFromState(record, isStoppedService(before) ? 'not-running' : 'stopped', state));
       } catch (err: any) {
         reports.push(reportFromState(record, 'failed', readPluginServiceState(record.id), err?.message ?? String(err)));
@@ -480,7 +473,7 @@ export async function listPluginServiceStatus(): Promise<PluginServiceReport[]> 
         const definition = await loadPluginServiceDefinition(record);
         if (!definition) continue;
         const app = findService(pluginServiceName(record.id));
-        const state = writePluginServiceState(record, definition, app);
+        const state = writeServiceState(record, definition, app);
         reports.push(reportFromState(record, 'status', state));
       } catch (err: any) {
         reports.push(reportFromState(record, 'failed', readPluginServiceState(record.id), err?.message ?? String(err)));

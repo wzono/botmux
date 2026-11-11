@@ -24,7 +24,6 @@ vi.mock('../src/core/fleet-supervisor.js', () => {
     FleetSupervisor: class {
       async stopAll(): Promise<void> {}
       async drainCommands(): Promise<void> {}
-      async migrateWorkspaceSchema() { return { status: 'migrated', epoch: 1 }; }
       start(): boolean {
         boundary.envAtFleetStart = { ...process.env };
         return true;
@@ -46,6 +45,12 @@ vi.mock('../src/core/fleet-runtime.js', () => ({
 
 vi.mock('../src/core/fleet-command-queue.js', () => ({
   drainFleetCommands: () => [],
+}));
+
+// Run from inside a bot session, the real one would move this test process
+// into a fleet scope of the host's user systemd.
+vi.mock('../src/core/fleet-scope.js', () => ({
+  moveSupervisorIntoFleetScope: () => ({ action: 'kept', unit: 'test.scope' }),
 }));
 
 vi.mock('../src/utils/logger.js', () => ({

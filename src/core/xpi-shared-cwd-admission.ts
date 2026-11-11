@@ -79,8 +79,7 @@ function malformedQueueDetail(session: Session): string | undefined {
       || typeof record.resume !== 'boolean'
       || (record.dispatchState !== undefined
         && record.dispatchState !== 'queued'
-        && record.dispatchState !== 'attempting'
-        && record.dispatchState !== 'blocked')
+        && record.dispatchState !== 'attempting')
       || !validCaller(record.caller)
       || typeof record.cliInput?.content !== 'string') {
       return `session ${session.sessionId} contains a malformed XPI shared-cwd queue record`;

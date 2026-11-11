@@ -12,15 +12,18 @@
  * 不清理附件、不限历史条数：看板是给人读的台账，规模由人维护的事项数决定（几十到几百项）。
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike, type StatementLike } from './sqlite-compat.js';
 import type { Locale } from '../i18n/types.js';
+import { decisionAskKey } from '../core/decision-board/ask-key.js';
+import { BOARD_EXPLAINER_EXT, boardFileKind } from '../core/decision-board/files.js';
 import {
   BOARD_LIMITS,
   BOARD_STATE_LABELS,
   CHAT_REF_PATTERN,
   type BoardActor,
+  type BatchSource,
   type BoardBatch,
   type BoardChatCheck,
   type BoardDecision,
@@ -65,7 +68,7 @@ export const decisionBoardFilesDir = (dataDir: string, appId: string): string =>
 // 看板仍能打开。补列见 migrateChatColumns，回滚期间旧构建留下的不一致见 healChatFields。
 // 「自动发现可以关的项」的六列（board_items.close_when / depends_on / next_check_at / hint_json /
 // hint_notified / hint_dismissed）同理：都可空，存量行全是 NULL = 没写条件、没有提示，不升版本号。
-// 补列见 migrateHintColumns。
+// 补列见 migrateHintColumns。「子任务提醒」的 board_items.task_notified 同理。
 const SCHEMA_VERSION = 3;
 
 /** 管家写入的字段补丁。undefined = 不动；null = 清空（仅可选字段）。 */
@@ -106,6 +109,22 @@ export interface ItemSummary extends BoardItem {
   pendingDecisions: number;
   /** 管家在 owner 上次打开详情之后写过东西。 */
   unseen: boolean;
+  /** 这一项附了几个图文说明（HTML 说明页 + 视频）；没有就不带。 */
+  explainers?: number;
+}
+
+/** 已经写在暂存区里的图文说明（见 decision-board-staging.ts）：attach 时挪进 files/。 */
+export interface StagedFileInput {
+  path: string;
+  sha256: string;
+  bytes: number;
+  mime: string;
+  name: string;
+}
+
+interface StagedMoves {
+  moved: Array<{ from: string; to: string }>;
+  duplicates: string[];
 }
 
 export interface ItemDetail {
@@ -128,6 +147,30 @@ export interface SubmitInput {
   items: Array<{ seq: number; draftUpdatedAt: number }>;
 }
 
+/** 管家群里一项的拍板卡片：一项只留一张，后续原地更新。 */
+export interface BoardCardRecord {
+  seq: number;
+  chatId: string;
+  messageId: string;
+  /** 上次发出 / 更新的卡片内容指纹：没变就不 PATCH。 */
+  hash: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** 卡片上点的一次决定（不经草稿）。 */
+export interface CardSubmitInput {
+  seq: number;
+  choice?: string;
+  text: string;
+  /** 'u:<union_id>' 或 'owner'：记进批次和历史。 */
+  submitter: string;
+  authorName?: string;
+  nonce: string;
+  /** 在写锁里核对这一项还能按这张卡拍板（状态、选项指纹）；不能就抛 BoardError。 */
+  verify(item: BoardItem): void;
+}
+
 export class BoardError extends Error {
   constructor(readonly code: string, message?: string) {
     super(message ?? code);
@@ -146,6 +189,7 @@ interface ItemRow {
   /** 同上：补列前的旧行没有这几列。 */
   close_when?: string | null; depends_on?: string | null; next_check_at?: number | null;
   hint_json?: string | null; hint_notified?: string | null; hint_dismissed?: string | null;
+  task_notified?: string | null;
 }
 
 function rowToItem(r: ItemRow): BoardItem {
@@ -195,6 +239,17 @@ function parseIds(json: string | null): string[] {
   } catch { return []; }
 }
 
+/** 没写 --note 时这次附件的默认历史文字。 */
+function attachSummary(files: BoardFile[]): string {
+  const count = (kind: string) => files.filter(f => boardFileKind(f.mime) === kind).length;
+  const parts = [
+    count('html') ? `说明页 ${count('html')} 个` : '',
+    count('video') ? `视频 ${count('video')} 个` : '',
+    count('image') ? `截图 ${count('image')} 张` : '',
+  ].filter(Boolean);
+  return `附了图文说明（${parts.join('、')}）`;
+}
+
 function checkLen(field: string, value: string | null | undefined, max: number): void {
   if (typeof value === 'string' && value.length > max) {
     throw new BoardError('field_too_long', `${field} 太长（上限 ${max} 字）`);
@@ -203,6 +258,7 @@ function checkLen(field: string, value: string | null | undefined, max: number):
 
 const FILE_EXT: Record<string, string> = {
   'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp',
+  ...BOARD_EXPLAINER_EXT,
 };
 
 /**
@@ -256,6 +312,7 @@ function migrateHintColumns(db: DatabaseSyncLike): void {
   const columns: Array<[string, string]> = [
     ['close_when', 'TEXT'], ['depends_on', 'TEXT'], ['next_check_at', 'INTEGER'],
     ['hint_json', 'TEXT'], ['hint_notified', 'TEXT'], ['hint_dismissed', 'TEXT'],
+    ['task_notified', 'TEXT'],
   ];
   for (const [column, type] of columns) {
     if (!have.has(column)) db.exec(`ALTER TABLE board_items ADD COLUMN ${column} ${type};`);
@@ -267,6 +324,24 @@ function migrateHintColumns(db: DatabaseSyncLike): void {
  * 收拾一遍（幂等，正常数据上什么都不改）：主群指向的群已不在关联里就清掉指定（否则那个群以后
  * 再挂回来会悄悄复位成主群）；已经有群的事项清掉无群原因（否则群删光后显示的是过期原因而不是缺群）。
  */
+/**
+ * 拍板卡片的三列：board_batches.source（'card' = 管家群卡片上点的，NULL = 网页）、
+ * board_decisions.superseded_by（同一项后来又提交了决定时，覆盖它的批次号）、
+ * board_decisions.ask_key（决定时待拍板内容的指纹，见 ask-key.ts）。照 migrateChatColumns
+ * 按列在不在补，幂等；都可空，旧构建的 SELECT * 与显式列 INSERT 照常工作，不升版本号。
+ * 卡片记录是单独的 board_cards 表（CREATE IF NOT EXISTS），旧构建不读它。
+ */
+function migrateCardColumns(db: DatabaseSyncLike): void {
+  const addMissing = (table: string, column: string, type: string) => {
+    const have = new Set((db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: unknown }>).map(c => c.name));
+    if (have.size === 0 || have.has(column)) return;
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type};`);
+  };
+  addMissing('board_batches', 'source', 'TEXT');
+  addMissing('board_decisions', 'superseded_by', 'INTEGER');
+  addMissing('board_decisions', 'ask_key', 'TEXT');
+}
+
 function healChatFields(db: DatabaseSyncLike): void {
   db.exec(`UPDATE board_items SET primary_chat = NULL
     WHERE primary_chat IS NOT NULL AND NOT EXISTS (SELECT 1 FROM board_links l
@@ -299,6 +374,7 @@ export class DecisionBoardStore {
       // 与版本号无关（本身幂等），所以不加版本门槛。
       migrateBoardFilesOrd(db);
       migrateChatColumns(db);
+      migrateCardColumns(db);
       migrateHintColumns(db);
       db.exec(`
         CREATE TABLE IF NOT EXISTS board_items (
@@ -335,6 +411,8 @@ export class DecisionBoardStore {
           hint_notified TEXT,
           -- 管家收起过的提示 key（JSON 数组）：之后不再标出。
           hint_dismissed TEXT,
+          -- 已提醒过管家的子任务结果 key（JSON 数组）：同一次交付 / 举手 / 中断只提醒一次。
+          task_notified TEXT,
           PRIMARY KEY (app_id, seq)
         ) WITHOUT ROWID;
         CREATE UNIQUE INDEX IF NOT EXISTS board_items_key ON board_items(app_id, item_key) WHERE item_key IS NOT NULL;
@@ -407,6 +485,8 @@ export class DecisionBoardStore {
           turn_id TEXT,
           delivered_at INTEGER,
           error TEXT,
+          -- 'card' = 管家群拍板卡片上点的；NULL = 网页看板。
+          source TEXT,
           PRIMARY KEY (app_id, id)
         ) WITHOUT ROWID;
         CREATE UNIQUE INDEX IF NOT EXISTS board_batches_nonce ON board_batches(app_id, nonce);
@@ -419,7 +499,21 @@ export class DecisionBoardStore {
           file_ids_json TEXT NOT NULL DEFAULT '[]',
           item_rev INTEGER NOT NULL,
           handled_at INTEGER,
+          -- 同一项后来又提交了决定（卡片与网页之间以后提交的为准）：覆盖它的批次号；被覆盖的不再算待执行。
+          superseded_by INTEGER,
+          -- 决定时「问题 + 选项 + 推荐」的指纹：之后选项改过就对不上（同一个选项键可能换了意思）。
+          ask_key TEXT,
           PRIMARY KEY (app_id, batch_id, seq)
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS board_cards (
+          app_id TEXT NOT NULL,
+          seq INTEGER NOT NULL,
+          chat_id TEXT NOT NULL,
+          message_id TEXT NOT NULL,
+          hash TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY (app_id, seq)
         ) WITHOUT ROWID;
       `);
       healChatFields(db);
@@ -924,6 +1018,51 @@ export class DecisionBoardStore {
     });
   }
 
+  // ─── 子任务提醒 ────────────────────────────────────────────────────────────────
+
+  /** 没结束、且关联了这些群之一的事项（含已提醒过的 key）。 */
+  itemsForChats(appId: string, chatIds: readonly string[]):
+    Array<{ item: BoardItem; links: BoardLink[]; taskNotified: string[] }> {
+    if (chatIds.length === 0) return [];
+    const wanted = new Set(chatIds);
+    const rows = this.stmt('SELECT * FROM board_items WHERE app_id = ? ORDER BY seq').all(appId) as ItemRow[];
+    const out: Array<{ item: BoardItem; links: BoardLink[]; taskNotified: string[] }> = [];
+    for (const row of rows) {
+      const item = rowToItem(row);
+      if (isEndedState(item.state)) continue;
+      const links = this.links(appId, item.seq);
+      const hit = (item.primaryChat && wanted.has(item.primaryChat)) || links.some(l => l.kind === 'chat' && wanted.has(l.ref));
+      if (hit) out.push({ item, links, taskNotified: keyListFromJson(row.task_notified) });
+    }
+    return out;
+  }
+
+  /** 提醒送进管家会话之前记下这些 key；送不出去再 {@link unmarkTaskNotified}。 */
+  markTaskNotified(appId: string, entries: ReadonlyArray<{ seq: number; key: string }>): void {
+    this.tx(() => {
+      for (const e of entries) {
+        const row = this.itemRow(appId, e.seq);
+        if (!row) continue;
+        this.stmt('UPDATE board_items SET task_notified = ? WHERE app_id = ? AND seq = ?')
+          .run(JSON.stringify(appendKey(keyListFromJson(row.task_notified), e.key)), appId, e.seq);
+      }
+    });
+  }
+
+  unmarkTaskNotified(appId: string, entries: ReadonlyArray<{ seq: number; key: string }>): void {
+    this.tx(() => {
+      for (const e of entries) {
+        const row = this.itemRow(appId, e.seq);
+        if (!row) continue;
+        const keys = keyListFromJson(row.task_notified);
+        if (!keys.includes(e.key)) continue;
+        const next = keys.filter(k => k !== e.key);
+        this.stmt('UPDATE board_items SET task_notified = ? WHERE app_id = ? AND seq = ?')
+          .run(next.length ? JSON.stringify(next) : null, appId, e.seq);
+      }
+    });
+  }
+
   links(appId: string, seq: number): BoardLink[] {
     // ord 是同一事项内严格单调的写入序号（见建表注释），单独按它排序即得稳定的作者顺序。
     return (this.stmt('SELECT kind, ref, label, chat_check, chat_name FROM board_links WHERE app_id = ? AND seq = ? ORDER BY ord')
@@ -956,6 +1095,7 @@ export class DecisionBoardStore {
       : []);
     const pending = new Map((this.stmt('SELECT seq, COUNT(*) AS n FROM board_decisions WHERE app_id = ? AND handled_at IS NULL GROUP BY seq')
       .all(appId) as Array<{ seq: number; n: number }>).map(r => [r.seq, r.n]));
+    const explainers = this.explainerCounts(appId);
     const q = opts.query?.trim().toLowerCase();
     const out: ItemSummary[] = [];
     for (const row of rows) {
@@ -973,6 +1113,7 @@ export class DecisionBoardStore {
         hasDraft: drafts.has(item.seq),
         pendingDecisions: pending.get(item.seq) ?? 0,
         unseen: !!item.stewardEventAt && (!item.ownerSeenAt || item.stewardEventAt > item.ownerSeenAt),
+        ...(explainers.get(item.seq) ? { explainers: explainers.get(item.seq) } : {}),
       });
     }
     // 待拍板按进入该状态的时间（先进先拍）；其它按最近更新。
@@ -1019,7 +1160,7 @@ export class DecisionBoardStore {
   addFile(appId: string, input: { seq?: number; bytes: Buffer; mime: string; name: string; by: 'owner' | 'steward' },
     now = Date.now()): BoardFile {
     const ext = FILE_EXT[input.mime];
-    if (!ext) throw new BoardError('unsupported_file', '只支持 png / jpg / gif / webp 图片');
+    if (!ext || boardFileKind(input.mime) !== 'image') throw new BoardError('unsupported_file', '只支持 png / jpg / gif / webp 图片');
     const sha256 = createHash('sha256').update(input.bytes).digest('hex');
     const dir = decisionBoardFilesDir(this.dataDir, appId);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -1052,6 +1193,40 @@ export class DecisionBoardStore {
     try { return { file: found.file, data: readFileSync(found.path) }; } catch { return undefined; }
   }
 
+  /** 每项的图文说明个数（只数已经挂到事项上的）。 */
+  explainerCounts(appId: string): Map<number, number> {
+    const mimes = Object.keys(BOARD_EXPLAINER_EXT);
+    const rows = this.stmt(`SELECT seq, COUNT(*) AS n FROM board_files WHERE app_id = ? AND seq IS NOT NULL
+      AND mime IN (${mimes.map(() => '?').join(', ')}) GROUP BY seq`).all(appId, ...mimes) as Array<{ seq: number; n: number }>;
+    return new Map(rows.map(r => [r.seq, r.n]));
+  }
+
+  /**
+   * 暂存区里的文件挪到按 sha256 命名的位置再写元数据。只在 attachExplainers 的事务里调用：同一份暂存
+   * 文件被并发 attach 两次时，后一个在写锁里发现它已不在，整个 attach 回滚。
+   * 挪动记进 moves，由调用方在回滚时挪回去、提交后删掉内容重复的暂存副本。
+   */
+  private addStagedFile(appId: string, seq: number, input: StagedFileInput, now: number, moves: StagedMoves): BoardFile {
+    const ext = FILE_EXT[input.mime];
+    if (!ext || boardFileKind(input.mime) === 'image') throw new BoardError('unsupported_file', '图文说明只支持 .html 说明页和 .mp4 / .webm 视频');
+    if (!existsSync(input.path)) throw new BoardError('unknown_file', '说明文件已经不在了，重新 attach');
+    const dir = decisionBoardFilesDir(this.dataDir, appId);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const path = join(dir, `${input.sha256}${ext}`);
+    if (existsSync(path)) {
+      moves.duplicates.push(input.path);
+    } else {
+      renameSync(input.path, path);
+      moves.moved.push({ from: input.path, to: path });
+      try { chmodSync(path, 0o600); } catch { /* best effort */ }
+    }
+    const id = randomUUID().replace(/-/g, '').slice(0, 20);
+    this.stmt(`INSERT INTO board_files (app_id, id, seq, sha256, mime, bytes, name, uploader, created_at, ord)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'steward', ?, (SELECT COALESCE(MAX(ord), 0) + 1 FROM board_files WHERE app_id = ?))`)
+      .run(appId, id, seq, input.sha256, input.mime, input.bytes, input.name, now, appId);
+    return { id, seq, sha256: input.sha256, mime: input.mime, bytes: input.bytes, name: input.name, by: 'steward', createdAt: now };
+  }
+
   /** 管家附截图：文件 + 一条历史，同一事务。 */
   attachFiles(appId: string, seq: number, files: Array<{ bytes: Buffer; mime: string; name: string }>, note: string | undefined,
     actorRef?: string, now = Date.now()): BoardFile[] {
@@ -1063,6 +1238,35 @@ export class DecisionBoardStore {
         saved.map(f => f.id));
       return saved;
     });
+  }
+
+  /** 管家附图文说明（可同时带截图）：文件 + 一条历史，同一事务。 */
+  attachExplainers(appId: string, seq: number, input: { images: Array<{ bytes: Buffer; mime: string; name: string }>; staged: StagedFileInput[] },
+    note: string | undefined, actorRef?: string, now = Date.now()): BoardFile[] {
+    checkLen('说明', note, BOARD_LIMITS.note);
+    const moves: StagedMoves = { moved: [], duplicates: [] };
+    let saved: BoardFile[];
+    try {
+      saved = this.tx(() => {
+        if (!this.itemRow(appId, seq)) throw new BoardError('item_not_found', `没有 #${seq}`);
+        const files = [
+          ...input.staged.map(f => this.addStagedFile(appId, seq, f, now, moves)),
+          ...input.images.map(f => this.addFile(appId, { ...f, seq, by: 'steward' }, now)),
+        ];
+        this.insertEvent(appId, seq, now, 'steward', actorRef, 'attach', note?.trim() || attachSummary(files), files.map(f => f.id));
+        return files;
+      });
+    } catch (error) {
+      // 没提交：库里没有行指向这次挪进 files/ 的文件，挪回暂存区（挪不回就删），不留孤儿。
+      for (const m of moves.moved) {
+        try { renameSync(m.to, m.from); } catch { try { unlinkSync(m.to); } catch { /* 已经不在 */ } }
+      }
+      throw error;
+    }
+    for (const path of moves.duplicates) {
+      try { unlinkSync(path); } catch { /* 暂存区下次上传时按时间清 */ }
+    }
+    return saved;
   }
 
   // ─── 草稿 ───────────────────────────────────────────────────────────────
@@ -1144,20 +1348,134 @@ export class DecisionBoardStore {
         VALUES (?, ?, ?, ?, ?, ?, 'pending', 0)`).run(appId, id, input.submitter ?? input.author, input.authorName ?? null, input.nonce, now);
       const decisions: BoardDecision[] = [];
       for (const { draft, item } of drafts) {
-        this.stmt(`INSERT INTO board_decisions (app_id, batch_id, seq, choice, text, file_ids_json, item_rev)
-          VALUES (?, ?, ?, ?, ?, ?, ?)`).run(appId, id, item.seq, draft.choice ?? null, draft.text,
-          JSON.stringify(draft.fileIds), item.rev);
+        this.stmt(`INSERT INTO board_decisions (app_id, batch_id, seq, choice, text, file_ids_json, item_rev, ask_key)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(appId, id, item.seq, draft.choice ?? null, draft.text,
+          JSON.stringify(draft.fileIds), item.rev, decisionAskKey(item));
         for (const fid of draft.fileIds) {
           this.stmt('UPDATE board_files SET seq = ? WHERE app_id = ? AND id = ? AND seq IS NULL').run(item.seq, appId, fid);
         }
         const summary = [draft.choice ? `选 ${draft.choice}` : '', draft.text.trim()].filter(Boolean).join('：') || '（附图）';
         this.insertEvent(appId, item.seq, now, 'owner', input.submitter ?? input.author, 'decision', summary, draft.fileIds, id);
+        // 网页草稿可能写在选项改动之前：选的选项已经不在、或事项已不在待拍板时，这份草稿不算「以后提交的
+        // 决定」，不去覆盖卡片上的决定（照旧作为普通的一批送达，由管家按 guide 核对）。
+        if (item.state === 'decide' && (!draft.choice || item.options.some(o => o.key === draft.choice))) {
+          this.supersedeEarlier(appId, item.seq, id, 'web', now);
+        }
         this.clearDraft(appId, item.seq, input.author);
         decisions.push({ batchId: id, seq: item.seq, ...(draft.choice ? { choice: draft.choice } : {}), text: draft.text,
-          fileIds: draft.fileIds, itemRev: item.rev });
+          fileIds: draft.fileIds, itemRev: item.rev, askKey: decisionAskKey(item) });
       }
       return { batch: this.getBatch(appId, id)!, decisions, duplicate: false };
     });
+  }
+
+  /**
+   * 卡片上点的一次决定：一个事务里建批次、写决定和历史，不经草稿（网页上那份草稿原样留着，
+   * 之后网页再提交就按「以后提交的为准」覆盖这次）。同一个 nonce 重复提交返回已有批次。
+   */
+  submitCard(appId: string, input: CardSubmitInput, now = Date.now()): { batch: BoardBatch; decision: BoardDecision; duplicate: boolean; supersedes: number[] } {
+    if (!input.nonce || input.nonce.length > 100) throw new BoardError('invalid_nonce');
+    const text = input.text.replace(/\r\n/g, '\n');
+    checkLen('说明', text, BOARD_LIMITS.longText);
+    const choice = input.choice?.trim() || undefined;
+    if (!choice && !text.trim()) throw new BoardError('nothing_to_submit', '要选一个选项或写一句说明');
+    return this.tx(() => {
+      const dup = this.stmt('SELECT id FROM board_batches WHERE app_id = ? AND nonce = ?').get(appId, input.nonce) as { id: number } | undefined;
+      if (dup) {
+        const decision = this.batchDecisions(appId, dup.id)[0]!;
+        return { batch: this.getBatch(appId, dup.id)!, decision, duplicate: true, supersedes: this.supersededBy(appId, dup.id, decision.seq) };
+      }
+      const item = this.getItem(appId, input.seq);
+      if (!item) throw new BoardError('item_not_found', `没有 #${input.seq}`);
+      input.verify(item);
+      if (choice && !item.options.some(o => o.key === choice)) throw new BoardError('unknown_choice', `没有选项 ${choice}`);
+      const id = ((this.stmt('SELECT MAX(id) AS m FROM board_batches WHERE app_id = ?').get(appId) as { m: number | null }).m ?? 0) + 1;
+      this.stmt(`INSERT INTO board_batches (app_id, id, author, author_name, nonce, created_at, delivery, attempts, source)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, 'card')`).run(appId, id, input.submitter, input.authorName ?? null, input.nonce, now);
+      const askKey = decisionAskKey(item);
+      this.stmt(`INSERT INTO board_decisions (app_id, batch_id, seq, choice, text, file_ids_json, item_rev, ask_key)
+        VALUES (?, ?, ?, ?, ?, '[]', ?, ?)`).run(appId, id, item.seq, choice ?? null, text, item.rev, askKey);
+      const summary = [choice ? `选 ${choice}` : '', text.trim()].filter(Boolean).join('：');
+      this.insertEvent(appId, item.seq, now, 'owner', input.submitter, 'decision', `${summary}（飞书卡片）`, [], id);
+      const supersedes = this.supersedeEarlier(appId, item.seq, id, 'card', now);
+      const decision: BoardDecision = { batchId: id, seq: item.seq, ...(choice ? { choice } : {}), text, fileIds: [], itemRev: item.rev, askKey };
+      return { batch: this.getBatch(appId, id)!, decision, duplicate: false, supersedes };
+    });
+  }
+
+  /**
+   * 同一项又有了新决定时，较早的、还没执行的决定以新的为准（以后提交的为准）。只在卡片参与时生效
+   *（新决定来自卡片，或较早的那条来自卡片）：网页上连续提交的几批仍按原来的规则逐批执行。
+   *
+   *   - 较早那批还没送到管家（pending / failed）：直接作废——记 superseded_by，同时记 handled_at，
+   *     它不再算待执行，`--handled` 也不会落到它头上；之后真被投递时消息里写明「不用执行」。
+   *   - 已经送到或正在送（dispatched / delivered）：管家可能已经在做，不能替它作废。只记 superseded_by，
+   *     仍按批次顺序待执行：管家按 guide 先把那条按实际情况 `--handled`（做了什么，或「已被覆盖，未执行」），
+   *     再执行新的一条。`--handled` 永远落在最早的未执行决定上，所以账本与管家实际做的事一致。
+   *
+   * 在调用方的事务里执行；返回被覆盖的批次号。
+   */
+  private supersedeEarlier(appId: string, seq: number, batchId: number, source: BatchSource, now: number): number[] {
+    const rows = this.stmt(`SELECT d.batch_id AS batch_id, b.source AS source, b.delivery AS delivery FROM board_decisions d
+      JOIN board_batches b ON b.app_id = d.app_id AND b.id = d.batch_id
+      WHERE d.app_id = ? AND d.seq = ? AND d.batch_id < ? AND d.handled_at IS NULL AND d.superseded_by IS NULL
+      ORDER BY d.batch_id`).all(appId, seq, batchId) as Array<{ batch_id: number; source: string | null; delivery: string }>;
+    const hit = rows.filter(r => source === 'card' || r.source === 'card');
+    for (const old of hit) {
+      const voided = old.delivery === 'pending' || old.delivery === 'failed';
+      this.stmt(`UPDATE board_decisions SET superseded_by = ?, handled_at = CASE WHEN ? THEN ? ELSE handled_at END
+        WHERE app_id = ? AND batch_id = ? AND seq = ?`).run(batchId, voided ? 1 : 0, now, appId, old.batch_id, seq);
+    }
+    if (hit.length) {
+      this.insertEvent(appId, seq, now, 'system', undefined, 'note',
+        `批次 #${batchId} 覆盖了批次 ${hit.map(r => `#${r.batch_id}`).join('、')} 里对这一项的决定（以后提交的为准）`, [], batchId);
+    }
+    return hit.map(r => r.batch_id);
+  }
+
+  /** 这个批次里对 seq 的决定覆盖了哪些较早批次。 */
+  supersededBy(appId: string, batchId: number, seq: number): number[] {
+    return this.supersededDetail(appId, batchId, seq).map(r => r.batchId);
+  }
+
+  /** 同上，带上那条现在是否已不用执行（作废，或管家已经 --handled）。 */
+  supersededDetail(appId: string, batchId: number, seq: number): Array<{ batchId: number; settled: boolean }> {
+    return (this.stmt('SELECT batch_id, handled_at FROM board_decisions WHERE app_id = ? AND seq = ? AND superseded_by = ? ORDER BY batch_id')
+      .all(appId, seq, batchId) as Array<{ batch_id: number; handled_at: number | null }>)
+      .map(r => ({ batchId: r.batch_id, settled: r.handled_at !== null }));
+  }
+
+  /** 这一项最近的一条决定（含已执行 / 被覆盖的），卡片据此显示「已选 X」。 */
+  latestDecision(appId: string, seq: number): BoardDecision | undefined {
+    const r = this.stmt('SELECT * FROM board_decisions WHERE app_id = ? AND seq = ? ORDER BY batch_id DESC LIMIT 1').get(appId, seq) as DecisionRow | undefined;
+    return r ? rowToDecision(r) : undefined;
+  }
+
+  // ─── 拍板卡片 ───────────────────────────────────────────────────────────
+
+  getCard(appId: string, seq: number): BoardCardRecord | undefined {
+    const r = this.stmt('SELECT * FROM board_cards WHERE app_id = ? AND seq = ?').get(appId, seq) as
+      { seq: number; chat_id: string; message_id: string; hash: string; created_at: number; updated_at: number } | undefined;
+    return r ? { seq: r.seq, chatId: r.chat_id, messageId: r.message_id, hash: r.hash, createdAt: r.created_at, updatedAt: r.updated_at } : undefined;
+  }
+
+  /** 全部卡片记录（启动时对一遍：补发没发出去的、刷新内容过期的）。 */
+  listCards(appId: string): BoardCardRecord[] {
+    return (this.stmt('SELECT seq FROM board_cards WHERE app_id = ? ORDER BY seq').all(appId) as Array<{ seq: number }>)
+      .map(r => this.getCard(appId, r.seq)!).filter(Boolean);
+  }
+
+  /** 卡片记录。messageId 为空串 = 要发、还没确认发出（发卡前先落这一行，发失败或进程死了之后据此重发）。 */
+  putCard(appId: string, rec: { seq: number; chatId: string; messageId: string; hash: string }, now = Date.now()): void {
+    this.stmt(`INSERT INTO board_cards (app_id, seq, chat_id, message_id, hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(app_id, seq) DO UPDATE SET
+        created_at = CASE WHEN board_cards.message_id = excluded.message_id THEN board_cards.created_at ELSE excluded.created_at END,
+        chat_id = excluded.chat_id, message_id = excluded.message_id, hash = excluded.hash, updated_at = excluded.updated_at`)
+      .run(appId, rec.seq, rec.chatId, rec.messageId, rec.hash, now, now);
+  }
+
+  deleteCard(appId: string, seq: number): void {
+    this.stmt('DELETE FROM board_cards WHERE app_id = ? AND seq = ?').run(appId, seq);
   }
 
   getBatch(appId: string, id: number): BoardBatch | undefined {
@@ -1236,6 +1554,8 @@ function rowToFile(r: FileRow): BoardFile {
 interface BatchRow {
   id: number; author: string; author_name: string | null; created_at: number; delivery: string; attempts: number;
   session_id: string | null; turn_id: string | null; delivered_at: number | null; error: string | null;
+  /** 补列前的旧库读出来没有这一列。 */
+  source?: string | null;
 }
 function rowToBatch(r: BatchRow): BoardBatch {
   return {
@@ -1243,11 +1563,17 @@ function rowToBatch(r: BatchRow): BoardBatch {
     delivery: r.delivery === 'delivered' || r.delivery === 'failed' || r.delivery === 'dispatched' ? r.delivery : 'pending', attempts: r.attempts,
     ...(r.session_id ? { sessionId: r.session_id } : {}), ...(r.turn_id ? { turnId: r.turn_id } : {}),
     ...(r.delivered_at ? { deliveredAt: r.delivered_at } : {}), ...(r.error ? { error: r.error } : {}),
+    ...(r.source === 'card' ? { source: 'card' as const } : {}),
   };
 }
 
-interface DecisionRow { batch_id: number; seq: number; choice: string | null; text: string; file_ids_json: string; item_rev: number; handled_at: number | null }
+interface DecisionRow {
+  batch_id: number; seq: number; choice: string | null; text: string; file_ids_json: string; item_rev: number; handled_at: number | null;
+  superseded_by?: number | null;
+  ask_key?: string | null;
+}
 function rowToDecision(r: DecisionRow): BoardDecision {
   return { batchId: r.batch_id, seq: r.seq, ...(r.choice ? { choice: r.choice } : {}), text: r.text, fileIds: parseIds(r.file_ids_json),
-    itemRev: r.item_rev, ...(r.handled_at ? { handledAt: r.handled_at } : {}) };
+    itemRev: r.item_rev, ...(r.handled_at ? { handledAt: r.handled_at } : {}),
+    ...(r.superseded_by ? { supersededBy: r.superseded_by } : {}), ...(r.ask_key ? { askKey: r.ask_key } : {}) };
 }
