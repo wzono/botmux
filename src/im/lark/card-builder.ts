@@ -974,7 +974,6 @@ export interface ActivityCardLabel {
   progressAgeSeconds?: number;
 }
 
-/** 卡头的替代标签：idle 专用的 {@link IdleCardLabel}，或 {@link BackgroundWaitCardLabel}。 */
 export type StreamCardLabel = IdleCardLabel | BackgroundWaitCardLabel | ActivityCardLabel;
 
 /** 兼容旧调用：布尔 `true` 等价于 'silent'。 */
@@ -987,7 +986,8 @@ function normalizeIdleLabel(v: boolean | StreamCardLabel | undefined): IdleCardL
 /** 后台子任务数；仅当标签是 {@link BackgroundWaitCardLabel} 且状态为 working/idle 时有值。 */
 function backgroundWaitCount(status: StreamStatus, label: boolean | StreamCardLabel | undefined): number | undefined {
   if (status !== 'working' && status !== 'idle') return undefined;
-  if (!label || typeof label !== 'object' || !('backgroundTasks' in label) || !(label.backgroundTasks > 0)) return undefined;
+  if (!label || typeof label !== 'object' || !('backgroundTasks' in label)
+    || !(label.backgroundTasks > 0)) return undefined;
   return label.backgroundTasks;
 }
 
@@ -1735,6 +1735,16 @@ function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | und
               ),
             ],
           },
+          ...(rootMessageId ? [{
+            tag: 'column',
+            width: 'auto',
+            vertical_align: 'center',
+            elements: [callbackButton(
+              t('card.repo.group_unbind', undefined, locale),
+              'default',
+              { key: 'group_workspace_unbind', root_id: rootMessageId },
+            )],
+          }] : []),
         ],
       }]),
       {

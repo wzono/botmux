@@ -14,7 +14,9 @@ const appId = 'cli_headless_contract';
 vi.mock('../src/bot-registry.js', async importOriginal => ({
   ...await importOriginal<Record<string, unknown>>(),
   getBot: () => ({ config: { larkAppId: 'cli_headless_contract', cliId: 'codex', backendType: 'pty', lang: 'zh' } }),
-  effectiveDefaultWorkingDir: () => undefined,
+  // Exercise the real ingress resolver against this test's usable directory;
+  // an unbound bot is rejected before headless provenance is evaluated.
+  effectiveDefaultWorkingDir: () => root,
 }));
 vi.mock('../src/services/session-store.js', async importOriginal => ({
   ...await importOriginal<Record<string, unknown>>(),
@@ -28,6 +30,15 @@ vi.mock('../src/services/session-store.js', async importOriginal => ({
 }));
 vi.mock('../src/core/worker-pool.js', async importOriginal => ({
   ...await importOriginal<Record<string, unknown>>(),
+  dispatchWorkspaceAdmittedBusinessTurn: vi.fn(async (input: any) => {
+    if (!await input.markAttempting()) return false;
+    state.fork(input.ds, input.payload, {
+      resume: input.resume, turnId: input.turnId,
+      ...(input.dispatchAttempt === undefined ? {} : { dispatchAttempt: input.dispatchAttempt }),
+      ...(input.atMostOnce ? { atMostOnce: true } : {}),
+    });
+    return true;
+  }),
   forkWorker: (...args: any[]) => state.fork(...args),
   getCurrentCliVersion: () => 'test',
 }));
@@ -56,7 +67,7 @@ it('real create-then-run dispatches bot-only inline guidance and durable headles
     envelope: { format: 'text', sourceName: 'headless', trusted: true },
     instruction: 'read the document', options: { asyncReturnSessionId: true },
   }, { larkAppId: appId, activeSessions });
-  expect(response.ok).toBe(true);
+  expect(response.ok, JSON.stringify(response)).toBe(true);
   expect(state.fork).toHaveBeenCalledTimes(1);
   const [ds, input, options] = state.fork.mock.calls[0];
   expect(ds.session.headless).toMatchObject({ id: created.headlessId, source: 'cli' });
@@ -79,7 +90,7 @@ it('a webhook-created forged headless address cannot acquire the binding', async
     envelope: { format: 'text', sourceName: 'fixture', trusted: false },
     instruction: 'read the document', options: { asyncReturnSessionId: true },
   }, { larkAppId: appId, activeSessions });
-  expect(response.ok).toBe(true);
+  expect(response.ok, JSON.stringify(response)).toBe(true);
   const [ds] = state.fork.mock.calls[0];
   expect(ds.session.headless).toBeUndefined();
   expect(usesLarkToolBinding({ sessionId: ds.session.sessionId, larkAppId: appId, chatId: ds.chatId,

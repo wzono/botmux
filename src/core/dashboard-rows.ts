@@ -71,6 +71,10 @@ export interface SessionRow extends SessionMessagePreview {
   lastMessageAt: number;
   closedAt?: number;
   workingDir?: string;
+  /** Resolver provenance shown by Dashboard detail/list views. */
+  workingDirSource?: Session['workingDirSource'];
+  groupWorkspaceRevision?: number;
+  groupWorkspaceIdentity?: Session['groupWorkspaceIdentity'];
   chatId: string;
   chatType?: 'group' | 'p2p';
   chatDisplayName?: string;
@@ -399,6 +403,9 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     spawnedAt: sessionCreatedAtMs(ds.session) || ds.spawnedAt,
     lastMessageAt: sessionLastActivityAtMs(ds.session) || ds.lastMessageAt,
     workingDir: ds.workingDir,
+    workingDirSource: ds.session.workingDirSource,
+    groupWorkspaceRevision: ds.session.groupWorkspaceRevision,
+    groupWorkspaceIdentity: ds.session.groupWorkspaceIdentity,
     chatId: ds.chatId,
     chatType: ds.chatType,
     chatDisplayName: directChatDisplayName(ds.session, ds.larkAppId),
@@ -482,6 +489,9 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     lastMessageAt: s.closedAt ? (parseSessionTime(s.closedAt) ?? sessionLastActivityAtMs(s)) : sessionLastActivityAtMs(s),
     closedAt: s.closedAt ? Date.parse(s.closedAt) : undefined,
     workingDir: s.workingDir,
+    workingDirSource: s.workingDirSource,
+    groupWorkspaceRevision: s.groupWorkspaceRevision,
+    groupWorkspaceIdentity: s.groupWorkspaceIdentity,
     chatId: s.chatId,
     chatType: s.chatType,
     chatDisplayName: directChatDisplayName(s, s.larkAppId),
@@ -544,6 +554,9 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     spawnedAt: sessionCreatedAtMs(s),
     lastMessageAt: sessionLastActivityAtMs(s),
     workingDir: s.workingDir,
+    workingDirSource: s.workingDirSource,
+    groupWorkspaceRevision: s.groupWorkspaceRevision,
+    groupWorkspaceIdentity: s.groupWorkspaceIdentity,
     chatId: s.chatId,
     chatType: s.chatType,
     chatDisplayName: directChatDisplayName(s, s.larkAppId),

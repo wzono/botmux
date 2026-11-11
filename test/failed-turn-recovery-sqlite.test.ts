@@ -11,6 +11,7 @@ import { startIpcServer, setIpcAuthSecret, setLarkAppId, type IpcServerHandle } 
 import { registerBot } from '../src/bot-registry.js';
 import { recordFailedTurnTerminal, recordLimitedFailedTurn } from '../src/core/failed-turn-recovery.js';
 import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
+import { installWorkspaceDispatchSpy } from './helpers/workspace-dispatch-spy.js';
 
 let directory: string;
 let oldDataDir: string;
@@ -35,6 +36,7 @@ beforeEach(async () => {
   vi.spyOn(permissions, 'canTalk').mockReturnValue(true);
   vi.spyOn(pool, 'prepareFailedTurnRecoveryIdentity').mockResolvedValue(undefined);
   vi.spyOn(pool, 'sendWorkerInput').mockReturnValue(true);
+  installWorkspaceDispatchSpy();
   vi.spyOn(pool, 'forkWorker').mockImplementation((_ds, _input, _options, callbacks) => { callbacks?.onAdmission?.('accepted'); return true; });
   vi.spyOn(pool, 'closeSessionForBackgroundCleanup').mockImplementation(async id => {
     store.closeSession(id); pool.getActiveSessionsRegistry()?.clear();

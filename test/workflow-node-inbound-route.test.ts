@@ -311,3 +311,8 @@ describe('workflow handoff with a working dir on the executing bot\'s daemon (re
     expect(refusalOf(h.nonce)).toBeUndefined();
   });
 });
+vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/admitted-turn-dispatch.js');
+  return { ...actual, dispatchAdmittedBusinessTurn: async (input: any) =>
+    (await import('./helpers/workspace-dispatch-spy.js')).dispatchAdmittedThroughWorkerSpy(input) };
+});

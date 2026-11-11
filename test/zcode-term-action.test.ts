@@ -16,6 +16,7 @@ import { isCriticalInterruptKey, sendCriticalControlKey } from '../src/adapters/
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { cursorStopLeftParkedFollowUp } from '../src/adapters/cli/cursor.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 const start = source.indexOf('// Quick-action key → real key event for the CLI');
@@ -79,6 +80,7 @@ function harness(
     sessionRenameInFlight: () => false,
     cursorStopLeftParkedFollowUp,
   };
+  state.canWriteTerminalBytes = loadWorkerFunction('canWriteTerminalBytes', state);
   const factory = new Function('state', `with (state) { ${slice}; return { handleTermAction }; }`);
   const handler = factory(state) as { handleTermAction: (key: string) => Promise<void> };
   return {
@@ -89,6 +91,14 @@ function harness(
 }
 
 describe('handleTermAction interrupt-key normalisation', () => {
+  it('refuses terminal control when a group fence is present without matching frozen authority', async () => {
+    const h = harness('esc');
+    h.state.currentTerminalWorkspaceFence = { source: 'group', groupRevision: 2,
+      workspaceIdentity: { path: '/unproven', dev: '1', ino: '2' } };
+    await h.handle('ctrlc');
+    expect(h.written).toEqual([]);
+    expect(h.specialKeys).toEqual([]);
+  });
   it('sends Escape, not Ctrl+C, when ZCode is asked to stop', async () => {
     const h = harness('esc');
     await h.handle('ctrlc');

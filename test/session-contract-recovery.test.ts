@@ -44,7 +44,7 @@ function inputScope(controller: SessionController) {
     getBot: () => ({ config: {} }), sessionCliId: () => 'claude-code', codexCapacityRecoveryCli: () => false,
     cancelOrdinaryRecoveryForUserInput: vi.fn(), cancelOrdinaryTurnRecoveryForStop: vi.fn(),
     withTurnCaller: (_ds: unknown, message: unknown) => message, bufferTransferInput: () => false,
-    afterWorkerIpcBootstrap: (_worker: unknown, send: () => boolean) => send(),
+    afterWorkerIpcBootstrap: (_worker: unknown, send: () => void) => { send(); return true; },
   };
 }
 function restartHarness(s: ReturnType<typeof fixture>) {

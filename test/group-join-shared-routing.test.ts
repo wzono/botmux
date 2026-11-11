@@ -83,6 +83,27 @@ vi.mock('../src/services/oncall-store.js', async () => {
   return { ...actual, ensureDefaultOncallBound: mocks.ensureDefaultOncallBound };
 });
 
+// These route tests retain real prompt/identity logic and replace only the
+// admitted worker boundary; permit-store and cwd proof have dedicated suites.
+vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/admitted-turn-dispatch.js');
+  return { ...actual, dispatchAdmittedBusinessTurn: async (input: any) => {
+    const permit = {
+      sessionId: input.ds.session.sessionId, turnId: input.turnId,
+      workerGeneration: input.ds.workerGeneration ?? input.ds.session.workerGeneration ?? 1,
+      workspace: actual.frozenSessionWorkspace(input.ds)?.workspace,
+      expiresAt: Date.now() + 60_000,
+    };
+    if (input.resource?.acquire && !await input.resource.acquire(permit)) return false;
+    if (input.resource?.markAttempting && !await input.resource.markAttempting(permit)) return false;
+    const pool = await import('../src/core/worker-pool.js');
+    if (input.ds.worker && !input.ds.worker.killed) {
+      return pool.sendWorkerInput(input.ds, input.payload, input.turnId, input.options);
+    }
+    return pool.forkWorker(input.ds, input.payload, { ...input.options, turnId: input.turnId }) !== false;
+  } };
+});
+
 vi.mock('../src/core/worker-pool.js', async () => {
   const actual = await vi.importActual<any>('../src/core/worker-pool.js');
   return { ...actual, forkWorker: mocks.forkWorker };
@@ -1291,7 +1312,6 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       ds,
       expect.objectContaining({ content: expect.stringContaining('seed 失败后仍需处理') }),
       expect.objectContaining({ turnId: userMessageId }),
-      expect.any(Object),
     );
     expect(ds?.session.currentReplyTarget).toMatchObject({
       rootMessageId: userMessageId,
@@ -1369,7 +1389,6 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       ds,
       expect.objectContaining({ content: expect.stringContaining('bootstrap 超时后接管') }),
       expect.objectContaining({ turnId: userMessageId }),
-      expect.any(Object),
     );
 
     releaseSeed('om_late_join_seed');

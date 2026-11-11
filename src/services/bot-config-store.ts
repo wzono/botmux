@@ -31,6 +31,7 @@ import { config } from '../config.js';
 import { resolvePairedBackendId } from '../core/remote-cli-ids.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { rmwBotEntry } from './config-store.js';
+import { withBotAdminIdentityPublication } from './bot-admin-unions-store.js';
 import { resolveAllowedUsersWithMap } from '../im/lark/client.js';
 import { detectUnusableOwnerEntries } from '../setup/owner-identity.js';
 import { CLI_SELECT_OPTIONS, resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
@@ -834,6 +835,16 @@ export type SetAllowedUsersResult =
  * confirm 二次确认由调用方（command-handler）处理，本函数只做校验 + 落盘。
  */
 export async function setBotAllowedUsers(
+  larkAppId: string,
+  rawEntries: string[],
+  senderOpenId: string | undefined,
+): Promise<SetAllowedUsersResult> {
+  return withBotAdminIdentityPublication(config.session.dataDir, () => setBotAllowedUsersUnderPublicationLease(
+    larkAppId, rawEntries, senderOpenId,
+  ));
+}
+
+async function setBotAllowedUsersUnderPublicationLease(
   larkAppId: string,
   rawEntries: string[],
   senderOpenId: string | undefined,

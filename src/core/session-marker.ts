@@ -28,6 +28,7 @@ export interface QueuedTypeAheadTurn {
 
 export interface AncestorSessionContext {
   sessionId: string;
+  workerGeneration?: number;
   turnId?: string;
   dispatchAttempt?: number;
   linkRefMode?: Exclude<LinkRefMode, 'disabled'>;
@@ -102,6 +103,7 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
       sessionId?: unknown;
       turnId?: unknown;
       dispatchAttempt?: unknown;
+      workerGeneration?: unknown;
       linkRefMode?: unknown;
       trustedCaller?: unknown;
       trustedController?: unknown;
@@ -112,6 +114,7 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
       capability?: unknown;
     };
     const dispatchAttempt = parseDispatchAttempt(parsed.dispatchAttempt);
+    const workerGeneration = parseDispatchAttempt(parsed.workerGeneration);
     const linkRefMode = parsed.linkRefMode === 'observe' || parsed.linkRefMode === 'enabled'
       ? parsed.linkRefMode
       : undefined;
@@ -139,6 +142,7 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
       sessionId: typeof parsed.sessionId === 'string' ? parsed.sessionId : '',
       ...(typeof parsed.turnId === 'string' && parsed.turnId ? { turnId: parsed.turnId } : {}),
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      ...(workerGeneration !== undefined ? { workerGeneration } : {}),
       ...(linkRefMode ? { linkRefMode } : {}),
       ...(parsed.trustedCaller && typeof parsed.trustedCaller === 'object' ? { trustedCaller: parsed.trustedCaller } : {}),
       ...(parsed.trustedController && typeof parsed.trustedController === 'object' ? { trustedController: parsed.trustedController } : {}),
@@ -295,6 +299,7 @@ export function findAncestorSessionMarkerContext(
           sessionId: marker.sessionId,
           ...(marker.turnId ? { turnId: marker.turnId } : {}),
           ...(marker.dispatchAttempt !== undefined ? { dispatchAttempt: marker.dispatchAttempt } : {}),
+          ...(marker.workerGeneration !== undefined ? { workerGeneration: marker.workerGeneration } : {}),
           ...(marker.linkRefMode ? { linkRefMode: marker.linkRefMode } : {}),
           ...(marker.trustedCaller ? { trustedCaller: marker.trustedCaller } : {}),
           ...(marker.trustedController ? { trustedController: marker.trustedController } : {}),
