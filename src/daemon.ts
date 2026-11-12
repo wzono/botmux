@@ -50,7 +50,7 @@ import { scheduleTimeZone } from './utils/timezone.js';
 import { authorizeVcMeetingSummaryShare } from './services/vc-meeting-send-policy.js';
 import { globalVcMeetingAgentConfigLive } from './global-config.js';
 import { resolveVcMeetingListenerPolicy, vcMeetingSummaryShareTarget, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
-import { createMessageListenerAutoCloseScheduler } from './core/message-listener-auto-close.js';
+import { createMessageListenerAutoCloseScheduler, recordMessageListenerTurnTerminal } from './core/message-listener-auto-close.js';
 import { deliverPublishedReport, type ReportDeliveryResponse } from './core/report-publication.js';
 import {
   REPORT_SOURCE_REPLY_ROUTE,
@@ -154,6 +154,7 @@ import { readSupervisorProcessStartIdentity } from './core/process-start-identit
 import { statSync } from 'node:fs';
 import { deliverWelcomeMessageOnce, planStartupWelcomeMessages } from './services/welcome-message.js';
 import { addReaction, deleteMessage, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageUpdateExpiredError, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, resolveUserUnionId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { removeReaction } from './im/lark/client.js';
 import { GROUP_JOIN_ANCHOR_SCAN_LIMIT, pickGroupJoinAnchorMessageId, resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -712,7 +713,7 @@ import {
 } from './core/scheduled-send.js';
 import { markScheduleRunLogDelivered } from './services/schedule-run-log-store.js';
 import { claimCardLocation, createScheduleIdentityClaims, resolveScheduledRunIdentity, type ScheduledRunIdentity } from './core/schedule-identity-claim.js';
-import { TRIGGER_USER_AUTH_TOOLS, delegatesOnMention } from './services/trigger-user-auth.js';
+import { TRIGGER_USER_AUTH_TOOLS, delegatesOnMention, dispatchOnlyToolsForTurn } from './services/trigger-user-auth.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
   runIdempotencyFailClose,
@@ -814,7 +815,7 @@ import { HerdrBackend } from './adapters/backend/herdr-backend.js';
 import { ZellijBackend } from './adapters/backend/zellij-backend.js';
 import { ZmxBackend } from './adapters/backend/zmx-backend.js';
 import { createGroupIdleCloseSweeper } from './core/group-idle-close-sweeper.js';
-import { sweepIdleWorkersAfterTurnDrain, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
+import { coalesceSweepTriggers, sweepIdleWorkersAfterTurnDrain, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
 import { resolveIdleSpinSuspendConfig } from './core/idle-spin-config.js';
 import { createIdleSpinSampler } from './core/idle-spin-sampler.js';
 import { createIdleSpinDetector } from './core/idle-spin-detector.js';
@@ -4531,7 +4532,8 @@ export async function noteTurnReceived(
       await refreshTurnCliIdentity(ds, _turnId ?? triggerMessageId);
     }
   }
-  (ds.pendingAckReactions ??= []).push({ messageId: triggerMessageId, reactionId });
+  (ds.pendingAckReactions ??= []).push({ messageId: triggerMessageId, reactionId,
+    ...(_turnId && _turnId !== triggerMessageId ? { turnId: _turnId } : {}) });
 }
 
 /**
@@ -9624,6 +9626,19 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
       : ds.session.failedTurnRecovery?.turnId === turnId ? ds.session.failedTurnRecovery.caller
         : active?.turnId === turnId ? active.caller
           : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId));
+    const tools = bot.triggerUserAuth?.enabled === true ? bot.triggerUserAuth.tools : [];
+    const dispatchOnlyTools = dispatchOnlyToolsForTurn(bot.triggerUserAuth, {
+      sourceChatId: ds.chatId,
+      targetChatId: chatId,
+      targetAppIds,
+      directHuman: ds.session.failedTurnRecovery?.turnId !== turnId
+        && !!active && active.turnId === turnId
+        && active.caller.senderType === 'user' && !active.caller.source
+        && active.caller.requestLarkAppId === ds.larkAppId
+        && !!active.caller.requestUserOpenId,
+      inherited: false,
+    });
+    const dispatchTools = [...new Set([...tools, ...dispatchOnlyTools])];
     // A host bot grant stands in only for turns that no human administrator
     // drives. An administrator's own dispatch (live, or restored from the reply
     // registry) keeps their identity, their tool delegation and the ordinary
@@ -9640,20 +9655,22 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     const botGrant = matchedGrant?.chatIds.includes(ds.chatId) ? matchedGrant : undefined;
     const scheduleCreateDefaulted = body.suppressScheduleCreate !== true
       && body.delegateScheduleCreate !== true
+      // A service grant must not replace a non-admin human's immediate tools;
+      // an admin's own schedule authority can coexist with those tools.
+      && (dispatchOnlyTools.length === 0 || directScheduleSource)
       && (delegationPolicy?.defaultOnDispatchFromBotAppIds?.includes(ds.larkAppId) === true || !!botGrant);
     const scheduleCreateRequested = body.suppressScheduleCreate !== true
       && (body.delegateScheduleCreate === true || scheduleCreateDefaulted);
     if (scheduleCreateRequested && delegationPolicy?.createEnabled !== true) {
       return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_disabled' });
     }
-    const tools = bot.triggerUserAuth?.enabled === true ? bot.triggerUserAuth.tools : [];
     const configuredScheduleRunScopes = delegationPolicy?.runScopes ?? [];
     if (scheduleCreateRequested && !botGrant
       && configuredScheduleRunScopes.some(scope => !tools.includes(scope))) {
       return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_source_run_scope_unavailable' });
     }
     const needsDelegation = targetAppIds.length > 0
-      && (tools.length > 0 || scheduleCreateRequested);
+      && (dispatchTools.length > 0 || scheduleCreateRequested);
     // Host IPC authentication proves the local command, not a human turn.
     // In particular a revoked worker may retain a policy-only origin. Never
     // report a protected dispatch as sent after dropping its user authority.
@@ -9687,7 +9704,7 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
       sourceAppId: ds.larkAppId,
       caller: dispatchCaller,
       inherited: inherited?.authority,
-      tools,
+      tools: inherited ? tools : dispatchTools,
       ...(scheduleCreateRequested ? {
         scheduleCreate: {
           targetAppIds,
@@ -9828,16 +9845,39 @@ ipcRoute('POST', DISPATCH_USER_MENTION_PREPARE_ROUTE, async (req, res) => {
     } else if (inherited && !await targetUserForDelegation(ds, inherited.authority)) {
       return skip('delegated_caller_not_allowed');
     }
+    const directHumanTurn = ds.session.failedTurnRecovery?.turnId !== turnId
+      && !!active && active.turnId === turnId
+      && active.caller.senderType === 'user' && !active.caller.source
+      && active.caller.requestLarkAppId === ds.larkAppId
+      && !!active.caller.requestUserOpenId;
+    // Scope the dispatch-only check to `targets` — the local bots that actually
+    // receive a signed record. The raw targetAppIds may name a bot that is not
+    // configured on this machine; it is filtered out above, so letting it veto
+    // the whitelist would only strip tools from the local targets that matched.
+    const dispatchOnlyTools = dispatchOnlyToolsForTurn(bot.triggerUserAuth, {
+      sourceChatId: ds.chatId,
+      targetChatId: chatId,
+      targetAppIds: targets,
+      directHuman: directHumanTurn,
+      inherited: !!inherited,
+    });
     const authority = await authorityForDispatch({
       sourceAppId: ds.larkAppId,
       caller: ds.session.failedTurnRecovery?.turnId === turnId ? ds.session.failedTurnRecovery.caller
         : active?.turnId === turnId ? active.caller
           : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId)),
       inherited: inherited?.authority,
-      tools: bot.triggerUserAuth!.tools,
+      tools: [...new Set([...bot.triggerUserAuth!.tools, ...dispatchOnlyTools])],
       resolveUnionId: resolveUnionIdFromOpenId,
     });
-    if (!authority) return skip(inherited ? 'no_shared_tool' : 'no_direct_human');
+    if (!authority) {
+      if (inherited) return skip('no_shared_tool');
+      // A live human whose policy signs no tool for this target is distinct
+      // from a turn that has no direct human at all; keep the audit reason
+      // truthful so a skipped handoff is not misread as a non-human caller.
+      if (!directHumanTurn) return skip('no_direct_human');
+      return skip('no_delegatable_tool');
+    }
     if (ds.managedTurnOrigin?.turnId !== turnId) {
       return jsonRes(res, 409, { ok: false, error: 'dispatch_turn_changed' });
     }
@@ -31713,6 +31753,29 @@ async function handleThreadReplyAdmitted(
             'live worker did not accept input',
             durablePrimaryLiveWorkerProgressToken(ds),
           );
+        } else if (!ctx.effortTaskReentry) {
+          // A normal false result bypasses the ingress exception handler. Do
+          // not leave an unaccepted message looking queued, or mark it done
+          // when an unrelated active turn completes.
+          const reactions = ds.pendingAckReactions?.filter(item => item.messageId === parsed.messageId) ?? [];
+          ds.pendingAckReactions = ds.pendingAckReactions?.filter(item => item.messageId !== parsed.messageId);
+          await Promise.all(reactions.map(async item => {
+            if (!item.reactionId) return;
+            await removeReaction(larkAppId, item.messageId, item.reactionId).catch(error => {
+              logger.warn(`[${tag(ds)}] Failed to remove unaccepted input reaction: ${error}`);
+            });
+          }));
+          // The boolean may also represent an uncertain downstream submit.
+          // Never invite a blind resend, or let a notice failure do so via the
+          // outer ordinary-ingress catch. Durable/attached-task owners report
+          // their own retry or rejection instead.
+          await sessionReply(
+            anchor,
+            tr('worker.input_delivery_failed', { turnId: parsed.messageId.substring(0, 16) }, localeForBot(larkAppId)),
+            'text', larkAppId, parsed.messageId,
+          ).catch(error => {
+            logger.warn(`[${tag(ds)}] Failed to report unaccepted live input: ${error}`);
+          });
         }
       }
     } finally {
@@ -34396,41 +34459,34 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // One cap implementation shared by event-driven checks (process start / idle
   // edge) and the 60s safety-net timer below. Each daemon owns exactly one
   // bot's activeSessions map, so the configured limit is per bot.
-  let liveSessionCapSweepPending = false;
-  const enforceLiveSessionCap = (source: 'session_change' | 'periodic'): void => {
-    // Coalesce spawn/idle/timer bursts.  The detached mutation evaluates the
-    // current map and current config only after every admitted turn has drained,
-    // so one pending sweep subsumes all triggers that arrive before it runs.
-    if (liveSessionCapSweepPending) return;
-    liveSessionCapSweepPending = true;
-    void (async () => {
-      try {
-        const liveBotConfig = getBot(cfg.larkAppId).config;
-        const maxLiveWorkers = liveBotConfig.maxLiveWorkers;
-        const idleTtlMs = typeof liveBotConfig.idleSuspendMinutes === 'number'
-          && liveBotConfig.idleSuspendMinutes > 0
-          ? liveBotConfig.idleSuspendMinutes * 60_000
-          : undefined;
-        const suspended = await sweepIdleWorkersAfterTurnDrain(
-          cfg.larkAppId,
-          activeSessions,
-          { maxLiveWorkers, idleTtlMs },
+  // Coalesced: the detached mutation evaluates the current map and config only
+  // after every admitted turn has drained, so one sweep subsumes the triggers
+  // that arrive before it starts (see coalesceSweepTriggers).
+  const enforceLiveSessionCap = coalesceSweepTriggers(async (source: 'session_change' | 'periodic'): Promise<void> => {
+    try {
+      const liveBotConfig = getBot(cfg.larkAppId).config;
+      const maxLiveWorkers = liveBotConfig.maxLiveWorkers;
+      const idleTtlMs = typeof liveBotConfig.idleSuspendMinutes === 'number'
+        && liveBotConfig.idleSuspendMinutes > 0
+        ? liveBotConfig.idleSuspendMinutes * 60_000
+        : undefined;
+      const suspended = await sweepIdleWorkersAfterTurnDrain(
+        cfg.larkAppId,
+        activeSessions,
+        { maxLiveWorkers, idleTtlMs },
+      );
+      if (suspended.length > 0) {
+        const ttlCount = suspended.filter(entry => entry.reason === 'idle_ttl').length;
+        logger.info(
+          `[idle-worker-sweeper] suspended ${suspended.length} session(s) `
+          + `[idle_ttl=${ttlCount}, live_worker_cap=${suspended.length - ttlCount}; `
+          + `cap-limit=${maxLiveWorkers ?? DEFAULT_MAX_LIVE_WORKERS}] source=${source}`,
         );
-        if (suspended.length > 0) {
-          const ttlCount = suspended.filter(entry => entry.reason === 'idle_ttl').length;
-          logger.info(
-            `[idle-worker-sweeper] suspended ${suspended.length} session(s) `
-            + `[idle_ttl=${ttlCount}, live_worker_cap=${suspended.length - ttlCount}; `
-            + `cap-limit=${maxLiveWorkers ?? DEFAULT_MAX_LIVE_WORKERS}] source=${source}`,
-          );
-        }
-      } catch (err) {
-        logger.warn(`[idle-worker-sweeper] cap enforcement failed: ${err instanceof Error ? err.message : String(err)}`);
-      } finally {
-        liveSessionCapSweepPending = false;
       }
-    })();
-  };
+    } catch (err) {
+      logger.warn(`[idle-worker-sweeper] cap enforcement failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
   // ─── CPU-driven idle-spin + host-pressure guard ──────────────────────────
   // TRAE CLI (0.214.x) keeps ~3k inotify watches over ~/.trae/skills and
   // self-excites on its own skill-directory IN_OPEN events. Dozens of idle
@@ -34907,8 +34963,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       } catch (err) {
         logger.error(`[retry] failed to record lastFailedTurn for ${terminal.turnId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
       }
-      if (ds.session.messageListenerAutoClose && ds.currentTurnId === terminal.turnId) {
-        ds.messageListenerCompletedTurnId = terminal.status === 'completed' ? terminal.turnId : undefined;
+      if (recordMessageListenerTurnTerminal(ds, terminal)) {
         scheduleMessageListenerAutoClose(ds);
       }
     },
@@ -36937,7 +36992,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   let oncallHandoffStopped = false;
   if (!cfg.apiOnly) {
     const reconcileOncall = async () => {
-      if (oncallHandoffRunning || oncallHandoffStopped || !getBot(cfg.larkAppId).config.oncallGroup?.enabled) return;
+      // Existing group invitations remain usable after new handoffs are disabled.
+      // The reconciler checks the live policy before forwarding conversations.
+      if (oncallHandoffRunning || oncallHandoffStopped) return;
       oncallHandoffRunning = true;
       try { await (await import('./im/lark/oncall-group.js')).retryPendingOncallHandoffs(cfg.larkAppId, () => !oncallHandoffStopped); }
       catch { logger.warn('[oncall-group] Handoff recovery failed; retry remains scheduled'); }

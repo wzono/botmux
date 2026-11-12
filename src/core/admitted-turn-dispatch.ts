@@ -10,6 +10,8 @@ import {
   type WorkspaceIdentity,
 } from './turn-admission.js';
 import { TurnPermitStore } from '../services/turn-permit-store.js';
+import { controllerForSession } from './session-controller.js';
+import { sameRuntime, type RuntimeRef } from '../services/session-contract.js';
 
 export type BusinessTurnSubmitOptions = {
   resume: boolean;
@@ -130,6 +132,9 @@ export async function dispatchAdmittedBusinessTurn(input: {
   const directory = input.ds.session.workingDir;
   const runtimeDirectory = input.ds.workingDir;
   const source = input.ds.session.workingDirSource;
+  const existingWorker = input.ds.worker && !input.ds.worker.killed ? input.ds.worker : undefined;
+  const existingController = existingWorker ? controllerForSession(input.ds) : undefined;
+  let provenRuntime: RuntimeRef | undefined;
   return dispatchWithPermit({
     sessionId: input.ds.session.sessionId,
     turnId: input.turnId,
@@ -141,8 +146,12 @@ export async function dispatchAdmittedBusinessTurn(input: {
       proveExistingWorkerReady: async (generation, workspace) => {
         const current = frozenSessionWorkspace(input.ds);
         const backend = authoritativeWorkerWorkspaceIdentity(input.ds);
+        // cliReady describes an idle prompt. A known initialized runtime may
+        // instead be busy and accept a correction through its native input path.
+        provenRuntime = existingController?.readyRuntimeForInput();
         return generation === (input.ds.workerGeneration ?? input.ds.session.workerGeneration)
-          && input.ds.workerReady === true && input.ds.cliReady === true
+          && input.ds.workerReady === true
+          && (existingController ? !!provenRuntime : input.ds.cliReady === true)
           && !!current && sameWorkspaceIdentity(current.workspace, workspace)
           && !!backend && sameWorkspaceIdentity(backend, workspace);
       },
@@ -175,6 +184,13 @@ export async function dispatchAdmittedBusinessTurn(input: {
         // Resource admission can await after the directory proof was frozen.
         if (input.ds.session.workingDir !== directory || input.ds.workingDir !== runtimeDirectory
           || input.ds.session.workingDirSource !== source) return Promise.resolve(false);
+        // Recheck after resource admission: a control operation or runtime
+        // replacement may have invalidated the proof within the same worker.
+        if (existingWorker && (input.ds.worker !== existingWorker || existingWorker.killed
+          || input.ds.workerReady !== true
+          || (existingController
+            ? !sameRuntime(provenRuntime, existingController.readyRuntimeForInput())
+            : input.ds.cliReady !== true))) return Promise.resolve(false);
         return input.boundary.submit(input.ds, input.payload, permit, payloadDigest(input.payload), input.options);
       },
     },

@@ -41,6 +41,7 @@ const mocks = vi.hoisted(() => {
     sendMessage: vi.fn(async () => 'om_top'),
     getMessageDetail: vi.fn(),
     addReaction: vi.fn(async () => 'reaction_received'),
+    removeReaction: vi.fn(async () => undefined),
     getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
     getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
     resolveTargetAppOpenId: vi.fn(async (_appId: string, unionId: string) => ({
@@ -129,6 +130,7 @@ vi.mock('../src/im/lark/client.js', async () => {
     sendMessage: mocks.sendMessage,
     getMessageDetail: mocks.getMessageDetail,
     addReaction: mocks.addReaction,
+    removeReaction: mocks.removeReaction,
     getChatMode: mocks.getChatMode,
     getChatNameAndMode: mocks.getChatNameAndMode,
     resolveTargetAppOpenId: mocks.resolveTargetAppOpenId,
@@ -423,6 +425,45 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       allowedUsers: [OWNER],
     });
     bot.resolvedAllowedUsers = [OWNER];
+  });
+
+  it.each([false, true])('reports a refused live input without a false resend claim, notice failure=%s', async noticeFails => {
+    const messageId = 'om_effort_plain_correction';
+    const anchor = 'om_busy_correction_root';
+    const ds = seedThreadSession(anchor, 'seeded');
+    ds.session.cliId = 'codex';
+    ds.worker = { killed: false, send: vi.fn() } as any;
+    ds.hasHistory = true;
+    ds.pendingAckReactions = [
+      { messageId: 'om_original', reactionId: 'original-reaction' },
+      { messageId, reactionId: 'rejected-reaction' },
+    ];
+    mocks.sendWorkerInput.mockReturnValueOnce(false);
+    if (noticeFails) mocks.replyMessage.mockRejectedValueOnce(new Error('notice transport unavailable'));
+    const ctx = makeCtx(anchor, messageId);
+    await expect(handleThreadReply(makeEventData(messageId, '纠正当前任务', anchor), ctx)).resolves.toBeUndefined();
+    expect(mocks.sendWorkerInput).toHaveBeenCalledOnce();
+    expect(ctx.ingressAdmission.admitted).toBe(false);
+    expect(mocks.removeReaction).toHaveBeenCalledExactlyOnceWith(APP, messageId, 'rejected-reaction');
+    expect(ds.pendingAckReactions).toEqual([{ messageId: 'om_original', reactionId: 'original-reaction' }]);
+    expect(repliedText()).toContain(tr('worker.input_delivery_failed', { turnId: messageId.substring(0, 16) }, localeForBot(APP)));
+    expect(repliedText()).not.toContain(expectedNotice());
+    expect(mocks.replyMessage).toHaveBeenCalledOnce();
+  });
+
+  it('does not report or clear the progress reaction of an accepted live input', async () => {
+    const messageId = 'om_effort_plain_accepted';
+    const anchor = 'om_busy_accepted_root';
+    const ds = seedThreadSession(anchor, 'seeded');
+    ds.worker = { killed: false, send: vi.fn() } as any;
+    ds.hasHistory = true;
+    ds.pendingAckReactions = [{ messageId, reactionId: 'accepted-reaction' }];
+    const ctx = makeCtx(anchor, messageId);
+    await handleThreadReply(makeEventData(messageId, '纠正当前任务', anchor), ctx);
+    expect(ctx.ingressAdmission.admitted).toBe(true);
+    expect(mocks.removeReaction).not.toHaveBeenCalled();
+    expect(ds.pendingAckReactions).toEqual([{ messageId, reactionId: 'accepted-reaction' }]);
+    expect(repliedText()).not.toContain(tr('worker.input_delivery_failed', { turnId: messageId.substring(0, 16) }, localeForBot(APP)));
   });
 
   it('runs an attached effort task through ordinary admission and propagates acceptance', async () => {
