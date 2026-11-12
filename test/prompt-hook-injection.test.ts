@@ -485,6 +485,21 @@ describe('buildNewTopicCliInput — hook 注入模式（opening）', () => {
     expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
   });
 
+  it('无 whiteboard/sender/mentions 时：全局回复规则进入 sidecar，PTY 保留用户正文前缀', () => {
+    // 全局回复规则本身是稳定的 Botmux-owned envelope；即使没有其它 envelope，
+    // hook 模式仍写 sidecar，让 PTY 文本从用户正文开始，避免提交指纹共享规则前缀。
+    const result = buildNewTopicCliInput(
+      '帮我修个 bug', SESSION_ID, 'claude-code', undefined,
+      undefined, undefined, undefined, undefined,
+      undefined,
+      undefined,
+      undefined,
+      openingOpts({ whiteboardId: undefined }),
+    );
+    expect(result.content).toBe('帮我修个 bug');
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toContain('<botmux_response_style>');
+  });
+
   it('skill catalog 追加到 prompt 尾部后：全量指纹 miss，prefix 兜底仍能 claim', () => {
     // opening 是 CLI generation 的首轮，prepareSessionSkillPrompt 会把 skill catalog
     // 追加到 prompt 尾部（${opts.prompt}\n\n${catalog}），这才是 claude-code 真正
