@@ -154,6 +154,7 @@ import { readSupervisorProcessStartIdentity } from './core/process-start-identit
 import { statSync } from 'node:fs';
 import { deliverWelcomeMessageOnce, planStartupWelcomeMessages } from './services/welcome-message.js';
 import { addReaction, deleteMessage, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageUpdateExpiredError, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, resolveUserUnionId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { removeReaction } from './im/lark/client.js';
 import { GROUP_JOIN_ANCHOR_SCAN_LIMIT, pickGroupJoinAnchorMessageId, resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -31713,6 +31714,29 @@ async function handleThreadReplyAdmitted(
             'live worker did not accept input',
             durablePrimaryLiveWorkerProgressToken(ds),
           );
+        } else if (!ctx.effortTaskReentry) {
+          // A normal false result bypasses the ingress exception handler. Do
+          // not leave an unaccepted message looking queued, or mark it done
+          // when an unrelated active turn completes.
+          const reactions = ds.pendingAckReactions?.filter(item => item.messageId === parsed.messageId) ?? [];
+          ds.pendingAckReactions = ds.pendingAckReactions?.filter(item => item.messageId !== parsed.messageId);
+          await Promise.all(reactions.map(async item => {
+            if (!item.reactionId) return;
+            await removeReaction(larkAppId, item.messageId, item.reactionId).catch(error => {
+              logger.warn(`[${tag(ds)}] Failed to remove unaccepted input reaction: ${error}`);
+            });
+          }));
+          // The boolean may also represent an uncertain downstream submit.
+          // Never invite a blind resend, or let a notice failure do so via the
+          // outer ordinary-ingress catch. Durable/attached-task owners report
+          // their own retry or rejection instead.
+          await sessionReply(
+            anchor,
+            tr('worker.input_delivery_failed', { turnId: parsed.messageId.substring(0, 16) }, localeForBot(larkAppId)),
+            'text', larkAppId, parsed.messageId,
+          ).catch(error => {
+            logger.warn(`[${tag(ds)}] Failed to report unaccepted live input: ${error}`);
+          });
         }
       }
     } finally {

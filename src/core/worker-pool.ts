@@ -18117,6 +18117,8 @@ export async function submitBusinessInput(
   const directory = ds.session.workingDir;
   const runtimeDirectory = ds.workingDir;
   const source = ds.session.workingDirSource;
+  const controller = controllerForSession(ds);
+  const runtime = controller?.readyRuntimeForInput();
   const workspaceIsCurrent = () => {
     const frozen = frozenSessionWorkspace(ds);
     const actual = authoritativeWorkerWorkspaceIdentity(ds);
@@ -18133,10 +18135,12 @@ export async function submitBusinessInput(
     && permit.sessionId === ds.session.sessionId
     && permit.workerGeneration === (ds.session.workerGeneration ?? 0)
     && permit.workerGeneration === ds.workerGeneration
+    && (!controller || sameRuntime(runtime, controller.readyRuntimeForInput()))
     && workspaceIsCurrent();
   if (!isCurrent()) return false;
   const dispatch = await permitStore.consumeBusiness(permit, payloadDigest);
-  // Permit consumption can yield while the session closes or its worker is replaced.
+  // Permit persistence can yield during a control operation or replacement of
+  // the runtime within the same worker. Recheck the exact runtime before IPC.
   if (!isCurrent() || (dispatch.status === 'acquired' && Date.now() >= permit.expiresAt)) {
     if (dispatch.status === 'acquired') await permitStore.abortBusinessDispatch(permit, payloadDigest);
     return false;

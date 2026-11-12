@@ -163,6 +163,16 @@ export class SessionController {
     }); this.refresh(); return execution.ref;
   }
   currentRuntime(): RuntimeRef | undefined { return this.store.read(this.ref)?.activeRuntime; }
+  /** A running turn clears promptReady, but its initialized runtime can still
+   * accept steering/type-ahead input. Keep lifecycle and runtime identity fences. */
+  readyRuntimeForInput(): RuntimeRef | undefined {
+    const state = this.store.read(this.ref);
+    const runtime = this.store.runtime(this.ref);
+    if (!state || !runtime || !state.workerOnline || state.lifecycle !== 'active'
+      || state.activeOperationId || !sameWorker(state.worker, runtime.worker)
+      || !sameRuntime(state.activeRuntime, runtime.ref) || runtime.phase !== 'ready') return undefined;
+    return runtime.ref;
+  }
   command(message: { type: string; turnId?: string; dispatchAttempt?: number; attemptId?: string; sessionCommand?: import('../services/session-contract.js').SessionCommandContext }): import('../services/session-contract.js').SessionCommandContext {
     const execution = message.sessionCommand?.execution ?? (message.turnId ? this.store.executions(this.ref, message.turnId, message.dispatchAttempt)[0]?.ref : undefined);
     const operation = message.attemptId ? this.operation(message.attemptId) : this.operation();
