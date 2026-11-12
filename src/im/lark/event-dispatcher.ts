@@ -132,6 +132,11 @@ import {
 import { isInputCaptureTerminalRejection } from '../../core/plugins/input-capture/runtime.js';
 import { shouldPersistTriggeredMessage } from '../../services/durable-primary-turn-admission.js';
 import { LARK_CODE_APP_SCOPE_MISSING } from './lark-errors.js';
+import {
+  authorizeGroupWorkspaceRoute,
+  classifyGroupWorkspaceTextRoute,
+  type GroupWorkspaceRouteIntent,
+} from '../../core/group-workspace-policy.js';
 
 function vcMeetingEventPayloadForLog(data: any): string {
   try {
@@ -2468,6 +2473,7 @@ async function bindDefaultOncallBeforeTalk(
     logger.warn(`[oncall:${larkAppId}] pre-permission auto-bind failed for ${chatId.substring(0, 12)}: ${err}`),
   );
 }
+export const __testOnly_bindDefaultOncallBeforeTalk = bindDefaultOncallBeforeTalk;
 /**
  * BOT 发送方的 talk 判定 —— bot 路由闸（外部 bot @ 本 bot）的**唯一**入口。
  *
@@ -2655,6 +2661,75 @@ export function canOperate(
  * 同一 owner 的 sibling 已在 canOperate 里放行（isTrustedSameOwnerSiblingBot），这条例外
  * 只对 owner 不同的 sibling（或关了 trustSameOwnerBots 的 bot）还有意义。
  */
+export interface GroupWorkspaceTextRouteInput {
+  text: string;
+  chatId: string;
+  chatType: 'group' | 'p2p';
+  scope: 'chat' | 'thread';
+  regularGroupTopLevel?: boolean;
+  senderOpenId?: string;
+  senderUnionId?: string;
+  tenantKey?: string;
+  messageId?: string;
+  humanProvenance?: boolean;
+}
+
+export interface GroupWorkspaceTextRouteDeps {
+  resolveAuthority: (input: GroupWorkspaceTextRouteInput) => Promise<import('../../core/group-workspace-policy.js').GroupWorkspaceRouteAuthorityResult | undefined>;
+  handleRoute: (route: GroupWorkspaceRouteIntent & {
+    source: 'text'; chatId: string; actor: import('../../services/bot-admin-unions-store.js').TenantHumanId;
+    authorityFingerprint: string; actorOpenId?: string; messageId?: string;
+  }) => Promise<void> | void;
+  canRunGenericCommand: () => boolean;
+  replyDenied: (message: string) => Promise<void> | void;
+  locale?: import('../../i18n/index.js').Locale;
+}
+
+/**
+ * Authorization seam before the receiving Bot's generic command gate. Production
+ * wiring may resolve stable identity/snapshot here while the later saga owns all writes.
+ */
+export function normalizeGroupWorkspaceRouteText(message: any): string {
+  return stripLeadingMentions(
+    (extractMessageTextForRouting(message) ?? '').trim(),
+    message?.mentions ?? [],
+  ).trim();
+}
+
+export async function tryDispatchGroupWorkspaceTextRoute(
+  input: GroupWorkspaceTextRouteInput,
+  deps: GroupWorkspaceTextRouteDeps,
+): Promise<'dispatched' | 'switch_denied' | 'recognized_denied' | 'not_authorized' | 'not_applicable'> {
+  const intent = classifyGroupWorkspaceTextRoute(input);
+  if (!intent) {
+    deps.canRunGenericCommand();
+    return 'not_applicable';
+  }
+  const authority = await deps.resolveAuthority(input);
+  if (!authorizeGroupWorkspaceRoute(authority)) {
+    if (authority?.status === 'recognized_denied') {
+      await deps.replyDenied(t(`cmd.repo.group.denied_${authority.reason}`, undefined, deps.locale));
+      return 'recognized_denied';
+    }
+    deps.canRunGenericCommand();
+    return 'not_authorized';
+  }
+  if (intent.kind === 'set' && !authority.canSwitchSession) {
+    await deps.replyDenied(t('cmd.repo.group.switch_denied', undefined, deps.locale));
+    return 'switch_denied';
+  }
+  await deps.handleRoute({
+    ...intent,
+    source: 'text',
+    chatId: input.chatId,
+    actor: authority.actor,
+    authorityFingerprint: authority.configFingerprint,
+    actorOpenId: input.senderOpenId,
+    messageId: input.messageId,
+  });
+  return 'dispatched';
+}
+
 export function canRunDaemonCommand(
   larkAppId: string,
   chatId: string | undefined,
@@ -4022,6 +4097,10 @@ export interface EventHandlers {
   handleCardAction: (data: any, larkAppId: string) => Promise<any>;
   handleNewTopic: (data: any, ctx: RoutingContext) => Promise<void>;
   handleThreadReply: (data: any, ctx: RoutingContext) => Promise<void>;
+  /** Task-4 seam: stable identity/fresh-snapshot authority is resolved before the
+   * receiving Bot's generic command gate; the operation saga is wired later. */
+  resolveGroupWorkspaceRouteAuthority?: GroupWorkspaceTextRouteDeps['resolveAuthority'];
+  handleGroupWorkspaceRoute?: GroupWorkspaceTextRouteDeps['handleRoute'];
   /** Validate a syntactically valid topic header before routing mutates scope.
    * The daemon supplies the same semantic resolver used by handleNewTopic. */
   validateTopicHeader?: (header: import('../../core/topic-header.js').TopicHeader, larkAppId: string) => boolean | Promise<boolean>;
@@ -6220,6 +6299,15 @@ export function createLarkEventDispatcherRuntime(
         }
       }
 
+      // Freeze immutable ingress topology before `/t`, shared-topic folding, or
+      // chat-mode recovery rewrites routing scope/source. A regular-group
+      // top-level event stays eligible in `new-topic` mode, while a real reply
+      // (`root_id + thread_id`) can never become eligible through later rewrites.
+      const ordinaryGroupTopLevel = chatType === 'group'
+        && !message.root_id
+        && routingSource !== 'topic-chat'
+        && routingSource !== 'real-thread';
+
       // 主动开工 — 场景②: capture only genuine topic-group seeds NOW, before
       // `/t` or the regular-group new-topic mode can create the same
       // {thread, anchor=messageId} shape in a regular group. autoStartOnNewTopic
@@ -6292,6 +6380,31 @@ export function createLarkEventDispatcherRuntime(
           // (messageId) is brand-new, so no current session owns it.
           ownsSession = false;
         }
+      }
+
+      // Narrow group-workspace command authorization runs before generic group
+      // addressing/command gates. Until the operation coordinator is wired, an
+      // absent dedicated handler leaves the existing route byte-for-byte intact.
+      if (handlers.resolveGroupWorkspaceRouteAuthority && handlers.handleGroupWorkspaceRoute) {
+        const routeResult = await tryDispatchGroupWorkspaceTextRoute({
+          text: normalizeGroupWorkspaceRouteText(message),
+          chatId,
+          chatType,
+          scope: ordinaryGroupTopLevel ? 'chat' : routing.scope,
+          regularGroupTopLevel: ordinaryGroupTopLevel,
+          senderOpenId,
+          senderUnionId: humanSenderUnionId,
+          tenantKey: sender?.tenant_key ?? sender?.sender_id?.tenant_key,
+          messageId,
+          humanProvenance: sender?.sender_type === 'user',
+        }, {
+          resolveAuthority: handlers.resolveGroupWorkspaceRouteAuthority,
+          handleRoute: handlers.handleGroupWorkspaceRoute,
+          canRunGenericCommand: () => false,
+          replyDenied: message => replyMessage(larkAppId, messageId, JSON.stringify({ text: message })).then(() => undefined),
+          locale: localeForBot(larkAppId),
+        });
+        if (routeResult === 'dispatched' || routeResult === 'switch_denied' || routeResult === 'recognized_denied') return;
       }
 
       const summaryCommandMatch = await resolveSummaryCommandMatch({

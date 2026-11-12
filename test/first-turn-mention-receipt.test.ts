@@ -101,6 +101,27 @@ vi.mock('../src/services/session-store.js', async () => {
   };
 });
 
+// These route tests retain real prompt/identity logic and replace only the
+// admitted worker boundary; permit-store and cwd proof have dedicated suites.
+vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/admitted-turn-dispatch.js');
+  return { ...actual, dispatchAdmittedBusinessTurn: async (input: any) => {
+    const permit = {
+      sessionId: input.ds.session.sessionId, turnId: input.turnId,
+      workerGeneration: input.ds.workerGeneration ?? input.ds.session.workerGeneration ?? 1,
+      workspace: actual.frozenSessionWorkspace(input.ds)?.workspace,
+      expiresAt: Date.now() + 60_000,
+    };
+    if (input.resource?.acquire && !await input.resource.acquire(permit)) return false;
+    if (input.resource?.markAttempting && !await input.resource.markAttempting(permit)) return false;
+    const pool = await import('../src/core/worker-pool.js');
+    if (input.ds.worker && !input.ds.worker.killed) {
+      return pool.sendWorkerInput(input.ds, input.payload, input.turnId, input.options);
+    }
+    return pool.forkWorker(input.ds, input.payload, { ...input.options, turnId: input.turnId }) !== false;
+  } };
+});
+
 vi.mock('../src/core/worker-pool.js', async () => {
   const actual = await vi.importActual<any>('../src/core/worker-pool.js');
   return { ...actual, forkWorker: mocks.forkWorker };
@@ -127,6 +148,7 @@ vi.mock('../src/im/lark/identity-cache.js', async () => {
 
 import { mkdirSync } from 'node:fs';
 import { registerBot } from '../src/bot-registry.js';
+import { init as initSessionStore } from '../src/services/session-store.js';
 import {
   __testOnly_activeSessions as activeSessions,
   __testOnly_handleNewTopic as handleNewTopic,
@@ -236,6 +258,8 @@ describe('new-topic first turn: explicit-@ silent receipt', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mkdirSync(mocks.dataDir, { recursive: true });
+    // The real cwd mutation persists its row before publishing metadata.
+    initSessionStore(APP);
     mocks.sessions.clear();
     activeSessions.clear();
     forks.length = 0;

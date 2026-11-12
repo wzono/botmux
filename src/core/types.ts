@@ -100,6 +100,18 @@ export interface DaemonSession {
    * separate from workerPort because backends without a Web Terminal still
    * emit screen/idle/screenshot updates and support native local attach. */
   workerReady?: boolean;
+  /** Exact cwd/backend proof reported by the current worker generation's ready IPC. */
+  lastWorkerReadyCwd?: string;
+  lastWorkerReadyHostWorkingDirContract?: {
+    workingDir: string;
+    identity: { dev: string; ino: string };
+  };
+  /** Task9 launch-only fence; set by the daemon's immediate pre-spawn group probe
+   * and consumed by the matching worker-ready cwd confirmation. */
+  groupWorkspaceLaunchGuard?: {
+    workingDir: string;
+    identity?: { dev: string; ino: string };
+  };
   /** True while the CURRENT CLI generation's prompt is known idle/ready.
    *  Set by the worker's `prompt_ready` IPC; cleared on spawn / restart /
    *  `claude_exit` / worker retirement, and when a MiniMax compact card request
@@ -291,6 +303,10 @@ export interface DaemonSession {
    * reached the first fork yet. Same-anchor turns must buffer into the opening
    * input instead of reforking worker:null and overtaking it. In-memory only. */
   initialStartPending?: boolean;
+  /** A guarded first fork synchronously refused before consuming its opening.
+   * The opening buffers remain authoritative, but no handler owns a live start
+   * claim; the next same-anchor turn may claim and retry this exact launch. */
+  initialGuardedLaunchRetry?: 'raw' | 'idle';
   /** Restore quarantine: a durable activation-tail promotion failed transiently
    * during restoreActiveSessions, so the row was registered with its tail
    * un-promoted. The next fork boundary (toReattach blank fork / daemon inbound
@@ -674,8 +690,14 @@ export interface DaemonSession {
   principalLaneDispatchRetry?: {
     turnId: string;
     attempt: number;
+    maxAttempts?: number;
     timer?: ReturnType<typeof setTimeout>;
   };
+  /** One exact durable head may cross admission for a worker generation. */
+  principalLaneDispatchFlight?: { generation: number; turnId: string; promise: Promise<boolean> };
+  principalLaneDispatchRejectedCount?: Record<string, number>;
+  retainedControlReplyWorkers?: Map<string, { worker: import('node:child_process').ChildProcess; generation: number;
+    controlDispatchId?: string; controlReplyDigest?: string; expiresAt: number; timer?: ReturnType<typeof setTimeout> }>;
   /** Host-owned classification/approval driver currently attached to disk state. */
   crossPrincipalInterruptionDriving?: boolean;
   /** Runtime wake-up for the bounded wait until the current owner turn ends. */

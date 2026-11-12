@@ -78,6 +78,22 @@ const mockForkWorker = vi.fn(() => { if (forkShouldThrow) throw new Error('injec
 const mockSendWorkerInput = vi.fn(() => !sendShouldRefuse);
 const mockCloseSession = vi.fn(async () => ({ ok: true, alreadyClosed: false, known: true }));
 vi.mock('../src/core/worker-pool.js', () => ({
+  // Workspace admission is a boundary of this lease suite. Keep the real
+  // idempotency stores and both dispatch fault-injection paths below.
+  dispatchWorkspaceAdmittedBusinessTurn: vi.fn(async (input: any) => {
+    if (!await input.markAttempting()) return false;
+    const options = {
+      ...(input.dispatchAttempt === undefined ? {} : { dispatchAttempt: input.dispatchAttempt }),
+      ...(input.atMostOnce ? { atMostOnce: true } : {}),
+      ...(input.codexAppSteerable ? { codexAppSteerable: true } : {}),
+      ...(input.trustedCaller ? { trustedCaller: input.trustedCaller } : {}),
+    };
+    if (input.ds.worker && !input.ds.worker.killed) {
+      return mockSendWorkerInput(input.ds, input.payload, input.turnId, options);
+    }
+    mockForkWorker(input.ds, input.payload, { resume: input.resume, turnId: input.turnId, ...options });
+    return true;
+  }),
   forkWorker: (...a: any[]) => mockForkWorker(...a),
   sendWorkerInput: (...a: any[]) => mockSendWorkerInput(...a),
   getCurrentCliVersion: vi.fn(() => 'test'),

@@ -79,7 +79,7 @@ import { markInitialUserTurnPending } from './initial-user-turn.js';
 import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystemCommandDiscovery } from './command-discovery.js';
 import { validateWorkingDir } from './working-dir.js';
 import { resolveRepoSelection } from './repo-selection.js';
-import { repinSessionWorkingDir } from './session-cwd.js';
+import { repinSessionWorkingDir, setSessionWorkingDirMetadata } from './session-cwd.js';
 import { answerRestartWithoutWorkingDir, onlyUnstartedOpeningHolds, publishWorkingDirRecovery, reclaimUnstartedOpening } from './working-dir-recovery.js';
 import { validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
 import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
@@ -181,6 +181,12 @@ import { recordCreatedWorktree } from '../services/botmux-worktree-store.js';
 import { offerWorktreeCleanup, runWorktreeCleanupJob } from './worktree-cleanup-run.js';
 import { runProjectGroupSlashCommand } from './project-group-command.js';
 import { runGroupContextSlashCommand } from './group-context-command.js';
+import type { TenantHumanId } from '../services/bot-admin-unions-store.js';
+import {
+  canonicalCardSourceEventId,
+  canonicalTextSourceEventId,
+  type CanonicalSourceResult,
+} from '../services/group-workspace-store.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -633,6 +639,131 @@ function invalidConfiguredWorkingDirs(ds: DaemonSession | undefined, larkAppId: 
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
+export type GroupWorkspaceRepoEntrypointResult =
+  | { status: 'session_committed' }
+  | { status: 'group_committed'; groupRevision: number; replayed?: boolean }
+  | { status: 'conflict' }
+  | { status: 'store_unavailable' }
+  | { status: 'unknown' }
+  | { status: 'convergence_quarantined' }
+  | { status: 'protocol_conflict' }
+  | { status: 'invalid_dir' }
+  | { status: 'unauthorized' }
+  | { status: 'aborted' };
+
+export type GroupWorkspaceRepoEntrypointRequest = {
+  kind: 'set' | 'unbind';
+  source: 'text' | 'card';
+  chatId: string;
+  actor: TenantHumanId;
+  selection?: string;
+  messageId?: string;
+  originMessageId?: string;
+  actionId?: string;
+  deliveryAttemptId?: string;
+};
+
+export interface GroupWorkspaceRepoEntrypointDeps {
+  executeSet(input: GroupWorkspaceRepoEntrypointRequest & { kind: 'set'; sourceEventId: string }): Promise<GroupWorkspaceRepoEntrypointResult>;
+  executeUnbind(input: GroupWorkspaceRepoEntrypointRequest & { kind: 'unbind'; sourceEventId: string }): Promise<GroupWorkspaceRepoEntrypointResult>;
+  reply(message: string): Promise<void>;
+  locale?: Locale;
+}
+
+function groupWorkspaceEntrypointSource(request: GroupWorkspaceRepoEntrypointRequest): CanonicalSourceResult {
+  return request.source === 'text'
+    ? canonicalTextSourceEventId({
+      tenantKey: request.actor.tenantKey,
+      chatId: request.chatId,
+      messageId: request.messageId ?? '',
+      deliveryAttemptId: request.deliveryAttemptId,
+    })
+    : canonicalCardSourceEventId({
+      tenantKey: request.actor.tenantKey,
+      chatId: request.chatId,
+      originMessageId: request.originMessageId ?? '',
+      actionId: request.actionId ?? '',
+      deliveryAttemptId: request.deliveryAttemptId,
+    });
+}
+
+/** Shared user-visible response boundary for text and card group-repo operations. */
+export async function runGroupWorkspaceRepoEntrypoint(
+  request: GroupWorkspaceRepoEntrypointRequest,
+  deps: GroupWorkspaceRepoEntrypointDeps,
+): Promise<GroupWorkspaceRepoEntrypointResult | { status: 'invalid_source' }> {
+  const source = groupWorkspaceEntrypointSource(request);
+  if (!source.ok) {
+    await deps.reply(t('cmd.repo.group.invalid_source', undefined, deps.locale));
+    return { status: 'invalid_source' };
+  }
+  const result = request.kind === 'set'
+    ? await deps.executeSet({ ...request, kind: 'set', sourceEventId: source.sourceEventId })
+    : await deps.executeUnbind({ ...request, kind: 'unbind', sourceEventId: source.sourceEventId });
+  const key = result.status === 'group_committed'
+    ? request.kind === 'unbind' ? 'cmd.repo.group.unbind_committed' : 'cmd.repo.group.committed'
+    : request.kind === 'unbind'
+      ? `cmd.repo.group.unbind_${result.status}`
+      : `cmd.repo.group.${result.status}`;
+  await deps.reply(t(key, result.status === 'group_committed'
+    ? { revision: result.groupRevision }
+    : undefined, deps.locale));
+  return result;
+}
+
+export interface GroupWorkspaceRepoShowLayer {
+  workingDir?: string;
+  source: string;
+  revision?: number;
+}
+
+export interface GroupWorkspaceRepoShowState {
+  session?: GroupWorkspaceRepoShowLayer;
+  explicitOncall?: GroupWorkspaceRepoShowLayer;
+  defaultOncall?: GroupWorkspaceRepoShowLayer;
+  resolution?: { status: string; detail?: string };
+  quarantine?: {
+    kind: string;
+    expectedRevision?: number;
+    expectedIdentity?: { path: string; dev: string; ino: string };
+    detail?: string;
+  };
+  migration?: { status: string; detail?: string };
+  operation?: { status: string; detail?: string; owner?: 'current' | 'unknown_legacy' };
+  group: {
+    state: 'bound' | 'unbound' | 'missing' | 'unavailable';
+    workingDir?: string;
+    revision?: number;
+    source?: string;
+    health: string;
+    updatedAt?: number;
+    managers?: string[];
+  };
+  botDefault?: GroupWorkspaceRepoShowLayer;
+  resolved?: GroupWorkspaceRepoShowLayer;
+}
+
+export function formatGroupWorkspaceRepoShow(state: GroupWorkspaceRepoShowState, locale: Locale = 'zh'): string {
+  const none = locale === 'en' ? 'none' : '无';
+  const layer = (name: string, value?: GroupWorkspaceRepoShowLayer) =>
+    `${name}: ${value?.workingDir ?? none} (${value?.source ?? none}${value?.revision !== undefined ? `; revision ${value.revision}` : ''})`;
+  const groupDirectory = state.group.state === 'bound' ? state.group.workingDir ?? none : state.group.state;
+  const managers = state.group.managers?.length ? state.group.managers.join(', ') : none;
+  const identity = state.quarantine?.expectedIdentity;
+  return [
+    layer('session', state.session),
+    layer('explicit oncall', state.explicitOncall),
+    layer('default oncall', state.defaultOncall),
+    `group: ${groupDirectory} (${state.group.source ?? none}; revision ${state.group.revision ?? none}; updated ${state.group.updatedAt ?? none}; managers ${managers}; health ${state.group.health})`,
+    `resolution: ${state.resolution?.status ?? none}${state.resolution?.detail ? ` (${state.resolution.detail})` : ''}`,
+    `quarantine: ${state.quarantine?.kind ?? none}${state.quarantine?.expectedRevision !== undefined ? `; revision ${state.quarantine.expectedRevision}` : ''}${identity ? `; identity ${identity.path} dev=${identity.dev} ino=${identity.ino}` : ''}${state.quarantine?.detail ? `; ${state.quarantine.detail}` : ''}`,
+    `migration: ${state.migration?.status ?? none}${state.migration?.detail ? ` (${state.migration.detail})` : ''}`,
+    `operation: ${state.operation?.status ?? none}${state.operation?.owner === 'unknown_legacy' ? ` (${locale === 'en' ? 'owner unknown/legacy' : '所有者未知/旧版'})` : ''}${state.operation?.detail ? ` (${state.operation.detail})` : ''}`,
+    layer('default', state.botDefault),
+    layer('resolved', state.resolved),
+  ].join('\n');
+}
+
 export interface CommandHandlerDeps {
   /** Source entry, independent of a shared session or newly created topic. */
   invocationContext?: 'new-topic' | 'thread';
@@ -651,6 +782,12 @@ export interface CommandHandlerDeps {
   invocationReplyTarget?: FrozenSessionReplyTarget;
   /** 会前预热文档评论会话：立即启动 CLI、读取文档并进入待命。 */
   prewarmDocCommentSession?: (ds: DaemonSession, sub: DocSubscription) => Promise<void>;
+  readGroupWorkspaceShow?: (ds: DaemonSession) => Promise<GroupWorkspaceRepoShowState>;
+  repairGroupWorkspace?: (ds: DaemonSession, sender: {
+    openId: string; unionId?: string; tenantKey?: string; humanProvenance: boolean;
+  }, requestedPath?: string) => Promise<
+    'repaired' | 'unauthorized' | 'not_quarantined' | 'group_unavailable' | 'unbound'
+    | 'identity_changed' | 'proof_mismatch' | 'conflict'>;
 }
 
 // ─── Schedule command ────────────────────────────────────────────────────────
@@ -3160,7 +3297,7 @@ export async function handleCommand(
           const suspended = !current.adoptedFrom
             && suspendWorker(current, 'working_dir_changed');
           if (!suspended) killWorker(current);
-          repinSessionWorkingDir(current, resolvedPath);
+          repinSessionWorkingDir(current, { workingDir: resolvedPath, source: 'explicit' });
           // cwd 变了，riff 多仓 stamp（选择卡多选时写入）随之失效——保留会让下次
           // refork 仍按旧仓库组合推导、无视新目录。
           current.session.riffRepoDirs = undefined;
@@ -3237,6 +3374,31 @@ export async function handleCommand(
         // A first message whose start was refused because the directory it fell
         // back to is missing still holds the session; `/repo <路径>` picks the
         // directory for it, like the recovery card (the no-card reply says so).
+        if (/^show$/i.test(repoArg) && ds && deps.readGroupWorkspaceShow) {
+          await sessionReply(rootId, formatGroupWorkspaceRepoShow(await deps.readGroupWorkspaceShow(ds), loc));
+          break;
+        }
+        const repairMatch = /^repair(?:\s+(.+))?$/i.exec(repoArg);
+        if (repairMatch && ds && deps.repairGroupWorkspace) {
+          const result = await deps.repairGroupWorkspace(ds, {
+            openId: message.senderId,
+            unionId: message.senderUnionId,
+            tenantKey: message.tenantKey,
+            humanProvenance: message.senderType === 'user',
+          }, repairMatch[1]?.trim());
+          const messages: Record<typeof result, string> = {
+            repaired: '群目录隔离已按当前权威绑定修复；会话将在下次启动使用已验证目录。',
+            unauthorized: '无权修复群目录隔离。',
+            not_quarantined: '当前会话没有待修复的群目录隔离。',
+            group_unavailable: '群目录存储不可用，未执行修复。',
+            unbound: '当前群没有有效绑定目录，未执行修复。',
+            identity_changed: '当前目录身份与权威绑定不一致，未执行修复。',
+            proof_mismatch: '会话目录与当前权威绑定不一致，未执行修复。',
+            conflict: '会话在修复期间已变化，请重新查看后重试。',
+          };
+          await sessionReply(rootId, messages[result]);
+          break;
+        }
         if (ds && !ds.pendingRepo && repoArg) reclaimUnstartedOpening(ds);
         if (ds && !ds.pendingRepo && !repoArg && onlyUnstartedOpeningHolds(ds)) {
           await sessionReply(
@@ -3270,8 +3432,7 @@ export async function handleCommand(
             );
             if (!current || current !== ds || !current.pendingRepo) return false;
             if (selection) {
-              current.workingDir = selection.path;
-              current.session.workingDir = selection.path;
+              repinSessionWorkingDir(current, { workingDir: selection.path, source: 'explicit' });
               current.session.riffRepoDirs = selection.riffRepoDirs;
               sessionStore.updateSession(current.session);
             }
@@ -3365,7 +3526,7 @@ export async function handleCommand(
                 selfBot.botOpenId,
               ));
             }
-            forkWorker(
+            const accepted = forkWorker(
               current,
               pendingRawInput ? '' : (wrappedInput ?? ''),
               !emptyStart && !pendingRawInput && pendingTurnId ? {
@@ -3373,6 +3534,7 @@ export async function handleCommand(
                 ...(current.pendingTrustedCaller ? { trustedCaller: current.pendingTrustedCaller } : {}),
               } : false,
             );
+            if (accepted === false) return false;
             current.pendingRepo = false;
             current.pendingRepoCommitInFlight = true;
             // Queued activation ownership lasts through adapter submission.
@@ -3539,7 +3701,7 @@ export async function handleCommand(
                 current.lastCliInput = undefined;
                 current.lastCliInputTurnId = undefined;
                 current.workingDir = selectedPath;
-                session.workingDir = selectedPath;
+                setSessionWorkingDirMetadata(session, { workingDir: selectedPath, source: 'explicit' });
                 session.larkAppId = current.larkAppId;
                 session.chatDisplayName = oldSession.chatDisplayName;
                 session.ownerOpenId = oldSession.ownerOpenId;
@@ -3549,7 +3711,9 @@ export async function handleCommand(
                 sessionStore.updateSession(session);
                 current.hasHistory = false;
                 activeSessions.set(key, current);
-                forkWorker(current, '', false);
+                if (forkWorker(current, '', false) === false) {
+                  return { ok: false as const, reason: 'start_refused' as const };
+                }
                 // Brand-new CLI in a brand-new session record: it has never
                 // seen the botmux opening context either, so the next real
                 // business message is its new-topic first turn (same invariant
@@ -7330,12 +7494,11 @@ export async function startCodexAppThreadSession(
       return { status: 'pending' as const, anchor: sessionAnchorId(current) };
     }
     current.adoptedFrom = undefined;
-    current.workingDir = thread.cwd;
+    repinSessionWorkingDir(current, { workingDir: thread.cwd, source: 'explicit' });
     current.hasHistory = true;
     current.currentTurnTitle = undefined;
     current.lastScreenContent = undefined;
     current.lastScreenStatus = undefined;
-    current.session.workingDir = thread.cwd;
     current.session.title = `Codex App: ${title}`;
     current.session.cliId = existingAppServerEndpoint ? 'codex' : 'codex-app';
     current.session.cliSessionId = thread.threadId;
@@ -7362,7 +7525,9 @@ export async function startCodexAppThreadSession(
     }
     current.session.adoptedFrom = undefined;
     sessionStore.updateSession(current.session);
-    forkWorker(current, '', true);
+    if (forkWorker(current, '', true) === false) {
+      return { status: 'start_refused' as const, anchor: sessionAnchorId(current) };
+    }
     noteProjectAssociationChanged(current.session);
     return { status: 'switched' as const, anchor: sessionAnchorId(current) };
   });
@@ -7375,6 +7540,10 @@ export async function startCodexAppThreadSession(
       switched.anchor,
       '当前 Codex App 仍有未结算消息，不能切换原生 thread；请等待本轮完成或先关闭会话。',
     );
+    return;
+  }
+  if (switched.status === 'start_refused') {
+    await sessionReply(switched.anchor, '会话启动被安全检查拒绝，原请求已保留；请修复工作目录后重试。');
     return;
   }
   await sessionReply(
@@ -7473,8 +7642,7 @@ export async function startAdoptSession(
     if (hasProtectedSessionMutationOwnership(current)) {
       return { status: 'pending' as const, anchor: sessionAnchorId(current) };
     }
-    current.workingDir = target.cwd;
-    current.session.workingDir = target.cwd;
+    repinSessionWorkingDir(current, { workingDir: target.cwd, source: 'explicit' });
     current.session.title = `Adopt: ${project}`;
     current.session.serviceTier = 'inherit';
     current.adoptedFrom = adoptedFromForTarget(target);
@@ -7592,8 +7760,7 @@ export async function startResumeImportSession(
     if (hasProtectedSessionMutationOwnership(current)) {
       return { status: 'pending' as const, anchor: sessionAnchorId(current) };
     }
-    current.workingDir = target.cwd;
-    current.session.workingDir = target.cwd;
+    repinSessionWorkingDir(current, { workingDir: target.cwd, source: 'explicit' });
     current.session.cliSessionId = target.cliSessionId;
     current.session.title = target.title || `Import: ${project}`;
     current.session.projectRouteRevision = (current.session.projectRouteRevision ?? 1) + 1;
@@ -7603,7 +7770,9 @@ export async function startResumeImportSession(
     // sandboxed, matching restore semantics). Mark history so this is a resume.
     current.hasHistory = true;
     sessionStore.updateSession(current.session);
-    forkWorker(current, '', true);
+    if (forkWorker(current, '', true) === false) {
+      return { status: 'start_refused' as const, anchor: sessionAnchorId(current) };
+    }
     noteProjectAssociationChanged(current.session);
     return { status: 'resumed' as const, anchor: sessionAnchorId(current) };
   });
@@ -7616,6 +7785,10 @@ export async function startResumeImportSession(
       resumed.anchor,
       '当前 Codex App 仍有未结算消息，不能导入外部会话；请等待本轮完成或先关闭会话。',
     );
+    return;
+  }
+  if (resumed.status === 'start_refused') {
+    await sessionReply(resumed.anchor, '会话启动被安全检查拒绝，导入状态已保留；请修复工作目录后重试。');
     return;
   }
 

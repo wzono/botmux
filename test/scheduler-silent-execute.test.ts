@@ -91,6 +91,23 @@ const sendWorkerInputMock = vi.fn(() => true);
 const closeSessionMock = vi.fn();
 const sessionStoreCloseMock = vi.fn();
 vi.mock('../src/core/worker-pool.js', () => ({
+  // This routing suite stubs the workspace-admission boundary, preserving
+  // exact turn/creator options and refusal rather than silently accepting it.
+  dispatchWorkspaceAdmittedBusinessTurn: vi.fn(async (input: any) => {
+    if (!await input.markAttempting()) return false;
+    const options = {
+      ...(input.dispatchAttempt === undefined ? {} : { dispatchAttempt: input.dispatchAttempt }),
+      ...(input.atMostOnce ? { atMostOnce: true } : {}),
+      ...(input.codexAppSteerable ? { codexAppSteerable: true } : {}),
+      ...(input.trustedCaller ? { trustedCaller: input.trustedCaller } : {}),
+    };
+    if (input.ds.worker && !input.ds.worker.killed) {
+      return sendWorkerInputMock(input.ds, input.payload, input.turnId, options);
+    }
+    if (input.ds.session.queued) throw new Error('queued session requires activation');
+    forkWorkerMock(input.ds, input.payload, { resume: input.resume, turnId: input.turnId, ...options });
+    return true;
+  }),
   forkWorker: (...a: any[]) => {
     // Faithfully model the production queued-session transition. A loose
     // no-op mock would hide the exact regression this suite guards: forking a
@@ -244,7 +261,7 @@ function forkedCliInput(): string {
 }
 
 function forkedTurnId(): string {
-  return forkWorkerMock.mock.calls[0][2];
+  return forkWorkerMock.mock.calls[0][2].turnId;
 }
 
 function forkedPayload(): any {
@@ -593,7 +610,7 @@ describe('executeScheduledTask — task position (dedicated per-task topic)', ()
   it('re-fires before materialization continue the SAME hidden session, with turn ownership handed over', async () => {
     const active = new Map<string, DaemonSession>();
     await executeScheduledTask(baseTask({ executionPosition: 'task', silent: true }), active, refreshCliVersion);
-    const firstTurn = forkWorkerMock.mock.calls[0][2] as string;
+    const firstTurn = forkWorkerMock.mock.calls[0][2].turnId as string;
     const firstSessionId = forkWorkerMock.mock.calls[0][0].session.sessionId as string;
 
     await executeScheduledTask(baseTask({ executionPosition: 'task', silent: true }), active, refreshCliVersion);
@@ -1427,26 +1444,23 @@ describe('executeScheduledTask — live-session injection', () => {
     expect(existing.silentScheduledTurns?.has(options.turnId)).toBe(true);
   });
 
-  it('falls back from a rejected live injection by re-forking the same registered session', async () => {
+  it('fails closed after rejected admission without re-forking the registered session', async () => {
     const active = new Map<string, DaemonSession>();
     const existing = liveSession('idle');
     active.set(sessionKey(ROOT, APP), existing);
     sendWorkerInputMock.mockReturnValueOnce(false);
 
-    await executeScheduledTask(
+    await expect(executeScheduledTask(
       baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
       active,
       refreshCliVersion,
-    );
+    )).rejects.toThrow('workspace admission rejected');
 
     expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
     expect(active.get(sessionKey(ROOT, APP))).toBe(existing);
     expect(store.size).toBe(1);
-    expect(forkWorkerMock).toHaveBeenCalledTimes(1);
-    const [, , options] = forkWorkerMock.mock.calls[0];
-    expect(options.resume).toBe(true);
-    expect(options.turnId).toMatch(/^schedule:task0001:/);
-    expect(existing.silentScheduledTurns?.has(options.turnId)).toBe(true);
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(existing.silentScheduledTurns?.has(sendWorkerInputMock.mock.calls[0][2])).not.toBe(true);
   });
 
   it('fails visibly instead of consuming a parked dashboard task', async () => {

@@ -8,6 +8,9 @@ import type { ChildProcess } from 'node:child_process';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { applyQueuedCodexAppLegacyFallback } from '../src/core/session-create.js';
 import { acceptSessionGroupTitle } from '../src/services/session-group-title.js';
+import { applySessionWorkingDir } from '../src/core/session-cwd.js';
+import { productionCallback, productionFunction } from './helpers/codex-async-answer-function-harness.js';
+import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 
 vi.mock('../src/services/session-group-title.js', () => ({
   acceptSessionGroupTitle: vi.fn(),
@@ -277,6 +280,7 @@ import {
   sendWorkerInput,
   admitQueuedActivationTail,
   setActiveSessionsRegistry,
+  setWorkspaceAdmittedBusinessTurnDispatcher,
   suspendWorker,
   currentGatewayCallerOpenId,
   __testOnly_setSuspendBackingVerifier,
@@ -319,7 +323,7 @@ import { invalidateGlobalConfigCache, readGlobalConfig } from '../src/global-con
 import { setLinkRefRuntime, type LinkRefRuntime } from '../src/services/link-ref-runtime.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { retireCodexAppDispatchAfterBackingMissing } from '../src/utils/codex-app-dispatch-ledger.js';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -3601,6 +3605,18 @@ describe('ordinary IM worker receipt acknowledgement', () => {
 });
 
 describe('TraeX task continuation', () => {
+  let disposeWorkspaceDispatcher: () => void;
+  beforeEach(() => {
+    // This worker-lifecycle unit fixture stands in for the daemon admission
+    // owner. Real permit consumption and replacement races are exercised by
+    // group-workspace-architecture-e2e.test.ts; keep the lease CAS here.
+    disposeWorkspaceDispatcher = setWorkspaceAdmittedBusinessTurnDispatcher(async input => {
+      if (input.markAttempting && !await input.markAttempting()) return false;
+      return sendWorkerInput(input.ds, input.payload, input.turnId, input.options);
+    });
+  });
+  afterEach(() => disposeWorkspaceDispatcher());
+
   const trustedCaller = {
     requestUserOpenId: 'ou_owner',
     requestUserUnionId: 'on_owner',
@@ -8924,6 +8940,44 @@ describe('managed turn authority worker generations', () => {
 
     secondWorker.emit('exit', 0);
     expect(ds.managedTurnOrigin).toBeUndefined();
+  });
+});
+
+describe('committed group workspace replacement', () => {
+  it('runs the production switch, real fork init and convergence before normal queue consumption', async () => {
+    const ds = makeDs();
+    const stat = statSync(REPO, { bigint: true });
+    const identity = { path: realpathSync(REPO), dev: String(stat.dev), ino: String(stat.ino) };
+    const generation = ds.workerGeneration ?? ds.session.workerGeneration ?? 0;
+    const scope: Record<string, any> = {
+      frozen: { chatId: ds.chatId }, cfg: { larkAppId: ds.larkAppId },
+      findGroupOperationSession: () => ds,
+      probePathUsability: () => ({ ok: true, normalizedPath: REPO, identity }),
+      retireWorkerForReplacement: async () => true,
+      applySessionWorkingDir, forkWorker,
+      getSessionWorkingDir: () => ds.session.workingDir,
+      logger: { warn: vi.fn() }, tag: () => 'test',
+    };
+    scope.publishTerminalWorkspaceFence = productionFunction('src/daemon.ts', 'publishTerminalWorkspaceFence', scope);
+    const switchSession = productionCallback('src/daemon.ts', 'createGroupWorkspaceSetCoordinator', 'switchSession', scope);
+    const converge = productionCallback('src/daemon.ts', 'createGroupWorkspaceSetCoordinator', 'convergeSession', scope);
+    expect(await switchSession({ sessionId: ds.session.sessionId, expectedGeneration: generation,
+      targetWorkingDir: REPO, workspaceIdentity: identity })).toEqual({ status: 'committed', generation: generation + 1 });
+    const init = ds.initConfig!;
+    expect(init).toMatchObject({ launchWorkingDirSource: 'explicit', launchWorkspaceIdentity: identity, workerGeneration: generation + 1 });
+    expect(init.terminalWorkspaceFence).toBeUndefined();
+    (ds.worker as any).connected = true;
+    expect(await converge({ sessionId: ds.session.sessionId, expectedGeneration: generation + 1,
+      source: 'group', groupRevision: 2, workspaceIdentity: identity })).toBe('converged');
+    const fence = (ds.worker!.send as any).mock.calls.map((args: any[]) => args[0]).filter((m: any) => m.type === 'terminal_workspace_fence').at(-1);
+    expect(fence).toMatchObject({ source: 'group', groupRevision: 2, adoptLaunchIdentity: true, workerGeneration: generation + 1 });
+    const worker = workerSubmitHarness();
+    Object.assign(worker.scope, { lastInitConfig: { ...init, cliId: 'traex' }, currentTerminalWorkspaceFence: fence,
+      backend: { getChildPid: () => 123 }, readCwd: () => REPO });
+    worker.scope.cliAdapter.writeInput.mockResolvedValue({ submitted: true });
+    await worker.flush();
+    expect(worker.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(1);
+    expect(worker.scope.lastInitConfig.terminalWorkspaceFence).toEqual({ source: 'group', groupRevision: 2, workspaceIdentity: identity });
   });
 });
 

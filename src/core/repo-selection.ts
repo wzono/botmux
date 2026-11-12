@@ -75,3 +75,17 @@ export function resolveRepoSelection(
 
   return null;
 }
+
+/** Resolve the same raw name/path/index forms accepted by the real `/repo` command. */
+export function resolveGroupWorkspaceRepoSelection(
+  repoArg: string,
+  scanDirs: string[],
+  indexedProjects?: readonly { path: string; name: string; branch: string }[],
+): { path: string; displayName: string } | null {
+  if (/^\d+$/.test(repoArg)) {
+    const index = Number(repoArg);
+    const project = index >= 1 ? indexedProjects?.[index - 1] : undefined;
+    return project ? { path: project.path, displayName: `${project.name} (${project.branch})` } : null;
+  }
+  return resolveRepoSelection(repoArg, scanDirs);
+}

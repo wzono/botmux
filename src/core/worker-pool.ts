@@ -1,3 +1,4 @@
+import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { isLeadOnlySession } from './lead-only.js';
 import { controllerForSession, type WorkerContractContext } from './session-controller.js';
 import { sameWorker, sameRuntime } from '../services/session-contract.js';
@@ -18,6 +19,7 @@ import { codexAppSettlementOutcome } from '../services/runner-final-outcome.js';
 import { turnFailureDiagnostics } from '../services/turn-failure-diagnostics.js';
 import { canTalk, evaluateTalk } from '../im/lark/event-dispatcher.js';
 import { cancelDeploymentContinuation, deploymentContinuationClaimCurrent } from '../services/deployment-continuation.js';
+
 import { deploymentContinuationAuthority } from './deployment-continuation-authority.js';
 import { CliProgressNotifier, cliProgressNoticeCard } from '../services/cli-progress-notice.js';
 import { traexStreamCardActivity } from './stream-card-activity.js';
@@ -272,6 +274,9 @@ import { TurnSendLedger, FinalPublicationUnknownError } from '../services/turn-s
 import { createTurnResultRuntime, setTurnResultRuntime } from './turn-result-runtime.js';
 import { PersistentTurnResultStore } from '../services/persistent-turn-result-store.js';
 import type { TurnResult, TurnDeliveryReceipt } from '../services/turn-result.js';
+import { reconcileTurnPermitDispatches as reconcilePersistedTurnPermitDispatches, type BlankBootstrapPermit, type BusinessSubmitPermit } from './turn-admission.js';
+import { TurnPermitStore } from '../services/turn-permit-store.js';
+import { authoritativeWorkerWorkspaceIdentity, frozenSessionWorkspace } from './admitted-turn-dispatch.js';
 import { turnResultEnabled, turnResultBinding, turnResultSessionEligible, observeTurnResultTerminal, observeTurnResultDelivery } from './turn-result-session.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
@@ -314,6 +319,19 @@ const stuckCardPostInFlight = new WeakMap<DaemonSession, {
   deduped: Array<Extract<WorkerToDaemon, { type: 'stuck_warning' }>>;
 }>();
 const transferRetiringWorkers = new WeakSet<ChildProcess>();
+let productionTurnPermitStore: TurnPermitStore | undefined;
+let productionTurnPermitStoreDataDir: string | undefined;
+function getProductionTurnPermitStore(): TurnPermitStore {
+  const dataDir = config.session.dataDir;
+  if (!productionTurnPermitStore || productionTurnPermitStoreDataDir !== dataDir) {
+    productionTurnPermitStore = new TurnPermitStore(dataDir);
+    productionTurnPermitStoreDataDir = dataDir;
+  }
+  return productionTurnPermitStore;
+}
+const activeBusinessPermitStores = new Map<string, Pick<TurnPermitStore, 'acknowledgeBusinessDelivery'>>();
+const businessPermitAckKey = (sessionId: string, turnId: string, workerGeneration: number) =>
+  JSON.stringify([sessionId, turnId, workerGeneration]);
 
 type WorkerIpcBootstrapState = {
   ready: boolean;
@@ -946,13 +964,13 @@ import {
   type TurnTerminalCarrier,
 } from './types.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { setSessionWorkingDirMetadata } from './session-cwd.js';
 import { decideAutoRestart, type RestartCounter } from './restart-policy.js';
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { acceptSessionGroupTitle } from '../services/session-group-title.js';
 import { freezePrincipalLaneTurnBinding, readPrincipalLaneTurnBinding } from './principal-lane-turn.js';
 import { settlePrincipalLaneOutboundProvenance } from './principal-lane-outbound-provenance.js';
 import { hasPendingSessionTurns } from './session-turn-queue.js';
-import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { buildTerminalUrl, getTerminalProxyPort } from './terminal-url.js';
 import { prependBotmuxBin, resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 import { snapshotProcessIdentities } from './current-actor-attestation.js';
@@ -1238,6 +1256,7 @@ export interface WorkerSessionReplyOptions {
 export interface WorkerPoolCallbacks {
   /** Exact store-owning app, including boot with no live sessions. */
   larkAppId?: string;
+  currentTerminalWorkspaceFence?: (ds: DaemonSession) => Extract<DaemonToWorker, { type: 'terminal_workspace_fence' }>;
   onTurnResult?: (result: Readonly<TurnResult>) => void | Promise<void>;
   /** Host-owned return path for zero-injection sub-bots. */
   onZeroPromptFinal?: (ds: DaemonSession, input: {
@@ -1252,13 +1271,29 @@ export interface WorkerPoolCallbacks {
     opts?: WorkerSessionReplyOptions,
   ) => Promise<string>;
   getSessionWorkingDir: (ds?: DaemonSession) => string;
+  /** Immediate pre-spawn policy gate. False means no worker process is created. */
+  authorizeWorkingDirLaunch?: (ds: DaemonSession) => boolean;
   /** forkWorker refused a start because the session's working directory is
    *  gone; tell the chat and offer recovery. Fired just before the
    *  {@link MissingWorkingDirError} is thrown, so callers need not reply. */
   onMissingWorkingDir?: (ds: DaemonSession, path: string, ctx: { turnId?: string }) => void;
+  /** Reject a worker generation whose observed launch cwd differs from policy. */
+  confirmWorkerReadyCwd?: (ds: DaemonSession, actualCwd: string | undefined) => boolean;
+  onWorkerReadyCwdMismatch?: (ds: DaemonSession, actualCwd: string | undefined) => void;
   getActiveCount: () => number;
   /** Prepare trigger-user CLI identity before a delayed raw-input turn. */
   prepareRawInputTurn?: (ds: DaemonSession, turnId: string) => void | Promise<void>;
+  /** Host-owned workspace + typed-permit admission for non-ordinary business
+   * ingress. The callback performs the actual send/fork; callers must not
+   * deliver the payload again after it returns. */
+  dispatchAdmittedBusinessTurn?: (input: {
+    ds: DaemonSession;
+    turnId: string;
+    payload: string | CliTurnPayload;
+    options: { resume: boolean; dispatchAttempt?: number; atMostOnce?: true; codexAppSteerable?: true; trustedCaller?: TrustedCaller };
+    markAttempting?: () => Promise<boolean>;
+    expectedWorkspace?: { workspace: import('./turn-admission.js').WorkspaceIdentity; groupRevision?: number };
+  }) => Promise<boolean>;
   /** A scheduled task as the host authority store holds it, for deciding who a
    *  scheduled turn runs as. Never backed by schedules.json (agent-writable
    *  inside a sandbox). Absent or undefined → the turn carries no identity. */
@@ -1301,6 +1336,16 @@ export interface WorkerPoolCallbacks {
     ds: DaemonSession,
     turnId: string,
     context: { workerGeneration: number },
+  ) => void;
+  /** Authoritative exact-turn model/tool progress updates turn feedback. */
+  onTurnProgress?: (
+    ds: DaemonSession,
+    progress: Extract<WorkerToDaemon, { type: 'turn_progress' }>,
+    context: { workerGeneration: number },
+  ) => void;
+  onTurnAttention?: (
+    ds: DaemonSession,
+    attention: { turnId: string; dispatchAttempt?: number; workerGeneration: number; state: 'needs_user' | 'resumed' },
   ) => void;
   /** Provider submission proof for one durable-primary Lark Inbox turn. */
   onTurnInputCommitted?: (
@@ -1417,6 +1462,10 @@ export interface WorkerPoolCallbacks {
 }
 
 let callbacks: WorkerPoolCallbacks | undefined;
+const embeddedWorkspaceDispatchers: Array<{
+  token: symbol;
+  dispatcher: NonNullable<WorkerPoolCallbacks['dispatchAdmittedBusinessTurn']>;
+}> = [];
 
 /**
  * Initialise worker-pool callbacks. Must be called once before forkWorker().
@@ -1451,6 +1500,20 @@ export function initWorkerPool(cb: WorkerPoolCallbacks): void {
     onTurnResult: cb.onTurnResult,
     onObserverError: (ref, code) => logger.warn(`[results] ${code} session=${ref.sessionId} turn=${ref.turnId}`),
   }));
+}
+
+/** Embedded IPC/test seam; production normally supplies this in initWorkerPool. */
+
+export function setWorkspaceAdmittedBusinessTurnDispatcher(
+  dispatcher: WorkerPoolCallbacks['dispatchAdmittedBusinessTurn'] | undefined,
+): () => void {
+  if (!dispatcher) return () => undefined;
+  const entry = { token: Symbol('workspace-admission-dispatcher'), dispatcher };
+  embeddedWorkspaceDispatchers.push(entry);
+  return () => {
+    const index = embeddedWorkspaceDispatchers.findIndex(candidate => candidate.token === entry.token);
+    if (index >= 0) embeddedWorkspaceDispatchers.splice(index, 1);
+  };
 }
 
 function requireCallbacks(): WorkerPoolCallbacks {
@@ -1617,6 +1680,49 @@ function acceptFinalOutputOffer(ds: DaemonSession, offer: FinalOutputOffer): voi
 
 export const __testOnly_acceptFinalOutputOffer = acceptFinalOutputOffer;
 export const __testOnly_pumpFinalOutputHandoffs = pumpFinalOutputHandoffs;
+
+export async function reconcileTurnPermitDispatches(
+  sessions: Iterable<DaemonSession>,
+  store: Pick<TurnPermitStore, 'listDispatching' | 'reconcileBusinessDispatch' | 'listDispatchingControls' | 'reconcileControlReplyDispatch' | 'listExpiredSpawns' | 'recoverExpiredSpawn'> = getProductionTurnPermitStore(),
+): Promise<void> {
+  const restored = [...sessions];
+  const sessionsById = new Map(restored.map(ds => [ds.session.sessionId, ds]));
+  for (const permit of await store.listExpiredSpawns?.() ?? []) {
+    const ds = sessionsById.get(permit.sessionId);
+    const observed = ds?.workerGeneration ?? ds?.session.workerGeneration ?? 0;
+    const aliveReserved = !!ds?.worker && !ds.worker.killed && observed === permit.reservedGeneration;
+    const positivelyAbsent = !!ds && !ds.worker && !ds.session.pid
+      && !ds.session.persistentBackendTarget && !ds.session.adoptedFrom;
+    if (positivelyAbsent && !aliveReserved) await store.recoverExpiredSpawn?.(permit, {
+      observedGeneration: observed,
+      reservedGenerationRetired: observed <= permit.reservedGeneration,
+      noChildForReservedGeneration: observed === permit.reservedGeneration,
+    });
+  }
+  await reconcilePersistedTurnPermitDispatches({
+    pending: await store.listDispatching(),
+    sessions: restored.map(ds => ({
+      sessionId: ds.session.sessionId,
+      workerGeneration: ds.session.workerGeneration,
+      workerAlive: !!ds.worker && !ds.worker.killed && ds.workerGeneration === ds.session.workerGeneration,
+      dispatchInputReceipts: ds.session.dispatchInputReceipts,
+    })),
+    reconcile: (permit, evidence) => store.reconcileBusinessDispatch(permit, evidence),
+  });
+  for (const pending of await store.listDispatchingControls()) {
+    const ds = sessionsById.get(pending.permit.sessionId);
+    const receipt = ds?.session.controlDispatchReceipts?.[pending.permit.controlDispatchId];
+    const acknowledged = receipt?.workerGeneration === pending.permit.expectedGeneration
+      && receipt.replyDigest === pending.replyDigest;
+    const sameGenerationAlive = !!ds?.worker && !ds.worker.killed
+      && ds.workerGeneration === pending.permit.expectedGeneration
+      && ds.session.workerGeneration === pending.permit.expectedGeneration;
+    await store.reconcileControlReplyDispatch(pending.permit, pending.replyDigest, {
+      acknowledged,
+      safeToRetry: !pending.retryUsed && !!ds && !sameGenerationAlive,
+    });
+  }
+}
 
 export function listActiveSessions(): DaemonSession[] {
   return activeSessionsRegistry ? [...activeSessionsRegistry.values()] : [];
@@ -1902,17 +2008,48 @@ function streamingCardDisabled(ds: DaemonSession, turnId?: string): boolean {
   } catch { return false; }
 }
 
+function doneReactionEmojiFor(ds: DaemonSession): string {
+  try {
+    return getBot(ds.larkAppId).config.doneReactionEmoji || DONE_REACTION_EMOJI_TYPE;
+  } catch { return DONE_REACTION_EMOJI_TYPE; }
+}
+
+async function finishTurnReactions(ds: DaemonSession): Promise<void> {
+  const list = ds.pendingAckReactions;
+  if (!list || list.length === 0) return;
+  // Detach the batch first so a second idle edge can't double-flip it.
+  ds.pendingAckReactions = [];
+  // Plan B: a meeting agent is an ordinary chat-scope session. Pending ack
+  // reactions only ever exist for a real inbound user message (the ✋ is placed
+  // when that message arrives — transcript deliveries have no inbound message to
+  // react to), so a non-empty list here always belongs to a plain user turn and
+  // must settle to ✅ like any session. No VC special-case.
+  const silent = silentTurnReactions(ds);
+  const doneEmoji = doneReactionEmojiFor(ds);
+  for (const ack of list) {
+    if (ack.reactionId) {
+      try {
+        await removeReaction(ds.larkAppId, ack.messageId, ack.reactionId);
+      } catch (err: any) {
+        logger.debug(`[reaction] failed to remove received reaction ${ack.reactionId}: ${err?.message ?? err}`);
+      }
+    }
+    if (silent) continue;
+    try {
+      await addReaction(ds.larkAppId, ack.messageId, doneEmoji);
+    } catch (err: any) {
+      logger.debug(`[reaction] failed to add done reaction to ${ack.messageId}: ${err?.message ?? err}`);
+    }
+  }
+}
+
+export const __testOnly_finishTurnReactions = finishTurnReactions;
+
 function silentTurnReactions(ds: DaemonSession): boolean {
   if (isSilentMessageListenerSession(ds.session)) return true;
   try {
     return getBot(ds.larkAppId).config.silentTurnReactions === true;
   } catch { return false; }
-}
-
-function doneReactionEmojiFor(ds: DaemonSession): string {
-  try {
-    return getBot(ds.larkAppId).config.doneReactionEmoji || DONE_REACTION_EMOJI_TYPE;
-  } catch { return DONE_REACTION_EMOJI_TYPE; }
 }
 
 /** Worker lifecycle readiness is independent from Web Terminal availability.
@@ -3256,9 +3393,13 @@ export function ensureAutomaticTaskContinuationLease(
   if (!ensureReadonlyTaskContinuationAttached(ds, botCfg)) return false;
 
   try {
+    const frozenWorkspace = frozenSessionWorkspace(ds);
+    if (!frozenWorkspace) return false;
     const state = startReadonlyTaskContinuation(ds.session, {
       turnId: authority.turnId,
       workerGeneration: workerGeneration!,
+      workspaceIdentity: frozenWorkspace.workspace,
+      ...(frozenWorkspace.groupRevision === undefined ? {} : { groupRevision: frozenWorkspace.groupRevision }),
       authorizationMode: 'inherited',
       startMode: 'automatic',
       trustedCaller: authority.caller,
@@ -3479,7 +3620,7 @@ export function ensureReadonlyTaskContinuationAttached(
   }
   attachReadonlyTaskContinuation(ds.session, {
     schedule: (delayMs, run) => {
-      const timer = setTimeout(run, delayMs);
+      const timer = setTimeout(() => { void run(); }, delayMs);
       timer.unref?.();
       return timer;
     },
@@ -3501,7 +3642,7 @@ export function ensureReadonlyTaskContinuationAttached(
         && ds.session.workerGeneration === workerGeneration
         && proof?.workerGeneration === workerGeneration;
     },
-    enqueue: (dispatch: ReadonlyTaskContinuationDispatch) => {
+    enqueue: async (dispatch: ReadonlyTaskContinuationDispatch) => {
       if (!readonlyTaskContinuationEligible(ds) || !ordinaryTurnRecoveryStillOwnsSession(ds)) {
         return false;
       }
@@ -3516,15 +3657,21 @@ export function ensureReadonlyTaskContinuationAttached(
         return false;
       }
       const current = ds.session.readonlyTaskContinuation;
-      if (!current || current.currentTurnId !== dispatch.turnId
+      const frozenWorkspace = frozenSessionWorkspace(ds);
+      if (!current || current.leaseId !== dispatch.leaseId || current.currentTurnId !== dispatch.turnId
         || current.currentDispatchAttempt !== dispatch.dispatchAttempt
         || current.authorizationMode !== 'inherited'
+        || !frozenWorkspace
+        || (current.workspaceIdentity && (current.workspaceIdentity.path !== frozenWorkspace.workspace.path
+          || current.workspaceIdentity.dev !== frozenWorkspace.workspace.dev
+          || current.workspaceIdentity.ino !== frozenWorkspace.workspace.ino))
+        || (!current.workspaceIdentity && ds.session.workingDirSource === 'group')
+        || current.groupRevision !== frozenWorkspace.groupRevision
         || !current.trustedCaller
         || current.trustedCaller.requestLarkAppId !== ds.larkAppId
         || (current.trustedController
           && current.trustedController.requestLarkAppId !== ds.larkAppId)) return false;
-      try {
-        ds.worker.send({
+      const payload = {
           type: 'message',
           content: dispatch.prompt,
           turnId: dispatch.turnId,
@@ -3542,7 +3689,41 @@ export function ensureReadonlyTaskContinuationAttached(
             rpcGeneration: proof.rpcGeneration,
             authorizationMode: 'inherited',
           },
-        } satisfies Extract<DaemonToWorker, { type: 'message' }>);
+        } satisfies Extract<DaemonToWorker, { type: 'message' }>;
+      try {
+        const frozen = frozenSessionWorkspace(ds);
+        if (!frozen || (!current.workspaceIdentity && ds.session.workingDirSource === 'group')) return false;
+        const accepted = await dispatchWorkspaceAdmittedBusinessTurn({
+          ds,
+          turnId: dispatch.turnId,
+          payload,
+          resume: true,
+          dispatchAttempt: dispatch.dispatchAttempt,
+          atMostOnce: true,
+          trustedCaller: current.trustedCaller,
+          ...(current.workspaceIdentity ? { expectedWorkspace: { workspace: current.workspaceIdentity,
+            ...(current.groupRevision === undefined ? {} : { groupRevision: current.groupRevision }) } } : {}),
+          markAttempting: async () => {
+            const live = ds.session.readonlyTaskContinuation;
+            return live?.leaseId === dispatch.leaseId && live.status === 'dispatching'
+              && live.currentTurnId === dispatch.turnId && live.currentDispatchAttempt === dispatch.dispatchAttempt;
+          },
+        });
+        if (!accepted) return false;
+        const afterAdmission = frozenSessionWorkspace(ds);
+        if (!afterAdmission || (ds.session.workingDirSource === 'group' && (!current.workspaceIdentity
+          || current.workspaceIdentity.path !== afterAdmission.workspace.path
+          || current.workspaceIdentity.dev !== afterAdmission.workspace.dev
+          || current.workspaceIdentity.ino !== afterAdmission.workspace.ino
+          || current.groupRevision !== afterAdmission.groupRevision))) {
+          const ambiguous = ds.session.readonlyTaskContinuation;
+          if (ambiguous?.leaseId === dispatch.leaseId) {
+            ds.session.readonlyTaskContinuation = { ...ambiguous, status: 'failed', nextAttemptAt: undefined,
+              lastErrorCode: 'readonly_continuation_workspace_ambiguous_after_submit' };
+            sessionStore.updateSession(ds.session);
+          }
+          return ds.workerGeneration ?? ds.session.workerGeneration ?? false;
+        }
         ds.activeInteractiveTurn = {
           turnId: dispatch.turnId,
           caller: { ...current.trustedCaller },
@@ -3554,7 +3735,7 @@ export function ensureReadonlyTaskContinuationAttached(
           beginRecovery: false,
           dispatchAttempt: dispatch.dispatchAttempt,
         });
-        return workerGeneration!;
+        return ds.workerGeneration ?? ds.session.workerGeneration ?? false;
       } catch (err) {
         logger.error(
           `[${tag(ds)}] Failed to enqueue task continuation `
@@ -4326,7 +4507,8 @@ export function cachedStreamingCardStatus(ds: DaemonSession): StreamStatus {
  *  subtasks ran under the worker too, so a stale count is dropped with it;
  *  the turn's own outcome labels still apply. */
 export function cachedStreamCardLabel(ds: DaemonSession): StreamCardLabel | undefined {
-  return hasNoCliUnderDaemon(ds) ? idleCardLabel(ds) : streamCardLabel(ds);
+  const live = streamCardLabel(ds);
+  return hasNoCliUnderDaemon(ds) ? idleCardLabel(ds) : live;
 }
 
 function hasNoCliUnderDaemon(ds: DaemonSession): boolean {
@@ -7300,6 +7482,8 @@ export function killWorker(
   restartCoordinator.cancelSession(ds.session.sessionId);
   clearUsageLimitState(ds);
   ds.workerReady = false;
+  ds.lastWorkerReadyCwd = undefined;
+  ds.lastWorkerReadyHostWorkingDirContract = undefined;
   // The CLI process dies with this worker — no prompt is ready any more.
   ds.cliReady = false;
   clearUsageRefreshTimer(ds);
@@ -7387,6 +7571,8 @@ export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void
   restartCoordinator.cancelSession(ds.session.sessionId);
   clearUsageLimitState(ds);
   ds.workerReady = false;
+  ds.lastWorkerReadyCwd = undefined;
+  ds.lastWorkerReadyHostWorkingDirContract = undefined;
   // SIGTERM below makes the worker killCli() — the CLI prompt is gone.
   ds.cliReady = false;
   clearUsageRefreshTimer(ds);
@@ -7418,6 +7604,8 @@ function clearTransferWorkerState(
   restartCoordinator.cancelSession(ds.session.sessionId);
   clearUsageLimitState(ds);
   ds.workerReady = false;
+  ds.lastWorkerReadyCwd = undefined;
+  ds.lastWorkerReadyHostWorkingDirContract = undefined;
   // The transfer detaches this worker/CLI pair; the replacement must re-prove
   // readiness with its own prompt_ready.
   ds.cliReady = false;
@@ -7447,6 +7635,68 @@ function clearTransferWorkerState(
  * session is already detached, so unlike killWorker() this path must never
  * destroy its orphaned backing resource.
  */
+export async function retireWorkerForReplacement(
+  ds: DaemonSession,
+  opts: { timeoutMs?: number } = {},
+): Promise<boolean> {
+  const w = ds.worker;
+  const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+  if (!backendType || isRemoteBackendType(backendType) || ds.adoptedFrom) return false;
+  if (!w) {
+    // Restore has no ChildProcess handle, but a persistent pane may have survived
+    // the daemon. Positive backing teardown is the old-generation exit proof.
+    return isSuspendableBackendType(backendType) ? destroySuspendBackingVerified(ds) : true;
+  }
+  if (w.killed && (w.exitCode !== null || w.signalCode !== null)) {
+    clearTransferWorkerState(ds, w, 'retireWorkerForReplacement:already_exited');
+    return true;
+  }
+  if (isSuspendableBackendType(backendType) && !destroySuspendBackingVerified(ds)) return false;
+
+  const requestId = randomUUID();
+  trackLifecycleRetirement(ds, w);
+  let acked = false;
+  let exited = w.exitCode !== null || w.signalCode !== null;
+  let finish!: (ok: boolean) => void;
+  const completion = new Promise<boolean>(resolve => { finish = resolve; });
+  const maybeFinish = (): void => { if (acked && exited) finish(true); };
+  const onMessage = (raw: unknown): void => {
+    const msg = raw as Partial<WorkerToDaemon>;
+    if (msg.type !== 'replacement_retired' || msg.requestId !== requestId) return;
+    acked = true;
+    maybeFinish();
+  };
+  const onExit = (): void => { exited = true; maybeFinish(); };
+  w.on('message', onMessage);
+  w.on('exit', onExit);
+  const timeout = setTimeout(() => finish(false), opts.timeoutMs ?? TRANSFER_DETACH_FENCE_MS);
+  timeout.unref?.();
+  void sendWorkerIpc(w, { type: 'retire_for_replacement', requestId }).catch(() => finish(false));
+  let completed = await completion;
+  if (!completed && !exited) {
+    const forcedExit = new Promise<boolean>(resolve => {
+      const forcedTimeout = setTimeout(() => resolve(false), TRANSFER_FORCE_EXIT_MS);
+      forcedTimeout.unref?.();
+      w.once('exit', () => { clearTimeout(forcedTimeout); resolve(true); });
+    });
+    try { w.kill('SIGKILL'); } catch { /* already gone */ }
+    exited = await forcedExit || exited;
+    // A hard-retired local worker is a verified terminal generation even when its
+    // graceful ACK was lost; persistent backing was already positively removed.
+    completed = exited;
+  }
+  clearTimeout(timeout);
+  w.off('message', onMessage);
+  w.off('exit', onExit);
+  if (!completed || !exited || (ds.worker !== w && ds.worker !== null)) {
+    clearLifecycleRetirement(ds, w);
+    return false;
+  }
+  clearTransferWorkerState(ds, w, 'retireWorkerForReplacement');
+  sessionStore.updateSessionPid(ds.session.sessionId, null);
+  return true;
+}
+
 export async function detachWorkerForTransfer(
   ds: DaemonSession,
   opts: { timeoutMs?: number } = {},
@@ -8044,6 +8294,8 @@ export function requestSessionRestart(
         const model = opts.topicEffort?.model ?? latestModelForRespawn(ds);
         if (opts.topicEffort) topicEffortRestartReadiness.set(ds.session.sessionId, { attemptId, worker: ds.worker, workerGeneration: ds.workerGeneration, workerReady: !!ds.workerReady, cliReady: !!ds.cliReady, requested: opts.topicEffort });
         ds.workerReady = false;
+  ds.lastWorkerReadyCwd = undefined;
+  ds.lastWorkerReadyHostWorkingDirContract = undefined;
         // In-worker respawn: the next prompt belongs to a NEW CLI generation.
         ds.cliReady = false;
         ds.worker.send({ type: 'restart', attemptId, ...restartIpcReason(observer.source), ...cwdMove,
@@ -8063,10 +8315,12 @@ export function requestSessionRestart(
       // would only lose it for nothing.
       const restartCwd = callbacks?.getSessionWorkingDir(ds);
       if (!restartCwd || existsSync(restartCwd)) destroyLivePaneBeforeRestart(ds);
-      forkWorker(ds, '', {
+      if (forkWorker(ds, '', {
         resume: ds.hasHistory,
         restartAttemptId: attemptId,
-      });
+      }) === false) {
+        throw new Error('worker restart refused before spawn');
+      }
     } catch (error) {
       start.failure = { error };
       const before = topicEffortRestartReadiness.get(ds.session.sessionId);
@@ -10376,6 +10630,8 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   }
   if (!ds.worker || ds.worker.killed) {
     ds.workerReady = false;
+  ds.lastWorkerReadyCwd = undefined;
+  ds.lastWorkerReadyHostWorkingDirContract = undefined;
     // No live worker ⟹ no live CLI prompt; converge the flag with reality.
     ds.cliReady = false;
     // There is no live generation that can still own this capability.
@@ -10435,6 +10691,8 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
 
   ds.worker = null;
   ds.workerReady = false;
+  ds.lastWorkerReadyCwd = undefined;
+  ds.lastWorkerReadyHostWorkingDirContract = undefined;
   // The CLI is destroyed by the suspend; the cold resume brings a new one.
   ds.cliReady = false;
   ds.localProcessAttestation = undefined;
@@ -13052,6 +13310,7 @@ function withTurnCaller(ds: DaemonSession, message: TransferBufferedInput): Tran
 export function sendWorkerSessionInput(
   ds: DaemonSession,
   message: TransferBufferedInput,
+  onIpcDispatchAttempted?: () => void,
 ): boolean {
   // Evaluate the cheap message-shape guards FIRST: getBot() THROWS for an
   // unregistered app (IPC tests / in-flight teardown), and every other input
@@ -13084,7 +13343,7 @@ export function sendWorkerSessionInput(
   if (bufferTransferInput(ds, annotated)) return true;
   const worker = ds.worker;
   if (!worker || worker.killed) return false;
-  return afterWorkerIpcBootstrap(worker, () => worker.send(annotated));
+  return afterWorkerIpcBootstrap(worker, () => { onIpcDispatchAttempted?.(); worker.send(annotated); });
 }
 
 /** Prompt-cache keep-alive delivery. Deliberately NOT routed through the
@@ -14222,7 +14481,6 @@ async function forkFromSource(
     childSession.pendingForkSession = true;
     childSession.cliSessionId = lockedCliSessionId;
     childSession.cliId = ds.session.cliId;
-    childSession.workingDir = ds.workingDir ?? ds.session.workingDir;
     childSession.ownerOpenId = opts?.childOwnerOpenId ?? ds.session.ownerOpenId;
     childSession.backendType = ds.session.backendType;
     // Bot identity on the PERSISTED row. Every other createSession caller sets
@@ -14241,7 +14499,7 @@ async function forkFromSource(
     // a missing sandbox stamp on resume can silently disable isolation.
     // Model remains a launch record; current matching-CLI settings still win
     // in resolveSessionLaunchModel. Native pane/conversation IDs are separate.
-    inheritSessionLaunchConfiguration(ds.session, childSession);
+    inheritSessionLaunchConfiguration(ds.session, childSession, ds.workingDir ?? ds.session.workingDir);
     childSession.promptInjection = sessionPromptInjection(ds);
     childSession.nativeSessionTitle = childTitle;
     childSession.nativeSessionTitleUserDefined = true;
@@ -14882,6 +15140,37 @@ export async function prepareFailedTurnRecoveryIdentity(ds: DaemonSession, turnI
   await callbacks.prepareRawInputTurn(ds, turnId);
 }
 
+export async function dispatchWorkspaceAdmittedBusinessTurn(input: {
+  ds: DaemonSession;
+  turnId: string;
+  payload: string | CliTurnPayload;
+  resume: boolean;
+  dispatchAttempt?: number;
+  codexAppSteerable?: true;
+  atMostOnce?: true;
+  queueAfterActiveTurn?: true;
+  trustedCaller?: TrustedCaller;
+  markAttempting(): Promise<boolean>;
+  expectedWorkspace?: { workspace: import('./turn-admission.js').WorkspaceIdentity; groupRevision?: number };
+}): Promise<boolean> {
+  const dispatcher = callbacks?.dispatchAdmittedBusinessTurn
+    ?? embeddedWorkspaceDispatchers.at(-1)?.dispatcher;
+  if (!dispatcher) throw new Error('recovery_workspace_admission_unavailable');
+  return dispatcher({
+    ds: input.ds,
+    turnId: input.turnId,
+    payload: input.payload,
+    options: { resume: input.resume,
+      ...(input.dispatchAttempt === undefined ? {} : { dispatchAttempt: input.dispatchAttempt }),
+      ...(input.codexAppSteerable ? { codexAppSteerable: true as const } : {}),
+      ...(input.atMostOnce ? { atMostOnce: true as const } : {}),
+      ...(input.queueAfterActiveTurn ? { queueAfterActiveTurn: true as const } : {}),
+      ...(input.trustedCaller ? { trustedCaller: input.trustedCaller } : {}) },
+    markAttempting: input.markAttempting,
+    ...(input.expectedWorkspace ? { expectedWorkspace: input.expectedWorkspace } : {}),
+  });
+}
+
 /** Send one normal (non-raw) worker turn while applying the per-bot Codex App
  * clean-input gate at message acceptance time. This freezes the sidecar onto
  * the IPC item, so later config flips do not mutate an already queued turn. */
@@ -14903,6 +15192,9 @@ export function sendWorkerInput(
      * onto an auto-restarted CLI after a crash+terminalize (turn-level PR #71).
      * The dormant-fork path rides `atMostOnce` on the fork init instead. */
     atMostOnce?: true;
+    controlDispatchId?: string;
+    controlReplyDigest?: string;
+    controlReplyGrant?: Extract<DaemonToWorker, { type: 'message' }>['controlReplyGrant'];
     /** Recovery from a poisoned-history image 400: the worker rewrites the
      *  session transcript (drops undersized image blocks), respawns with
      *  --resume, and this turn is delivered only after the fresh CLI is ready. */
@@ -14911,6 +15203,7 @@ export function sendWorkerInput(
     /** Queue behind a running turn instead of folding into it (type-ahead):
      *  the input must start as a turn of its own. */
     queueAfterActiveTurn?: true;
+    onIpcDispatchAttempted?: () => void;
   } = {},
 ): boolean {
   cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
@@ -15085,10 +15378,14 @@ export function sendWorkerInput(
     ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
     ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
     ...(opts.atMostOnce ? { atMostOnce: true } : {}),
+    ...(opts.controlDispatchId ? { controlDispatchId: opts.controlDispatchId } : {}),
+    ...(opts.controlReplyDigest ? { controlReplyDigest: opts.controlReplyDigest } : {}),
+    ...(opts.controlReplyGrant ? { controlReplyGrant: opts.controlReplyGrant } : {}),
     ...(opts.purgeUndersizedImages ? { purgeUndersizedImages: true as const } : {}),
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(trustedController ? { trustedController } : {}),
     ...(normalized.rerouteEnvelope ? { rerouteEnvelope: normalized.rerouteEnvelope } : {}),
+    ...(typeof payload !== 'string' && payload.taskContinuation ? { taskContinuation: payload.taskContinuation } : {}),
     ...(opts.queueAfterActiveTurn || (opts.dispatchAttempt === undefined
       && (opts.trustedCaller?.source === 'schedule_creator'
         || isSerialGroupInput(ds, opts.trustedCaller)))
@@ -15109,7 +15406,7 @@ export function sendWorkerInput(
     if (!transferGate && shouldTrackOrdinaryImDelivery(ds, message)) {
       return sendOrdinaryImDeliveryTracked(ds, message);
     }
-    return sendWorkerSessionInput(ds, message);
+    return sendWorkerSessionInput(ds, message, opts.onIpcDispatchAttempted);
   };
   try {
     if (!performSend()) {
@@ -16948,6 +17245,10 @@ function forkWorkerPrepared(
   // let the chat offer recovery (rebuild the worktree / switch directories).
   // Only re-attaching a backing session that is still alive goes ahead — that
   // CLI keeps running where it was and is not respawned.
+  if (cb.authorizeWorkingDirLaunch && !cb.authorizeWorkingDirLaunch(ds)) {
+    reportAdmission('rejected');
+    return false;
+  }
   const rawCwd = cb.getSessionWorkingDir(ds);
   const workingDirMissing = !!rawCwd && !existsSync(rawCwd);
   if (workingDirMissing && !opts.reattachLiveBackend) {
@@ -16988,7 +17289,7 @@ function forkWorkerPrepared(
   // dir with no repo context) instead of getting its own repo card. Compared via
   // realpath so a symlinked/aliased $HOME is excluded too, not just the literal string.
   if (!ds.session.workingDir && cwd === rawCwd && !resolvesToHome(cwd)) {
-    ds.session.workingDir = cwd;
+    setSessionWorkingDirMetadata(ds.session, { workingDir: cwd, source: 'bot-default' });
     sessionStore.updateSession(ds.session);
   }
 
@@ -17035,6 +17336,8 @@ function forkWorkerPrepared(
     try { replacedWorker.kill(); } catch { /* ignore */ }
     ds.worker = null;
     ds.workerReady = false;
+  ds.lastWorkerReadyCwd = undefined;
+  ds.lastWorkerReadyHostWorkingDirContract = undefined;
     ds.workerPort = null;
     ds.workerToken = null;
     ds.workerViewToken = null;
@@ -17320,6 +17623,7 @@ function forkWorkerPrepared(
       BOTMUX: '1',  // Marker so user scripts/skills can detect a botmux-spawned CLI
       SESSION_DATA_DIR: config.session.dataDir,
       BOTMUX_SESSION_ID: ds.session.sessionId,
+      BOTMUX_WORKER_GENERATION: String(workerGeneration),
       LARK_APP_ID: botCfg.larkAppId,
       // Withhold the real secret from the worker's own CLI env for a no-transport
       // session (apiOnly bot or HTTP virtual chat). SEPARATE leak from the
@@ -17470,6 +17774,21 @@ function forkWorkerPrepared(
     chatType: ds.chatType,
     rootMessageId: sessionAnchorId(ds),
     workingDir: cwd,
+    workerGeneration,
+    launchWorkspaceIdentity: freezeWorkerLaunchWorkspace(cwd),
+    launchWorkingDirSource: ds.session.workingDirSource,
+    ...(ds.groupWorkspaceLaunchGuard?.identity
+      ? { expectedWorkingDirIdentity: { ...ds.groupWorkspaceLaunchGuard.identity } }
+      : {}),
+    ...(ds.session.workingDirSource === 'group'
+      ? { terminalWorkspaceFence: {
+          source: 'group' as const,
+          ...(ds.session.groupWorkspaceRevision === undefined ? {} : { groupRevision: ds.session.groupWorkspaceRevision }),
+          workspaceIdentity: ds.session.groupWorkspaceIdentity
+            ? { ...ds.session.groupWorkspaceIdentity }
+            : { path: cwd, dev: '', ino: '' },
+        } }
+      : {}),
     cliId: agentCfg.cliId,
     cliRuntime: agentCfg.cliRuntime,
     cliPathOverride: agentCfg.cliPathOverride,
@@ -17940,6 +18259,108 @@ function forkWorkerPrepared(
  * already resolved the card to its final state — we only need to drop the
  * nonce/cardId/turnId so a late duplicate click cannot re-inject keys.
  */
+/** Capture the same host directory identity for explicit and group launches. */
+function freezeWorkerLaunchWorkspace(path: string): import('./turn-admission.js').WorkspaceIdentity | undefined {
+  try {
+    const canonical = realpathSync(path);
+    const identity = statSync(canonical, { bigint: true });
+    return identity.isDirectory() ? { path: canonical, dev: String(identity.dev), ino: String(identity.ino) } : undefined;
+  } catch { return undefined; }
+}
+
+/** Foundational AR-01 boundary. Production ingress adapters adopt this in later tasks. */
+export async function forkWorkerBlank(
+  ds: DaemonSession,
+  permit: BlankBootstrapPermit,
+  options: Exclude<ForkResumeOrTurnId, boolean | string> = {},
+  permitStore: Pick<TurnPermitStore, 'beginSpawn' | 'releasePreForkFailure'> = getProductionTurnPermitStore(),
+): Promise<'started' | 'deferred' | 'observing' | 'rejected'> {
+  if (permit.sessionId !== ds.session.sessionId) return 'rejected';
+  const transition = await permitStore.beginSpawn(permit);
+  if (transition.status === 'observing') return 'observing';
+  if (transition.status !== 'acquired') return 'rejected';
+  try {
+    if (ds.adoptedFrom) {
+      const accepted = forkAdoptWorker(ds, {
+      prompt: '', turnId: permit.turnId, atMostOnce: options.atMostOnce,
+      trustedCaller: options.trustedCaller,
+      onWorkerGenerationReserved: options.onWorkerGenerationReserved,
+      onIpcDispatchAttempted: options.onIpcDispatchAttempted,
+      }) === 'accepted';
+      if (!accepted) await permitStore.releasePreForkFailure(permit, transition.spawnAttemptId);
+      return accepted ? 'started' : 'rejected';
+    }
+    const before = ds.worker;
+    const accepted = forkWorker(ds, '', { ...options, turnId: permit.turnId });
+    if (!accepted) await permitStore.releasePreForkFailure(permit, transition.spawnAttemptId);
+    return accepted && ds.worker && ds.worker !== before ? 'started' : accepted ? 'deferred' : 'rejected';
+  } catch (error) {
+    const generation = ds.workerGeneration ?? ds.session.workerGeneration ?? 0;
+    if (generation < permit.reservedGeneration) {
+      await permitStore.releasePreForkFailure(permit, transition.spawnAttemptId);
+    }
+    throw error;
+  }
+}
+
+export type PermitAwareSubmitOptions = Parameters<typeof sendWorkerInput>[3];
+
+/** One-shot business boundary paired with forkWorkerBlank. */
+export async function submitBusinessInput(
+  ds: DaemonSession,
+  payload: string | CliTurnPayload,
+  permit: BusinessSubmitPermit,
+  payloadDigest: string,
+  options: PermitAwareSubmitOptions = {},
+  permitStore: Pick<TurnPermitStore, 'consumeBusiness' | 'acknowledgeBusinessDelivery' | 'abortBusinessDispatch'> = getProductionTurnPermitStore(),
+): Promise<boolean> {
+  const worker = ds.worker;
+  const directory = ds.session.workingDir;
+  const runtimeDirectory = ds.workingDir;
+  const source = ds.session.workingDirSource;
+  const controller = controllerForSession(ds);
+  const runtime = controller?.readyRuntimeForInput();
+  const workspaceIsCurrent = () => {
+    const frozen = frozenSessionWorkspace(ds);
+    const actual = authoritativeWorkerWorkspaceIdentity(ds);
+    return !!frozen && !!actual
+      && ds.session.workingDir === directory && ds.workingDir === runtimeDirectory
+      && ds.session.workingDirSource === source
+      && frozen.groupRevision === permit.groupRevision
+      && [frozen.workspace, actual].every(identity =>
+        identity.path === permit.workspace.path && identity.dev === permit.workspace.dev && identity.ino === permit.workspace.ino);
+  };
+  const isCurrent = () => ds.session.status === 'active'
+    && (!activeSessionsRegistry || activeSessionsRegistry.get(activeSessionKey(ds)) === ds)
+    && !!worker && ds.worker === worker && !worker.killed
+    && permit.sessionId === ds.session.sessionId
+    && permit.workerGeneration === (ds.session.workerGeneration ?? 0)
+    && permit.workerGeneration === ds.workerGeneration
+    && (!controller || sameRuntime(runtime, controller.readyRuntimeForInput()))
+    && workspaceIsCurrent();
+  if (!isCurrent()) return false;
+  const dispatch = await permitStore.consumeBusiness(permit, payloadDigest);
+  // Permit persistence can yield during a control operation or replacement of
+  // the runtime within the same worker. Recheck the exact runtime before IPC.
+  if (!isCurrent() || (dispatch.status === 'acquired' && Date.now() >= permit.expiresAt)) {
+    if (dispatch.status === 'acquired') await permitStore.abortBusinessDispatch(permit, payloadDigest);
+    return false;
+  }
+  if (dispatch.status === 'duplicate') return true;
+  if (dispatch.status !== 'acquired') return false;
+  const key = businessPermitAckKey(permit.sessionId, permit.turnId, permit.workerGeneration);
+  activeBusinessPermitStores.set(key, permitStore);
+  const accepted = sendWorkerInput(ds, payload, permit.turnId, {
+    ...options,
+    onIpcDispatchAttempted: options.onIpcDispatchAttempted,
+  });
+  if (!accepted) {
+    activeBusinessPermitStores.delete(key);
+    await permitStore.abortBusinessDispatch(permit, payloadDigest);
+  }
+  return accepted;
+}
+
 export function clearStuckWarningAuthority(ds: DaemonSession): void {
   ds.stuckWarningCardId = undefined;
   ds.stuckWarningTurnId = undefined;
@@ -18924,11 +19345,47 @@ function setupWorkerHandlers(
   if (journal) universalOutputProcessors.set(outputProcessorKey(ds), { worker, run: runOutput });
 
   const handleLegacyWorkerMessage = async (msg: WorkerToDaemon): Promise<void> => {
+    if (msg.type === 'control_reply_rejected') {
+      const retained = [...(ds.retainedControlReplyWorkers?.entries() ?? [])].find(([, binding]) =>
+        binding.worker === worker && binding.generation === workerGeneration
+        && binding.controlDispatchId === msg.controlDispatchId && binding.controlReplyDigest === msg.controlReplyDigest);
+      if (!retained) return;
+      const released = await getProductionTurnPermitStore().releaseUnsentControlReply({
+        sessionId: ds.session.sessionId, controlDispatchId: msg.controlDispatchId,
+        replyDigest: msg.controlReplyDigest, workerGeneration,
+      });
+      if (released && ds.retainedControlReplyWorkers?.get(retained[0]) === retained[1]) {
+        if (retained[1].timer) clearTimeout(retained[1].timer);
+        ds.retainedControlReplyWorkers.delete(retained[0]);
+      }
+      return;
+    }
     // Every IPC message is scoped to the child generation that emitted it.
     // A replaced worker can drain queued messages after the new child has been
     // installed; never let those stale events mutate the replacement's cards,
     // tokens, readiness, transcript metadata, or durable turn state.
     if (ds.worker !== worker) {
+      if (msg.type === 'turn_input_committed' && msg.controlDispatchId && msg.controlReplyDigest) {
+        const retainedEntry = [...(ds.retainedControlReplyWorkers?.entries() ?? [])]
+          .find(([, binding]) => binding.worker === worker && binding.generation === workerGeneration
+            && binding.controlDispatchId === msg.controlDispatchId
+            && binding.controlReplyDigest === msg.controlReplyDigest);
+        if (retainedEntry) {
+          const receipts = ds.session.controlDispatchReceipts ??= {};
+          receipts[msg.controlDispatchId] = { replyDigest: msg.controlReplyDigest,
+            committedAt: new Date().toISOString(), workerGeneration };
+          sessionStore.updateSession(ds.session);
+          void getProductionTurnPermitStore().acknowledgeControlReplyByDispatch({
+            controlDispatchId: msg.controlDispatchId, replyDigest: msg.controlReplyDigest, workerGeneration,
+          }).then(result => {
+            if (result.status !== 'delivered') return;
+            if (retainedEntry[1].timer) clearTimeout(retainedEntry[1].timer);
+            ds.retainedControlReplyWorkers?.delete(retainedEntry[0]);
+          }).catch(err => logger.warn(`[${t}] retained control ACK failed: ${err instanceof Error ? err.message : String(err)}`));
+          return;
+        }
+      }
+
       // A retiring worker's own COMMIT ACK still settles the ordinary
       // deliveries tracked against THAT worker object: suspend detaches
       // ds.worker and a replacement advances the generation BEFORE the old
@@ -19049,6 +19506,9 @@ function setupWorkerHandlers(
         break;
       }
       case 'worker_ipc_ready':
+        if (worker.connected && callbacks?.currentTerminalWorkspaceFence) {
+          worker.send(callbacks.currentTerminalWorkspaceFence(ds));
+        }
         // Consumed by the standalone bootstrap listener installed at spawn.
         break;
       case 'cron_task_anchors_sync': {
@@ -19211,6 +19671,7 @@ function setupWorkerHandlers(
           }
         }
         cliNotices.progress(msg.turnId, msg.dispatchAttempt, workerGeneration, msg.stage);
+        cb.onTurnProgress?.(ds, msg, { workerGeneration });
         break;
       }
       case 'turn_execution_started': {
@@ -19270,6 +19731,48 @@ function setupWorkerHandlers(
         // Compatibility/fallback: a commit also proves receipt if the earlier
         // receipt ACK was delayed or dropped on the reverse IPC channel.
         completeOrdinaryImDelivery(ds, msg.turnId, workerGeneration);
+        if (msg.controlDispatchId && msg.controlReplyDigest) {
+          const retainedEntry = [...(ds.retainedControlReplyWorkers?.entries() ?? [])]
+            .find(([, binding]) => binding.worker === worker && binding.generation === workerGeneration
+              && binding.controlDispatchId === msg.controlDispatchId
+              && binding.controlReplyDigest === msg.controlReplyDigest);
+          const retainedForDispatch = [...(ds.retainedControlReplyWorkers?.values() ?? [])]
+            .some(binding => binding.controlDispatchId === msg.controlDispatchId);
+          if (retainedForDispatch && !retainedEntry) break;
+          const receipts = ds.session.controlDispatchReceipts ??= {};
+          receipts[msg.controlDispatchId] = {
+            replyDigest: msg.controlReplyDigest,
+            committedAt: new Date().toISOString(),
+            workerGeneration,
+          };
+          if (Object.keys(receipts).length > 128) delete receipts[Object.keys(receipts)[0]!];
+          sessionStore.updateSession(ds.session);
+          void getProductionTurnPermitStore().acknowledgeControlReplyByDispatch({
+            controlDispatchId: msg.controlDispatchId,
+            replyDigest: msg.controlReplyDigest,
+            workerGeneration,
+          }).catch(err => logger.warn(
+            `[${t}] durable control ACK failed: ${err instanceof Error ? err.message : String(err)}`,
+          ));
+          if (retainedEntry) {
+            if (retainedEntry[1].timer) clearTimeout(retainedEntry[1].timer);
+            ds.retainedControlReplyWorkers?.delete(retainedEntry[0]);
+          }
+        }
+        const permitAckKey = businessPermitAckKey(ds.session.sessionId, msg.turnId, workerGeneration);
+        const permitStore = activeBusinessPermitStores.get(permitAckKey) ?? getProductionTurnPermitStore();
+        void permitStore.acknowledgeBusinessDelivery({
+          sessionId: ds.session.sessionId,
+          turnId: msg.turnId,
+          workerGeneration,
+        }).then(() => {
+          // The exact generation ACK has been handed to the originating store.
+          // Keep no process-lifetime reference after any durable verdict; a
+          // later duplicate can safely fall back to the production store.
+          activeBusinessPermitStores.delete(permitAckKey);
+        }).catch(err => logger.warn(
+          `[${t}] durable business ACK failed: ${err instanceof Error ? err.message : String(err)}`,
+        ));
         // An input ACK proves acceptance, not a new execution. Codex can emit
         // it after transcript failure while awaiting submit confirmation. Keep
         // that HTTP terminal and its failed UI closed to late/repeated ACKs.
@@ -19433,9 +19936,38 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored ready from stale/transferring worker generation`);
           break;
         }
+        const launchGuard = ds.groupWorkspaceLaunchGuard;
+        const remoteHostProof = msg.hostWorkingDirContract;
+        const readyBackendType = ds.initConfig?.backendType ?? ds.session.backendType;
+        const effectiveProof = msg.effectiveWorkspaceProof;
+        const exactEffectiveProof = readyBackendType === 'riff'
+          ? effectiveProof?.kind === 'riff-repository' && !!launchGuard?.identity && effectiveProof.hostPath === launchGuard.workingDir
+            && effectiveProof.identity.dev === launchGuard.identity.dev && effectiveProof.identity.ino === launchGuard.identity.ino
+            && !!effectiveProof.repository.repoName && !!effectiveProof.repository.repoBranch
+          : readyBackendType === 'mojo' ? false : true;
+        const exactRemoteHostProof = (readyBackendType === 'riff' || readyBackendType === 'mojo')
+          && !!launchGuard?.identity
+          && remoteHostProof?.workingDir === launchGuard.workingDir
+          && remoteHostProof.identity.dev === launchGuard.identity.dev
+          && remoteHostProof.identity.ino === launchGuard.identity.ino
+          && exactEffectiveProof;
+        const remoteProofRequired = launchGuard && (readyBackendType === 'riff' || readyBackendType === 'mojo');
+        if (launchGuard
+          && ((remoteProofRequired && !exactRemoteHostProof)
+            || (!remoteProofRequired && !exactRemoteHostProof
+              && (!cb.confirmWorkerReadyCwd || !cb.confirmWorkerReadyCwd(ds, msg.cwd))))) {
+          logger.error(`[${t}] Worker ready cwd mismatch: requested=${launchGuard.workingDir} actual=${msg.cwd ?? '(unavailable)'}`);
+          cb.onWorkerReadyCwdMismatch?.(ds, msg.cwd);
+          ds.groupWorkspaceLaunchGuard = undefined;
+          worker.kill('SIGTERM');
+          break;
+        }
+        ds.groupWorkspaceLaunchGuard = undefined;
         startupState.ready = true;
         startupState.onPreReadyExit = undefined;
         ds.workerReady = true;
+        ds.lastWorkerReadyCwd = msg.cwd;
+        ds.lastWorkerReadyHostWorkingDirContract = msg.hostWorkingDirContract;
         resumeCotMessage(ds);
         // A generation reached ready: the transient-startup failing streak is
         // over. Clear the budget and any still-pending retry timer (an inbound
@@ -20414,16 +20946,10 @@ function setupWorkerHandlers(
             content: msg.content,
           });
           // Usage ledger: any settle-to-idle/limited edge records the delta.
-          // Turn reactions are stricter — only flip ✋→✅ after a real busy
-          // period (working/analyzing) that settles to IDLE. A limited settle
-          // is a blocked turn, not completion: DONE-ing ✋ on working→limited
-          // made users think the task finished while the CLI was stuck (the
-          // rate-limit notification below owns that attention instead).
-          // Cold-start starting→idle (or the first prompt-ready before the turn
-          // has gone working) must NOT DONE a message that is still about to be
-          // / just being processed. Grok card-off sessions hit this when the
-          // ready-gate settle fired idle ~seconds after GoGoGo while the CLI
-          // was still running the prompt.
+          // A screen idle only means the terminal looks ready for input. It is
+          // not evidence that any exact user turn completed, especially during
+          // `/th` cold start before UserPromptSubmit. Turn reactions therefore
+          // follow the upstream working-to-idle transition below.
           if (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited') {
             recordUsageForDaemonSession(ds);
             if (ds.lastScreenStatus === 'idle' && (prevStatus === 'working' || prevStatus === 'analyzing')) {
@@ -20948,6 +21474,9 @@ function setupWorkerHandlers(
         }
         clearTuiPromptAuthority(ds);
         if (hadAuthority) publishAttentionPatch(ds);
+        if (msg.turnId) cb.onTurnAttention?.(ds, {
+          turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt, workerGeneration, state: 'resumed',
+        });
         break;
       }
 
@@ -21188,6 +21717,9 @@ function setupWorkerHandlers(
           }
           ds.stuckWarningCardId = cardMsgId;
           publishAttentionPatch(ds);
+          if (msg.turnId) cb.onTurnAttention?.(ds, {
+            turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt, workerGeneration, state: 'needs_user',
+          });
         } catch (err: any) {
           logger.warn(`[${t}] Failed to post stuck warning card: ${err}`);
           // The card replaced the worker's plain-text submit notice: if the
@@ -21218,6 +21750,9 @@ function setupWorkerHandlers(
             logger.debug(`[${t}] Failed to update stuck-warning card on expired: ${err}`),
           );
           clearStuckWarningAuthority(ds);
+          if (msg.turnId) cb.onTurnAttention?.(ds, {
+            turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt, workerGeneration, state: 'resumed',
+          });
         }
         break;
       }
@@ -21246,6 +21781,9 @@ function setupWorkerHandlers(
             logger.debug(`[${t}] Failed to resolve stuck-warning card on delivered: ${err}`),
           );
           clearStuckWarningAuthority(ds);
+          if (msg.turnId) cb.onTurnAttention?.(ds, {
+            turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt, workerGeneration, state: 'resumed',
+          });
         }
         break;
       }
@@ -21540,6 +22078,8 @@ function setupWorkerHandlers(
             // terminal URL can show the startup failure; the next user message
             // tells that same worker to destroy the diagnostic shell and retry.
             ds.workerReady = false;
+  ds.lastWorkerReadyCwd = undefined;
+  ds.lastWorkerReadyHostWorkingDirContract = undefined;
             // The worker now holds a parked diagnostic shell and will respawn the
             // CLI itself on the next message (no restart IPC in that path), so the
             // next message must carry the current launch model. Cleared once a
@@ -23300,6 +23840,17 @@ function setupWorkerHandlers(
     }
   };
   const handleWorkerMessage = async (msg: WorkerToDaemon): Promise<void> => {
+    const receiptMessage = msg;
+    // A retained control receipt settles only its host-issued dispatch, even
+    // after the worker's runtime contract has retired. It grants no lifecycle
+    // or business-input authority to that historical worker.
+    if ((receiptMessage.type === 'control_reply_rejected' || receiptMessage.type === 'turn_input_committed')
+      && receiptMessage.controlDispatchId && receiptMessage.controlReplyDigest
+      && [...(ds.retainedControlReplyWorkers?.values() ?? [])].some(binding =>
+        binding.worker === worker && binding.generation === workerGeneration
+        && binding.controlDispatchId === receiptMessage.controlDispatchId && binding.controlReplyDigest === receiptMessage.controlReplyDigest)) {
+      return handleLegacyWorkerMessage(msg);
+    }
     if (!sessionController || !contractWorker || msg.type === 'worker_ipc_ready') return handleLegacyWorkerMessage(msg);
     // V1 recovery authenticates its frozen offer/token in the existing host
     // store. It cannot acquire executor control from a new worker envelope.
@@ -23453,8 +24004,25 @@ function setupWorkerHandlers(
     return pending;
   });
 
+  worker.on('disconnect', () => {
+    for (const [askId, binding] of ds.retainedControlReplyWorkers ?? []) {
+      if (binding.worker !== worker) continue;
+      if (binding.timer) clearTimeout(binding.timer);
+      ds.retainedControlReplyWorkers?.delete(askId);
+      if (binding.controlDispatchId && !ds.session.controlDispatchReceipts?.[binding.controlDispatchId]) {
+        logger.warn(`[${t}] retained control dispatch disconnected after IPC; permit remains ambiguous ${binding.controlDispatchId}`);
+      }
+    }
+  });
+
   worker.on('exit', (code, signal) => {
     if (sessionController && contractWorker) { try { sessionController.workerLost(contractWorker); } catch (error) { logger.warn(`[${t}] Worker loss contract not persisted: ${String(error)}`); } }
+    for (const [askId, binding] of ds.retainedControlReplyWorkers ?? []) {
+      if (binding.worker === worker) {
+        if (binding.timer) clearTimeout(binding.timer);
+        ds.retainedControlReplyWorkers?.delete(askId);
+      }
+    }
     clearInterval(cliNoticeTimer);
     if (ownsLifecycleMutation()) {
       cliNoticeExitGeneration = workerGeneration + 1;
@@ -23549,6 +24117,8 @@ function setupWorkerHandlers(
       }
       ds.worker = null;
       ds.workerReady = false;
+  ds.lastWorkerReadyCwd = undefined;
+  ds.lastWorkerReadyHostWorkingDirContract = undefined;
       // The worker process died; its CLI died with it.
       ds.cliReady = false;
       // Its background-task anchors died with it: nothing can forward a wake
@@ -25400,7 +25970,6 @@ export const __testOnly_deliverFinalOutput = deliverFinalOutput;
 export const __testOnly_setupWorkerHandlers = setupWorkerHandlers;
 export const __testOnly_reserveWorkerGeneration = reserveWorkerGeneration;
 export const __testOnly_bindPreparedGroupContextWorker = bindPreparedGroupContextWorker;
-export const __testOnly_finishTurnReactions = finishTurnReactions;
 export const __testOnly_retireTerminalizedCodexAppLedgerEntriesForRecovery = retireTerminalizedCodexAppLedgerEntriesForRecovery;
 
 // ─── Fork adopt worker ──────────────────────────────────────────────────────
@@ -25541,6 +26110,8 @@ export function forkAdoptWorker(
   }
   if (!canForkRegisteredSession(ds)) return 'rejected';
   ds.workerReady = false;
+  ds.lastWorkerReadyCwd = undefined;
+  ds.lastWorkerReadyHostWorkingDirContract = undefined;
   ds.taskContinuationRpcProof = undefined;
   // Same spawn rule as forkWorker: the adopt bridge is a new CLI generation.
   ds.cliReady = false;
@@ -25597,6 +26168,8 @@ export function forkAdoptWorker(
     try { replacedWorker.kill(); } catch {}
     ds.worker = null;
     ds.workerReady = false;
+  ds.lastWorkerReadyCwd = undefined;
+  ds.lastWorkerReadyHostWorkingDirContract = undefined;
     ds.workerPort = null;
     ds.workerToken = null;
     ds.workerViewToken = null;
@@ -25771,6 +26344,16 @@ export function forkAdoptWorker(
     rootMessageId: sessionAnchorId(ds),
     terminalCardEpoch: ds.session.terminalCardEpoch,
     workingDir: adopted.cwd,
+    workerGeneration,
+    launchWorkspaceIdentity: freezeWorkerLaunchWorkspace(adopted.cwd),
+    launchWorkingDirSource: ds.session.workingDirSource,
+    ...(ds.session.workingDirSource === 'group' ? { terminalWorkspaceFence: {
+      source: 'group' as const,
+      ...(ds.session.groupWorkspaceRevision === undefined ? {} : { groupRevision: ds.session.groupWorkspaceRevision }),
+      workspaceIdentity: ds.session.groupWorkspaceIdentity
+        ? { ...ds.session.groupWorkspaceIdentity }
+        : { path: adopted.cwd, dev: '', ino: '' },
+    } } : {}),
     cliId: adoptedCliId,
     codexProfile: agentCfg.codexProfile,
     codexProfileHome: agentCfg.codexProfileHome,

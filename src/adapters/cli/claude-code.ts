@@ -499,6 +499,7 @@ const BOTMUX_ENVELOPE_TAGS = new Set([
   'session_id',
   'role',
   'summary_memory',
+  'botmux_response_style',
   'botmux_reminder',
   'botmux_formatting',
   'whiteboard',

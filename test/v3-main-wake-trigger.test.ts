@@ -65,6 +65,8 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/core/worker-pool.js')>();
   return {
   forkWorker: (...args: any[]) => mockForkWorker(...args),
+  dispatchWorkspaceAdmittedBusinessTurn: async (input: any) =>
+    (await import('./helpers/workspace-dispatch-spy.js')).dispatchWorkspaceThroughWorkerSpy(input),
   sendWorkerInput: (ds: any, payload: any, turnId?: string, opts: any = {}) => {
     sentInputs.calls.push({ turnId, opts });
     if (sentInputs.refuse) return false;
@@ -126,6 +128,8 @@ const mockBuildNewTopicCliInput = vi.fn((prompt: string, ...args: any[]) => ({
   codexAppInput: args[1] === 'codex-app' && args[10]?.codexAppText ? { text: args[10].codexAppText } : undefined,
 }));
 vi.mock('../src/core/session-manager.js', () => ({
+  resolveIngressWorkspace: async (input: any) => ({ status: 'resolved',
+    mutation: { workingDir: input.botDefaultWorkingDir, source: 'bot-default' } }),
   buildFollowUpContent: vi.fn((prompt: string) => `follow:${prompt}`),
   buildFollowUpCliInput: (...args: any[]) => mockBuildFollowUpCliInput(...args),
   buildNewTopicPrompt: vi.fn((prompt: string) => `new:${prompt}`),
