@@ -2014,35 +2014,6 @@ function doneReactionEmojiFor(ds: DaemonSession): string {
   } catch { return DONE_REACTION_EMOJI_TYPE; }
 }
 
-async function finishTurnReactions(ds: DaemonSession): Promise<void> {
-  const list = ds.pendingAckReactions;
-  if (!list || list.length === 0) return;
-  // Detach the batch first so a second idle edge can't double-flip it.
-  ds.pendingAckReactions = [];
-  // Plan B: a meeting agent is an ordinary chat-scope session. Pending ack
-  // reactions only ever exist for a real inbound user message (the ✋ is placed
-  // when that message arrives — transcript deliveries have no inbound message to
-  // react to), so a non-empty list here always belongs to a plain user turn and
-  // must settle to ✅ like any session. No VC special-case.
-  const silent = silentTurnReactions(ds);
-  const doneEmoji = doneReactionEmojiFor(ds);
-  for (const ack of list) {
-    if (ack.reactionId) {
-      try {
-        await removeReaction(ds.larkAppId, ack.messageId, ack.reactionId);
-      } catch (err: any) {
-        logger.debug(`[reaction] failed to remove received reaction ${ack.reactionId}: ${err?.message ?? err}`);
-      }
-    }
-    if (silent) continue;
-    try {
-      await addReaction(ds.larkAppId, ack.messageId, doneEmoji);
-    } catch (err: any) {
-      logger.debug(`[reaction] failed to add done reaction to ${ack.messageId}: ${err?.message ?? err}`);
-    }
-  }
-}
-
 export const __testOnly_finishTurnReactions = finishTurnReactions;
 
 function silentTurnReactions(ds: DaemonSession): boolean {
