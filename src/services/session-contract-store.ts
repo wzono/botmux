@@ -347,9 +347,19 @@ export class SessionContractStore {
       return runtime.ref;
     });
   }
-  bindRuntime(ref: ContractSessionRef, proposed: RuntimeRef, worker: WorkerRef, identity: RuntimeIdentity, operationId?: string): RuntimeContract {
+  bindRuntime(ref: ContractSessionRef, proposed: RuntimeRef, worker: WorkerRef, identity: RuntimeIdentity, operationId?: string, continued?: RuntimeRef): RuntimeContract {
     return this.transaction(() => {
       const previous = this.runtime(ref);
+      const state = this.read(ref);
+      // Resolving the launcher PID or the native conversation does not start a
+      // new local CLI. Keep its initialization proof, including a busy prompt,
+      // only for the current worker's explicit in-process continuation. A new
+      // remote generation still needs its own readiness evidence.
+      const initialized = previous?.phase === 'ready' && sameRuntime(previous.ref, continued)
+        && sameWorker(previous.worker, worker) && sameWorker(state?.worker, worker)
+        && previous.identity?.proof === 'process_start' && identity.proof === 'process_start'
+        && previous.identity.backend === identity.backend && previous.identity.nativeGeneration === identity.nativeGeneration
+        && state?.lifecycle === 'active' && !state.activeOperationId ? previous : undefined;
       const reserved = this.runtime(ref, proposed.runtimeId);
       if (!reserved || !sameRuntime(reserved.ref, proposed)) throw new Error('runtime_reservation_missing');
       if (!reserved.identity && ['stopped', 'retiring'].includes(reserved.phase)) throw new Error('runtime_reservation_abandoned');
@@ -400,7 +410,9 @@ export class SessionContractStore {
         }
       }
       const runtime: RuntimeContract = { ...(reuse ?? reserved), worker, identity,
-        ...(!enriching ? { phase: 'starting' as const, promptReady: false } : {}) };
+        ...(!enriching ? { phase: 'starting' as const, promptReady: false } : {}),
+        ...(initialized ? { phase: 'ready' as const, promptReady: initialized.promptReady,
+          promptReadySequence: initialized.promptReadySequence } : {}) };
       const result = this.applyInside(ref, { type: 'runtime_bound', runtime, ...(operationId ? { operationId } : {}) }, randomUUID());
       if (!['applied', 'historical'].includes(result.decision)) throw new Error(`runtime_binding_${result.decision}`);
       if (result.decision === 'applied' && previous && !sameRuntime(previous.ref, runtime.ref) && !['stopped', 'unresolved'].includes(previous.phase)) {

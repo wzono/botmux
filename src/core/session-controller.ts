@@ -92,7 +92,7 @@ export class SessionController {
       // The operation that spawned the live CLI may already be confirmed;
       // continuing or enriching that CLI is not part of it.
       const operation = (continued || enrichesActive) && !state?.activeOperationId ? undefined : operationId;
-      const bound = this.store.bindRuntime(this.ref, proposed.ref, worker, identity, operation);
+      const bound = this.store.bindRuntime(this.ref, proposed.ref, worker, identity, operation, continued);
       if (continued && !sameRuntime(continued, bound.ref) && sameRuntime(this.store.read(this.ref)?.activeRuntime, bound.ref)) {
         this.store.continueRuntime(this.ref, continued, bound.ref, worker);
       }

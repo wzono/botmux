@@ -7,6 +7,7 @@ import { dispatchAdmittedBusinessTurn } from '../src/core/admitted-turn-dispatch
 import { controllerForSession, type SessionController } from '../src/core/session-controller.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { TurnPermitStore } from '../src/services/turn-permit-store.js';
+import type { RuntimeIdentity } from '../src/services/session-contract.js';
 
 let directory: string;
 let previousDataDir: string;
@@ -24,7 +25,9 @@ afterEach(() => {
   rmSync(directory, { recursive: true, force: true });
 });
 
-function fixture(cliId = 'codex') {
+function fixture(cliId = 'codex', identity: RuntimeIdentity = {
+  backend: 'tmux', physicalId: 'fixture:1', proof: 'process_start',
+}) {
   const ds = {
     larkAppId: 'cli_busy_admission',
     session: {
@@ -38,9 +41,7 @@ function fixture(cliId = 'codex') {
   const bootstrap = controller.bindWorker(1);
   controller.store.apply(controller.ref, { type: 'worker_online', worker: bootstrap.worker });
   ds.initConfig = { cliId, backendType: 'tmux', sessionContract: bootstrap } as never;
-  const runtime = controller.bindRuntime('binding', bootstrap.worker, {
-    backend: 'tmux', physicalId: 'fixture:1', proof: 'process_start',
-  });
+  const runtime = controller.bindRuntime('binding', bootstrap.worker, identity);
   const ready = () => controller.store.apply(controller.ref, { type: 'runtime_ready', runtime: runtime.ref });
   const busy = () => controller.store.apply(controller.ref, { type: 'runtime_busy', runtime: runtime.ref });
   const submit = vi.fn(async () => true);
@@ -78,6 +79,53 @@ describe('business input during an active native turn', () => {
     const f = fixture(); f.ready();
     expect(await f.dispatch()).toBe(true);
     expect(f.submit).toHaveBeenCalledOnce();
+  });
+
+  it.each(['codex', 'claude-code'])('keeps %s steering admissible when its live launcher resolves to the native CLI', async cliId => {
+    const f = fixture(cliId); f.ready(); f.busy();
+    const original = controller.admitInput('om_original');
+    controller.store.bindQueuedExecution(controller.ref, original, f.runtime.ref);
+    const resolved = controller.bindRuntime('native-binding', f.bootstrap.worker, {
+      backend: 'tmux', physicalId: 'native-cli:2', proof: 'process_start', nativeSessionId: 'native-session',
+    }, undefined, 'binding');
+
+    expect(await f.dispatch()).toBe(true);
+    expect(f.submit).toHaveBeenCalledOnce();
+    expect(controller.readyRuntimeForInput()).toEqual(resolved.ref);
+    expect(controller.store.runtime(controller.ref)).toMatchObject({ phase: 'ready', promptReady: false });
+    expect(controller.store.execution(controller.ref, original.executionId)?.runtime).toEqual(f.runtime.ref);
+    expect(f.ds.cliReady).toBe(false);
+    expect(f.forkBlank).not.toHaveBeenCalled();
+  });
+
+  it('does not turn a pre-prompt identity refinement into initialized input readiness', async () => {
+    const f = fixture('claude-code');
+    controller.bindRuntime('native-binding', f.bootstrap.worker, {
+      backend: 'tmux', physicalId: 'native-cli:2', proof: 'process_start', nativeSessionId: 'native-session',
+    }, undefined, 'binding');
+    expect(await f.dispatch()).toBe(false);
+    expect(f.submit).not.toHaveBeenCalled();
+  });
+
+  it('does not transfer initialization to a new runtime without a continuation', async () => {
+    const f = fixture('claude-code'); f.ready(); f.busy();
+    controller.bindRuntime('replacement', f.bootstrap.worker, {
+      backend: 'tmux', physicalId: 'replacement:2', proof: 'process_start', nativeSessionId: 'native-session',
+    });
+    expect(await f.dispatch()).toBe(false);
+    expect(f.submit).not.toHaveBeenCalled();
+  });
+
+  it('does not borrow initialization across a remote native generation change', () => {
+    const f = fixture('hermes', {
+      backend: 'hermes', physicalId: 'remote-session', proof: 'native_generation', nativeGeneration: '1',
+    });
+    f.ready(); f.busy();
+    controller.bindRuntime('remote-next', f.bootstrap.worker, {
+      backend: 'hermes', physicalId: 'remote-session', proof: 'native_generation', nativeGeneration: '2',
+    }, undefined, 'binding');
+    expect(controller.readyRuntimeForInput()).toBeUndefined();
+    expect(controller.store.runtime(controller.ref)?.phase).toBe('starting');
   });
 
   it('does not treat a runtime that has never reached its prompt as busy and ready', async () => {

@@ -227,6 +227,24 @@ const lostTurnWarnings = (warn: ReturnType<typeof vi.spyOn>) => warn.mock.calls.
   .filter(line => /Dropped managed_turn_origin|not delivered|Worker user_notify/.test(line));
 
 describe('turns around a semantic runtime rebind', () => {
+  it('keeps busy input initialization when the live worker publishes its resolved CLI identity', async () => {
+    const s = await startWorker({ opening: false });
+    expect(s.controller.readyRuntimeForInput()).toEqual(s.binding.runtime);
+    const first = await s.deliver(TURNS[0]);
+    s.controller.store.apply(s.controller.ref, { type: 'runtime_busy', runtime: s.binding.runtime! });
+
+    await s.relayResolvesRealCli();
+    await s.publishNativeSession('native-resumed');
+    const current = s.scope.currentBinding()!.runtime;
+    expect(current).not.toEqual(s.binding.runtime);
+    expect(s.controller.readyRuntimeForInput()).toEqual(current);
+    expect(s.controller.store.runtime(s.controller.ref)).toMatchObject({ phase: 'ready', promptReady: false });
+    expect(s.ds.cliReady).toBe(false);
+
+    await s.answer(TURNS[0], first);
+    await vi.waitFor(() => expect(s.replies()).toEqual(answers(TURNS[0])));
+  });
+
   it('delivers both turns of a cold resume whose relay resolves the real CLI mid-turn', async () => {
     const warn = vi.spyOn(logger, 'warn');
     const s = await startWorker();
