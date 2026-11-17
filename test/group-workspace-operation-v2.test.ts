@@ -258,11 +258,14 @@ describe('same-source winner and executor lease', () => {
     const effectFile = join(dataDir, 'effects.log');
     const childSource = `
       import { OperationExecutorLeaseStore } from ${JSON.stringify(moduleUrl)};
-      const dataDir = process.env.TEST_DATA_DIR; const owner = process.env.TEST_OWNER; const delay = process.env.TEST_DELAY;
-      const store = new OperationExecutorLeaseStore(dataDir);
+      const dataDir = process.env.TEST_DATA_DIR; const owner = process.env.TEST_OWNER;
+      let now = Number(process.env.TEST_NOW);
+      const store = new OperationExecutorLeaseStore(dataDir, { now: () => now });
       const acquired = await store.acquire('shared-op', owner, 80);
       process.stdout.write(JSON.stringify(acquired) + '\\n');
-      await new Promise(resolve => setTimeout(resolve, Number(delay)));
+      const input = [];
+      for await (const chunk of process.stdin) input.push(chunk);
+      now = Number(Buffer.concat(input).toString());
       const effect = await store.runFencedEffect('shared-op', acquired.lease, async () => {
         const { appendFileSync } = await import('node:fs');
         appendFileSync(process.env.TEST_EFFECT_FILE, owner + '\\n');
@@ -270,36 +273,54 @@ describe('same-source winner and executor lease', () => {
       });
       process.stdout.write(JSON.stringify(effect) + '\\n');
     `;
-    const run = (owner: string, delay: number) => {
-      let firstResolve!: () => void;
-      const first = new Promise<void>(resolve => { firstResolve = resolve; });
-      const done = new Promise<string[]>((resolve, reject) => {
-        const child = spawnTsEvalWithRepoImports(childSource, {
-          cwd: process.cwd(), env: { ...process.env, TEST_DATA_DIR: dataDir, TEST_OWNER: owner,
-            TEST_DELAY: String(delay), TEST_EFFECT_FILE: effectFile },
-          stdio: ['ignore', 'pipe', 'pipe'],
-        });
-        const lines: string[] = []; let stderr = '';
+    const run = (owner: string, now: number) => {
+      const child = spawnTsEvalWithRepoImports(childSource, {
+        cwd: process.cwd(), env: { ...process.env, TEST_DATA_DIR: dataDir, TEST_OWNER: owner,
+          TEST_NOW: String(now), TEST_EFFECT_FILE: effectFile },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      let firstResolve!: (line: string) => void;
+      const first = new Promise<string>(resolve => { firstResolve = resolve; });
+      const done = new Promise<{ code: number | null; lines: string[]; stderr: string }>(resolve => {
+        let stdout = ''; let stderr = '';
         child.stdout!.on('data', chunk => {
-          lines.push(...String(chunk).trim().split('\n').filter(Boolean));
-          if (lines.length > 0) firstResolve();
+          stdout += String(chunk);
+          const newline = stdout.indexOf('\n');
+          if (newline >= 0) firstResolve(stdout.slice(0, newline));
         });
         child.stderr!.on('data', chunk => { stderr += String(chunk); });
-        child.on('error', reject);
-        child.on('exit', code => code === 0 ? resolve(lines) : reject(new Error(stderr)));
+        child.on('error', error => { stderr += error.message; });
+        child.on('close', code => {
+          firstResolve(stdout);
+          resolve({ code, lines: stdout.trim().split('\n').filter(Boolean), stderr });
+        });
       });
-      return { first, done };
+      return { child, first, done };
     };
-    const oldOwner = run('old-owner', 300);
-    await oldOwner.first;
-    await new Promise(resolve => setTimeout(resolve, 110));
-    const newOwner = run('new-owner', 0);
-    const [oldLines, newLines] = await Promise.all([oldOwner.done, newOwner.done]);
-    expect(JSON.parse(oldLines[0]!)).toMatchObject({ status: 'acquired', lease: { fencingToken: 1 } });
-    expect(JSON.parse(newLines[0]!)).toMatchObject({ status: 'acquired', lease: { fencingToken: 2 } });
-    expect(JSON.parse(oldLines[1]!)).toEqual({ status: 'stale_fence' });
-    expect(JSON.parse(newLines[1]!)).toEqual({ status: 'applied', value: 'new-owner' });
-    expect(readFileSync(effectFile, 'utf8')).toBe('new-owner\n');
+    const oldOwner = run('old-owner', 10);
+    let newOwner: ReturnType<typeof run> | undefined;
+    try {
+      expect(JSON.parse(await oldOwner.first)).toMatchObject({ status: 'acquired', lease: { fencingToken: 1 } });
+      // Expire the old lease explicitly; process scheduling must not expire the
+      // new lease before either process gets to check its fencing token.
+      newOwner = run('new-owner', 91);
+      expect(JSON.parse(await newOwner.first)).toMatchObject({ status: 'acquired', lease: { fencingToken: 2 } });
+      oldOwner.child.stdin!.end('91');
+      const oldResult = await oldOwner.done;
+      expect(oldResult.code, oldResult.stderr).toBe(0);
+      expect(JSON.parse(oldResult.lines[1]!)).toEqual({ status: 'stale_fence' });
+      newOwner.child.stdin!.end('91');
+      const newResult = await newOwner.done;
+      expect(newResult.code, newResult.stderr).toBe(0);
+      expect(JSON.parse(newResult.lines[1]!)).toEqual({ status: 'applied', value: 'new-owner' });
+      expect(readFileSync(effectFile, 'utf8')).toBe('new-owner\n');
+    } finally {
+      for (const owner of [oldOwner, newOwner]) {
+        if (!owner) continue;
+        if (owner.child.exitCode === null && owner.child.signalCode === null) owner.child.kill();
+        await owner.done;
+      }
+    }
   });
 
   it('holds the journal lock while validating the fencing token', async () => {
