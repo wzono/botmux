@@ -372,6 +372,21 @@ describe('bot-config store', () => {
     expect(effectiveReplyDelivery('app_default', cliId)).toBe('transcript');
   });
 
+  it.each(['grok-4.7', 'grok-4.7-build-fast'])('toggles zero injection without dropping %s xhigh', async model => {
+    const { registry, store } = await loaded({ cliId: 'grok', model, reasoningEffort: 'xhigh', replyDelivery: 'send', backendType: 'tmux' });
+    const zero = store.findConfigField('promptInjection')!;
+    expect(await store.applyConfigField('app_default', zero, 'none')).toMatchObject({ ok: true });
+    expect(readConfig()).toMatchObject({ model, reasoningEffort: 'xhigh', promptInjection: 'none', replyDelivery: 'send' });
+    expect(registry.getBot('app_default').config).toMatchObject({ model, reasoningEffort: 'xhigh', promptInjection: 'none' });
+    expect(registry.loadBotConfigs()[0]).toMatchObject({ model, reasoningEffort: 'xhigh', promptInjection: 'none' });
+    const { effectiveReplyDelivery } = await import('../src/core/reply-delivery.js');
+    expect(effectiveReplyDelivery('app_default', 'grok')).toBe('transcript');
+
+    expect(await store.applyConfigField('app_default', zero, 'default')).toMatchObject({ ok: true });
+    expect(readConfig()).toMatchObject({ model, reasoningEffort: 'xhigh', promptInjection: 'default' });
+    expect(effectiveReplyDelivery('app_default', 'grok')).toBe('send');
+  });
+
   it.each(['codex', 'traex'])('supports zero injection with local %s RPC input', async (cliId) => {
     const { store } = await loaded({ cliId, codexRpcInput: true });
     expect((await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none')).ok).toBe(true);
@@ -759,6 +774,27 @@ describe('bot-config store', () => {
     expect(cleared).toMatchObject({ ok: true });
     expect(registry.getBot('app_default').config.noProgressNotify).toBeUndefined();
     expect(readConfig().noProgressNotify).toBeUndefined();
+  });
+
+  it('stores a per-bot providerRecovery override, survives a reload, rejects bad values and unsets', async () => {
+    const { store, registry } = await loaded();
+    const spec = store.findConfigField('providerRecovery')!;
+    expect(spec).toMatchObject({ kind: 'json', effect: 'immediate', clearable: true });
+    const value = { enabled: true, maxWaitMinutes: 30 };
+    const parsed = store.coerceConfigValue(spec, JSON.stringify(value));
+    expect(parsed).toEqual({ ok: true, value });
+    if (!parsed.ok) throw new Error(parsed.reason);
+    expect(await store.applyConfigField('app_default', spec, parsed.value)).toMatchObject({ ok: true });
+    expect(registry.getBot('app_default').config.providerRecovery).toEqual(value);
+    expect(readConfig().providerRecovery).toEqual(value);
+    const cold = await freshModules();
+    cold.registry.loadBotConfigs().forEach((c: any) => cold.registry.registerBot(c));
+    expect(cold.registry.getBot('app_default').config.providerRecovery).toEqual(value);
+    const bad = store.coerceConfigValue(spec, JSON.stringify({ enabled: true, maxWaitMinutes: 0 }));
+    expect(bad.ok).toBe(false);
+    if (!bad.ok) expect(bad.reason).toMatch(/^invalid_provider_recovery: /);
+    expect(await store.applyConfigField('app_default', spec, null)).toMatchObject({ ok: true });
+    expect(readConfig().providerRecovery).toBeUndefined();
   });
 
   it('keeps CLI progress notices and prompt-cache configuration independent across reload and unset', async () => {

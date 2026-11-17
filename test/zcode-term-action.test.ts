@@ -79,7 +79,9 @@ function harness(
     commandLineWritesPending: 0,
     sessionRenameInFlight: () => false,
     cursorStopLeftParkedFollowUp,
+    promptReadinessRevision: 0,
   };
+  state.invalidatePromptReadinessEvidence = loadWorkerFunction('invalidatePromptReadinessEvidence', state);
   state.canWriteTerminalBytes = loadWorkerFunction('canWriteTerminalBytes', state);
   const factory = new Function('state', `with (state) { ${slice}; return { handleTermAction }; }`);
   const handler = factory(state) as { handleTermAction: (key: string) => Promise<void> };

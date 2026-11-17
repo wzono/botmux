@@ -520,9 +520,19 @@ export class SessionContractStore {
       return runtime.ref;
     });
   }
-  bindRuntime(ref: ContractSessionRef, proposed: RuntimeRef, worker: WorkerRef, identity: RuntimeIdentity, operationId?: string): RuntimeContract {
+  bindRuntime(ref: ContractSessionRef, proposed: RuntimeRef, worker: WorkerRef, identity: RuntimeIdentity, operationId?: string, continued?: RuntimeRef): RuntimeContract {
     return this.transaction(() => {
       const previous = this.runtime(ref);
+      const state = this.read(ref);
+      // Resolving the launcher PID or the native conversation does not start a
+      // new local CLI. Keep its initialization proof, including a busy prompt,
+      // only for the current worker's explicit in-process continuation. A new
+      // remote generation still needs its own readiness evidence.
+      const initialized = previous?.phase === 'ready' && sameRuntime(previous.ref, continued)
+        && sameWorker(previous.worker, worker) && sameWorker(state?.worker, worker)
+        && previous.identity?.proof === 'process_start' && identity.proof === 'process_start'
+        && previous.identity.backend === identity.backend && previous.identity.nativeGeneration === identity.nativeGeneration
+        && state?.lifecycle === 'active' && !state.activeOperationId ? previous : undefined;
       const reserved = this.runtime(ref, proposed.runtimeId);
       if (!reserved || !sameRuntime(reserved.ref, proposed)) throw new Error('runtime_reservation_missing');
       if (!reserved.identity && ['stopped', 'retiring'].includes(reserved.phase)) throw new Error('runtime_reservation_abandoned');
@@ -535,14 +545,19 @@ export class SessionContractStore {
       }
       const enriching = !!reserved.identity && reserved.worker.workerId === worker.workerId;
       let reuse = previous && !['retiring', 'stopped'].includes(previous.phase) && reusableRuntimeIdentity(previous.identity, identity) ? previous : undefined;
+      const sameBarePhysical = !!previous?.identity && samePhysicalRuntimeIdentity(previous.identity, identity);
+      const continuedBareLauncher = !!previous?.identity && !!continued && sameWorker(previous.worker, worker)
+        && this.runtimeContinues(ref, previous.ref, continued, worker)
+        && previous.identity.proof === 'process_start' && previous.identity.nativeGeneration === undefined;
       if (!reuse && !reserved.identity && identity.proof === 'process_start' && identity.nativeSessionId
         && previous?.identity && previous.identity.nativeSessionId === undefined
-        && samePhysicalRuntimeIdentity(previous.identity, identity)) {
+        && (sameBarePhysical || continuedBareLauncher)) {
         // Repair an unbound/bare intermediate observation only on a NEW binding.
         // Proven transitions or outstanding work in that interval prevent reuse.
         const history = (this.db.prepare("SELECT value FROM entities WHERE session_key=? AND kind='runtime'").all(sessionKey(ref)) as Array<{ value: string }>).map(row => JSON.parse(row.value) as RuntimeContract);
         const executions = this.executions(ref);
-        if (executions.some(execution => !terminalPhase(execution.phase) && sameRuntime(execution.runtime, previous.ref))) {
+        const previousHasOpenWork = executions.some(execution => !terminalPhase(execution.phase) && sameRuntime(execution.runtime, previous.ref));
+        if (previousHasOpenWork && sameBarePhysical) {
           // Work still open on the selected bare observation keeps the older
           // runtime out of reach. The complete identity is that same live
           // process, so it completes the selected runtime: refusing the binding
@@ -551,7 +566,7 @@ export class SessionContractStore {
           reuse = previous;
         }
         const records = (this.db.prepare("SELECT value FROM events WHERE session_key=? AND type IN ('runtime_bound','runtime_reserved')").all(sessionKey(ref)) as Array<{ value: string }>).map(row => JSON.parse(row.value) as Extract<ContractEvent, { type: 'runtime_bound' | 'runtime_reserved' }>);
-        const candidates = reuse ? [] : history.filter(runtime => runtime.phase === 'unresolved'
+        const candidates = reuse || previousHasOpenWork ? [] : history.filter(runtime => runtime.phase === 'unresolved'
           && runtime.ref.epoch < previous.ref.epoch && reusableRuntimeIdentity(runtime.identity, identity));
         if (candidates.length === 1) {
           const candidate = candidates[0];
@@ -559,13 +574,23 @@ export class SessionContractStore {
             && runtime.ref.epoch < proposed.epoch);
           const proven = records.filter(event => event.type === 'runtime_bound').map(event => event.runtime)
             .filter(runtime => runtime.ref.epoch > candidate.ref.epoch && runtime.ref.epoch < proposed.epoch);
-          const uncertainOnly = [...interval, ...proven].every(runtime => !runtime.identity || (samePhysicalRuntimeIdentity(runtime.identity, identity)
-            && runtime.identity.nativeSessionId === undefined && runtime.identity.nativeGeneration === undefined));
-          const outstanding = executions.some(execution => !terminalPhase(execution.phase)
-            && interval.some(runtime => sameRuntime(runtime.ref, execution.runtime)));
-          if (outstanding) throw new Error('runtime_recovery_has_active_execution');
+          const isContinuedBareLauncher = (runtime: RuntimeContract): boolean => !!continued
+            && sameWorker(runtime.worker, worker)
+            && this.runtimeContinues(ref, runtime.ref, continued, worker)
+            && runtime.identity?.proof === 'process_start'
+            && runtime.identity.nativeSessionId === undefined
+            && runtime.identity.nativeGeneration === undefined;
+          const uncertainOnly = [...interval, ...proven].every(runtime => !runtime.identity || ((samePhysicalRuntimeIdentity(runtime.identity, identity)
+            && runtime.identity.nativeSessionId === undefined && runtime.identity.nativeGeneration === undefined)
+            || isContinuedBareLauncher(runtime)));
+          const openIntervalRuntimes = interval.filter(runtime => executions.some(execution =>
+            !terminalPhase(execution.phase) && sameRuntime(runtime.ref, execution.runtime)));
+          if (openIntervalRuntimes.some(runtime => !isContinuedBareLauncher(runtime))) {
+            throw new Error('runtime_recovery_has_active_execution');
+          }
           const candidateProofs = records.filter(event => event.type === 'runtime_bound' && sameRuntime(event.runtime.ref, candidate.ref));
-          const complete = interval.length === proposed.epoch - candidate.ref.epoch - 1
+          const complete = openIntervalRuntimes.length === 0
+            && interval.length === proposed.epoch - candidate.ref.epoch - 1
             && new Set(interval.map(runtime => runtime.ref.epoch)).size === interval.length
             && interval.every(runtime => Number.isSafeInteger(runtime.ref.epoch)
               && records.some(event => event.type === 'runtime_reserved' && sameRuntime(event.runtime.ref, runtime.ref)))
@@ -578,7 +603,9 @@ export class SessionContractStore {
         }
       }
       const runtime: RuntimeContract = { ...(reuse ?? reserved), worker, identity,
-        ...(!enriching ? { phase: 'starting' as const, promptReady: false } : {}) };
+        ...(!enriching ? { phase: 'starting' as const, promptReady: false } : {}),
+        ...(initialized ? { phase: 'ready' as const, promptReady: initialized.promptReady,
+          promptReadySequence: initialized.promptReadySequence } : {}) };
       const result = this.applyInside(ref, { type: 'runtime_bound', runtime, ...(operationId ? { operationId } : {}) }, randomUUID());
       if (!['applied', 'historical'].includes(result.decision)) throw new Error(`runtime_binding_${result.decision}`);
       if (result.decision === 'applied' && previous && !sameRuntime(previous.ref, runtime.ref) && !['stopped', 'unresolved'].includes(previous.phase)) {
@@ -619,11 +646,14 @@ export class SessionContractStore {
       const state = this.read(ref); const current = this.runtime(ref);
       const attempt = this.execution(ref, execution.executionId);
       const source = attempt?.runtime && this.runtime(ref, attempt.runtime.runtimeId);
+      const lineage = source ? [source.ref, ...this.continuedRuntimes(ref, source.ref, source.worker)] : [];
+      const survivor = lineage.length ? this.runtime(ref, lineage.at(-1)!.runtimeId) : undefined;
       if (!state || state.lifecycle !== 'active' || state.activeOperationId || !sameWorker(state.worker, worker)
           || !current || !sameWorker(current.worker, worker) || !['starting', 'ready'].includes(current.phase)
-          || !sameExecution(attempt?.ref, execution) || attempt?.phase !== 'reconciling'
-          || !source || !sameRuntime(attempt.runtime, source.ref) || source.phase !== 'unresolved' || sameRuntime(source.ref, current.ref)
-          || !current.identity?.nativeSessionId || !reusableRuntimeIdentity(source.identity, current.identity)) return false;
+          || !sameExecution(attempt?.ref, execution) || !['submitting', 'accepted', 'reconciling'].includes(attempt!.phase) || attempt?.terminal
+          || !source || !sameRuntime(attempt.runtime, source.ref) || sameWorker(source.worker, worker)
+          || !survivor || (survivor.phase !== 'unresolved' && !sameRuntime(survivor.ref, current.ref)) || sameRuntime(source.ref, current.ref)
+          || !current.identity?.nativeSessionId || !reusableRuntimeIdentity(survivor.identity, current.identity)) return false;
       if (this.authorizedExecutionObserver(ref, source.ref, worker, execution)) return true;
       this.saveEntity(ref, 'execution_observer', JSON.stringify([worker.workerId, worker.generation, execution.executionId]),
         'authorized', { worker, execution, runtime: source.ref });

@@ -88,6 +88,7 @@ import type { FeedbackPolicy, FeedbackPolicyInput } from './services/feedback-po
 import { normalizeOncallGroupPolicy, type OncallGroupPolicy } from './services/oncall-group-policy.js';
 import { normalizeNoProgressNotifyPolicy, type NoProgressNotifyPolicy } from './services/no-progress-notify-policy.js';
 import { normalizePromptCacheConfig, type PromptCacheConfig } from './services/prompt-cache-policy.js';
+import { normalizeProviderRecoveryConfig, type ProviderRecoveryConfig } from './services/provider-recovery-policy.js';
 import { normalizeLinkRefConfig } from './services/link-ref-config.js';
 import type { LinkRefConfig } from './services/link-ref-types.js';
 import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
@@ -1404,7 +1405,7 @@ export interface SessionGroupConfig {
     mode?: 'ai-summary' | 'session-title' | 'truncate';
     /** Optional model for Codex AI-summary calls; absent inherits the bot model. */
     model?: string;
-    /** Max title length in characters for the AI summary (12). */
+    /** Max title length in characters for generated or reused titles (20). */
     maxLen?: number;
   };
   /**
@@ -1672,6 +1673,15 @@ export interface BotConfig {
    * live by the daemon's idle sweep.
    */
   promptCache?: PromptCacheConfig;
+  /**
+   * Claude Code only: automatic continuation after a transient model-provider
+   * failure for this bot. Each field overrides the machine-wide
+   * `providerRecovery` in config.json; unset fields inherit it
+   * (services/provider-recovery-policy.ts). Missing on both layers = off.
+   * Read live: a new turn picks up the current value, and switching it off
+   * settles a pending automatic continuation.
+   */
+  providerRecovery?: ProviderRecoveryConfig;
   /**
    * Codex App only, explicit opt-in: expose a restricted browser dynamic tool
    * backed by the locally installed Codex Chrome/Edge extension plugin.
@@ -2339,6 +2349,14 @@ export interface BotConfig {
    */
   writableTerminalLinkInCard?: boolean;
   /**
+   * Opt-in (default off): when a Codex / TRAE session sets a native goal, post
+   * one goal status card in the conversation and update it in place (status,
+   * animation, CLI-counted elapsed time). Off means no card, no refresh timer
+   * and no goal-store polling in the worker. The worker side is read when a
+   * worker process starts; the daemon side is read live.
+   */
+  goalStatusCard?: boolean;
+  /**
    * When true, `/card` sends a **private** static snapshot card via the ephemeral
    * API, visible only to the bot's `allowedUsers` (owner / co-owners), instead of
    * the group-visible live streaming card. Talk-only grants (globalGrants /
@@ -2355,6 +2373,25 @@ export interface BotConfig {
    * (undefined) keeps reply cards unchanged.
    */
   replyCardActions?: boolean;
+  /**
+   * Per-bot opt-in for the「下一步」row: the CLI's own next-input suggestion
+   * (Claude Code's greyed-out prompt suggestion) as a button above the last
+   * reply card's footer. Default (undefined) keeps reply cards unchanged.
+   */
+  replyCardNextStep?: boolean;
+  /**
+   * Per-bot opt-in for the collapsed「本轮回顾」panel above the last reply
+   * card's footer: files edited and commands run, plus the CLI's own recap
+   * (Claude Code's transcript away summary) once it writes one. Default
+   * (undefined) keeps reply cards unchanged.
+   */
+  replyCardRecap?: boolean;
+  /**
+   * With replyCardRecap on, also let a small model write the recap for a turn
+   * the CLI left without one (one extra model call per such turn, billed to
+   * the CLI's own credentials; Claude Code only). Default (undefined) off.
+   */
+  replyCardRecapModel?: boolean;
   /**
    * bot@bot 同目录拉起 (cross-bot working-dir inheritance). When a bot is @-ed
    * into a chat/thread where a sibling bot already has an active session, it
@@ -4329,6 +4366,18 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
           return undefined;
         }
       })(),
+      providerRecovery: (() => {
+        if (entry.providerRecovery === undefined) return undefined;
+        try {
+          return normalizeProviderRecoveryConfig(entry.providerRecovery);
+        } catch (error) {
+          logger.warn(
+            `[bot-registry:${entry.larkAppId}] ignoring invalid providerRecovery: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          );
+          return undefined;
+        }
+      })(),
       feedback: entry.feedback === undefined
         ? undefined
         : normalizeFeedbackPolicyLayer(entry.feedback),
@@ -4580,8 +4629,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.noCardChats.filter((x: any): x is string => typeof x === 'string' && x.trim().length > 0).map((x: string) => x.trim())
         : undefined,
       writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true || undefined,
+      goalStatusCard: entry.goalStatusCard === true || undefined,
       privateCard: entry.privateCard === true || undefined,
       replyCardActions: entry.replyCardActions === true || undefined,
+      replyCardNextStep: entry.replyCardNextStep === true || undefined,
+      replyCardRecap: entry.replyCardRecap === true || undefined,
+      replyCardRecapModel: entry.replyCardRecapModel === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       botToBotSameDir: entry.botToBotSameDir === false ? false : undefined,
       // 平台团队展示默认 ON：只有显式 false 有意义/落盘（undefined = 展示）。

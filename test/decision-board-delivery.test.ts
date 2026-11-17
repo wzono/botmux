@@ -29,6 +29,7 @@ const wp = vi.hoisted(() => ({
 }));
 
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   forkWorker: wp.forkWorker,
   sendWorkerInput: wp.sendWorkerInput,
   dispatchWorkspaceAdmittedBusinessTurn: vi.fn(async (input: any) => {

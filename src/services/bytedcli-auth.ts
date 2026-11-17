@@ -38,6 +38,7 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
 import { isUsableOpenId } from '../utils/user-token.js';
 import { scrubSessionTurnMarkerEnv } from '../utils/child-env.js';
+import { jwtClaims } from '../utils/bytecloud-jwt-claims.js';
 import { cliAuthEpochAllows, readCliAuthEpoch, stampCliAuthEpoch } from './cli-auth-epoch.js';
 
 /** Root under which each authorized person gets their own bytedcli HOME. */
@@ -496,8 +497,7 @@ export interface BytedcliJwts {
 }
 
 /**
- * ByteCloud JWTs are partition-scoped: the default (cn) token is rejected by
- * i18n services with `invalid jwt token ... partition i18n`. Each entry names
+ * ByteCloud JWTs are partition-scoped. Each entry names
  * the region and one `--site` that mints its token; the wrapper maps every
  * `--site` value onto these regions (see renderIdentityWrapper).
  */
@@ -506,6 +506,7 @@ export const BYTEDCLI_REGIONAL_SITES = [
   ['i18n', 'i18n-tt'],
   ['i18nbd', 'i18n-bd'],
   ['tx', 'us-ttp'],
+  ['cn', 'cn'],
 ] as const;
 export type BytedcliRegion = typeof BYTEDCLI_REGIONAL_SITES[number][0];
 export type BytedcliRegionalJwts = Partial<Record<BytedcliRegion, string>>;
@@ -560,20 +561,12 @@ function credentialEpochCurrent(openId: string, epoch: number, durableEpoch: num
 const regionalJwtCache = new Map<string, { jwt: string; expiresAtMs: number; durableEpoch: number; fingerprint?: string }>();
 const REGIONAL_JWT_REUSE_MARGIN_MS = 30 * 60_000;
 
-function jwtClaims(jwt: string): { exp?: unknown; region?: unknown } | null {
-  try {
-    return JSON.parse(Buffer.from(jwt.split('.')[1] ?? '', 'base64url').toString('utf8'));
-  } catch {
-    return null;
-  }
-}
-
 /**
  * Regions this person's login could not mint a token for, and under which
  * login. Most logins hold no regional access, so without this every turn spent
  * three failing CLI runs (~2.5s measured) re-learning that. A miss only means
- * "that region keeps the default token", which is also what a failure means,
- * so remembering it can never widen access. It is forgotten on any change of
+ * "that region has no token" (its calls are refused by the wrapper), which is
+ * also what a failure means, so remembering it can never widen access. It is forgotten on any change of
  * login or epoch, on logout, and after {@link REGIONAL_MISS_TTL_MS}.
  */
 const regionalMissCache = new Map<string, { fingerprint: string; epoch: number; durableEpoch: number; atMs: number }>();
@@ -601,9 +594,9 @@ async function regionalCloudJwt(
   if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
   const jwt = result.ok ? result.stdout.trim() : '';
   const claims = jwt && !/\s/.test(jwt) ? jwtClaims(jwt) : null;
-  // A token for another partition would only move the failure; keep the default.
+  // A token for another partition would only move the failure; publish none.
   if (!claims || claims.region !== region) {
-    logger.debug(`[bytedcli-auth] no ${region} ByteCloud JWT for ${openId}; that region keeps the default token`);
+    logger.debug(`[bytedcli-auth] no ${region} ByteCloud JWT for ${openId}; that region's calls are refused`);
     // Remember only a definite answer about this login (the CLI ran and said
     // it holds no login for that site, or handed back no usable token). A
     // timeout, a crash or a missing binary says nothing, so the next turn asks
@@ -715,6 +708,7 @@ async function renewJwts(openId: string, epoch: number, durableEpoch: number): P
   const codeJwt = code.ok ? code.stdout.trim() : '';
   const regionalCloudJwts: BytedcliRegionalJwts = {};
   for (const [region, site] of BYTEDCLI_REGIONAL_SITES) {
+    if (region === 'cn' && jwtClaims(cloudJwt)?.region === 'cn') continue;
     const jwt = await regionalCloudJwt(openId, region, site, true, epoch, durableEpoch, login.fingerprint);
     if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
     if (jwt) regionalCloudJwts[region] = jwt;
@@ -770,11 +764,13 @@ async function mintJwts(openId: string, epoch: number, durableEpoch: number): Pr
   if (!codeJwt) {
     logger.debug(`[bytedcli-auth] no Codebase JWT for ${openId}; git attribution will fall back`);
   }
-  // Regional tokens are best-effort like the Codebase JWT: without one, that
-  // region's calls keep the default token. Minted one at a time — concurrent
+  // Regional tokens are best-effort like the Codebase JWT: without one, the
+  // wrapper refuses that region's calls (never sends the default token there),
+  // and the rest of the turn is unaffected. Minted one at a time — concurrent
   // mints against the same HOME were measured returning another region's token.
   const regionalCloudJwts: BytedcliRegionalJwts = {};
   for (const [region, site] of BYTEDCLI_REGIONAL_SITES) {
+    if (region === 'cn' && jwtClaims(cloudJwt)?.region === 'cn') continue;
     const jwt = await regionalCloudJwt(openId, region, site, false, epoch, durableEpoch, fingerprint);
     if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
     if (jwt) regionalCloudJwts[region] = jwt;

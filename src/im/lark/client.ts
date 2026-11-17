@@ -24,6 +24,7 @@ import { stampBotmuxCallbackMarkers } from './callback-button-marker.js';
 import { prepareLocalAddressContent, sanitizeLocalAddressNode } from './local-address-policy.js';
 import { linkFieldContext } from './local-address-context.js';
 import { executeWithLarkGate } from './api-gate.js';
+import { readMessageWithinContext } from './message-read-context.js';
 import {
   LARK_CODE_APP_SCOPE_MISSING,
   LARK_CODE_CONTACT_INVALID_PARAM,
@@ -954,6 +955,80 @@ export async function listChatMemberOpenIds(larkAppId: string, chatId: string): 
   return (await listChatUserMembers(larkAppId, chatId)).map(member => member.openId);
 }
 
+/** Pages {@link findCurrentChatUserMembers} reads before giving up (100/page). */
+export const CURRENT_CHAT_USER_MEMBER_PAGE_CAP = 100;
+
+/** The member list was still `has_more` at the page cap with someone unconfirmed. */
+export class ChatMemberListTooLargeError extends Error {
+  constructor(chatId: string) {
+    super(
+      `Chat ${chatId} has more than ${CURRENT_CHAT_USER_MEMBER_PAGE_CAP * 100} members; `
+      + 'could not read the member list to the end to rule anyone out',
+    );
+    this.name = 'ChatMemberListTooLargeError';
+  }
+}
+
+/**
+ * Authorization-grade: which of `openIds` are current human members of the
+ * chat, per `larkAppId`'s live `/members` list (app-scoped open_ids; the list
+ * never contains bots). Stops paging as soon as everyone is found — a row in
+ * any live page proves membership — but only rules someone out after reading
+ * the list to the end. Anything that would make the list look shorter than it
+ * is throws instead: an API error, a page without an `items` array, a
+ * non-boolean `has_more`, `has_more` without a fresh page token (missing or
+ * already used), or hitting the page cap ({@link ChatMemberListTooLargeError}).
+ * Unlike {@link listChatUserMembers} it never returns a silently partial list.
+ */
+export async function findCurrentChatUserMembers(
+  larkAppId: string,
+  chatId: string,
+  openIds: readonly string[],
+): Promise<Set<string>> {
+  if (openIds.length === 0) return new Set();
+  const c = getBotClient(larkAppId);
+  return scanChatMemberPages(chatId, openIds, pageToken => larkGet(
+    c,
+    `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members`,
+    { member_id_type: 'open_id', page_size: '100', ...(pageToken ? { page_token: pageToken } : {}) },
+  ));
+}
+
+/** The paging rules of {@link findCurrentChatUserMembers}, over any page source. */
+export async function scanChatMemberPages(
+  chatId: string,
+  openIds: readonly string[],
+  fetchPage: (pageToken: string | undefined) => Promise<any>,
+): Promise<Set<string>> {
+  const wanted = new Set(openIds);
+  const found = new Set<string>();
+  if (wanted.size === 0) return found;
+  const usedTokens = new Set<string>();
+  let pageToken: string | undefined;
+  for (let page = 0; page < CURRENT_CHAT_USER_MEMBER_PAGE_CAP; page++) {
+    const res = await fetchPage(pageToken);
+    if (res?.code !== 0) throw larkApiError('list chat members', res);
+    const items = res.data?.items;
+    if (!Array.isArray(items)) throw new Error(`list chat members: page ${page + 1} has no items array`);
+    for (const it of items) {
+      const id = it?.member_id;
+      if (typeof id === 'string' && wanted.has(id)) found.add(id);
+    }
+    if (found.size === wanted.size) return found;
+    const hasMore = res.data?.has_more;
+    if (typeof hasMore !== 'boolean') throw new Error(`list chat members: page ${page + 1} has no boolean has_more`);
+    if (!hasMore) return found;
+    const next = res.data?.page_token;
+    if (typeof next !== 'string' || !next) {
+      throw new Error(`list chat members: page ${page + 1} has more members but no page_token`);
+    }
+    if (usedTokens.has(next)) throw new Error(`list chat members: page ${page + 1} repeats an earlier page_token`);
+    usedTokens.add(next);
+    pageToken = next;
+  }
+  throw new ChatMemberListTooLargeError(chatId);
+}
+
 /**
  * Resolve a chat's display name (the user-facing group title). Returns `null`
  * on any failure (chatId is unknown to this bot, network error, bot not in
@@ -1481,6 +1556,31 @@ export async function resolveCardKitId(larkAppId: string, messageId: string): Pr
   });
 }
 
+/** Sequenced whole-card updates prevent a delayed pre-restart frame overwriting a newer status. */
+export async function updateCardJson(larkAppId: string, cardId: string, messageId: string, content: string,
+  sequence: number, uuid: string, options?: OutboundMessageOptions): Promise<void> {
+  assertLarkTransport(larkAppId, 'updateCardJson');
+  content = prepareLocalAddressContent(content, 'interactive', linkFieldContext(larkAppId));
+  return executeWithLarkGate(larkAppId, 'updateCardJson', async () => {
+    await assertMessageWriteAllowed(larkAppId, messageId);
+    if (options?.beforeWrite) await options.beforeWrite();
+    let response: any;
+    try {
+      response = await getBotClient(larkAppId).cardkit.v1.card.update({
+        path: { card_id: cardId }, data: { card: { type: 'card_json', data: content }, sequence, uuid },
+      });
+    } catch (err) {
+      // Same withdrawn signal resolveCardKitId maps for the CardKit API.
+      if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) throw withdrawnWriteError(larkAppId, messageId);
+      throw err;
+    }
+    if (response.code !== 0) {
+      if (response.code === LARK_CODE_MESSAGE_WITHDRAWN) throw withdrawnWriteError(larkAppId, messageId);
+      throw larkApiError('update CardKit card', response);
+    }
+  });
+}
+
 /** Enable/finalize native CardKit streaming without replacing the whole card. */
 export async function updateCardStreamingSettings(
   larkAppId: string,
@@ -1566,33 +1666,114 @@ export async function patchCardStreamElement(
   });
 }
 
+/** Element-level writes bypass the whole-card egress, so stamp their callback
+ * buttons here the same way (the parser drops stamped buttons from flattened
+ * text read by other bots). */
+function stampedCardNode(node: Record<string, unknown>): Record<string, unknown> {
+  return JSON.parse(stampBotmuxCallbackMarkers(JSON.stringify(node))) as Record<string, unknown>;
+}
+
+/** Insert elements into an existing CardKit card (element-level; the rest of
+ * the card, including a normalized answer body, is left untouched). */
+export async function insertCardElements(
+  larkAppId: string,
+  cardId: string,
+  placement: { type: 'insert_before' | 'insert_after'; targetElementId: string } | { type: 'append' },
+  elements: Record<string, unknown>[],
+  sequence: number,
+  uuid: string,
+  messageId?: string,
+): Promise<void> {
+  assertLarkTransport(larkAppId, 'insertCardElements');
+  elements = elements.map(element => stampedCardNode(sanitizeLocalAddressNode(element, linkFieldContext(larkAppId))));
+  return executeWithLarkGate(larkAppId, 'insertCardElements', async () => {
+    await assertMessageWriteAllowed(larkAppId, messageId);
+    const res: any = await getBotClient(larkAppId).cardkit.v1.cardElement.create({
+      path: { card_id: cardId },
+      data: {
+        type: placement.type,
+        ...(placement.type === 'append' ? {} : { target_element_id: placement.targetElementId }),
+        elements: JSON.stringify(elements),
+        sequence,
+        uuid,
+      },
+    });
+    if (res.code !== 0) throw larkApiError('insert CardKit elements', res);
+  });
+}
+
+/** Replace one existing CardKit element as a whole, keeping its element id. */
+export async function replaceCardElement(
+  larkAppId: string,
+  cardId: string,
+  elementId: string,
+  element: Record<string, unknown>,
+  sequence: number,
+  uuid: string,
+  messageId?: string,
+): Promise<void> {
+  assertLarkTransport(larkAppId, 'replaceCardElement');
+  element = stampedCardNode(sanitizeLocalAddressNode(element, linkFieldContext(larkAppId)));
+  return executeWithLarkGate(larkAppId, 'replaceCardElement', async () => {
+    await assertMessageWriteAllowed(larkAppId, messageId);
+    const res: any = await getBotClient(larkAppId).cardkit.v1.cardElement.update({
+      path: { card_id: cardId, element_id: elementId },
+      data: { element: JSON.stringify(element), sequence, uuid },
+    });
+    if (res.code !== 0) throw larkApiError('replace CardKit element', res);
+  });
+}
+
+/** Remove one element from an existing CardKit card. */
+export async function deleteCardElement(
+  larkAppId: string,
+  cardId: string,
+  elementId: string,
+  sequence: number,
+  uuid: string,
+  messageId?: string,
+): Promise<void> {
+  assertLarkTransport(larkAppId, 'deleteCardElement');
+  return executeWithLarkGate(larkAppId, 'deleteCardElement', async () => {
+    await assertMessageWriteAllowed(larkAppId, messageId);
+    const res: any = await getBotClient(larkAppId).cardkit.v1.cardElement.delete({
+      path: { card_id: cardId, element_id: elementId },
+      data: { sequence, uuid },
+    });
+    if (res.code !== 0) throw larkApiError('delete CardKit element', res);
+  });
+}
+
 export async function getMessageDetail(
   larkAppId: string,
   messageId: string,
   options: { userCardContent?: boolean; userIdType?: 'open_id' } & LarkRequestOptions = {},
 ): Promise<any> {
-  const c = getBotClient(larkAppId);
-  // card_msg_content_type=user_card_content returns the original card JSON
-  // (including v2 schema/body/elements) instead of Lark's simplified fallback
-  // ("请升级至最新版本客户端，以查看内容"). We default to true for single-message
-  // fetches, but merge_forward enumeration MUST pass false — Lark returns
-  // HTTP 500 when the param is combined with a merge_forward message_id.
-  // Without the param, sub-messages still come back in the "Format A"
-  // simplified card shape which extractCardContent handles.
-  const userCardContent = options.userCardContent ?? true;
-  const res = await larkGet(c, `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
-    ...(userCardContent ? { card_msg_content_type: 'user_card_content' } : {}),
-    // Opt into server-side sender names (sender_name / sender_i18n_names, for
-    // user AND bot senders); without it the server omits them. Matters here for
-    // merge_forward sub-messages, whose senders appear nowhere else.
-    with_sender_name: 'true',
-    // Explicit ID type makes Feishu return app_id for bot mentions.
-    ...(options.userIdType ? { user_id_type: options.userIdType } : {}),
-  }, options);
-  if (res.code !== 0) {
-    throw larkApiError('get message', res);
-  }
-  return res.data;
+  const key = options.signal ? undefined : JSON.stringify([larkAppId, messageId, options.userCardContent ?? true, options.timeoutMs ?? null, options.userIdType ?? null]);
+  return readMessageWithinContext(key, async () => {
+    const c = getBotClient(larkAppId);
+    // card_msg_content_type=user_card_content returns the original card JSON
+    // (including v2 schema/body/elements) instead of Lark's simplified fallback
+    // ("请升级至最新版本客户端，以查看内容"). We default to true for single-message
+    // fetches, but merge_forward enumeration MUST pass false — Lark returns
+    // HTTP 500 when the param is combined with a merge_forward message_id.
+    // Without the param, sub-messages still come back in the "Format A"
+    // simplified card shape which extractCardContent handles.
+    const userCardContent = options.userCardContent ?? true;
+    const res = await larkGet(c, `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
+      ...(userCardContent ? { card_msg_content_type: 'user_card_content' } : {}),
+      // Opt into server-side sender names (sender_name / sender_i18n_names, for
+      // user AND bot senders); without it the server omits them. Matters here for
+      // merge_forward sub-messages, whose senders appear nowhere else.
+      with_sender_name: 'true',
+      ...(options.userIdType ? { user_id_type: options.userIdType } : {}),
+    }, options);
+    if (res.code !== 0) {
+      throw larkApiError('get message', res);
+    }
+    return res.data;
+  });
+
 }
 
 /** Parse the sender union_id from an IM message fetched with

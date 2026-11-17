@@ -78,6 +78,7 @@ const mockForkWorker = vi.fn(() => { if (forkShouldThrow) throw new Error('injec
 const mockSendWorkerInput = vi.fn(() => !sendShouldRefuse);
 const mockCloseSession = vi.fn(async () => ({ ok: true, alreadyClosed: false, known: true }));
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   // Workspace admission is a boundary of this lease suite. Keep the real
   // idempotency stores and both dispatch fault-injection paths below.
   dispatchWorkspaceAdmittedBusinessTurn: vi.fn(async (input: any) => {

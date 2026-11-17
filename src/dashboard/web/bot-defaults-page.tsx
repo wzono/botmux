@@ -1,4 +1,5 @@
 import type { OncallPresetOptions } from '../../services/oncall-preset-options.js';
+import { normalizePassthroughCommand, parseCustomPassthroughInput } from '../../core/passthrough-commands.js';
 import type { OncallGroupBusinessTarget } from '../../services/oncall-group-client.js';
 import type { OncallGroupPolicy } from '../../services/oncall-group-policy.js';
 import { SessionGroupNamingRow } from './session-group-naming-row.js';
@@ -13,7 +14,9 @@ import { StreamingCardPinToggle } from './streaming-card-pin-toggle.js';
 import { BlockedUsersEditor } from './blocked-users-editor.js';
 import { QuietPresetSection } from './quiet-preset-section.js';
 import { PromptCacheEditor } from './prompt-cache-editor.js';
-import type { PromptCacheConfig } from '../../services/prompt-cache-policy.js';
+import { resolvePromptCachePolicy, type PromptCacheConfig } from '../../services/prompt-cache-policy.js';
+import { ProviderRecoveryEditor } from './provider-recovery-editor.js';
+import type { ProviderRecoveryConfig } from '../../services/provider-recovery-policy.js';
 import {
   BOT_DEFAULTS_TABS,
   BOT_DEFAULTS_TAB_LABEL_KEYS,
@@ -27,6 +30,7 @@ import {
   fetchCliOptions,
   fetchCardBrandLabelEnabled,
   fetchGlobalPromptCache,
+  fetchGlobalProviderRecovery,
   fetchDetectedModels,
   fetchDshProfiles,
   createDshProfile,
@@ -654,8 +658,12 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     codexBrowser: body.codexBrowser,
     codexBrowserAutoApproveOrigins: body.codexBrowserAutoApproveOrigins,
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
+    goalStatusCard: body.goalStatusCard,
     privateCard: body.privateCard,
     replyCardActions: body.replyCardActions,
+    replyCardNextStep: body.replyCardNextStep,
+    replyCardRecap: body.replyCardRecap,
+    replyCardRecapModel: body.replyCardRecapModel,
     cotEnabled: body.cotEnabled,
     replyCardShowTools: body.replyCardShowTools,
     replyCardNativeCot: body.replyCardNativeCot,
@@ -1173,6 +1181,10 @@ function BotDefaultsCard(props: {
             {/* 提示缓存 TTL / 保活只对 Claude Code 生效（--settings promptCacheTtl + 注入保活轮）。 */}
             {bot.cliId === 'claude-code' ? (
               <section className="bd-tile" id={botDefaultsSectionDomId('prompt-cache')}><PromptCacheSection bot={bot} patchBot={patchBot} /></section>
+            ) : null}
+            {/* 暂态故障自动续跑只接 Claude Code 的普通轮次（Codex 容量续跑另有开关）。 */}
+            {bot.cliId === 'claude-code' ? (
+              <section className="bd-tile" id={botDefaultsSectionDomId('provider-recovery')}><ProviderRecoverySection bot={bot} patchBot={patchBot} /></section>
             ) : null}
             <section className="bd-tile" id={botDefaultsSectionDomId('startup-commands')}><StartupCommandsSection bot={bot} patchBot={patchBot} lock={props.linkedAgent} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('summary-trigger')}><SummaryTriggerSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
@@ -4576,10 +4588,10 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   const { bot, patchBot } = props;
   const policy = bot.triggerUserAuth ?? null;
   const enabled = policy?.enabled === true;
-  const tools = policy?.tools ?? ['lark-cli', 'bytedcli'];
-  const fallback = policy?.fallback ?? 'bot-identity';
+  const capabilities = policy?.capabilities ?? ['lark-user' as const, 'bytecloud' as const, 'meego' as const];
   const credentialSource = policy?.credentialSource ?? 'auto';
   const delegateOnMention = policy?.delegateOnMention !== false;
+  const allowSpeakerSwitch = policy?.allowSpeakerSwitch === true;
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [info, setInfo] = useState<{
@@ -4588,6 +4600,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
     mcpAdvisory?: string;
     platformBound?: boolean;
     platformCredentialsUrl?: string;
+    crossPrincipalIsolation?: boolean;
   } | null>(null);
 
   // Only fetch the advisories when the feature is on: they describe THIS
@@ -4619,17 +4632,23 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
     });
   }
 
-  function toggleTool(tool: 'lark-cli' | 'bytedcli', on: boolean): void {
-    const next = on ? [...new Set([...tools, tool])] : tools.filter(t => t !== tool);
-    void save({ enabled: true, tools: next, fallback, credentialSource, delegateOnMention });
+  function policyWith(next: { capabilities?: typeof capabilities; credentialSource?: typeof credentialSource; delegateOnMention?: boolean; allowSpeakerSwitch?: boolean }) {
+    return {
+      enabled: true,
+      capabilities: next.capabilities ?? capabilities,
+      credentialSource: next.credentialSource ?? credentialSource,
+      delegateOnMention: next.delegateOnMention ?? delegateOnMention,
+      allowSpeakerSwitch: next.allowSpeakerSwitch ?? allowSpeakerSwitch,
+      ...(policy?.legacyCapabilities && !next.capabilities ? { legacyCapabilities: true } : {}),
+    };
   }
 
-  function setCredentialSource(next: 'auto' | 'platform' | 'local'): void {
-    void save({ enabled: true, tools, fallback, credentialSource: next, delegateOnMention });
+  function saveWith(next: Parameters<typeof policyWith>[0]): void {
+    void save(policyWith(next));
   }
 
-  function setDelegateOnMention(next: boolean): void {
-    void save({ enabled: true, tools, fallback, credentialSource, delegateOnMention: next });
+  function toggleCapability(capability: typeof capabilities[number], on: boolean): void {
+    saveWith({ capabilities: on ? [...new Set([...capabilities, capability])] : capabilities.filter(c => c !== capability) });
   }
 
   return (
@@ -4641,34 +4660,35 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
         dataAction="toggle-trigger-user-auth"
         title={tr('botDefaults.triggerUserAuthToggle')}
         help={tr('botDefaults.triggerUserAuthHelp')}
-        onChange={checked => void save(
-          checked ? { enabled: true, tools, fallback, credentialSource, delegateOnMention } : null,
-        )}
+        onChange={checked => void save(checked ? policyWith({}) : null)}
       />
       {enabled ? (
         <>
           <div className="bd-row">
             <span>{tr('botDefaults.triggerUserAuthTools')}</span>
-            {(['lark-cli', 'bytedcli'] as const).map(tool => (
-              <label key={tool} className="bd-inline-check">
+            {(['lark-user', 'bytecloud', 'meego'] as const).map(capability => (
+              <label key={capability} className="bd-inline-check">
                 <input
                   type="checkbox"
-                  data-action={`trigger-user-auth-tool-${tool}`}
-                  checked={tools.includes(tool)}
+                  data-action={`trigger-user-auth-capability-${capability}`}
+                  checked={capabilities.includes(capability)}
                   disabled={busy}
-                  onChange={event => toggleTool(tool, event.currentTarget.checked)}
+                  onChange={event => toggleCapability(capability, event.currentTarget.checked)}
                 />
-                <span>{tool}</span>
+                <span>{tr(`botDefaults.triggerUserAuthCapability.${capability}`)}</span>
               </label>
             ))}
           </div>
+          {capabilities.includes('lark-user') || policy?.legacyCapabilities ? null : (
+            <p className="bd-section-note" data-action="trigger-user-auth-lark-user-native-note">{tr('botDefaults.triggerUserAuthLarkUserNativeNote')}</p>
+          )}
           <div className="bd-row">
             <span>{tr('botDefaults.triggerUserAuthSource')}</span>
             <select
               data-action="trigger-user-auth-source"
               value={credentialSource}
               disabled={busy}
-              onChange={event => setCredentialSource(event.currentTarget.value as 'auto' | 'platform' | 'local')}
+              onChange={event => saveWith({ credentialSource: event.currentTarget.value as 'auto' | 'platform' | 'local' })}
             >
               <option value="auto">{tr('botDefaults.triggerUserAuthSourceAuto')}</option>
               <option value="platform">{tr('botDefaults.triggerUserAuthSourcePlatform')}</option>
@@ -4695,10 +4715,21 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
             dataAction="toggle-trigger-user-auth-delegate-on-mention"
             title={tr('botDefaults.triggerUserAuthDelegateOnMention')}
             help={tr('botDefaults.triggerUserAuthDelegateOnMentionHelp')}
-            onChange={checked => setDelegateOnMention(checked)}
+            onChange={checked => saveWith({ delegateOnMention: checked })}
           />
-          <p className="bd-section-note">{tr('botDefaults.triggerUserAuthFallbackNote')}</p>
-          {tools.includes('bytedcli') ? (
+          <ToggleRow
+            checked={allowSpeakerSwitch}
+            disabled={busy || (info?.crossPrincipalIsolation === true && !allowSpeakerSwitch)}
+            dataAction="toggle-trigger-user-auth-allow-speaker-switch"
+            title={tr('botDefaults.triggerUserAuthAllowSpeakerSwitch')}
+            help={tr('botDefaults.triggerUserAuthAllowSpeakerSwitchHelp')}
+            onChange={checked => saveWith({ allowSpeakerSwitch: checked })}
+          />
+          {info?.crossPrincipalIsolation === true ? (
+            <p className="bd-section-note" data-action="trigger-user-auth-speaker-switch-xpi-note">{tr('botDefaults.triggerUserAuthAllowSpeakerSwitchXpi')}</p>
+          ) : null}
+          <p className="bd-section-note">{tr('botDefaults.triggerUserAuthCapabilityNote')}</p>
+          {capabilities.includes('bytecloud') ? (
             <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>
           ) : null}
           {typeof info?.authorizedCount === 'number' ? (
@@ -5988,8 +6019,12 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [pinStreamingCard, setPinStreamingCard] = useState(bot.pinStreamingCard === true);
   const [silentReactions, setSilentReactions] = useState(bot.silentTurnReactions === true);
   const [writableLink, setWritableLink] = useState(bot.writableTerminalLinkInCard === true);
+  const [goalStatusCard, setGoalStatusCard] = useState(bot.goalStatusCard === true);
   const [privateCard, setPrivateCard] = useState(bot.privateCard === true);
   const [replyActions, setReplyActions] = useState(bot.replyCardActions === true);
+  const [nextStep, setNextStep] = useState(bot.replyCardNextStep === true);
+  const [recap, setRecap] = useState(bot.replyCardRecap === true);
+  const [recapModel, setRecapModel] = useState(bot.replyCardRecapModel === true);
   const [cotEnabled, setCotEnabled] = useState(bot.cotEnabled !== false);
   const [showTools, setShowTools] = useState(bot.replyCardShowTools !== false);
   const [nativeCot, setNativeCot] = useState(bot.replyCardNativeCot === true);
@@ -6004,12 +6039,16 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setPinStreamingCard(bot.pinStreamingCard === true);
     setSilentReactions(bot.silentTurnReactions === true);
     setWritableLink(bot.writableTerminalLinkInCard === true);
+    setGoalStatusCard(bot.goalStatusCard === true);
     setPrivateCard(bot.privateCard === true);
     setReplyActions(bot.replyCardActions === true);
+    setNextStep(bot.replyCardNextStep === true);
+    setRecap(bot.replyCardRecap === true);
+    setRecapModel(bot.replyCardRecapModel === true);
     setCotEnabled(bot.cotEnabled !== false);
     setShowTools(bot.replyCardShowTools !== false);
     setNativeCot(bot.replyCardNativeCot === true);
-  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.replyCardRecap, bot.replyCardRecapModel, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     await saveBotField({
@@ -6110,6 +6149,19 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
             />
             <p role="status" data-card-pref-moot className="bd-card-mode-note">{tr('botDefaults.manualCardHint')}</p>
           </div>
+          <ToggleRow
+            checked={goalStatusCard}
+            disabled={busy !== null}
+            dataAction="toggle-goal-status-card"
+            title={tr('botDefaults.goalStatusCard')}
+            description={tr('botDefaults.goalStatusCardDescription')}
+            help={tr('botDefaults.goalStatusCardHelp')}
+            onChange={checked => {
+              const previous = goalStatusCard;
+              setGoalStatusCard(checked);
+              void savePatch({ goalStatusCard: checked }, 'goal-status-card', () => setGoalStatusCard(previous));
+            }}
+          />
           <ToggleRow
             checked={cotEnabled}
             disabled={busy !== null}
@@ -6274,6 +6326,45 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
                 const previous = replyActions;
                 setReplyActions(checked);
                 void savePatch({ replyCardActions: checked }, 'reply-actions', () => setReplyActions(previous));
+              }}
+            />
+            <ToggleRow
+              checked={nextStep}
+              disabled={busy !== null}
+              dataAction="toggle-reply-card-next-step"
+              title={tr('botDefaults.replyCardNextStep')}
+              description={tr('botDefaults.replyCardNextStepDescription')}
+              help={tr('botDefaults.replyCardNextStepHelp')}
+              onChange={checked => {
+                const previous = nextStep;
+                setNextStep(checked);
+                void savePatch({ replyCardNextStep: checked }, 'reply-next-step', () => setNextStep(previous));
+              }}
+            />
+            <ToggleRow
+              checked={recap}
+              disabled={busy !== null}
+              dataAction="toggle-reply-card-recap"
+              title={tr('botDefaults.replyCardRecap')}
+              description={tr('botDefaults.replyCardRecapDescription')}
+              help={tr('botDefaults.replyCardRecapHelp')}
+              onChange={checked => {
+                const previous = recap;
+                setRecap(checked);
+                void savePatch({ replyCardRecap: checked }, 'reply-recap', () => setRecap(previous));
+              }}
+            />
+            <ToggleRow
+              checked={recapModel}
+              disabled={busy !== null || !recap}
+              dataAction="toggle-reply-card-recap-model"
+              title={tr('botDefaults.replyCardRecapModel')}
+              description={tr('botDefaults.replyCardRecapModelDescription')}
+              help={tr('botDefaults.replyCardRecapModelHelp')}
+              onChange={checked => {
+                const previous = recapModel;
+                setRecapModel(checked);
+                void savePatch({ replyCardRecapModel: checked }, 'reply-recap-model', () => setRecapModel(previous));
               }}
             />
           </div>
@@ -9056,6 +9147,50 @@ function PromptCacheSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) 
   );
 }
 
+function ProviderRecoverySection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const [globals, setGlobals] = useState<{ providerRecovery: ProviderRecoveryConfig | null; promptCache: PromptCacheConfig | null }>(
+    { providerRecovery: null, promptCache: null });
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    void fetchGlobalProviderRecovery().then(value => { if (alive) setGlobals(value); });
+    return () => { alive = false; };
+  }, []);
+
+  async function save(value: ProviderRecoveryConfig | null): Promise<void> {
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/provider-recovery`, { providerRecovery: value }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: body => {
+        const next = body.providerRecovery && typeof body.providerRecovery === 'object'
+          ? body.providerRecovery as ProviderRecoveryConfig : null;
+        props.patchBot(props.bot.larkAppId, { providerRecovery: next });
+      },
+    });
+  }
+
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionProviderRecovery')}</h3>
+      <small className="bd-section-note">{tr('botDefaults.providerRecoveryNote')}</small>
+      <ProviderRecoveryEditor
+        scope="bot"
+        value={props.bot.providerRecovery ?? null}
+        globalValue={globals.providerRecovery}
+        promptCacheTtl={resolvePromptCachePolicy(globals.promptCache ?? undefined, props.bot.promptCache ?? undefined).ttl}
+        disabled={busy}
+        onSave={save}
+      />
+      <StatusSpan status={status} attr={{ 'data-provider-recovery-status': '' }} />
+    </section>
+  );
+}
+
 export function StartupCommandsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; lock?: AgentLockInfo | null }) {
   const tr = useT();
   const [value, setValue] = useState(typeof props.bot.startupCommands === 'string' ? props.bot.startupCommands : '');
@@ -9387,15 +9522,21 @@ export function NativeSlashCommandRegistration(props: { bot: BotDefaultsRow }) {
   );
 }
 
-function SlashCommandPermissionsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+export function SlashCommandPermissionsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const [passthrough, setPassthrough] = useState(typeof props.bot.customPassthroughCommands === 'string' ? props.bot.customPassthroughCommands : '');
+  const [commandDraft, setCommandDraft] = useState('');
+  const [commandError, setCommandError] = useState('');
+  const commandHelpId = useId();
+  const commandTags = parseCustomPassthroughInput(passthrough);
   const [canTalk, setCanTalk] = useState(typeof props.bot.canTalkDaemonCommands === 'string' ? props.bot.canTalkDaemonCommands : '');
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
   useEffect(() => {
     setPassthrough(typeof props.bot.customPassthroughCommands === 'string' ? props.bot.customPassthroughCommands : '');
+    setCommandDraft('');
+    setCommandError('');
   }, [props.bot.customPassthroughCommands]);
   // 分开两个 effect：只让「被保存的那个字段」的 prop 变化重置对应输入框，否则保存
   // 一个字段触发 patchBot 重渲染会连带把另一个字段的未保存草稿一并清空。
@@ -9403,9 +9544,26 @@ function SlashCommandPermissionsSection(props: { bot: BotDefaultsRow; patchBot: 
     setCanTalk(typeof props.bot.canTalkDaemonCommands === 'string' ? props.bot.canTalkDaemonCommands : '');
   }, [props.bot.canTalkDaemonCommands]);
 
+  function commitCommandDraft(text = commandDraft): string | null {
+    if (!text.trim()) return passthrough;
+    const entries = text.trim().split(/[,;\r\n]+|\s+(?=\/)/).map(entry => entry.trim()).filter(Boolean);
+    const normalized = entries.map(entry => normalizePassthroughCommand(entry.startsWith('/') ? entry : `/${entry}`));
+    if (!entries.length || normalized.some(command => !command)) {
+      setCommandError(tr('botDefaults.commandTagInvalid'));
+      return null;
+    }
+    const next = [...new Set([...commandTags, ...normalized as string[]])].join(' ');
+    setPassthrough(next);
+    setCommandDraft('');
+    setCommandError('');
+    return next;
+  }
+
   async function savePassthrough(): Promise<void> {
+    const commands = commitCommandDraft();
+    if (commands === null) return;
     await saveBotField({
-      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/custom-passthrough`, { customPassthroughCommands: passthrough }),
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/custom-passthrough`, { customPassthroughCommands: commands }),
       setStatus,
       setBusy: on => setBusy(on ? 'passthrough' : null),
       saved: tr('botDefaults.cardPrefSaved'),
@@ -9437,14 +9595,52 @@ function SlashCommandPermissionsSection(props: { bot: BotDefaultsRow; patchBot: 
       <NativeSlashCommandRegistration bot={props.bot} />
       <div className="bd-subsection">
         <h4 className="bd-subsection-title"><FieldTitle help={tr('botDefaults.customPassthroughHelp')}>{tr('botDefaults.customPassthrough')}</FieldTitle></h4>
-        <textarea
-          data-input="customPassthroughCommands"
-          rows={2}
-          placeholder={tr('botDefaults.customPassthroughPlaceholder')}
-          value={passthrough}
-          disabled={busy === 'passthrough'}
-          onChange={event => setPassthrough(event.currentTarget.value)}
-        />
+        {props.bot.defaultPassthroughCommands?.length ? (
+          <div data-default-passthrough-commands="">
+            <p>{tr('botDefaults.defaultPassthrough')}</p>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 12 }}>
+              {props.bot.defaultPassthroughCommands.map(command => <code key={command}>{command}</code>)}
+            </div>
+          </div>
+        ) : null}
+        <p>{tr('botDefaults.customPassthroughInputHelp')}</p>
+        <div className={`bd-command-tags${busy === 'passthrough' ? ' is-disabled' : ''}`}>
+          {commandTags.map(command => (
+            <span className="bd-command-tag" key={command} data-command-tag={command}>
+              <code>{command}</code>
+              <button type="button" disabled={busy === 'passthrough'} data-remove-command={command}
+                aria-label={tr('botDefaults.commandTagRemove', { command })}
+                onClick={() => setPassthrough(commandTags.filter(value => value !== command).join(' '))}>×</button>
+            </span>
+          ))}
+          <input data-input="customPassthroughCommands" type="text" value={commandDraft}
+            aria-label={tr('botDefaults.customPassthrough')} aria-describedby={commandHelpId} aria-invalid={!!commandError}
+            placeholder={tr('botDefaults.customPassthroughPlaceholder')} disabled={busy === 'passthrough'}
+            onChange={event => { setCommandDraft(event.currentTarget.value); setCommandError(''); }}
+            onBlur={() => { if (busy !== 'passthrough') commitCommandDraft(); }}
+            onKeyDown={event => {
+              if (event.nativeEvent.isComposing) return;
+              if (event.key === 'Enter' || event.key === ',' || event.key === ';') {
+                event.preventDefault(); commitCommandDraft();
+              } else if (event.key === 'Tab' && commandDraft.trim()) {
+                commitCommandDraft();
+              } else if (event.key === 'Backspace' && !commandDraft && commandTags.length) {
+                event.preventDefault(); setPassthrough(commandTags.slice(0, -1).join(' '));
+              }
+            }}
+            onPaste={event => {
+              const text = event.clipboardData.getData('text');
+              if (/[,;\r\n]|\s+\//.test(text)) {
+                event.preventDefault();
+                const start = event.currentTarget.selectionStart ?? commandDraft.length;
+                const end = event.currentTarget.selectionEnd ?? start;
+                const next = commandDraft.slice(0, start) + text + commandDraft.slice(end);
+                if (commitCommandDraft(next) === null) setCommandDraft(next);
+              }
+            }} />
+        </div>
+        <p className="bd-section-note" id={commandHelpId}>{tr('botDefaults.commandTagHelp')}</p>
+        {commandError ? <p role="alert" className="bd-command-error">{commandError}</p> : null}
         <div className="actions">
           <button type="button" className="primary" data-action="save-custom-passthrough" disabled={busy === 'passthrough'} onClick={() => void savePassthrough()}>{tr('botDefaults.customPassthroughSave')}</button>
         </div>

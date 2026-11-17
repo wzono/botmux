@@ -1,6 +1,9 @@
 export const CODEX_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
 /** Common verified effort levels honored by both Antigravity terminal and ACP. */
 export const ANTIGRAVITY_REASONING_EFFORTS: readonly CodexReasoningEffort[] = ['low', 'medium', 'high'];
+/** Doubao's model-independent CLI flag accepts these BotMux levels; the
+ * selected provider decides how to honour them. `ultra` is rejected by the CLI. */
+export const DOUBAO_REASONING_EFFORTS: readonly CodexReasoningEffort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 export const CODEX_COMMON_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 4);
 export const GROK_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 4);
 export const GROK_COMMON_REASONING_EFFORTS = GROK_REASONING_EFFORTS.slice(0, 3);
@@ -47,7 +50,8 @@ const SIX_LEVEL_MODELS = new Set([
   'gpt-5.6-sol', 'gpt-5.6-terra',
 ]);
 const FIVE_LEVEL_MODELS = new Set(['gpt-6-luna', 'gpt-5.6-luna']);
-const GROK_XHIGH_MODELS = new Set(['grok-4.6']);
+// Grok's model catalog advertises xhigh for both 4.7 variants too.
+const GROK_XHIGH_MODELS = new Set(['grok-4.6', 'grok-4.7', 'grok-4.7-build-fast']);
 const TRAEX_REASONING_EFFORTS_BY_MODEL = new Map<string, readonly CodexReasoningEffort[]>([
   ['gpt-6-astra', CODEX_COMMON_REASONING_EFFORTS],
   ['gpt-6.1-sol', CODEX_COMMON_REASONING_EFFORTS],
@@ -87,7 +91,7 @@ export function isBackendVariantCliId(cliId: string | undefined): boolean {
 
 export function isConfigurableReasoningCliId(cliId: string | undefined): boolean {
   return isCodexReasoningCliId(cliId) || cliId === 'grok' || isBackendVariantCliId(cliId)
-    || cliId === 'claude-code' || cliId === 'kimi' || cliId === 'minimax'
+    || cliId === 'claude-code' || cliId === 'kimi' || cliId === 'minimax' || cliId === 'doubao'
     // ZCode's per-model levels are declared in its own provider catalog and can
     // differ per model (grok-4.6 tops out at xhigh, GLM/Opus go to max, MiMo is
     // a switch). The launch path resolves the closest supported level, so the
@@ -134,6 +138,7 @@ export function reasoningEffortsForCliModel(
   model: string | undefined,
 ): readonly CodexReasoningEffort[] {
   if (cliId === 'antigravity') return ANTIGRAVITY_REASONING_EFFORTS;
+  if (cliId === 'doubao') return DOUBAO_REASONING_EFFORTS;
   if (cliId === 'grok') return grokReasoningEffortsForModel(model);
   if (cliId === 'remote-runner') return REMOTE_RUNNER_REASONING_EFFORTS;
   if (cliId === 'traex') return traexReasoningEffortsForModel(model);

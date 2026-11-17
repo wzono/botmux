@@ -91,6 +91,7 @@ const sendWorkerInputMock = vi.fn(() => true);
 const closeSessionMock = vi.fn();
 const sessionStoreCloseMock = vi.fn();
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   // This routing suite stubs the workspace-admission boundary, preserving
   // exact turn/creator options and refusal rather than silently accepting it.
   dispatchWorkspaceAdmittedBusinessTurn: vi.fn(async (input: any) => {
