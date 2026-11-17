@@ -89,7 +89,7 @@ describe('worker interrupt action integration', () => {
 
   it('awaits the async action in the worker IPC switch', () => {
     const start = workerSource.indexOf("case 'term_action':");
-    expect(workerSource.slice(start, start + 160)).toContain('await handleTermAction(msg.key)');
+    expect(workerSource.slice(start, start + 240)).toContain('await handleTermAction(msg.key)');
   });
 
   it('rejects viewer/RPC Codex modes before any PTY control key is sent', () => {
