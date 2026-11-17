@@ -11825,11 +11825,12 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
       const active = findActiveBySessionId(askSession.session.sessionId);
       return !res.destroyed && active === askSession && askSession.session.status === 'active'
         && !!asyncWorker && asyncWorker.connected !== false && !asyncWorker.killed
-        && ((!retained && isAsyncAskCurrent()
+        && ((askSession.worker === asyncWorker && isAsyncAskCurrent()
             && (askSession.workerGeneration ?? askSession.session.workerGeneration ?? 0) === asyncGeneration
             && (askSession.session.workerGeneration === undefined || askSession.session.workerGeneration === asyncGeneration)
             && asyncGeneration === askInput.controlWait?.expectedGeneration)
-          || (!!retained && retained.worker === asyncWorker && retained.generation === asyncGeneration
+          || (askSession.worker !== asyncWorker && !!retained
+            && retained.worker === asyncWorker && retained.generation === asyncGeneration
             && askSession.session.cliSessionId === asyncInput.threadId));
     };
     const delivered = await deliverCodexAsyncAnswer(asyncInput, boundAsk.questions, result, {

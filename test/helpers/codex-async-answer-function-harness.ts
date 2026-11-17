@@ -73,11 +73,24 @@ export function deliveryIsCurrent(scope: Record<string, any>): any {
   const path = 'src/daemon.ts';
   const file = ts.createSourceFile(path, readFileSync(join(process.env.CODEX_ASYNC_REVIEW_SOURCE_ROOT ?? '.', path), 'utf8'), ts.ScriptTarget.Latest, true);
   let expression: ts.Expression | undefined;
+  let deliveryExpression: ts.Expression | undefined;
   function visit(node: ts.Node): void {
     if (ts.isVariableDeclaration(node) && node.name.getText(file) === 'isAsyncAskCurrent') expression = node.initializer;
+    if (ts.isCallExpression(node) && node.expression.getText(file) === 'deliverCodexAsyncAnswer') {
+      let parent: ts.Node | undefined = node.parent;
+      while (parent && !ts.isBlock(parent)) parent = parent.parent;
+      if (parent && ts.isBlock(parent)) {
+        for (const statement of parent.statements) {
+          if (!ts.isVariableStatement(statement)) continue;
+          const current = statement.declarationList.declarations.find(d => d.name.getText(file) === 'isCurrent');
+          if (current?.initializer) deliveryExpression = current.initializer;
+        }
+      }
+    }
     ts.forEachChild(node, visit);
   }
   visit(file);
-  if (!expression) throw new Error('Missing async delivery current-origin closure');
-  return evaluate(expression.getText(file), scope);
+  if (!expression || !deliveryExpression) throw new Error('Missing async delivery current-origin closure');
+  scope.isAsyncAskCurrent = evaluate(expression.getText(file), scope);
+  return evaluate(deliveryExpression.getText(file), scope);
 }

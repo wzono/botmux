@@ -17,6 +17,9 @@ import { managedOriginCapabilityPath, replaceManagedOriginCapabilityFile } from 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { captureCodexAsyncAskOrigin } from '../src/core/codex-async-ask-origin.js';
+import * as sessionControllers from '../src/core/session-controller.js';
+import { SessionContractStore } from '../src/services/session-contract-store.js';
+import type { DaemonSession } from '../src/core/types.js';
 import { TurnPermitStore } from '../src/services/turn-permit-store.js';
 
 vi.mock('../src/services/bytedcli-auth.js', () => ({
@@ -87,6 +90,7 @@ asyncOriginMessageId: 'om_original', asyncOriginTurn: 'om_original', audience: {
   scope.askSession.worker = scope.asyncWorker;
   scope.askSession.session.workerGeneration = 7;
   scope.askSession.session.cliSessionId = 'thread';
+  scope.asyncAskOriginIsCurrent = captureCodexAsyncAskOrigin(scope.askSession, 'thread');
   scope.codexAsyncAnswerSteerTarget = productionFunction('src/services/codex-async-user-input.ts', 'codexAsyncAnswerSteerTarget', scope);
   return scope;
 }
@@ -463,13 +467,48 @@ describe('correlated async answer adversarial production probes', () => {
     res.destroy();
   });
 
+  it.each([undefined, 'stale-thread'])(
+    'keeps the current runtime authoritative after acquiring a permit with legacy mirror %s', async mirror => {
+      const scope = daemonScope();
+      const dir = mkdtempSync(join(tmpdir(), 'async-answer-runtime-origin-'));
+      const store = new SessionContractStore(dir, 'app');
+      const res = new ServerResponse(new IncomingMessage(new Socket()));
+      Object.assign(scope.askSession, { workerGeneration: 7 });
+      Object.assign(scope.askSession.session, { sessionId: 'session', cliSessionId: mirror });
+      const controller = new sessionControllers.SessionController(scope.askSession as DaemonSession, store);
+      const lookup = vi.spyOn(sessionControllers, 'controllerForSession').mockReturnValue(controller);
+      try {
+        const { worker } = controller.bindWorker(7);
+        controller.reserveBinding('native', worker);
+        controller.bindRuntime('native', worker, { backend: 'tmux', physicalId: '10:100',
+          proof: 'process_start', nativeSessionId: 'thread' });
+        Object.assign(scope, { res, asyncAskOriginIsCurrent: captureCodexAsyncAskOrigin(scope.askSession, 'thread') });
+        scope.isCurrent = deliveryIsCurrent(scope);
+        expect(await delivery(scope)('answer', 'ou_owner')).toBe(true);
+        expect(scope.askSession.retainedControlReplyWorkers.get('call').worker).toBe(scope.asyncWorker);
+        expect(scope.sendWorkerInput).toHaveBeenCalledOnce();
+        expect(scope.centralTurnPermitStore.abortControlReplyDispatch).not.toHaveBeenCalled();
+        controller.reserveBinding('replacement', worker);
+        controller.bindRuntime('replacement', worker, { backend: 'tmux', physicalId: '11:101',
+          proof: 'process_start', nativeSessionId: 'thread' });
+        expect(scope.isCurrent()).toBe(false);
+      } finally {
+        lookup.mockRestore();
+        store.close();
+        res.destroy();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
   it('allows an answer after natural native completion with an intact question response', async () => {
     const scope = daemonScope();
     const res = new ServerResponse(new IncomingMessage(new Socket()));
     const worker = { killed: false };
     Object.assign(scope.askSession, { worker });
     Object.assign(scope.askSession.session, { status: 'active', workerGeneration: 7, cliSessionId: 'thread' });
-    Object.assign(scope, { res, asyncAskOriginIsCurrent: captureCodexAsyncAskOrigin(scope.askSession, 'thread'),
+    Object.assign(scope, { res, asyncWorker: worker,
+      asyncAskOriginIsCurrent: captureCodexAsyncAskOrigin(scope.askSession, 'thread'),
       findActiveBySessionId: () => scope.askSession });
     scope.isCurrent = deliveryIsCurrent(scope);
     // Natural completion leaves the same worker/native thread alive and the
