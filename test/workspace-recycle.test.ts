@@ -130,7 +130,7 @@ describe('workspace ownership discovery', () => {
     const db = new DatabaseSync(join(dir, 'sessions.db'));
     db.exec('CREATE TABLE sessions (session_id TEXT PRIMARY KEY, row TEXT NOT NULL)');
     db.prepare('INSERT INTO sessions VALUES (?, ?)').run(session.sessionId, JSON.stringify(session)); db.close();
-    expect(loadAllSessionsStrict(f.dataDir)).toEqual([session]);
+    expect(loadAllSessionsStrict(f.dataDir)).toEqual([{ ...session, workingDirSource: 'legacy-unknown' }]);
     expect(readFileSync(join(f.dataDir, 'sessions-app-a.json'), 'utf8')).toBe('{stale snapshot');
   });
 

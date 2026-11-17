@@ -47,10 +47,13 @@ export function createMojoAdapter(_pathOverride?: string): CliAdapter {
         buildArgs(): string[] {
             return [];
         },
-        async writeInput(pty: PtyHandle, content: string): Promise<void> {
+        async writeInput(pty: PtyHandle, content: string) {
             // Direct passthrough — no PTY paste-burst detection or bracketed paste.
-            // MojoBackend.write() performs the actual CLI call.
-            pty.write(content);
+            const result = await pty.writeBusinessInput?.(content);
+            if (result === 'retryable_pre_dispatch_rejection') {
+                return { submitted: false, submissionDisposition: 'untouched' as const };
+            }
+            if (!result) pty.write(content);
         },
         // No <botmux_routing> is emitted for mojo, by omission rather than design:
         // the shared block recommends --mention-back, which is wrong for a

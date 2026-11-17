@@ -715,3 +715,8 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
   });
 
 });
+vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/admitted-turn-dispatch.js');
+  return { ...actual, dispatchAdmittedBusinessTurn: async (input: any) =>
+    (await import('./helpers/workspace-dispatch-spy.js')).dispatchAdmittedThroughWorkerSpy(input) };
+});

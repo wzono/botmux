@@ -9,7 +9,7 @@ const dirs: string[] = [];
 function tmp(): string { const d = mkdtempSync(join(tmpdir(), 'fleet-state-')); dirs.push(d); return d; }
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
 
-const state = (procs = [freshProc('botmux-0', 'cli_a', 100, 'T')]): FleetState =>
+const state = (procs = [{ ...freshProc('botmux-0', 'cli_a', 100, 'T'), processStart: 'boot:100' }]): FleetState =>
   ({
     supervisorPid: 42, supervisorStartedAt: 'T', supervisorProcessStart: 'boot:123',
     supervisorPidNamespace: 'pid:[100]', supervisorCommand: '/opt/botmux __supervisor', procs,
@@ -54,24 +54,25 @@ describe('fleet-state-store', () => {
     expect(readFleetState(p)!.procs).toHaveLength(1);
   });
 
-  it('tolerates a corrupt/partial file (returns null, does not throw)', () => {
+  it('rejects a corrupt existing file instead of treating it as an absent fleet', () => {
     const p = join(tmp(), 'fleet.json');
     writeFileSync(p, '{ this is not json');
-    expect(readFleetState(p)).toBeNull();
+    expect(() => readFleetState(p)).toThrow(SyntaxError);
   });
 
-  it('coerces unknown proc status to stopped and drops malformed procs', () => {
+  it.each([
+    { name: 'botmux-0', appId: 'cli_a', pid: 5, generation: 1, status: 'weird', restarts: 0 },
+    { pid: 9 },
+    { name: 'botmux-0', appId: 'cli_a', pid: 5, generation: 1, status: 'online', restarts: 0 },
+  ])('rejects malformed process identity without dropping the recorded process: %j', row => {
     const p = join(tmp(), 'fleet.json');
     writeFileSync(p, JSON.stringify({
       supervisorPid: 1, supervisorStartedAt: 'T',
-      procs: [
-        { name: 'botmux-0', appId: 'cli_a', pid: 5, generation: 1, status: 'weird', restarts: 0 },
-        { pid: 9 }, // malformed (no name/appId) → dropped
-      ],
+      procs: [row],
     }));
-    const s = readFleetState(p)!;
-    expect(s.procs).toHaveLength(1);
-    expect(s.procs[0].status).toBe('stopped');
+    const before = readFileSync(p, 'utf8');
+    expect(() => readFleetState(p)).toThrow(/malformed .*identity row/);
+    expect(readFileSync(p, 'utf8')).toBe(before);
   });
 
   it('writes with 0600 perms (state file may carry sensitive proc info)', () => {

@@ -47,19 +47,22 @@ describe('postAsk retry classifier (codex P1-3 seam)', () => {
 describe('daemon /api/asks startup readiness guard (codex P1-2 seam)', () => {
   it('unknown session + restore not finished → 503 startup_not_ready', () => {
     expect(shouldReturnAskStartupNotReady({
-      hasSession: false, sessionsRestored: false,
+      hasSession: false, targetReady: false,
     })).toBe(true);
   });
 
   it('once restore has finished, a still-unknown session does NOT get 503 (falls through to 403/proceed)', () => {
     expect(shouldReturnAskStartupNotReady({
-      hasSession: false, sessionsRestored: true,
+      hasSession: false, targetReady: true,
     })).toBe(false);
   });
 
-  it('a session that already resolved never hits the startup guard', () => {
+  it('a session that already resolved is still fenced until its bot is ready', () => {
     expect(shouldReturnAskStartupNotReady({
-      hasSession: true, sessionsRestored: false,
+      hasSession: true, targetReady: false,
+    })).toBe(true);
+    expect(shouldReturnAskStartupNotReady({
+      hasSession: true, targetReady: true,
     })).toBe(false);
   });
 
@@ -71,7 +74,7 @@ describe('daemon /api/asks startup readiness guard (codex P1-2 seam)', () => {
     // takes trustedHost at all: an unknown session mid-restore ALWAYS 503s,
     // regardless of how it authenticated.
     expect(shouldReturnAskStartupNotReady({
-      hasSession: false, sessionsRestored: false,
+      hasSession: false, targetReady: false,
     })).toBe(true);
   });
 });

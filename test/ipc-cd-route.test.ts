@@ -19,6 +19,7 @@ import { setIpcAuthSecret, startIpcServer, type IpcServerHandle } from '../src/c
 import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import * as sessionCwd from '../src/core/session-cwd.js';
+import * as sessionStore from '../src/services/session-store.js';
 
 /** 会话当前轮换 capability（daemon 侧 ds.managedTurnOrigin 与请求 body 双方持有）。 */
 const CAP = 'deadbeef'.repeat(8);
@@ -252,7 +253,8 @@ describe('POST /api/sessions/:sessionId/cd', () => {
       initConfig: { workingDir: '/old/stale/dir' },
     } as any;
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
-    const repinSpy = vi.spyOn(sessionCwd, 'repinSessionWorkingDir').mockImplementation(() => {});
+    const updateSpy = vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => {});
+    const repinSpy = vi.spyOn(sessionCwd, 'repinSessionWorkingDir');
     const killSpy = vi.spyOn(workerPool, 'killWorker').mockImplementation(() => {});
 
     const res = await postCd('s-respawn', roleDir);
@@ -263,7 +265,12 @@ describe('POST /api/sessions/:sessionId/cd', () => {
     // （realpath 归一），而非请求原始输入。worker 侧据此收敛 lastInitConfig 后
     // respawn（--resume 续上下文 + 新 cwd 开场注入新角色 CLAUDE.md/记忆索引）。
     expect(send).toHaveBeenCalledWith({ type: 'restart', attemptId: expect.any(String), updateWorkingDir: roleDirReal });
-    expect(repinSpy).toHaveBeenCalledWith(ds, roleDirReal);
+    expect(repinSpy).toHaveBeenCalledWith(ds, { workingDir: roleDirReal, source: 'explicit' });
+    expect(ds.session).toMatchObject({ workingDir: roleDirReal, workingDirSource: 'explicit' });
+    expect(ds.session.groupWorkspaceRevision).toBeUndefined();
+    expect(updateSpy).toHaveBeenCalledWith(expect.objectContaining({
+      workingDir: roleDirReal, workingDirSource: 'explicit', groupWorkspaceRevision: undefined,
+    }));
     // 落盘重钉必须先于 restart（记录 = 唯一事实源；respawn 只是让活进程跟上）。
     expect(repinSpy.mock.invocationCallOrder[0]).toBeLessThan(send.mock.invocationCallOrder[0]);
     expect(killSpy).not.toHaveBeenCalled();
@@ -293,7 +300,7 @@ describe('POST /api/sessions/:sessionId/cd', () => {
     // 绝不能留下「记录新、进程仍在旧目录」的分裂状态：send 抛错必须触发 killWorker。
     expect(killSpy).toHaveBeenCalledTimes(1);
     expect(killSpy).toHaveBeenCalledWith(ds);
-    expect(repinSpy).toHaveBeenCalledWith(ds, roleDirReal);
+    expect(repinSpy).toHaveBeenCalledWith(ds, { workingDir: roleDirReal, source: 'explicit' });
   });
 
   it('200 mode:cold-restart — NO live worker: killWorker is STILL called (unconditional, no ds.worker guard)', async () => {
@@ -317,7 +324,7 @@ describe('POST /api/sessions/:sessionId/cd', () => {
     expect(await res.json()).toEqual({ ok: true, mode: 'cold-restart', dir: roleDirReal });
     expect(killSpy).toHaveBeenCalledTimes(1);
     expect(killSpy).toHaveBeenCalledWith(ds);
-    expect(repinSpy).toHaveBeenCalledWith(ds, roleDirReal);
+    expect(repinSpy).toHaveBeenCalledWith(ds, { workingDir: roleDirReal, source: 'explicit' });
   });
 
   it('200 mode:respawn-resume — respawn 对 CLI 一视同仁（codex 等非 claude 家族同样走 restart）', async () => {
@@ -340,7 +347,7 @@ describe('POST /api/sessions/:sessionId/cd', () => {
     expect(await res.json()).toEqual({ ok: true, mode: 'respawn-resume', dir: roleDirReal });
     expect(send).toHaveBeenCalledWith({ type: 'restart', attemptId: expect.any(String), updateWorkingDir: roleDirReal });
     expect(killSpy).not.toHaveBeenCalled();
-    expect(repinSpy).toHaveBeenCalledWith(ds, roleDirReal);
+    expect(repinSpy).toHaveBeenCalledWith(ds, { workingDir: roleDirReal, source: 'explicit' });
   });
 
   it('200 mode:respawn-resume — unknown cliId 不再查适配器，同样 respawn（no crash）', async () => {
@@ -447,7 +454,7 @@ describe('POST /api/sessions/:sessionId/cd', () => {
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, mode: 'respawn-resume', dir: ownRoleReal });
-    expect(repinSpy).toHaveBeenCalledWith(ds, ownRoleReal);
+    expect(repinSpy).toHaveBeenCalledWith(ds, { workingDir: ownRoleReal, source: 'explicit' });
   });
   it('initConfig.workingDir 与 repin 同步 —— 连 no-worker 分支也同步（否则冷启动带回旧 cwd）', async () => {
     const rolesRoot = join(fakeHome, 'botmux-roles');

@@ -9,7 +9,7 @@
  *
  * Run:  pnpm vitest run test/mojo-backend.test.ts
  */
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -92,6 +92,36 @@ beforeAll(() => { binDir = mkdtempSync(join(tmpdir(), 'mojo-fake-')); });
 afterAll(() => { rmSync(binDir, { recursive: true, force: true }); });
 
 describe('MojoBackend spawn contract', () => {
+  it('rejects at the serialized dispatch edge when the host directory identity changes', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'mojo-write-contract-'));
+    const moved = `${root}-moved`;
+    const log = join(binDir, 'dispatch.log');
+    const bin = fakeMojo(`printf '%s\\n' "$*" >> ${JSON.stringify(log)}`);
+    const stat = statSync(root, { bigint: true });
+    const backend = new MojoBackend({ bin }, 'sid-contract');
+    backend.spawn('', [], { cwd: root, env: {}, expectedWorkingDirIdentity: { dev: String(stat.dev), ino: String(stat.ino) } } as never);
+    let release!: () => void;
+    (backend as any).writeChain = new Promise<void>(resolve => { release = resolve; });
+    try {
+      const pending = backend.writeBusinessInput('retained prompt');
+      renameSync(root, moved);
+      mkdirSync(root);
+      release();
+      await expect(pending).resolves.toBe('retryable_pre_dispatch_rejection');
+      expect(existsSync(log) ? readFileSync(log, 'utf8') : '').toBe('');
+      rmSync(root, { recursive: true, force: true });
+      renameSync(moved, root);
+      await expect(backend.writeBusinessInput('retained prompt')).resolves.toBe('submitted');
+      await vi.waitFor(() => expect(readFileSync(log, 'utf8')).toContain('retained prompt'));
+      expect(readFileSync(log, 'utf8').match(/retained prompt/g)).toHaveLength(1);
+    } finally {
+      backend.kill();
+      rmSync(root, { recursive: true, force: true });
+      rmSync(moved, { recursive: true, force: true });
+      rmSync(log, { force: true });
+    }
+  });
+
   it('refuses an unexpected launch wrapper instead of silently dropping it', () => {
     // spawn() assumed any non-empty bin could only be wrapperCli, because the
     // FILE sandbox is refused for this backend before spawn. But MANDATORY

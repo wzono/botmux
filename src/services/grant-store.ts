@@ -7,6 +7,7 @@
 import { getBot, getOwnerOpenId } from '../bot-registry.js';
 import { republishResolvedAllowedUsersDescriptor } from '../bot-registry.js';
 import { rmwBotEntry } from './config-store.js';
+import { withBotAdminIdentityPublication } from './bot-admin-unions-store.js';
 import { mutateBotEntryAndGrantState, mutateGrantState } from './grant-state-store.js';
 import { objectGrantTx, parseGrantKey, type GrantTx } from './grant-state.js';
 import { config } from '../config.js';
@@ -370,6 +371,14 @@ export async function removeAllowedChatGroup(
  *   R3#3 在 RMW 锁内按最新磁盘 entry 再判一次（catch 并发写把 allowlist 删空）。
  */
 export async function revokeGrant(
+  larkAppId: string, chatId: string, openId: string,
+): Promise<{ ok: true; removed: { chat: boolean; global: boolean; globalTalk: boolean } } | Fail> {
+  return withBotAdminIdentityPublication(config.session.dataDir, () => revokeGrantUnderPublicationLease(
+    larkAppId, chatId, openId,
+  ));
+}
+
+async function revokeGrantUnderPublicationLease(
   larkAppId: string, chatId: string, openId: string,
 ): Promise<{ ok: true; removed: { chat: boolean; global: boolean; globalTalk: boolean } } | Fail> {
   let bot; try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }

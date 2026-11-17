@@ -106,6 +106,31 @@ vi.mock('../src/im/lark/identity-cache.js', async () => {
   return { ...actual, resolveSender: (...args: any[]) => mocks.resolveSender(...args) };
 });
 
+// These route fixtures replace the worker boundary; real permit and filesystem
+// admission are exercised separately against real stores and worker components.
+vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/admitted-turn-dispatch.js');
+  return {
+    ...actual,
+    dispatchAdmittedBusinessTurn: async (input: any) => {
+      const permit = {
+        sessionId: input.ds.session.sessionId,
+        turnId: input.turnId,
+        workerGeneration: input.ds.workerGeneration ?? input.ds.session.workerGeneration ?? 1,
+        workspace: actual.frozenSessionWorkspace(input.ds)?.workspace,
+        expiresAt: Date.now() + 60_000,
+      };
+      if (input.resource?.acquire && !await input.resource.acquire(permit)) return false;
+      if (input.resource?.markAttempting && !await input.resource.markAttempting(permit)) return false;
+      const pool = await import('../src/core/worker-pool.js');
+      if (input.ds.worker && !input.ds.worker.killed) {
+        return pool.sendWorkerInput(input.ds, input.payload, input.turnId, input.options);
+      }
+      return pool.forkWorker(input.ds, input.payload, { ...input.options, turnId: input.turnId }) !== false;
+    },
+  };
+});
+
 vi.mock('../src/core/worker-pool.js', async () => {
   const actual = await vi.importActual<any>('../src/core/worker-pool.js');
   return { ...actual, forkWorker: (...args: any[]) => mocks.forkWorker(...args) };

@@ -16,7 +16,8 @@
  * worker globals it reads; renaming either fails loudly (missing function /
  * undefined read), never silently green.
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import ts from 'typescript';
@@ -78,6 +79,7 @@ function transpiledWorkerFunction(name: string): string {
   // an otherwise standalone function would inject module-only boilerplate.
   const transformed = ts.transform(declaration, [context => node => {
     const visit: ts.Visitor = child => {
+      if (child.kind === ts.SyntaxKind.ExportKeyword) return undefined;
       if (ts.isPropertyAccessExpression(child) && ts.isMetaProperty(child.expression)
         && child.expression.keywordToken === ts.SyntaxKind.ImportKeyword && child.name.text === 'url') {
         return context.factory.createStringLiteral(pathToFileURL(join(process.cwd(), 'src/worker.ts')).href);
@@ -113,7 +115,10 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'traexQuestionFlowVisible') return traexQuestionFlowVisible;
     if (key === 'traexStartupInputReady') return traexStartupInputReady;
     if (key === 'traexQuestionBridge') return INERT_TRAEX_QUESTION_BRIDGE;
-    if (typeof key === 'string' && ['traexNativeStartupInputIsPending', 'readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'spawnCliBody', 'setCaptureIdentity', 'cotEntryWithoutSentinel', 'clearCodexAppInterruptTarget', ...TRAEX_QUESTION_FUNCTIONS].includes(key)) {
+    if (key === 'realpathSync') return realpathSync;
+    if (key === 'statSync') return statSync;
+    if (key === 'createHash') return createHash;
+    if (typeof key === 'string' && ['canWriteTerminalBytes', 'terminalWorkspaceBytesAllowed', 'adoptCommittedWorkspaceFence', 'workerBackendWorkspaceMatches', 'controlReplyWorkspaceAllowed', 'writeBackendWorkingDirRejected', 'assertPendingWorkspaceBeforeWrite', 'rejectUnsentControlReply', 'backendRequiresEffectiveWorkspaceProof', 'traexNativeStartupInputIsPending', 'readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'spawnCliBody', 'setCaptureIdentity', 'cotEntryWithoutSentinel', 'clearCodexAppInterruptTarget', ...TRAEX_QUESTION_FUNCTIONS].includes(key)) {
       if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
       return dependencies.get(key);
     }
@@ -147,11 +152,16 @@ export function loadWorkerMessageHandler(name: string, scope: Record<string, unk
   const code = ts.transpileModule(`async function handle(msg: any) { switch (msg.type) { ${clause.getText(source)} } }`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
   }).outputText;
+  const dependencies = new Map<string, unknown>();
   const proxy = new Proxy(scope, {
     has: (_target, key) => key !== Symbol.unscopables,
     get: (target, key) => {
       if (key in target) return target[key as string];
       if (key === 'revokePromptReadiness') return loadWorkerFunction('revokePromptReadiness', scope);
+      if (typeof key === 'string' && ['canWriteTerminalBytes', 'adoptCommittedWorkspaceFence', 'writeBackendWorkingDirRejected'].includes(key)) {
+        if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
+        return dependencies.get(key);
+      }
       return (globalThis as any)[key];
     },
     set: (target, key, value) => { target[key as string] = value; return true; },

@@ -107,6 +107,15 @@ vi.mock('../src/services/session-store.js', async () => {
   };
 });
 
+vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/admitted-turn-dispatch.js');
+  return { ...actual, dispatchAdmittedBusinessTurn: async (input: any) => {
+    const workspace = actual.frozenSessionWorkspace(input.ds);
+    if (!workspace) return false;
+    return mocks.forkWorker(input.ds, input.payload, { ...input.options, turnId: input.turnId }) !== false;
+  } };
+});
+
 vi.mock('../src/core/worker-pool.js', async () => {
   const actual = await vi.importActual<any>('../src/core/worker-pool.js');
   return { ...actual, forkWorker: mocks.forkWorker };
@@ -134,6 +143,7 @@ vi.mock('../src/im/lark/identity-cache.js', async () => {
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { registerBot } from '../src/bot-registry.js';
+import { init as initSessionStore } from '../src/services/session-store.js';
 import { sessionKey } from '../src/core/types.js';
 import {
   __testOnly_activeSessions as activeSessions,
@@ -210,6 +220,7 @@ function registerTestBot(defaultWorkingDir: string, workingDir?: string): void {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  initSessionStore(APP);
   mocks.sessions.clear();
   activeSessions.clear();
   mocks.replyMessage.mockImplementation(async (...args: any[]) => (args[3] === 'interactive' ? CARD_ID : 'om_reply'));

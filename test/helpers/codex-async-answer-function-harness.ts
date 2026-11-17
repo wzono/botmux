@@ -21,6 +21,23 @@ export function productionFunction(path: string, name: string, scope: Record<str
   if (!declaration) throw new Error(`Missing function ${name}`);
   return evaluate(declaration.getText(file), scope);
 }
+export function productionCallback(path: string, factory: string, property: string, scope: Record<string, any>, occurrence = 0): any {
+  const file = ts.createSourceFile(path, readFileSync(join(process.env.CODEX_ASYNC_REVIEW_SOURCE_ROOT ?? '.', path), 'utf8'), ts.ScriptTarget.Latest, true);
+  const callbacks: ts.Expression[] = [];
+  function visit(node: ts.Node): void {
+    if (ts.isCallExpression(node) && node.expression.getText(file) === factory) {
+      const deps = node.arguments[0];
+      if (deps && ts.isObjectLiteralExpression(deps)) {
+        const member = deps.properties.find(p => ts.isPropertyAssignment(p) && p.name.getText(file) === property);
+        if (member && ts.isPropertyAssignment(member)) callbacks.push(member.initializer);
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(file);
+  if (!callbacks[occurrence]) throw new Error(`Missing ${factory}.${property}[${occurrence}]`);
+  return evaluate(callbacks[occurrence].getText(file), scope);
+}
 export function productionConst(path: string, name: string, scope: Record<string, any>): any {
   const file = ts.createSourceFile(path, readFileSync(join(process.env.CODEX_ASYNC_REVIEW_SOURCE_ROOT ?? '.', path), 'utf8'), ts.ScriptTarget.Latest, true);
   for (const statement of file.statements) {

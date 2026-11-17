@@ -121,16 +121,17 @@ describe('default-oncall store persistence', () => {
     expect(r).toEqual({
       ok: true,
       created: true,
-      entry: { chatId: 'oc_new', workingDir: '/default' },
+      entry: { chatId: 'oc_new', workingDir: '/default', provenance: 'oncall-default-auto' },
     });
     expect(readConfig().oncallChats).toEqual([
       { chatId: 'oc_existing', workingDir: '/existing' },
-      { chatId: 'oc_new', workingDir: '/default' },
+      { chatId: 'oc_new', workingDir: '/default', provenance: 'oncall-default-auto' },
     ]);
     expect(readConfig().defaultOncallAutoboundChats).toEqual(['oc_old', 'oc_new']);
     expect(registry.getBot('app_default').config.oncallChats).toContainEqual({
       chatId: 'oc_new',
       workingDir: '/default',
+      provenance: 'oncall-default-auto',
     });
     expect(registry.getBot('app_default').config.defaultOncallAutoboundChats).toEqual(['oc_old', 'oc_new']);
   });
@@ -143,7 +144,9 @@ describe('default-oncall store persistence', () => {
     const r = await store.bindOncall('app_default', 'oc_manual', '/manual');
 
     expect(r.ok).toBe(true);
-    expect(readConfig().oncallChats).toEqual([{ chatId: 'oc_manual', workingDir: '/manual' }]);
+    expect(readConfig().oncallChats).toEqual([
+      { chatId: 'oc_manual', workingDir: '/manual', provenance: 'oncall-explicit' },
+    ]);
     expect(readConfig().defaultOncallAutoboundChats).toEqual(['oc_old']);
     expect(registry.getBot('app_default').config.defaultOncallAutoboundChats).toEqual(['oc_old']);
   });
@@ -477,9 +480,11 @@ describe('default-oncall store persistence', () => {
     const r = await store.setWorkingDirMode('app_default', 'default', '/repos/dwd');
 
     expect(r.ok).toBe(true);
-    expect(readConfig().oncallChats).toEqual([{ chatId: 'oc_x', workingDir: '/repos/oncall' }]);
+    expect(readConfig().oncallChats).toEqual([
+      { chatId: 'oc_x', workingDir: '/repos/oncall', provenance: 'oncall-explicit' },
+    ]);
     expect(registry.getBot('app_default').config.oncallChats).toEqual([
-      { chatId: 'oc_x', workingDir: '/repos/oncall' },
+      { chatId: 'oc_x', workingDir: '/repos/oncall', provenance: 'oncall-explicit' },
     ]);
   });
 

@@ -63,6 +63,24 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/core/worker-pool.js')>();
   return {
   forkWorker: (...args: any[]) => mockForkWorker(...args),
+  dispatchWorkspaceAdmittedBusinessTurn: vi.fn(async (input: any) => {
+    if (!await input.markAttempting()) return false;
+    const opts = input;
+    if (input.ds.worker && !input.ds.worker.killed) {
+      if (actual.hasQueuedActivationAdmissionGate(input.ds)) {
+        return mockQueuedTailAdmission(input.ds, input.payload, input.turnId, {
+          ...(opts.dispatchAttempt === undefined ? {} : { dispatchAttempt: opts.dispatchAttempt }),
+        });
+      }
+      input.ds.worker.send({ type: 'message', content: typeof input.payload === 'string' ? input.payload : input.payload.content,
+        ...(typeof input.payload === 'object' && input.payload.codexAppInput ? { codexAppInput: input.payload.codexAppInput } : {}),
+        turnId: input.turnId, ...(opts.dispatchAttempt === undefined ? {} : { dispatchAttempt: opts.dispatchAttempt }) });
+      return true;
+    }
+    mockForkWorker(input.ds, input.payload, { resume: input.resume, turnId: input.turnId,
+      ...(opts.dispatchAttempt === undefined ? {} : { dispatchAttempt: opts.dispatchAttempt }) });
+    return true;
+  }),
   sendWorkerInput: (ds: any, payload: any, turnId?: string, opts: any = {}) => {
     if (!ds.worker || ds.worker.killed) return false;
     if (actual.hasQueuedActivationAdmissionGate(ds)) return mockQueuedTailAdmission(ds, payload, turnId, opts);
@@ -130,6 +148,10 @@ vi.mock('../src/core/session-manager.js', () => ({
   ensureSessionWhiteboard: vi.fn(),
   getAvailableBots: (...args: any[]) => mockGetAvailableBots(...args),
   rememberLastCliInput: (...args: any[]) => mockRememberLastCliInput(...args),
+  resolveIngressWorkspace: vi.fn(async (input: any) => ({
+    status: 'resolved', workspace: { path: input.botDefaultWorkingDir ?? '/tmp', dev: '1', ino: '2' },
+    mutation: { workingDir: input.botDefaultWorkingDir ?? '/tmp', source: 'bot-default' },
+  })),
 }));
 
 const mockBotAutoWorktreeEnabled = vi.fn(() => false);
@@ -240,7 +262,11 @@ describe('triggerSessionTurn rootMessageId target', () => {
     const ds = activeSessions.get(sessionKey(ROOT, APP));
     expect(ds?.scope).toBe('thread');
     expect(ds?.session.rootMessageId).toBe(ROOT);
-    expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') }, mockRememberLastCliInput.mock.calls.at(-1)?.[3]);
+    expect(ds?.session).toMatchObject({ workingDir: '/tmp', workingDirSource: 'bot-default' });
+    expect(ds?.session.groupWorkspaceRevision).toBeUndefined();
+    expect(mockUpdateSession).toHaveBeenCalledWith(ds?.session);
+    expect(mockForkWorker).toHaveBeenCalledWith(ds, expect.objectContaining({ content: expect.stringContaining('new:') }),
+      expect.objectContaining({ resume: false, turnId: expect.stringMatching(/^trg_/) }));
     expect(mockRememberLastCliInput.mock.calls.at(-1)?.[3]).toEqual(expect.any(String));
   });
 
@@ -643,7 +669,8 @@ describe('triggerSessionTurn rootMessageId target', () => {
     const ds = activeSessions.get(sessionKey(CHAT, APP));
     expect(ds?.scope).toBe('chat');
     expect(ds?.session.externalTriggerTopicless).toBe(true);
-    expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') }, mockRememberLastCliInput.mock.calls.at(-1)?.[3]);
+    expect(mockForkWorker).toHaveBeenCalledWith(ds, expect.objectContaining({ content: expect.stringContaining('new:') }),
+      expect.objectContaining({ resume: false, turnId: expect.stringMatching(/^trg_/) }));
     expect(mockRememberLastCliInput.mock.calls.at(-1)?.[3]).toEqual(expect.any(String));
   });
 
@@ -1147,7 +1174,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(mockForkWorker).toHaveBeenCalledWith(
       activeSessions.get(sessionKey(ROOT, APP)),
       expect.objectContaining({ codexAppInput: { text: '外部事件触发' } }),
-      mockRememberLastCliInput.mock.calls.at(-1)?.[3],
+      expect.objectContaining({ resume: false, turnId: expect.stringMatching(/^trg_/) }),
     );
   });
 
@@ -1423,7 +1450,7 @@ describe('triggerSessionTurn suppressFinalOutput (loud connector opt-in)', () =>
     expect(mockForkWorker).toHaveBeenCalledWith(
       ds,
       expect.objectContaining({ content: expect.stringContaining('new:') }),
-      turnId,
+      expect.objectContaining({ resume: false, turnId }),
     );
   });
 
@@ -1434,8 +1461,9 @@ describe('triggerSessionTurn suppressFinalOutput (loud connector opt-in)', () =>
 
     const ds = activeSessions.get(sessionKey(ROOT, APP))!;
     expect(ds.suppressedTriggerFinalTurns).toBeUndefined();
-    // Loud delivery carries the same input owner without enabling suppression.
-    expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') }, mockRememberLastCliInput.mock.calls.at(-1)?.[3]);
+    // Loud admitted fork retains the exact turn identity.
+    expect(mockForkWorker).toHaveBeenCalledWith(ds, expect.objectContaining({ content: expect.stringContaining('new:') }),
+      expect.objectContaining({ resume: false, turnId: expect.stringMatching(/^trg_/) }));
     expect(mockRememberLastCliInput.mock.calls.at(-1)?.[3]).toEqual(expect.any(String));
   });
 

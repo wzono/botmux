@@ -74,7 +74,7 @@ describe('startup streaming-card Pin recovery helper', () => {
 });
 
 describe('startup restore phase wiring for restored streaming-card Pin recovery', () => {
-  it('waits for restore, then marks ready without waiting for the Pin recovery task', async () => {
+  it('waits for restore without treating cosmetic Pin recovery as readiness', async () => {
     const restoreGate = deferred<void>();
     const recoveryGate = deferred<void>();
     const events: string[] = [];
@@ -93,9 +93,6 @@ describe('startup restore phase wiring for restored streaming-card Pin recovery'
         await restoreGate.promise;
         events.push('restore:done');
       },
-      markSessionsRestored: () => {
-        events.push('ready');
-      },
       driveRestoredXpiGroup: () => {},
     });
 
@@ -108,11 +105,33 @@ describe('startup restore phase wiring for restored streaming-card Pin recovery'
 
     expect(reconcileRestoredStreamingCardPinsMock).toHaveBeenCalledTimes(1);
     expect(reconcileRestoredStreamingCardPinsMock).toHaveBeenCalledWith('app-pin');
-    expect(events).toEqual(['restore:start', 'restore:done', 'ready', 'pin:app-pin']);
+    expect(events).toEqual(['restore:start', 'restore:done', 'pin:app-pin']);
 
     recoveryGate.resolve();
     await Promise.resolve();
-    expect(events).toEqual(['restore:start', 'restore:done', 'ready', 'pin:app-pin', 'pin:done:app-pin']);
+    expect(events).toEqual(['restore:start', 'restore:done', 'pin:app-pin', 'pin:done:app-pin']);
+  });
+
+  it('completes group-operation recovery before restored queues are scheduled', async () => {
+    const activeSessions = daemon.__testOnly_activeSessions;
+    activeSessions.clear();
+    const events: string[] = [];
+    await daemon.__testOnly_restoreSessionsAndScheduleStartupRecovery({
+      larkAppId: 'app-group-recovery',
+      restoreSessions: async () => {
+        events.push('restore');
+        activeSessions.set('app-group-recovery:session', {
+          larkAppId: 'app-group-recovery',
+          session: { sessionId: 'session', status: 'active', xpiSharedCwdAdmissionGroupId: 'restored-group' },
+        } as any);
+      },
+      recoverGroupWorkspaceOperations: async () => { events.push('group-recovery'); },
+      driveRestoredXpiGroup: () => { events.push('queue'); },
+      driveRestoredPrincipalLane: () => {},
+    });
+    await Promise.resolve();
+    expect(events).toEqual(['restore', 'group-recovery', 'queue']);
+    activeSessions.clear();
   });
 
   it('re-drives each restored durable XPI group once after runtime sessions are published', async () => {
@@ -134,7 +153,6 @@ describe('startup restore phase wiring for restored streaming-card Pin recovery'
           } as any);
         }
       },
-      markSessionsRestored: () => {},
       driveRestoredXpiGroup: groupId => { driven.push(groupId); },
     });
     await Promise.resolve();

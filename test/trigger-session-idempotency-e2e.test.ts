@@ -66,6 +66,10 @@ vi.mock('../src/core/session-manager.js', () => ({
   ensureSessionWhiteboard: vi.fn(),
   getAvailableBots: vi.fn(async () => []),
   rememberLastCliInput: vi.fn(),
+  resolveIngressWorkspace: vi.fn(async (input: any) => ({
+    status: 'resolved', workspace: { path: input.botDefaultWorkingDir ?? '/tmp', dev: '1', ino: '2' },
+    mutation: { workingDir: input.botDefaultWorkingDir ?? '/tmp', source: 'bot-default' },
+  })),
 }));
 vi.mock('../src/services/default-worktree.js', () => ({ botAutoWorktreeEnabled: vi.fn(() => false) }));
 vi.mock('../src/im/lark/card-handler.js', () => ({ runAutoWorktreeCommit: vi.fn(async () => {}) }));
@@ -76,6 +80,16 @@ const mockForkWorker = vi.fn(() => { if (forkShouldThrow) throw new Error('injec
 const mockCloseSession = vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false, known: true }));
 vi.mock('../src/core/worker-pool.js', () => ({
   dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
+  dispatchWorkspaceAdmittedBusinessTurn: vi.fn(async (input: any) => {
+    if (!await input.markAttempting()) return false;
+    mockForkWorker(input.ds, input.payload, {
+      resume: input.resume, turnId: input.turnId,
+      ...(input.dispatchAttempt === undefined ? {} : { dispatchAttempt: input.dispatchAttempt }),
+      ...(input.atMostOnce ? { atMostOnce: true } : {}),
+      ...(input.codexAppSteerable ? { codexAppSteerable: true } : {}),
+    });
+    return true;
+  }),
   forkWorker: (...a: any[]) => mockForkWorker(...a),
   sendWorkerInput: vi.fn(() => true),
   getCurrentCliVersion: vi.fn(() => 'test'),

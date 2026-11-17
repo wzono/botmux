@@ -258,6 +258,25 @@ describe('raw command backend acceptance', () => {
     expect(onDurableFailure).toHaveBeenCalledOnce();
   });
 
+  it.each(['paste', 'sendText', 'write'] as const)(
+    'rejects stale %s text before emitting any bytes', async mode => {
+      const write = vi.fn(() => true);
+      const sendText = vi.fn(() => true);
+      const pasteText = vi.fn(() => true);
+      const sendSpecialKeys = vi.fn(() => true);
+      const backend = mode === 'paste'
+        ? { write, pasteText, sendSpecialKeys, supportsRawCommandPasteLine: true }
+        : mode === 'sendText' ? { write, sendText, sendSpecialKeys } : { write };
+      await expect(writeRawCommandLine(backend, '/model x', {
+        pasteLine: mode === 'paste', isCurrent: () => false, delay: immediateDelay,
+      })).resolves.toBe(false);
+      expect(write).not.toHaveBeenCalled();
+      expect(sendText).not.toHaveBeenCalled();
+      expect(pasteText).not.toHaveBeenCalled();
+      expect(sendSpecialKeys).not.toHaveBeenCalled();
+    },
+  );
+
   it('CoCo: types char-by-char with the throttle, then exactly one Enter after the submit beat', async () => {
     // A one-shot write coalesces into a paste on CoCo, skipping command mode and
     // the slash picker; a stray second Enter would confirm a /model selector pick.

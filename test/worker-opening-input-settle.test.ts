@@ -22,6 +22,8 @@ it.each([false, true])('a passthrough queues behind an opening whose input box h
     freshnessInputQueue: { enqueueRaw }, deliverRawInput, flushPending: vi.fn(async () => {}),
   };
   const msg = { type: 'raw_input', content: '/status', turnId: 'om_status' };
+  scope.terminalWorkspaceBytesAllowed = loadWorkerFunction('terminalWorkspaceBytesAllowed', scope);
+  scope.canWriteTerminalBytes = loadWorkerFunction('canWriteTerminalBytes', scope);
   await loadWorkerMessageHandler('raw_input', scope)(msg);
   expect(enqueueRaw.mock.calls).toEqual(queued ? [[msg]] : []);
   expect(deliverRawInput.mock.calls).toEqual(queued ? [] : [[msg]]);

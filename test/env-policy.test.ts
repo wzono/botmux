@@ -73,11 +73,13 @@ describe('per-bot environment policy', () => {
   });
   it('preserves host worker controls and the workflow kill switch without widening CLI inheritance', () => {
     const base = { BOTMUX_WORKFLOW_ENABLED: 'false', BOTMUX_REQUIRE_MENTION_DECISION: 'true',
-      WEB_HOST: '127.0.0.1', STUCK_DETECTOR_TIMEOUT_MS: '45000', UNKNOWN_CREDENTIAL: 'secret-sentinel' };
+      WEB_HOST: '127.0.0.1', STUCK_DETECTOR_TIMEOUT_MS: '45000', TMUX_TMPDIR: '/run/botmux-tmux',
+      UNKNOWN_CREDENTIAL: 'secret-sentinel' };
     const worker = buildBotWorkerEnv(base, { mode: 'strict' });
     for (const key of Object.keys(base).filter(key => key !== 'UNKNOWN_CREDENTIAL')) expect(worker[key]).toBe(base[key as keyof typeof base]);
     const child = buildSessionChildEnv(worker, { mode: 'strict' });
-    for (const key of Object.keys(base)) expect(key in child, key).toBe(false);
+    expect(child.TMUX_TMPDIR).toBe(base.TMUX_TMPDIR);
+    for (const key of Object.keys(base).filter(key => key !== 'TMUX_TMPDIR')) expect(key in child, key).toBe(false);
   });
   it('keeps the fenced-run marker through strict worker, CLI and backend boundaries', () => {
     const worker = buildBotWorkerEnv({ ...host, BOTMUX_FENCED_RUN: '1' }, strict);

@@ -393,8 +393,11 @@ describe('POST /api/asks/cli-resolved 路由', () => {
     expect(handle(unknown, { trustedHost: true })).toEqual({ status: 404, body: { ok: false, error: 'session_not_found' } });
   });
 
-  it('宿主 HMAC 请求不需要 capability；已知会话在启动窗口内也能处理', () => {
+  it('宿主 HMAC 请求等待目标恢复完成；就绪后不需要 capability', () => {
     expect(handle(report({ originCapability: undefined }), { trustedHost: true, sessionsRestored: false }))
+      .toEqual({ status: 503, body: { ok: false, error: 'startup_not_ready' } });
+    expect(d.settled).toHaveLength(0);
+    expect(handle(report({ originCapability: undefined }), { trustedHost: true, sessionsRestored: true }))
       .toEqual({ status: 200, body: { ok: true, outcome: 'settled' } });
   });
 

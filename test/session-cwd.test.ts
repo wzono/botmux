@@ -24,7 +24,7 @@ describe('repinSessionWorkingDir', () => {
     } as DaemonSession;
 
     try {
-      repinSessionWorkingDir(ds, '/repo/new');
+      repinSessionWorkingDir(ds, { workingDir: '/repo/new', source: 'explicit' });
     } finally {
       off();
     }
@@ -37,7 +37,7 @@ describe('repinSessionWorkingDir', () => {
       type: 'session.update',
       body: {
         sessionId: 'session-one',
-        patch: { workingDir: '/repo/new' },
+        patch: { workingDir: '/repo/new', workingDirSource: 'explicit', groupWorkspaceRevision: undefined },
       },
     });
   });
@@ -54,7 +54,7 @@ describe('repinSessionWorkingDir', () => {
     } as DaemonSession;
 
     try {
-      expect(() => repinSessionWorkingDir(ds, '/repo/new')).toThrow('disk unavailable');
+      expect(() => repinSessionWorkingDir(ds, { workingDir: '/repo/new', source: 'explicit' })).toThrow('disk unavailable');
     } finally {
       off();
     }

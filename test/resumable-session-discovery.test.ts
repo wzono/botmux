@@ -1718,6 +1718,7 @@ describe('isBotmuxInjectedPrompt', () => {
   // Every leading-block combination the builder can emit, with NO trailing block
   // (the senderTag-off + no-mentions case). Each must be recognized as botmux.
   const leadingCombos: Array<[string, string[]]> = [
+    ['response style', ['<botmux_response_style>Use the configured reply style.</botmux_response_style>']],
     ['none', []],
     ['role', [ROLE]],
     ['summary_memory', [SUMMARY]],
@@ -1770,6 +1771,9 @@ describe('isBotmuxInjectedPrompt', () => {
   // The other half of the contract: a real external session must survive, even
   // when its text DISCUSSES botmux's XML (common in this very repo).
   const external: Array<[string, string]> = [
+    ['unclosed response style', '<botmux_response_style>style<user_message>hi</user_message>'],
+    ['unknown response-style-like tag', '<botmux_response_style_extra>style</botmux_response_style_extra><user_message>hi</user_message>'],
+    ['response style followed by prose', '<botmux_response_style>style</botmux_response_style>please explain<user_message>hi</user_message>'],
     ['discusses a join block without envelope', `${GJC}\n解释这个入群上下文`],
     ['pastes a join template with intervening prose', `${GJC}\n帮我改这个模板：\n${UM}`],
     ['plain natural language', '帮我把这个函数重构一下'],

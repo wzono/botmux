@@ -58,6 +58,21 @@ describe('session-card-model · composeEntries / statusToDot', () => {
       label: 'sessions.status.stalled',
     });
   });
+
+  it('ignores retired capacity feedback when composing list and detail', () => {
+    const row = makeRow({
+      status: 'working',
+      ...({ capacityFeedback: { state: 'waiting', position: 3, observedAtMs: FIXED_NOW - 1_000, ageMs: 1_000 } } as object),
+    });
+    const [entry] = composeEntries([row], FIXED_NOW);
+    const detail = composeDetail(row, FIXED_NOW);
+
+    expect(entry.status).toBe('working');
+    expect('capacityFeedback' in entry).toBe(false);
+    expect(entry.secondary).not.toContain('capacity waiting');
+    expect(detail.status).toBe('working');
+    expect('capacityFeedback' in detail).toBe(false);
+  });
 });
 
 describe('session-card-model · sortByStatus', () => {

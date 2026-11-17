@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -18,6 +18,7 @@ import {
 import * as sessionStore from '../src/services/session-store.js';
 import { logger } from '../src/utils/logger.js';
 import { enqueueXpiSharedCwdTurn, xpiSharedCwdQueuedTurnId } from '../src/core/xpi-shared-cwd-admission.js';
+import { initWorkerPool } from '../src/core/worker-pool.js';
 
 let dataDir: string;
 let previousDataDir: string;
@@ -34,6 +35,12 @@ beforeEach(() => {
   config.session.dataDir = dataDir;
   sessionStore.init('app-xpi-callbacks');
   activeSessions.clear();
+  initWorkerPool({
+    sessionReply: vi.fn(async () => ''),
+    getSessionWorkingDir: ds => ds?.workingDir ?? dataDir,
+    getActiveCount: () => activeSessions.size,
+    closeSession: vi.fn(async () => true),
+  });
 });
 
 afterEach(() => {
@@ -45,6 +52,8 @@ afterEach(() => {
 });
 
 function fixture() {
+  const workingDir = join(dataDir, 'workspace');
+  mkdirSync(workingDir, { recursive: true });
   const coordinator = sessionStore.createSession('chat-a', 'root-a', 'Coordinator', 'group');
   const member = sessionStore.createSession('chat-b', 'root-b', 'Member', 'group');
   for (const row of [coordinator, member]) {
@@ -53,6 +62,7 @@ function fixture() {
     row.xpiSharedCwdAdmissionCoordinatorSessionId = coordinator.sessionId;
   }
   member.workerGeneration = 6;
+  member.workingDir = workingDir;
   member.xpiSharedCwdQueuedTurns = [{
     version: 1,
     id: xpiSharedCwdQueuedTurnId(member.sessionId, 'turn-current'),
@@ -92,6 +102,10 @@ function fixture() {
     lastMessageAt: 1,
     hasHistory: true,
     workerGeneration: 6,
+    workerReady: true,
+    cliReady: true,
+    lastWorkerReadyCwd: workingDir,
+    workingDir,
     activeInteractiveTurn: {
       turnId: 'turn-current',
       caller: {
@@ -146,6 +160,8 @@ describe('daemon XPI shared-cwd lifecycle callbacks', () => {
   });
 
   it('re-forks a dead adopt queue head and then dispatches the next group member', async () => {
+    const workingDir = join(dataDir, 'adopt-workspace');
+    mkdirSync(workingDir, { recursive: true });
     const coordinator = sessionStore.createSession('chat-adopt-coordinator', 'root-adopt-coordinator', 'Coordinator', 'group');
     const adopted = sessionStore.createSession('chat-adopted', 'root-adopted', 'Adopted', 'group');
     const follower = sessionStore.createSession('chat-follower', 'root-follower', 'Follower', 'group');
@@ -180,6 +196,9 @@ describe('daemon XPI shared-cwd lifecycle callbacks', () => {
       resume: true,
       createdAt: '2026-01-01T00:00:02.000Z',
     });
+    adopted.workingDir = workingDir;
+    adopted.workerGeneration = 10;
+    follower.workingDir = workingDir;
     for (const row of [coordinator, adopted, follower]) sessionStore.updateSession(row);
 
     const adoptedDs = {
@@ -195,7 +214,9 @@ describe('daemon XPI shared-cwd lifecycle callbacks', () => {
       cliVersion: 'test',
       lastMessageAt: 1,
       hasHistory: true,
-      adoptedFrom: { source: 'tmux', tmuxTarget: 'synthetic:1', cwd: dataDir },
+      adoptedFrom: { source: 'tmux', tmuxTarget: 'synthetic:1', cwd: workingDir },
+      workingDir,
+      workerGeneration: 10,
     } as DaemonSession;
     const followerSend = vi.fn();
     const followerDs = {
@@ -212,6 +233,7 @@ describe('daemon XPI shared-cwd lifecycle callbacks', () => {
       lastMessageAt: 1,
       hasHistory: true,
       workerGeneration: 12,
+      workerReady: true, cliReady: true, lastWorkerReadyCwd: workingDir, workingDir,
     } as unknown as DaemonSession;
     follower.workerGeneration = 12;
     sessionStore.updateSession(follower);
@@ -223,6 +245,9 @@ describe('daemon XPI shared-cwd lifecycle callbacks', () => {
     }) => {
       target.workerGeneration = 11;
       target.session.workerGeneration = 11;
+      target.worker = { killed: false, connected: true, send: vi.fn() } as unknown as DaemonSession['worker'];
+      target.workerReady = true; target.cliReady = true; target.lastWorkerReadyCwd = workingDir; target.workingDir = workingDir;
+      sessionStore.updateSession(target.session);
       opts?.onWorkerGenerationReserved?.(11);
       return 'accepted' as const;
     });
@@ -233,7 +258,7 @@ describe('daemon XPI shared-cwd lifecycle callbacks', () => {
 
     expect(await driveNextTurn('xpi-admission:adopt-progress', dependencies)).toBe(true);
     expect(forkAdopt).toHaveBeenCalledWith(adoptedDs, expect.objectContaining({
-      prompt: 'bridge formatted adopted first',
+      prompt: '',
       turnId: 'turn-adopted-first',
       atMostOnce: true,
     }));
@@ -250,6 +275,8 @@ describe('daemon XPI shared-cwd lifecycle callbacks', () => {
   });
 
   it('parks a restore-quarantined queue head with notice before sending the healthy follower', async () => {
+    const workingDir = join(dataDir, 'restore-workspace');
+    mkdirSync(workingDir, { recursive: true });
     const coordinator = sessionStore.createSession('chat-park-coordinator', 'root-park-coordinator', 'Coordinator', 'group');
     const blocked = sessionStore.createSession('chat-park-blocked', 'root-park-blocked', 'Blocked', 'group');
     const follower = sessionStore.createSession('chat-park-follower', 'root-park-follower', 'Follower', 'group');
@@ -278,6 +305,7 @@ describe('daemon XPI shared-cwd lifecycle callbacks', () => {
       createdAt: '2026-01-01T00:00:02.000Z',
     });
     follower.workerGeneration = 21;
+    follower.workingDir = workingDir;
     for (const row of [coordinator, blocked, follower]) sessionStore.updateSession(row);
 
     const send = vi.fn();
@@ -295,6 +323,7 @@ describe('daemon XPI shared-cwd lifecycle callbacks', () => {
       lastMessageAt: 1,
       hasHistory: true,
       workerGeneration: 21,
+      workerReady: true, cliReady: true, lastWorkerReadyCwd: workingDir, workingDir,
     } as unknown as DaemonSession;
     activeSessions.set('xpi-restore-follower', followerDs);
     const notifyQuarantine = vi.fn(async () => {});

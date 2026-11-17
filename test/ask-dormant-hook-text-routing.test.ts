@@ -259,3 +259,8 @@ describe('hook ask that is still waiting (unchanged behaviour)', () => {
     expect(workerStrings(send)).not.toContain('取消后重新部署吧');
   });
 });
+vi.mock('../src/core/admitted-turn-dispatch.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/admitted-turn-dispatch.js');
+  return { ...actual, dispatchAdmittedBusinessTurn: async (input: any) =>
+    (await import('./helpers/workspace-dispatch-spy.js')).dispatchAdmittedThroughWorkerSpy(input) };
+});

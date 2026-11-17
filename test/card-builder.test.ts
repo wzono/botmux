@@ -1424,6 +1424,21 @@ describe('buildStreamingCard', () => {
   // ── Header / status / template color ───────────────────────────────────
 
   describe('header status and color', () => {
+    it('ignores historical capacity labels without duplicating the process body', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'working', undefined, 'hidden',
+        undefined, undefined, false, false, undefined, undefined, undefined, false,
+        undefined, undefined, undefined, {
+          capacityWait: { state: 'waiting', position: 3, ageMs: 125_000 },
+        } as any,
+      ));
+      const status = card.elements.filter(
+        (element: any) => element.element_id === 'capacity_wait_status',
+      );
+      expect(status).toHaveLength(0);
+      expect(card.header.title.content).toContain('工作中');
+    });
+
     it('should show yellow template and "启动中..." for starting status', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'starting'));
       expect(card.header.template).toBe('yellow');

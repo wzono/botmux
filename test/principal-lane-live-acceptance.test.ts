@@ -202,6 +202,9 @@ function sourceDaemonSession(session: ReturnType<typeof sessionStore.createSessi
     workerPort: null,
     workerToken: null,
     workerGeneration: 1,
+    workerReady: true,
+    cliReady: true,
+    lastWorkerReadyCwd: session.workingDir,
     larkAppId: appId,
     chatId,
     chatType: 'group',
@@ -288,10 +291,16 @@ describe('principal lane production live acceptance', () => {
       ds.workerGeneration = generation;
       ds.session.workerGeneration = generation;
       opts?.onWorkerGenerationReserved?.(generation);
-      ds.worker = { killed: false, send: vi.fn() } as any;
+      queueMicrotask(() => { ds.workerReady = true; ds.cliReady = true; ds.lastWorkerReadyCwd = ds.workingDir; });
+      ds.worker = { killed: false, connected: true, send: vi.fn((message: any) => {
+        if (message?.type === 'message') mocks.workerInputs.push({
+          kind: 'live', laneId, turnId: String(message.turnId ?? ''), workingDir: ds.workingDir,
+          content: String(message.content ?? ''),
+        });
+      }) } as any;
       freezePrincipalLaneTurnBinding(ds, turnId, generation);
       opts?.onIpcDispatchAttempted?.();
-      mocks.workerInputs.push({
+      if (String(input?.content ?? input ?? '')) mocks.workerInputs.push({
         kind: 'fork', laneId, turnId, workingDir: ds.workingDir,
         content: String(input?.content ?? input ?? ''),
       });
@@ -303,6 +312,7 @@ describe('principal lane production live acceptance', () => {
       ds.workerGeneration = generation;
       ds.session.workerGeneration = generation;
       opts?.onWorkerGenerationReserved?.(generation);
+      queueMicrotask(() => { ds.workerReady = true; ds.cliReady = true; ds.lastWorkerReadyCwd = ds.workingDir; });
       ds.worker = { killed: false, send: vi.fn() } as any;
       opts?.onIpcDispatchAttempted?.();
       mocks.workerInputs.push({
@@ -435,8 +445,8 @@ describe('principal lane production live acceptance', () => {
       { turnId: 'om_b2', dispatchState: 'queued' },
       { turnId: 'om_b3', dispatchState: 'queued' },
     ]);
-    expect(onPrincipalLaneTurnTerminal(b, 'om_stale', b1Generation)).toBe(false);
-    expect(onPrincipalLaneTurnTerminal(b, 'om_b1', b1Generation - 1)).toBe(false);
+    expect(await onPrincipalLaneTurnTerminal(b, 'om_stale', b1Generation)).toBe(false);
+    expect(await onPrincipalLaneTurnTerminal(b, 'om_b1', b1Generation - 1)).toBe(false);
     expect(onPrincipalLaneWorkerExit(b, b1Generation - 1)).toBe(false);
     expect(b.principalLaneRunningTurn).toEqual({
       turnId: 'om_b1',
@@ -446,7 +456,7 @@ describe('principal lane production live acceptance', () => {
 
     // Full-turn FIFO: B2 is not merely ordered after B1's input; it remains
     // outside the worker until B1's exact terminal edge releases the lane.
-    expect(onPrincipalLaneTurnTerminal(b, 'om_b1', b1Generation)).toBe(true);
+    expect(await onPrincipalLaneTurnTerminal(b, 'om_b1', b1Generation)).toBe(true);
     const turnOrder = mocks.workerInputs.map(row => row.turnId);
     expect(turnOrder.indexOf('om_b1')).toBeGreaterThanOrEqual(0);
     expect(turnOrder.indexOf('om_b1')).toBeLessThan(turnOrder.indexOf('om_b2'));
@@ -479,6 +489,10 @@ describe('principal lane production live acceptance', () => {
     expect(b.workingDir).not.toBe(repo);
     expect(c.workingDir).not.toBe(repo);
     expect(b.workingDir).not.toBe(c.workingDir);
+    expect(hydratedB.session).toMatchObject({ workingDirSource: 'worktree' });
+    expect(hydratedC.session).toMatchObject({ workingDirSource: 'worktree' });
+    expect(hydratedB.session.groupWorkspaceRevision).toBeUndefined();
+    expect(hydratedC.session.groupWorkspaceRevision).toBeUndefined();
     expect(hydratedB.worktree.worktreeGitCommonDir).toBe(hydratedC.worktree.worktreeGitCommonDir);
 
     const db = new DatabaseSync(join(mocks.dataDir, 'session-stores', appId, 'sessions.db'));
@@ -595,23 +609,26 @@ describe('principal lane production live acceptance', () => {
       },
     ];
     sessionStore.updateSession(c.session);
-    mocks.forkWorker.mockImplementationOnce(() => {
-      throw new Error('synthetic pre-IPC fork failure');
+    let dispatchAttempt = 0;
+    const rejectOnce = vi.fn(async (input: any) => {
+      if (dispatchAttempt++ === 0) return false;
+      await input.resource?.markAttempting?.({ workerGeneration: c.workerGeneration ?? c.session.workerGeneration ?? 1 });
+      return true;
     });
-
-    expect(driveNextPrincipalLaneTurn(c)).toBe(false);
+    expect(await driveNextPrincipalLaneTurn(c, { dispatch: rejectOnce })).toBe(false);
     expect(c.session.principalLaneQueuedTurns).toMatchObject([
       { turnId: 'om_retry_head', dispatchState: 'queued' },
       { turnId: 'om_retry_follower', dispatchState: 'queued' },
     ]);
     expect(mocks.workerInputs.some(row => row.turnId === 'om_retry_follower')).toBe(false);
 
-    expect(driveNextPrincipalLaneTurn(c)).toBe(true);
+    clearTimeout(c.principalLaneDispatchRetry?.timer); c.principalLaneDispatchRetry = undefined;
+    expect(await driveNextPrincipalLaneTurn(c, { dispatch: rejectOnce })).toBe(true);
     expect(c.session.principalLaneQueuedTurns).toMatchObject([
       { turnId: 'om_retry_head', dispatchState: 'attempting' },
       { turnId: 'om_retry_follower', dispatchState: 'queued' },
     ]);
-    expect(mocks.workerInputs.filter(row => row.turnId === 'om_retry_head')).toHaveLength(1);
+    expect(rejectOnce).toHaveBeenCalledTimes(2);
     expect(mocks.workerInputs.some(row => row.turnId === 'om_retry_follower')).toBe(false);
   }, 30_000);
 
@@ -640,16 +657,20 @@ describe('principal lane production live acceptance', () => {
       dispatchState: 'queued',
     }];
     sessionStore.updateSession(c.session);
-    mocks.forkWorker.mockImplementationOnce(() => false);
-
-    expect(driveNextPrincipalLaneTurn(c)).toBe(false);
+    let dispatchAttempt = 0;
+    const rejectOnce = vi.fn(async (input: any) => {
+      if (dispatchAttempt++ === 0) return false;
+      await input.resource?.markAttempting?.({ workerGeneration: c.workerGeneration ?? c.session.workerGeneration ?? 1 });
+      return true;
+    });
+    expect(await driveNextPrincipalLaneTurn(c, { dispatch: rejectOnce })).toBe(false);
     expect(c.session.principalLaneQueuedTurns).toMatchObject([
       { turnId: 'om_reject_head', dispatchState: 'queued' },
     ]);
     expect(mocks.workerInputs.some(row => row.turnId === 'om_reject_head')).toBe(false);
 
     await vi.waitFor(() => {
-      expect(mocks.workerInputs.filter(row => row.turnId === 'om_reject_head')).toHaveLength(1);
+      expect(rejectOnce).toHaveBeenCalledTimes(2);
     }, { timeout: 2_000, interval: 10 });
     expect(c.session.principalLaneQueuedTurns).toMatchObject([
       { turnId: 'om_reject_head', dispatchState: 'attempting' },
@@ -682,9 +703,8 @@ describe('principal lane production live acceptance', () => {
       dispatchState: 'queued',
     }];
     sessionStore.updateSession(c.session);
-    mocks.forkWorker.mockImplementationOnce(() => false);
-
-    expect(driveNextPrincipalLaneTurn(c)).toBe(false);
+    const reject = vi.fn().mockResolvedValue(false);
+    expect(await driveNextPrincipalLaneTurn(c, { dispatch: reject })).toBe(false);
     c.session.principalLaneQueuedTurns = [{
       ...c.session.principalLaneQueuedTurns[0]!,
       turnId: 'om_stale_replacement',
@@ -1010,7 +1030,7 @@ describe('principal lane production live acceptance', () => {
     await dispatch('c', 'om_adopt_c1', 'materialize C');
     const c = laneByPrincipal('user:union:on_c')!;
     const firstGeneration = c.principalLaneRunningTurn!.workerGeneration;
-    expect(onPrincipalLaneTurnTerminal(c, 'om_adopt_c1', firstGeneration)).toBe(false);
+    expect(await onPrincipalLaneTurnTerminal(c, 'om_adopt_c1', firstGeneration)).toBe(false);
     c.activeInteractiveTurn = undefined;
     c.worker = null;
     c.adoptedFrom = { cwd: c.workingDir } as any;
