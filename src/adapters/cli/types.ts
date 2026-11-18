@@ -8,8 +8,6 @@ export interface PtyHandle {
   /** `false` means the backend rejected the write before it could confirm
    * delivery. Callers must not silently promote that result to success. */
   write(data: string): void | boolean;
-  /** Remote backends resolve this at the serialized dispatch edge. */
-  writeBusinessInput?(data: string): Promise<'submitted' | 'retryable_pre_dispatch_rejection'>;
   /** Send text literally via tmux send-keys -l (tmux mode only).
    *  Returns `false` when the backend could not confirm the write (for example,
    *  send-keys timed out while the pane stayed alive). Delivery may still have
@@ -94,6 +92,9 @@ export type RunnerSubmissionDisposition =
  * keep protocol ids separate from reply-routing ids. */
 export interface WriteInputContext {
   turnId?: string;
+  /** Durable replay identity. Runner adapters may forward this with turnId so
+   * late output from an older attempt cannot settle its successor. */
+  dispatchAttempt?: number;
   /** Owned, prompt-injected Codex input may carry a fresh correlation marker.
    * An exact post-write history match then proves ownership even when the OS
    * sandbox prevents reading the CLI's open rollout file descriptors. */

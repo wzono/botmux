@@ -405,6 +405,7 @@ function executeProductionSetCaptureIdentity(send: (msg: unknown) => void): Iden
   ).outputText;
   const factory = new Function('send', `
     const workerSessionEventScope = undefined;
+    const lastInitConfig = undefined;
     let currentBotmuxTurnId;
     let currentBotmuxDispatchAttempt;
     let captureRevision = 0;
@@ -486,8 +487,7 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       { compilerOptions: { module: ts.ModuleKind.None, target: ts.ScriptTarget.ES2022 } },
     ).outputText;
     const send = vi.fn();
-    const harness = new Function('send', 'isCodexAppCliId', 'assertPendingWorkspaceBeforeWrite', `
-      const writeBackend = {};
+    const harness = new Function('send', 'isCodexAppCliId', `
       const workerSessionEventScope = undefined;
       let currentBotmuxTurnId, currentBotmuxDispatchAttempt, currentVcMeetingImTurnOrigin;
       let captureRevision = 0, captureIdentityAnnounced = false, currentTurnSteerPromoted = false;
@@ -533,7 +533,7 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
         state: () => ({ turnId: currentBotmuxTurnId, attempt: currentBotmuxDispatchAttempt,
           revision: captureRevision, queued: queuedTypeAheadTurns, retired: [...retiredTurnIds], started }),
       };
-    `)(send, isCodexAppCliId, loadWorkerFunction('assertPendingWorkspaceBeforeWrite', { lastInitConfig: { cliId: 'dsh-tui' } })) as {
+    `)(send, isCodexAppCliId) as {
       enqueue(record: { turnId: string; dispatchAttempt: number }): void;
       acknowledge(turnId: string): void;
       advance(): boolean;
@@ -760,4 +760,3 @@ describe('R2 turn-only capture acceptance', () => {
     expect(harness.lastHash()).toBe('0:0:213x58:same-pixels');
   });
 });
-import { loadWorkerFunction } from './helpers/worker-function-harness.js';

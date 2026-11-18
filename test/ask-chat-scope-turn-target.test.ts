@@ -20,7 +20,6 @@ import { createLarkAskCardDispatcher } from '../src/im/lark/ask-card.js';
 import { isSilentMessageListenerSession } from '../src/core/message-listener-silence.js';
 import { productionConst } from './helpers/codex-async-answer-function-harness.js';
 import { captureCodexAsyncAskOrigin } from '../src/core/codex-async-ask-origin.js';
-import { frozenSessionWorkspace } from '../src/core/admitted-turn-dispatch.js';
 import * as sessionControllers from '../src/core/session-controller.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -75,13 +74,8 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
   });
 
   function post(ds: Ds, body: Record<string, unknown>, dependencies: Record<string, unknown> = {}) {
-    // The real async-ask path freezes the workspace for its original-turn
-    // control reply. Model that live session boundary with this test's directory.
-    Object.assign(ds, { workingDir: dir });
-    Object.assign(ds.session, { workingDir: dir, workingDirSource: 'explicit' });
     const responses: Array<{ status: number; payload: any }> = [];
     const handler = productionConst('src/daemon.ts', 'handleAskRequest', {
-      startupAdmission: { isReady: () => true },
       readJsonBody: async () => body,
       jsonRes: (_res: unknown, status: number, payload: unknown) => { responses.push({ status, payload }); },
       parseAskBody,
@@ -105,7 +99,6 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
       isKnownPeerBot: () => false,
       isHumanOpenId: async () => true,
       frozenReplyContextForTurn,
-      frozenSessionWorkspace,
       activeSessions: new Map([['k', ds]]),
       logger: { info: () => {}, warn: () => {}, debug: () => {} },
       ...dependencies,
@@ -384,7 +377,6 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
       sessionsRestored: true, findActiveBySessionId: () => ds, explicitAskSessionBound,
       releaseExplicitAskHandoff: () => {}, hasExplicitAskHandoff: () => true, invalidateExplicitAsk: () => {},
     };
-    scope.startupAdmission = { allReady: () => scope.sessionsRestored, isReady: () => scope.sessionsRestored };
     const deps = productionConst('src/daemon.ts', 'explicitAskContinuation', scope);
     expect(deps.shouldInvalidate(receipt)).toBe(false);
     expect(deps.canResume(receipt)).toBe(true);

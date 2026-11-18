@@ -103,18 +103,6 @@ export interface DaemonSession {
    * separate from workerPort because backends without a Web Terminal still
    * emit screen/idle/screenshot updates and support native local attach. */
   workerReady?: boolean;
-  /** Exact cwd/backend proof reported by the current worker generation's ready IPC. */
-  lastWorkerReadyCwd?: string;
-  lastWorkerReadyHostWorkingDirContract?: {
-    workingDir: string;
-    identity: { dev: string; ino: string };
-  };
-  /** Task9 launch-only fence; set by the daemon's immediate pre-spawn group probe
-   * and consumed by the matching worker-ready cwd confirmation. */
-  groupWorkspaceLaunchGuard?: {
-    workingDir: string;
-    identity?: { dev: string; ino: string };
-  };
   /** True while the CURRENT CLI generation's prompt is known idle/ready.
    *  Set by the worker's `prompt_ready` IPC; cleared on spawn / restart /
    *  `claude_exit` / worker retirement, and when a MiniMax compact card request
@@ -317,10 +305,6 @@ export interface DaemonSession {
    * reached the first fork yet. Same-anchor turns must buffer into the opening
    * input instead of reforking worker:null and overtaking it. In-memory only. */
   initialStartPending?: boolean;
-  /** A guarded first fork synchronously refused before consuming its opening.
-   * The opening buffers remain authoritative, but no handler owns a live start
-   * claim; the next same-anchor turn may claim and retry this exact launch. */
-  initialGuardedLaunchRetry?: 'raw' | 'idle';
   /** Restore quarantine: a durable activation-tail promotion failed transiently
    * during restoreActiveSessions, so the row was registered with its tail
    * un-promoted. The next fork boundary (toReattach blank fork / daemon inbound
@@ -604,6 +588,23 @@ export interface DaemonSession {
    *  streamCardLabel) and a suspend guard (idle-worker-sweeper: the tasks die
    *  with the CLI). In-memory only. */
   backgroundTaskCount?: number;
+  /** Wall-clock of the most recent `turn_terminal` observed for this session,
+   *  and the turn it named. The terminal edge is the daemon's authority that a
+   *  turn is over, so these drive the post-terminal display settle (see
+   *  schedulePostTerminalStatusSettle) and the periodic stale-card self-heal.
+   *  In-memory only. */
+  lastTurnTerminalAt?: number;
+  lastTurnTerminalTurnId?: string;
+  lastTurnTerminalDispatchAttempt?: number;
+  /** Wall-clock of the first genuine LIVE-work signal observed after the last
+   *  completed terminal, when that work has no managed turn of its own (Web
+   *  Terminal / sandbox direct-submit). Managed turns and retry attempts are
+   *  recognized via currentTurnId / the dispatch high-water instead. This epoch
+   *  keeps the post-terminal settle and self-heal from re-idling a card that a
+   *  direct-submit episode legitimately put back to work. Reset on every
+   *  turn_terminal so a fresh post-terminal window starts clean. In-memory only. */
+  postTerminalLiveWorkAt?: number;
+  lastTurnTerminalStatus?: Extract<import('../types.js').WorkerToDaemon, { type: 'turn_terminal' }>['status'];
   /**
    * Timestamp (ms) since which the session has CONTINUOUSLY been `idle`
    * (stamped on the non-idle → idle edge, cleared on any other status). Drives
@@ -713,14 +714,8 @@ export interface DaemonSession {
   principalLaneDispatchRetry?: {
     turnId: string;
     attempt: number;
-    maxAttempts?: number;
     timer?: ReturnType<typeof setTimeout>;
   };
-  /** One exact durable head may cross admission for a worker generation. */
-  principalLaneDispatchFlight?: { generation: number; turnId: string; promise: Promise<boolean> };
-  principalLaneDispatchRejectedCount?: Record<string, number>;
-  retainedControlReplyWorkers?: Map<string, { worker: import('node:child_process').ChildProcess; generation: number;
-    controlDispatchId?: string; controlReplyDigest?: string; expiresAt: number; timer?: ReturnType<typeof setTimeout> }>;
   /** Host-owned classification/approval driver currently attached to disk state. */
   crossPrincipalInterruptionDriving?: boolean;
   /** Runtime wake-up for the bounded wait until the current owner turn ends. */
@@ -760,6 +755,8 @@ export interface DaemonSession {
   activeModel?: string;
   /** Latest reasoning effort reported by the live executor. */
   activeReasoningEffort?: string;
+  /** Native current selection, separate from the last executed turn_context. */
+  nativeReasoningObservation?: import('../services/native-reasoning-observation.js').NativeReasoningObservation & { workerGeneration: number };
   /** A confirmed native-menu preference awaiting its first new turn. */
   codexCliEffortConfirmed?: { effort: string; workerGeneration?: number };
   /** Undefined means no observation; null means native/default context. */
@@ -883,6 +880,17 @@ export interface DaemonSession {
   lastCliInput?: string;
   /** Exact dispatch turn that owns lastCliInput; absent inputs cannot be replayed automatically. */
   lastCliInputTurnId?: string;
+  /** Inputs sent with a failed-turn rewind directive, until the worker says
+   *  whether it cut the failed turn (`failed_turn_rewind`). Keyed by the
+   *  input's turn id; bounded, in-memory (a dead worker never reports). */
+  pendingFailedTurnRewinds?: Map<string, {
+    failedTurnId: string;
+    mode: 'merge' | 'resend';
+    content: string;
+    failedUserPrompt: string;
+    /** The worker process that was asked; another one never answers. */
+    worker: DaemonSession['worker'];
+  }>;
   lastCodexAppInput?: CodexAppTurnInput;
   replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
@@ -913,7 +921,7 @@ export interface DaemonSession {
   frozenCards?: Map<string, FrozenCard>;  // nonce → FrozenCard (historical cards' cached state for toggle)
   /** Wait Mode / HTTP Sync integration: pending Promise handlers for synchronous
    *  webhook triggers waiting for a response in this session. Key is turnId. */
-  pendingWaitPromises?: Map<string, { resolve: (text: string) => void; reject?: (err: Error) => void }>;
+  pendingWaitPromises?: Map<string, { resolve: (text: string) => void; reject?: (err: Error) => void; createdAt?: number }>;
   /** Bounded HTTP terminal tombstones: late outputs cannot fall through to IM. */
   settledHttpTerminalTurns?: Set<string>;
   /** Async webhook trigger state keyed by triggerId. `sessionId` polling reads

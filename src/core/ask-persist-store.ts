@@ -66,7 +66,6 @@ export interface PersistedAsk {
   chatId: string;
   rootMessageId: string | null;
   sessionId: string;
-  controlWait?: CreateAskInput['controlWait'];
   chatType?: 'group' | 'p2p';
   /** Optional app-scoped responder lock for host-owned approval asks. */
   answererOpenId?: string;

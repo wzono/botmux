@@ -10,6 +10,10 @@ import type { LinkRefMode } from '../services/link-ref-types.js';
 export interface PendingCliInput {
   queueAfterActiveTurn?: true;
   content: string;
+  /** Refreshed catalog parked for the TraeX RPC write edge; folded into
+   *  `content` if the item is written through a plain-text transport instead. */
+  traexSkillCatalog?: string;
+  traexSkillCatalogDigest?: string;
   /** The real user turn represented by `content` when delivery uses a short
    * adapter command. Transcript bridges fingerprint this value, while the PTY
    * receives `content`. */
@@ -19,10 +23,6 @@ export interface PendingCliInput {
   dispatchAttempt?: number;
   /** This item belongs to the durable-primary Lark Inbox commit protocol. */
   durablePrimaryInbox?: true;
-  /** Exact durable control reply submission correlated through worker commit. */
-  controlDispatchId?: string;
-  controlReplyDigest?: string;
-  controlReplyGrant?: Extract<import('../types.js').DaemonToWorker, { type: 'message' }>['controlReplyGrant'];
   /** Admission-frozen mode for the exact queued turn. */
   linkRefMode?: Exclude<LinkRefMode, 'disabled'>;
   /** Open id of the human whose turn this is. The worker publishes it beside

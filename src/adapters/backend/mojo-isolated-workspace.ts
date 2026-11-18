@@ -63,16 +63,6 @@ export function ensureMojoIsolatedWorkspace(sessionId: string, home: string = ho
     return realpathSync(raw);
 }
 
-export function proveMojoIsolationMapping(input: { repositoryPath: string; executionPath: string }): {
-    repositoryPath: string; executionPath: string;
-} | undefined {
-    try {
-        const repositoryPath = realpathSync(input.repositoryPath);
-        const executionPath = realpathSync(input.executionPath);
-        return repositoryPath === executionPath ? undefined : { repositoryPath, executionPath };
-    } catch { return undefined; }
-}
-
 export type MojoDaemonReapResult =
     | { outcome: 'killed'; daemonId: string; pid: number; forced: boolean }
     | { outcome: 'not-found'; reason: string }

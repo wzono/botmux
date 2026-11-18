@@ -21,23 +21,6 @@ export function productionFunction(path: string, name: string, scope: Record<str
   if (!declaration) throw new Error(`Missing function ${name}`);
   return evaluate(declaration.getText(file), scope);
 }
-export function productionCallback(path: string, factory: string, property: string, scope: Record<string, any>, occurrence = 0): any {
-  const file = ts.createSourceFile(path, readFileSync(join(process.env.CODEX_ASYNC_REVIEW_SOURCE_ROOT ?? '.', path), 'utf8'), ts.ScriptTarget.Latest, true);
-  const callbacks: ts.Expression[] = [];
-  function visit(node: ts.Node): void {
-    if (ts.isCallExpression(node) && node.expression.getText(file) === factory) {
-      const deps = node.arguments[0];
-      if (deps && ts.isObjectLiteralExpression(deps)) {
-        const member = deps.properties.find(p => ts.isPropertyAssignment(p) && p.name.getText(file) === property);
-        if (member && ts.isPropertyAssignment(member)) callbacks.push(member.initializer);
-      }
-    }
-    ts.forEachChild(node, visit);
-  }
-  visit(file);
-  if (!callbacks[occurrence]) throw new Error(`Missing ${factory}.${property}[${occurrence}]`);
-  return evaluate(callbacks[occurrence].getText(file), scope);
-}
 export function productionConst(path: string, name: string, scope: Record<string, any>): any {
   const file = ts.createSourceFile(path, readFileSync(join(process.env.CODEX_ASYNC_REVIEW_SOURCE_ROOT ?? '.', path), 'utf8'), ts.ScriptTarget.Latest, true);
   for (const statement of file.statements) {
@@ -73,24 +56,11 @@ export function deliveryIsCurrent(scope: Record<string, any>): any {
   const path = 'src/daemon.ts';
   const file = ts.createSourceFile(path, readFileSync(join(process.env.CODEX_ASYNC_REVIEW_SOURCE_ROOT ?? '.', path), 'utf8'), ts.ScriptTarget.Latest, true);
   let expression: ts.Expression | undefined;
-  let deliveryExpression: ts.Expression | undefined;
   function visit(node: ts.Node): void {
     if (ts.isVariableDeclaration(node) && node.name.getText(file) === 'isAsyncAskCurrent') expression = node.initializer;
-    if (ts.isCallExpression(node) && node.expression.getText(file) === 'deliverCodexAsyncAnswer') {
-      let parent: ts.Node | undefined = node.parent;
-      while (parent && !ts.isBlock(parent)) parent = parent.parent;
-      if (parent && ts.isBlock(parent)) {
-        for (const statement of parent.statements) {
-          if (!ts.isVariableStatement(statement)) continue;
-          const current = statement.declarationList.declarations.find(d => d.name.getText(file) === 'isCurrent');
-          if (current?.initializer) deliveryExpression = current.initializer;
-        }
-      }
-    }
     ts.forEachChild(node, visit);
   }
   visit(file);
-  if (!expression || !deliveryExpression) throw new Error('Missing async delivery current-origin closure');
-  scope.isAsyncAskCurrent = evaluate(expression.getText(file), scope);
-  return evaluate(deliveryExpression.getText(file), scope);
+  if (!expression) throw new Error('Missing async delivery current-origin closure');
+  return evaluate(expression.getText(file), scope);
 }

@@ -232,16 +232,6 @@ export class SessionController {
     }); this.refresh(); return execution.ref;
   }
   currentRuntime(): RuntimeRef | undefined { return this.store.read(this.ref)?.activeRuntime; }
-  /** A running turn clears promptReady, but its initialized runtime can still
-   * accept steering/type-ahead input. Keep lifecycle and runtime identity fences. */
-  readyRuntimeForInput(): RuntimeRef | undefined {
-    const state = this.store.read(this.ref);
-    const runtime = this.store.runtime(this.ref);
-    if (!state || !runtime || !state.workerOnline || state.lifecycle !== 'active'
-      || state.activeOperationId || !sameWorker(state.worker, runtime.worker)
-      || !sameRuntime(state.activeRuntime, runtime.ref) || runtime.phase !== 'ready') return undefined;
-    return runtime.ref;
-  }
   command(message: { type: string; turnId?: string; dispatchAttempt?: number; attemptId?: string; sessionCommand?: import('../services/session-contract.js').SessionCommandContext }): import('../services/session-contract.js').SessionCommandContext {
     const execution = message.sessionCommand?.execution ?? (message.turnId ? this.store.executions(this.ref, message.turnId, message.dispatchAttempt)[0]?.ref : undefined);
     const operation = message.attemptId ? this.operation(message.attemptId) : this.operation();
@@ -416,11 +406,14 @@ export class SessionController {
       if (existing.length === 1) context.scope.execution = existing[0].ref;
       else if (!existing.length && message.type !== 'screen_update' && sameRuntime(current, context.scope.runtime)) context.scope.execution = this.admitInput(message.turnId, message.dispatchAttempt);
     }
-    // Physical screen status is a runtime observation, not an execution claim:
-    // keep proven runtime-bound attribution, but drop unproven/unbound turn
-    // scopes instead of rejecting the current runtime's idle/working frame.
+    // Physical screen status is a runtime observation, not an execution claim.
+    // A turn that was already running when its physical CLI continued into a
+    // new runtime keeps its display attribution: the execution remains on the
+    // submitted runtime, while the frame observes the continued live runtime.
+    // Unrelated/replaced-process executions still lose scope and are fenced by
+    // the gateway below; no execution is minted from an unknown turnId.
     if (message.type === 'screen_update' && context.scope.runtime && context.scope.execution
-      && !sameRuntime(this.store.execution(this.ref, context.scope.execution.executionId)?.runtime, context.scope.runtime)) {
+      && !this.sameOrContinuedRuntime(this.store.execution(this.ref, context.scope.execution.executionId)?.runtime, context.scope.runtime, channel)) {
       delete context.scope.execution;
     }
     const continuationFailure = message.continuationFailure as RuntimeExecutionContinuationFailure | undefined;
@@ -454,7 +447,7 @@ export class SessionController {
     // runtime's, and the daemon keeps the turn looking idle until it ends.
     const liveRuntime = runtime && (message.type === 'prompt_ready' || message.type === 'screen_update')
       ? this.continuedInto(runtime, channel) : runtime;
-    if (liveRuntime && ['prompt_ready', 'screen_update', 'active_runtime', 'remote_backend_state', 'remote_usage', 'usage_update', 'cli_session_id'].includes(message.type)
+    if (liveRuntime && ['prompt_ready', 'screen_update', 'active_runtime', 'claude_effort', 'native_reasoning', 'remote_backend_state', 'remote_usage', 'usage_update', 'cli_session_id'].includes(message.type)
       && !this.store.acceptObservation(this.ref, channel, liveRuntime, context.sequence)) return { kind: 'reject', reason: 'stale_observation_sequence' };
     let event: ContractEvent | undefined;
     if (message.type === 'ready') event = { type: 'worker_online', worker: channel };

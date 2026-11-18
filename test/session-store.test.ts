@@ -38,17 +38,23 @@ vi.mock('node:fs', async (importOriginal) => {
   };
 });
 
-// Mock config so we can point session.dataDir at a temp directory
+// Override the store directory while retaining real configuration helpers
+// used by the integrated worktree creation path.
 let tempDir: string;
 let testWorktreeDirs = new Set<string>();
 
-vi.mock('../src/config.js', () => ({
-  config: {
-    session: {
-      get dataDir() { return tempDir; },
+vi.mock('../src/config.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/config.js')>();
+  return {
+    ...actual,
+    config: {
+      ...actual.config,
+      session: {
+        get dataDir() { return tempDir; },
+      },
     },
-  },
-}));
+  };
+});
 
 // Mock logger to suppress output
 vi.mock('../src/utils/logger.js', () => ({
@@ -119,9 +125,6 @@ import {
   markMessageProvenanceUntrusted,
   recordMessageProvenance,
   readTrustedMessageProvenance,
-  quiesceForWorkspaceMigration,
-  reopenAfterWorkspaceMigration,
-  workspaceSqliteStatus,
 } from '../src/services/session-store.js';
 import { settlePrincipalLaneOutboundProvenance } from '../src/core/principal-lane-outbound-provenance.js';
 import { topicResumeBlockReason } from '../src/core/topic-session-continuity.js';
@@ -195,33 +198,6 @@ beforeEach(() => {
   mockDeleteFrozenCards.mockReset();
   // Reset module state for each test
   init('test-app');
-});
-
-it('keeps SQLite closed and blocks ordinary readers and writers after quiescence until exact release', () => {
-  const session = createSession('chat-quiesce', 'root-quiesce', 'before');
-  expect(getSession(session.sessionId)).toBeDefined();
-  expect(quiesceForWorkspaceMigration(7)).toEqual({ open: false, writers: 0, inflight: 0, checkpointed: true });
-  expect(workspaceSqliteStatus().open).toBe(false);
-  expect(() => getSession(session.sessionId)).toThrow('quiesced at epoch 7');
-  session.title = 'blocked';
-  expect(() => updateSession(session)).toThrow('quiesced at epoch 7');
-  expect(workspaceSqliteStatus().open).toBe(false);
-  expect(() => reopenAfterWorkspaceMigration(8)).toThrow('release epoch mismatch');
-  expect(workspaceSqliteStatus().open).toBe(false);
-  reopenAfterWorkspaceMigration(7);
-  expect(workspaceSqliteStatus().open).toBe(true);
-  expect(getSession(session.sessionId)?.title).toBe('before');
-});
-
-it('rejects the real session writer while a migration epoch is active', () => {
-  const session = createSession('chat-fence', 'root-fence', 'fenced');
-  writeFileSync(join(tempDir, 'workspace-migration-manifest.json'), JSON.stringify({
-    manifestVersion: 1, batchId: 'batch', epoch: 1, sourceVersion: 1, targetVersion: 2,
-    phase: 'prepared', writer: { ownerId: 'other-process', leaseExpiresAt: Date.now() + 10_000, fencingToken: 1 },
-    stores: {}, createdAt: Date.now(), updatedAt: Date.now(),
-  }));
-  session.title = 'stale write';
-  expect(() => updateSession(session)).toThrow('workspace migration is active');
 });
 
 afterEach(() => {
@@ -2484,7 +2460,7 @@ describe('init()', () => {
 
     expect(getSession('broken')?.scope).toBe('chat');
     expect(getSession('healthy')?.title).toBe('Healthy thread');
-    expect(listSessions()).toHaveLength(3);
+    expect(listSessions()).toHaveLength(4);
   });
 
   it('repairs the corruption signature through the shared deserialization helper', () => {
@@ -2822,35 +2798,6 @@ describe('closeSession()', () => {
 
     expect(getSession(session.sessionId)?.status).toBe('closed');
     expect(getSession(session.sessionId)?.crossPrincipalInterruptions).toBeUndefined();
-  });
-
-  it('persists an explicit repin across close/reload/reopen without inferring group provenance', () => {
-    const session = createSession('chat1', 'root1', 'Provenance reload');
-    Object.assign(session, {
-      workingDir: '/repo/group', workingDirSource: 'group', groupWorkspaceRevision: 4,
-      workspaceSchemaVersion: 2,
-      groupWorkspaceIdentity: { path: '/repo/group', dev: '1', ino: '2' },
-      groupWorkspaceDirectoryIdentity: { dev: '1', ino: '2' },
-    });
-    updateSession(session);
-    Object.assign(session, {
-      workingDir: '/repo/explicit', workingDirSource: 'explicit', groupWorkspaceRevision: undefined,
-    });
-    updateSession(session);
-
-    closeSession(session.sessionId);
-    init('test-app');
-    const reloaded = getSession(session.sessionId)!;
-    expect(reloaded).toMatchObject({
-      workingDir: '/repo/explicit', workingDirSource: 'explicit', status: 'closed',
-    });
-    expect(reloaded.groupWorkspaceRevision).toBeUndefined();
-
-    reactivateClosedSession(session.sessionId);
-    init('test-app');
-    expect(getSession(session.sessionId)).toMatchObject({
-      workingDir: '/repo/explicit', workingDirSource: 'explicit', status: 'active',
-    });
   });
 
   it('should set status to closed and add closedAt timestamp', () => {

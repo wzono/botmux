@@ -3221,7 +3221,7 @@ async function cmdRestart(): Promise<void> {
 
       // Stop the live supervisor (graceful, then killed if it overruns) and
       // start a fresh one, which re-reads bots.json and (re)spawns every bot.
-      const { restartFleet, fleetMemberNames, waitFleetOnline } = await import('./core/fleet-runtime.js');
+      const { restartFleet, resolveFleetMembers, waitFleetOnline } = await import('./core/fleet-runtime.js');
       let health: ReturnType<typeof waitFleetOnline>;
       try {
         const r = restartFleet({
@@ -3236,8 +3236,8 @@ async function cmdRestart(): Promise<void> {
         }
         // Health-gate on every supervised member (bot daemons + dashboard), so a
         // restart that leaves the dashboard down is reported unhealthy, not "ok".
-        const names = fleetMemberNames();
-        health = waitFleetOnline(names, pm2StartVerifyTimeoutMs(names.length));
+        const members = resolveFleetMembers();
+        health = waitFleetOnline(members, pm2StartVerifyTimeoutMs(members.length));
         if (!health.healthy) {
           throw new Error(
             `[restart] fleet 未在超时时间内全部上线 (${health.online}/${health.expected})；`
@@ -18255,9 +18255,6 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   const larkAppId = process.env.BOTMUX_LARK_APP_ID!;
   const askSessionId = process.env.BOTMUX_SESSION_ID!;
   const liveAskOrigin = resolveSessionContext(resolveDataDir(), askSessionId);
-  const askWorkerGeneration = liveAskOrigin?.workerGeneration
-    ?? (Number(process.env.BOTMUX_WORKER_GENERATION) > 0
-      ? Number(process.env.BOTMUX_WORKER_GENERATION) : undefined);
   const askRelayDir = process.env.BOTMUX_SEND_RELAY;
   const askOriginCapability = readManagedOriginCapability(
     resolveDataDir(),
@@ -18283,9 +18280,6 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     ...(liveAskOrigin?.turnId ? { originTurnId: liveAskOrigin.turnId } : {}),
     ...(liveAskOrigin?.dispatchAttempt !== undefined
       ? { originDispatchAttempt: liveAskOrigin.dispatchAttempt }
-      : {}),
-    ...(askWorkerGeneration !== undefined
-      ? { originWorkerGeneration: askWorkerGeneration }
       : {}),
     ...(askOriginCapability ? { originCapability: askOriginCapability } : {}),
     // `botmux ask --mention <open_id>`：daemon 确认对方是本应用通讯录里的真人后，在卡片
@@ -18404,7 +18398,7 @@ export async function runHook(
   /** 按 OpenCode 原生会话 id（payload.session_id，ses_*）反查所属 botmux 会话；
    *  缺省用真实实现（在线 daemon 并发查询 + budget 封顶）。测试注入 stub。 */
   resolveCliSessionRouteFn?: (cliSessionId: string) => Promise<import('./adapters/adopt-route.js').AdoptRoute | null>,
-  resolveTurnOriginFn: (sessionId: string) => { turnId?: string; dispatchAttempt?: number; workerGeneration?: number } | null | undefined =
+  resolveTurnOriginFn: (sessionId: string) => { turnId?: string; dispatchAttempt?: number } | null | undefined =
     sessionId => resolveSessionContext(resolveDataDir(), sessionId),
   /** 权限确认专用：观察 CLI 是否绕过卡片自行了结了这次确认，并把结局回报 daemon。缺省 = 只等卡片。 */
   cliOutcome?: HookCliOutcomeOptions,
@@ -18561,8 +18555,6 @@ export async function runHook(
   // routing cannot borrow this process's ambient turn identity.
   const hookOrigin = !explicitRoute && routeSessionId === sessionId && ['claude-code', 'codex'].includes(cliId)
     ? resolveTurnOriginFn(routeSessionId!) : undefined;
-  const hookWorkerGeneration = hookOrigin?.workerGeneration
-    ?? (Number(env.BOTMUX_WORKER_GENERATION) > 0 ? Number(env.BOTMUX_WORKER_GENERATION) : undefined);
 
   const body: Record<string, unknown> = {
     sessionId: routeSessionId,
@@ -18575,7 +18567,6 @@ export async function runHook(
     originKind: 'hook',
     ...(hookOrigin?.turnId ? { originTurnId: hookOrigin.turnId } : {}),
     ...(hookOrigin?.dispatchAttempt !== undefined ? { originDispatchAttempt: hookOrigin.dispatchAttempt } : {}),
-    ...(hookWorkerGeneration !== undefined ? { originWorkerGeneration: hookWorkerGeneration } : {}),
   };
 
   // Post the ask, RETRYING across a daemon restart. The daemon holds pending
@@ -20145,12 +20136,12 @@ if (__entrySubcommand) {
   else if (__entrySubcommand === 'dashboard') await import('./index-dashboard.js');
   else if (__entrySubcommand === 'sandbox-network-runner') await import('./sandbox-network-runner.js');
   else if (__entrySubcommand === 'program-status-relay') await import('./program-status-relay.js');
-  else if (__entrySubcommand === 'background-execution-runner') {
-    await import('./background-execution-runner.js');
+  else if (__entrySubcommand === 'reply-file-sanitizer') {
+    await import('./reply-file-sanitizer.js');
     process.exit(process.exitCode ?? 0);
   }
-  else if (__entrySubcommand === 'path-usability-runner') {
-    await import('./path-usability-runner.js');
+  else if (__entrySubcommand === 'background-execution-runner') {
+    await import('./background-execution-runner.js');
     process.exit(process.exitCode ?? 0);
   }
   else if (__entrySubcommand === 'plugin-supervisor') await import('./index-plugin-supervisor.js');
@@ -21061,6 +21052,8 @@ async function cmdPlugin(args: string[]): Promise<void> {
       if (!pluginRegistryCache.plugins[pluginId]) throw new Error(`plugin_not_installed:${pluginId}`);
       const { materializePlugin, dematerializePlugin } = await import('./core/plugins/materializer.js');
       if (enable) {
+        const { assertPluginPrerequisitesReady } = await import('./core/plugins/prerequisites.js');
+        await assertPluginPrerequisitesReady(pluginId);
         if (botSelector) {
           updateBotPluginBinding(pluginId, botSelector, true, () => materializePlugin(pluginId));
         } else {

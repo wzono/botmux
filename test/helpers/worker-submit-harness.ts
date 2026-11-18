@@ -31,7 +31,7 @@ export function workerSubmitHarness() {
     refreshHookReviewInputHold: vi.fn(),
     hookReviewHoldsQueuedWrite: () => false,
     pendingInputMayFlush: () => true,
-    rpcLifecycleFailClosedOwners: new Map(), structuredTurnsWithSubmitNotice: new Set(),
+    rpcLifecycleFailClosedOwners: new Map(),
     probeStartupBlocker: () => false,
     readyGate: { shouldHold: () => false, isArmed: false },
     codexBridgeFallbackActive: () => true,
@@ -48,7 +48,6 @@ export function workerSubmitHarness() {
     traexAutoModelRuntimeEligible: () => false,
     freshnessInputQueue: { takeNormal: () => pendingMessages.shift() },
     attachDeferredPluginSkillCatalog: vi.fn(), applyMojoLivePatch: vi.fn(),
-    requeueUnsubmittedQueuedActivation: () => false,
     usageLimitTracker: { currentTurn: () => 1, beginTurn: () => 1, detectedThisTurn: () => false },
     syncQueuedTurnsFromMarkerDisk: vi.fn(), readSendMarkers: () => [], queuedTypeAheadTurns: [],
     setCaptureIdentity: vi.fn(), markActiveTurnStarted: vi.fn(),
@@ -85,22 +84,25 @@ export function workerSubmitHarness() {
     projectedRuntimeScreenStatus: () => (scope.isPromptReady ? 'idle' : 'working'),
     publishScreenStatus: vi.fn(),
     log: vi.fn(), send: vi.fn(), t: (key: string) => key,
-    universalOutputHandoff: null, ordinaryImTurnDedupe: { commit: vi.fn() },
-    maybeQueuePostSubmitNativeSessionTitle: () => false,
     buildSubmitMessagePreview,
     cliName: () => 'TraeX',
     // Any unrelated failure path is observable instead of silently swallowed.
-    SubmissionWriteError: class extends Error {},
+    SubmissionWriteError: class extends Error {
+      constructor(
+        message: string,
+        readonly recoveryFailureReason?: string,
+        readonly submissionStarted = true,
+        readonly runnerGenerationUnsafe = false,
+        readonly traexCatalogAdmissionRequired = false,
+      ) { super(message); }
+    },
     emitTurnTerminal: vi.fn(),
     shouldStopPendingBatch: () => true,
   };
   scope.nativeSessionForkPending = loadWorkerFunction('nativeSessionForkPending', scope);
-  scope.deferTurnInputCommitUntilSubmission = loadWorkerFunction('deferTurnInputCommitUntilSubmission', scope);
-  scope.acknowledgeTurnInputCommitted = loadWorkerFunction('acknowledgeTurnInputCommitted', scope);
-  scope.canWriteTerminalBytes = loadWorkerFunction('canWriteTerminalBytes', scope);
-  scope.terminalWorkspaceBytesAllowed = loadWorkerFunction('terminalWorkspaceBytesAllowed', scope);
-  scope.backendRequiresEffectiveWorkspaceProof = loadWorkerFunction('backendRequiresEffectiveWorkspaceProof', scope);
-  scope.writeBackendWorkingDirRejected = loadWorkerFunction('writeBackendWorkingDirRejected', scope);
+  // Real write-edge transport fold: a no-op unless an item carries a parked
+  // TraeX RPC catalog and no RPC engine will write it.
+  scope.inlineParkedTraexSkillCatalog = loadWorkerFunction('inlineParkedTraexSkillCatalog', scope);
   const schedule = loadWorkerFunction('scheduleSubmitFailureNotify', scope);
   scope.scheduleSubmitFailureNotify = schedule;
   // Real predicates for flushPending's native-consumption proof (traex harness →

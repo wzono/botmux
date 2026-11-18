@@ -82,7 +82,9 @@ function harness(
     promptReadinessRevision: 0,
   };
   state.invalidatePromptReadinessEvidence = loadWorkerFunction('invalidatePromptReadinessEvidence', state);
-  state.canWriteTerminalBytes = loadWorkerFunction('canWriteTerminalBytes', state);
+  // This bespoke with(state) factory bypasses the shared harness resolver; the
+  // real stop gate stays inert because no failed-turn rewind is modelled here.
+  state.stopHeldFailedTurnRewind = loadWorkerFunction('stopHeldFailedTurnRewind', state);
   const factory = new Function('state', `with (state) { ${slice}; return { handleTermAction }; }`);
   const handler = factory(state) as { handleTermAction: (key: string) => Promise<void> };
   return {
@@ -93,14 +95,6 @@ function harness(
 }
 
 describe('handleTermAction interrupt-key normalisation', () => {
-  it('refuses terminal control when a group fence is present without matching frozen authority', async () => {
-    const h = harness('esc');
-    h.state.currentTerminalWorkspaceFence = { source: 'group', groupRevision: 2,
-      workspaceIdentity: { path: '/unproven', dev: '1', ino: '2' } };
-    await h.handle('ctrlc');
-    expect(h.written).toEqual([]);
-    expect(h.specialKeys).toEqual([]);
-  });
   it('sends Escape, not Ctrl+C, when ZCode is asked to stop', async () => {
     const h = harness('esc');
     await h.handle('ctrlc');

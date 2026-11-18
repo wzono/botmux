@@ -24,7 +24,6 @@ import { readTurnRegistration } from '../src/core/trigger-registration.js';
 import * as idempotency from '../src/services/idempotency-store.js';
 import { ProjectCoordinator, type ProjectCoordinatorTransport } from '../src/services/project-coordinator.js';
 import { createProjectWorkstreamAttachments } from '../src/services/project-workstream-attachments.js';
-import { installWorkspaceDispatchSpy } from './helpers/workspace-dispatch-spy.js';
 
 const APP = 'cli_import_main', CHAT = 'oc_import_project', WORKER = 'cli_import_worker';
 let dataDir: string, handle: IpcServerHandle, ds: any, source: any;
@@ -70,7 +69,6 @@ beforeEach(async () => {
   replyCardSpy = vi.spyOn(client, 'replyMessage').mockResolvedValue('om_import_topic_card');
   updateCardSpy = vi.spyOn(client, 'updateMessage').mockResolvedValue(undefined);
   fork = vi.spyOn(pool, 'forkWorker').mockImplementation(() => {});
-  installWorkspaceDispatchSpy();
   send = vi.spyOn(pool, 'sendWorkerInput').mockImplementation((target, _content, triggerId) => {
     const entry = target.idempotentAsyncTurns?.get(triggerId!);
     if (entry) {

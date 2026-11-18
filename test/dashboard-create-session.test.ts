@@ -81,12 +81,6 @@ vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: (...a: any[]) => forkWorkerMock(...a),
   recordTurnExplicitMention: (...a: any[]) => recordTurnExplicitMentionMock(...a),
   sendWorkerInput: (...a: any[]) => sendWorkerInputMock(...a),
-  dispatchWorkspaceAdmittedBusinessTurn: vi.fn(async (input: any) => {
-    if (!await input.markAttempting()) return false;
-    return input.ds.worker && !input.ds.worker.killed
-      ? sendWorkerInputMock(input.ds, input.payload, input.turnId, { trustedCaller: input.trustedCaller })
-      : (forkWorkerMock(input.ds, input.payload, { resume: input.resume, turnId: input.turnId }), true);
-  }),
   forkAdoptWorker: vi.fn(),
   adoptSandboxBlocked: vi.fn((botCfg, session) => botCfg?.sandbox === true || botCfg?.readIsolation === true || session?.sandbox === true || process.env.BOTMUX_SANDBOX === '1'),
   killStalePids: vi.fn(),
@@ -163,7 +157,7 @@ import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { getBot } from '../src/bot-registry.js';
 import { getAllBots } from '../src/bot-registry.js';
 import type { ScheduledTask } from '../src/types.js';
-import { setActiveSessionSafe, dispatchWorkspaceAdmittedBusinessTurn } from '../src/core/worker-pool.js';
+import { setActiveSessionSafe } from '../src/core/worker-pool.js';
 import {
   applyQueuedCodexAppLegacyFallback,
   mergeQueuedCodexAppTurn,
@@ -1192,14 +1186,6 @@ describe('activateQueuedSession', () => {
   });
 
   it('keeps the backlog payload retryable when fork pre-accept throws', async () => {
-    // Hermetic admitted boundary: this test intentionally drives the worker's
-    // pre-init throw, regardless of embedded IPC servers run earlier in-process.
-    const admitted = vi.mocked(dispatchWorkspaceAdmittedBusinessTurn);
-    admitted.mockImplementationOnce(async input => {
-      if (!await input.markAttempting()) return false;
-      forkWorkerMock(input.ds, input.payload, { resume: input.resume, turnId: input.turnId });
-      return true;
-    });
     const active = new Map<string, DaemonSession>();
     await spawnDashboardSession(active, undefined, {
       larkAppId: APP, chatId: CHAT, content: 'do not lose this task', column: 'backlog', role: 'solo',

@@ -23,7 +23,6 @@ export const messages: Record<string, string> = {
   'cmd.cli.unknown': '未知 CLI：{input}',
   'cmd.cli.ambiguous': '「{input}」对应多个 CLI，没有替你选。请改发其中一个：{choices}',
   'cmd.cli.choice': '/cli {cliId}（{name}）',
-  'worker.purge_images_none': '🧹 未能在当前会话记录中找到尺寸过小的图片（会话文件可能已轮转）。请把网页终端里的完整报错反馈给管理员，或先用 /clear 恢复。',
   'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> [任务] — 修改 Codex 推理强度；任务可同一行或换行附带，强度确认后再投递。CLI 从下一轮生效；App 更新当前轮需启用 step_model_switching（默认关闭，档位以模型为准）',
   'cmd.effort.task_not_submitted': '附带任务未投递：推理强度修改未确认、会话已变化或输入通道不可用。任务已保留在原消息，请重试本条任务。任务：{task}',
   'cmd.effort.cli_next_turn': '当前会话的推理强度已设为 {effort}，从下一轮生效；正在执行的这一轮保持原强度。',
@@ -186,7 +185,14 @@ export const messages: Record<string, string> = {
   'card.model_fallback.no_reason': '',
   'worker.rate_limit_notify.rate': '⚠️ {cliName} 触发限流，本轮任务已暂停。请在 {retryLabel} 后重发上一条任务，或直接发送新消息继续。',
   'worker.rate_limit_notify.usage': '⚠️ {cliName} 已达使用限额，本轮任务已暂停。额度刷新后（{retryLabel}）请重发上一条任务，或直接发送新消息继续。',
-  'worker.traex_auto_model.capacity_switch': '⚠️ TraeX 模型 {fromModel} 持续排队超过 {seconds} 秒，已切换到白名单中的 {toModel}，正在从当前会话上下文继续本轮任务。',
+  'worker.traex_auto_model.catalog_prune': '⚠️ 实时完整目录已确认以下模型在当前 TraeX 入口不可用：{models}。即将永久删除它们在自动模型池中的条目及独立设置；其余模型和原会话历史保留。',
+  'worker.traex_auto_model.catalog_switch': '↪️ {fromModel} 已不在当前可用目录中，正在使用白名单内的 {toModel} 续接原会话；不保证免排队，也不会重新发送原始任务。',
+  'worker.traex_auto_model.catalog_empty': '⚠️ 自动模型池已没有可用模型，已停止选模。请前往控制台重新配置模型池；不会使用池外模型或清空原会话。',
+  'worker.traex_auto_model.catalog_query_retry': '⚠️ 模型目录暂未获取，保存的模型池不变，暂不清理。若启动或选模仍未完成，将在 30 秒后重试，本轮总共最多查询三次；当前模型正常工作后停止重试。',
+  'worker.traex_auto_model.catalog_query_failed': '⚠️ 本轮三次模型目录查询均未成功，无法核实可用模型。未清理保存的模型池，也不会尝试未经核实的备用模型；下一次独立请求会重新查询。',
+  'worker.traex_auto_model.catalog_persist_failed': '⚠️ 失效模型清理未能保存，本次按原模型池继续。保存配置未被本次请求修改，后续目录核对会再次尝试。',
+  'worker.traex_auto_model.catalog_persist_timeout': '⚠️ 失效模型清理的保存结果尚未确认，本次按原模型池继续。若稍后保存成功，后续目录核对会收敛。',
+  'worker.traex_auto_model.capacity_switch': '⚠️ TraeX 模型 {fromModel} 持续排队超过 {seconds} 秒，正在尝试白名单中的 {toModel}（负载未获取），将续接原会话；不代表替代模型已成功启动。',
   'worker.traex_auto_model.new_turn_switch': '↩️ 收到新输入，已从降级模型 {fromModel} 回到核心模型 {toModel} 重新探测。',
   'worker.traex_auto_model.exhausted': '⚠️ 配置的 {count} 个 TraeX 模型本轮均持续排队。已比较本轮最近可读的队列名次，当前保持 {model} 等待，避免循环切换；不会使用池外模型。',
   'worker.traex_auto_model.shortest_queue': '⚠️ 本轮模型池均排队，{toModel} 最近观测的队列名次最靠前（第 {position} 位）。正在切换并继续原会话，此后保持等待，避免反复切换。',
@@ -332,7 +338,13 @@ export const messages: Record<string, string> = {
   // /invite（把群外 bot 拉进本群，owner 专用）
   'cmd.invite.owner_only': '⚠️ 仅 Bot 管理员可以使用 /invite。',
   'cmd.invite.p2p': '⚠️ 私聊里不能拉机器人，请在群里使用 /invite。',
-  'cmd.invite.usage': '用法：@我 /invite @要拉进群的机器人（可多个），或 @我 /invite --app cli_xxx',
+  'cmd.invite.usage': '用法：@我 /invite @目标（可多个），或 @我 /invite --app cli_xxx；@我 /invite all 补齐 inviteConfig.agents 配置中的机器人。',
+  'cmd.invite.no_defaults': '尚未配置 inviteConfig.agents，可用 /botconfig set inviteConfig {"agents":["机器人名称或 App ID"]} 设置名单。',
+  'cmd.invite.invalid_defaults': '⚠️ inviteConfig.agents 配置无效，未拉入任何机器人：{reason}',
+  'cmd.invite.roster_unavailable': '⚠️ 暂时无法查询群成员，未执行默认名单邀请。请稍后重试。',
+  'cmd.invite.queue_timeout': '⚠️ 上一个拉人请求仍在处理中，本次未执行邀请。请稍后重试。',
+  'cmd.invite.owner_changed': '⚠️ 管理员权限已变更，已停止后续邀请；已完成的邀请保留。',
+  'cmd.invite.defaults_changed': '⚠️ inviteConfig.agents 已变更，已停止后续邀请；已完成的邀请保留，请确认名单后重新执行 /invite all。',
   'cmd.invite.header': '🤝 /invite 结果：',
   'cmd.invite.ok': '✅ 已拉进群：{names}',
   'cmd.invite.already': '⏭️ 已在群内（跳过）：{names}',
@@ -685,7 +697,6 @@ export const messages: Record<string, string> = {
   'cmd.rename.updated_unsupported': '✅ Botmux 会话标题已更新：{title}\n{cliName} 暂不支持原生会话名同步。',
   'cmd.rename.updated_failed': '⚠️ Botmux 会话标题已更新：{title}\n向 {cliName} 发送原生改名请求失败。',
   'cmd.repo.no_prior_scan': '请先执行 /repo 查看项目列表。',
-  'card.repo.group_unbind': '解除群目录',
   'cmd.repo.index_out_of_range': '序号超出范围，有效范围：1-{max}',
   'cmd.repo.path_not_found': '❌ 找不到目录或项目：`{arg}`\n请传入绝对路径、相对路径，或 workingDir 下的一级项目名。',
   'cmd.repo.here_missing': '⚠️ 当前群聊还没有可复用的工作目录。请先在普通群启动一个会话或使用 /oncall bind 绑定目录。',
@@ -707,31 +718,6 @@ export const messages: Record<string, string> = {
   'cmd.repo.worktree_created_not_switched': '🌿 worktree 已创建：`{path}`（分支 `{branch}`），但会话状态已变化，未自动切换。需要时可用 `/repo {path}` 打开。',
   'cmd.repo.worktree_switch_failed': '⚠️ worktree 已创建：`{path}`，但自动切换失败：{error}\n可用 `/repo {path}` 手动打开。',
   'cmd.repo.switch_close_failed': '⚠️ 无法安全关闭当前会话，仓库未切换：{error}',
-  'cmd.repo.group.denied_identity_unavailable': '⚠️ 无法验证群目录操作身份；本次未切换会话，也未写入群目录。',
-  'cmd.repo.group.denied_stale_config': '⚠️ 群目录授权配置暂不可验证；本次未切换会话，也未写入群目录。',
-  'cmd.repo.group.denied_unauthorized': '⚠️ 你没有群目录管理权限；本次未切换会话，也未写入群目录。',
-  'cmd.repo.group.denied_tenant_mismatch': '⚠️ 群目录操作租户不匹配；本次未切换会话，也未写入群目录。',
-  'cmd.repo.group.switch_denied': '⚠️ 你有群目录管理权限，但没有接收机器人的会话切换权限；本次未切换会话，也未写入群目录。',
-  'cmd.repo.group.invalid_source': '⚠️ 无法验证操作来源，本次未切换会话，也未写入群目录。',
-  'cmd.repo.group.session_committed': '⏳ 会话已切换，群目录提交待确认；暂不宣告成功。',
-  'cmd.repo.group.conflict': '⚠️ 会话已切换，但群目录版本冲突，群目录未更新。请执行 `/repo show` 查看当前状态后重新操作。',
-  'cmd.repo.group.store_unavailable': '⚠️ 会话已切换，但群目录存储不可用，群目录未更新。',
-  'cmd.repo.group.unknown': '⚠️ 会话状态已变化，但群目录提交结果未知；为避免覆盖，未自动重试。请执行 `/repo show` 检查。',
-  'cmd.repo.group.convergence_quarantined': '⚠️ 群目录已提交，但会话代次无法安全收敛，操作已隔离且不会重复切换。请执行 `/repo show` 后修复。',
-  'cmd.repo.group.protocol_conflict': '⚠️ 同一来源对应了不同请求，协议冲突；本次未执行。',
-  'cmd.repo.group.invalid_dir': '⚠️ 目标目录无效、不可访问或目录实体已变化；本次未切换会话，也未写入群目录。',
-  'cmd.repo.group.unauthorized': '⚠️ 群目录操作权限已失效；本次未继续切换或写入。',
-  'cmd.repo.group.aborted': '⚠️ 会话未切换，群目录也未更新。',
-  'cmd.repo.group.committed': '✅ 群目录更新成功（revision {revision}）。',
-  'cmd.repo.group.unbind_committed': '✅ 群目录解绑成功（revision {revision}）。',
-  'cmd.repo.group.unbind_conflict': '⚠️ 解绑版本冲突，群目录未更新。请执行 `/repo show` 查看当前状态后重试。',
-  'cmd.repo.group.unbind_store_unavailable': '⚠️ 解绑存储不可用，暂不确认结果。',
-  'cmd.repo.group.unbind_unknown': '⚠️ 解绑结果未知；为避免覆盖，未自动重试。请执行 `/repo show` 检查。',
-  'cmd.repo.group.unbind_protocol_conflict': '⚠️ 解绑请求与同一来源的既有请求冲突，本次未执行。',
-  'cmd.repo.group.unbind_invalid_dir': '⚠️ 解绑请求无效，本次未执行。',
-  'cmd.repo.group.unbind_unauthorized': '⚠️ 无权解绑群目录，本次未执行。',
-  'cmd.repo.group.unbind_aborted': '⚠️ 解绑未执行，群目录未更新。',
-  'cmd.repo.group.unbind_session_committed': '⚠️ 解绑状态异常，暂不确认结果。',
   // 「仅默认目录」模式开启「自动创建 worktree」后，新会话启动时用（daemon 交互新话题 /
   // dashboard 建会话 / webhook 外部事件三条路复用）。
   'worktree.auto_creating': '🌿 正在为本会话创建独立 worktree（含 git fetch，可能需要几秒）…',
@@ -762,6 +748,7 @@ export const messages: Record<string, string> = {
   'cmd.login.bytedcli_note': '说明：这是 ByteCloud 的授权，和飞书 /login 是两回事，两边都要授权一次。登录态约 3 周有效，到期前不用重复扫码。',
   'cmd.login.bytedcli_pending': '⏳ 还没检测到授权完成。请先点上面那条链接授权，再发 /login bytedcli done。',
   'cmd.login.bytedcli_ok': '✅ ByteCloud 授权已保存。',
+  'cmd.login.bytedcli_already': '✅ ByteCloud 已授权，无需重复授权。如需换账号或重新登录，先发 /logout（会一并撤销你在本机的其它授权），再发 /login bytedcli。',
   'cmd.login.bytedcli_enabled': '当前 Bot 已为 bytedcli 启用按当轮发起人身份注入授权。',
   'cmd.login.bytedcli_configure': '当前 Bot 的 bytedcli 身份注入尚未启用。请管理员将 triggerUserAuth.enabled 设为 true，并在 triggerUserAuth.capabilities 中加入 bytecloud（Meego 加 meego）。注意 capabilities 会替代 tools，需要把想要的能力全部列出（lark-user / bytecloud / meego）；配置在新会话生效。',
   'cmd.login.bytedcli_git_enabled': '当前 Bot 已为 {host} 的 git 鉴权配置当轮 bytedcli 身份。',
@@ -1253,7 +1240,6 @@ export const messages: Record<string, string> = {
   'cmd.models.inherit_saved': '已恢复跟随会话默认模型，下次重启生效。',
   'cmd.models.inherit_unsupported': '当前会话不支持此操作；仅支持本地 Codex 终端会话。',
   'cmd.models.inherit_unavailable': '暂时无法读取当前 Codex 设置，请等终端就绪后重试。',
-  'help.capacity': '/capacity status - 查看容量反馈分批阶段和已禁用的机器人 × adapter',
   'help.retry': '/retry      - 重试最近一个失败或被中断的 turn（10s 冷却）',
   'help.rewind': '/rewind [n|n confirm] - 回退会话上下文：不带参数列出最近检查点，`n` 预览、`n confirm` 回退到第 n 轮之前（仅 Claude Code，执行前自动备份 transcript）',
   'cmd.retry.no_session': '当前话题没有活跃的会话，无法重试。',
@@ -1462,8 +1448,7 @@ export const messages: Record<string, string> = {
   'ai.followup.reminder_no_resend': '需要回复的请求，结束前必须用 botmux send --response-kind final 交付结果或具体阻碍并核验成功；查询完成、发过进度不等于交付。最终答复已成功交付时，终端无正文是正常的，不要重复发送；发送结果未知先核对。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND。',
   'ai.followup.feishu_safe_emphasis': '短进度优先纯文本；强调仅包短词或无中文标点的短语，标点和后文放在 `**` 外。',
   'ai.followup.no_local_addresses': '回复里不要放开发机路径、文件协议或本机服务地址，文件用附件或可访问链接。',
-  'ai.response_style.contract': '按任务自适应组织回复：先给结果或动作；多步骤才编号，每步一个有边界的动作；跨轮次重述当前阶段、已完成内容和下一阶段；估时使用具体单位或明确条件；完成时写明必要证据、剩余风险，并区分已保存、已验证、已发布或已部署；错误写清位置、现象、已知原因和下一诊断动作，未知保持未知；补足理解当前回复所需的上下文，使用短句和一致术语，项目有词汇表时遵循词汇表；先完成当前主问题再提出其它问题；只有有效开始、阶段完成、新风险或阻塞、需要决策时才发进度。有真实用户待办时只给一个下一动作；没有待办时直接结束。简单问题可以一句话回答，解释型问题可以充分展开。安全、审批、交付和岗位规则优先，不得为了简短省略确认、证据、风险或交付状态。',
-  // No-transport 续轮（apiOnly bot / HTTP 虚拟会话）：这是程序发起的请求-应答，无飞书
+  'ai.response_style.contract': '按任务自适应组织回复：先给结果或动作；多步骤才编号，每步一个有边界的动作；跨轮次重述当前阶段、已完成内容和下一阶段；估时使用具体单位或明确条件；完成时写明必要证据、剩余风险，并区分已保存、已验证、已发布或已部署；错误写清位置、现象、已知原因和下一诊断动作，未知保持未知；补足理解当前回复所需的上下文，使用短句和一致术语，项目有词汇表时遵循词汇表；先完成当前主问题再提出其它问题；只有有效开始、阶段完成、新风险或阻塞、需要决策时才发进度。有真实用户待办时只给一个下一动作；没有待办时直接结束。简单问题可以一句话回答，解释型问题可以充分展开。安全、审批、交付和岗位规则优先，不得为了简短省略确认、证据、风险或交付状态。',  // No-transport 续轮（apiOnly bot / HTTP 虚拟会话）：这是程序发起的请求-应答，无飞书
   // 会话、无其它 bot 协作，也不该 botmux send。哨兵语义只在本轮内容里的
   // <botmux_http_response_mode> 出现一次（迁移不删，#808 async settle 依赖它），
   // 这条 reminder 绝不能再带 send/@/BOTMUX_NOTHING_TO_SEND，否则又和 http_response_mode 打架。
@@ -1819,10 +1804,12 @@ export const messages: Record<string, string> = {
   'card.turn_failed.field_error': '**错误码**：{errorCode}',
   'card.turn_failed.field_when': '**失败时刻**：{when}',
   'card.turn_failed.field_task': '**任务**：{task}',
+  'card.turn_failed.field_repeat': '**连续失败**：同一条输入已连续第 {count} 次失败，除了报错没有任何输出；会话里只保留最近一次失败，这张卡显示的是最近一次的错误',
   'card.turn_failed.field_continuations': '**已自动续跑**：{count} 次（仍未恢复）',
   'card.turn_failed.provider_eta': '**上游预计恢复**：{eta}（之后再继续更稳）',
   'card.turn_failed.reason': '**原因**：{reason}',
   // 「没跑就挂了」——重发无副作用风险，可以放心点。
+  'card.turn_failed.retry_direct': '这一轮除了报错**没有任何输出**（没有调用工具，也没有回复）。点「重试」会先把这次失败从会话里拿掉，再原样重发这条输入；之后再发来的消息也会和它合成一轮发出，不会在会话里一轮轮叠上去。',
   'card.turn_failed.retry_safe': '这一轮的输入没有送达 CLI，**没有任何已执行的操作**，可以安全重试。',
   // 「跑到一半挂了」——重发会重跑，必须让用户自己判断。
   'card.turn_failed.retry_caveated': '⚠️ 这一轮**可能已经执行了一部分**（改文件 / 提交 / 发消息等）。点「继续」不会原样重跑：会让 CLI **先读取当前现场**，判断做到哪一步，再从上次的进度接着做；判断不了会停下来交回你决定。仍建议先看一眼 Web 终端。',
@@ -1839,6 +1826,7 @@ export const messages: Record<string, string> = {
   'card.action.purge_images_started': '正在清理会话小图并重启续跑…',
   'card.action.retry_turn_missing': '⚠️ 找不到这一轮的输入记录，无法重试。请直接发送新的消息。',
   'card.action.retry_turn_stale': '⚠️ 这张卡片已过期（会话后来又失败过或已重试）。请用最新那张卡片，或直接发送新的消息。',
+  'card.action.retry_turn_in_flight': '这条输入正在重新发送（会先把失败那一轮从会话里拿掉），无需再点重试。',
   'card.action.retry_turn_cooldown': '⏳ 重试冷却中，请在 {seconds} 秒后再试。',
   'card.action.retry_turn_submit_failed': '⚠️ 重试提交失败：worker 当前不接受输入，请稍后再试。',
   'card.action.retry_turn_success': '🔁 已重新提交这一轮任务，请等待执行。',
@@ -2029,7 +2017,6 @@ export const messages: Record<string, string> = {
   'daemon.force_topic_started': '↪️ 已转入新话题，正在处理…',
   'daemon.force_topic_current_dir_missing': '⚠️ 当前群聊还没有可复用的工作目录。请先在普通群启动一个会话或使用 /oncall bind 绑定目录。',
   'daemon.force_topic_worktree_command_unsupported': '⚠️ /tw 后面不能直接跟 {cmd}：/tw 话题要等 worktree 建好才有会话，命令没有落点。不需要 worktree 就直接发 {cmd}；需要的话先发 /tw <任务> 开话题，再在话题里发 {cmd}。',
-  'daemon.group_workspace_repair_required': '⚠️ 群工作目录 `{path}` 已不可访问，本会话未启动，绑定仍保留。请管理员在群顶层重新执行 `/repo` 修复，或用 `/repo unbind` 解除绑定。',
   // ─── 话题指令头（`[标题] /t /repo … /model … 正文`）的拒绝文案 ───────────
   // fail closed：任一项不合法就整条不生效，所以这条回复是用户唯一的反馈，
   // 必须指名道姓说清哪一项错了。
@@ -2368,6 +2355,8 @@ export const messages: Record<string, string> = {
   'settings.autoRestart.disabled.needsAutoUpdate': '⚠️ 需先开启「每日自动更新」',
   'settings.sectionAccess': '访问控制',
   'settings.sectionCards': '卡片行为',
+  'settings.modelQueueNotify': '排队通知',
+  'settings.modelQueueNotifyHelp': '默认关闭。开启后，TRAE CLI 的状态卡显示明确的模型容量排队状态。对本机所有 Bot 生效，保存后随卡片刷新生效。',
   'settings.sectionMaintenance': '维护',
   'settings.publicReadOnly': '公开只读模式',
   'settings.publicReadOnlyHelp': '允许无 token 访问只读 API。',
@@ -2386,11 +2375,9 @@ export const messages: Record<string, string> = {
   // ─── i18n coverage v2: shared fragments + cards + chat messages ───────────
   'common.operator': '操作人：{by}',
   'common.empty_paren': '（空）',
-  'common.truncated_short': '…（已截断）',
 
   // Ask card
   'card.ask.field.deadline': '截止',
-  'card.ask.permanent': '等待你回答',
   'card.ask.field.answerable': '可答复',
   'card.ask.question_n': '问题 {n}',
   'card.ask.prompt_truncated': '（问题正文过长，卡片内已截断；完整内容见本话题中的附件文件）',
@@ -2489,6 +2476,8 @@ export const messages: Record<string, string> = {
   'card.usage.turn': '本轮',
   'card.usage.total': '累计',
   'card.usage.cache_hit': '缓存命中',
+  'card.usage.effort_selected': '{effort}（已选）',
+  'card.usage.effort_last_execution': '{effort}（最近执行）',
 
   // Adopt preamble card title
   'card.adopt_last_round': '📜 /adopt 前最后一轮',

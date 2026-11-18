@@ -11,7 +11,7 @@ import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection
  * Handles working directory resolution, attachment downloads, prompt building,
  * session restoration, and scheduled task execution.
  */
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { normalizeImageAttachment, imageSequenceHint } from './attachment-image-format.js';
 import { randomUUID } from 'node:crypto';
 import { recordScheduledSessionRun } from './scheduled-send.js';
@@ -24,7 +24,7 @@ import { getRuntimeTask, scheduledWorkingDirSwapReason, updateRuntimeTaskState }
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, findActiveBySessionId, identityStorageModelForDaemonSession, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart, recordTurnExplicitMention, resumeTurnNotices, dispatchWorkspaceAdmittedBusinessTurn } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, findActiveBySessionId, identityStorageModelForDaemonSession, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart, recordTurnExplicitMention, resumeTurnNotices } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
@@ -38,7 +38,9 @@ import {
   buildBuiltinSkillCatalogBlock,
   builtinSkillHelpPointer,
   chatManagerEnabledForApp,
+  type BuiltinSkillEntry,
 } from '../skills/injection-mode.js';
+import { compactSkillTriggerSummary } from './skills/prompt.js';
 import { resolveConditionalLine } from '../skills/effective-builtins.js';
 import {
   getSessionPersistentBackendType,
@@ -73,6 +75,8 @@ import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
 import type { BackendType } from '../adapters/backend/types.js';
 import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
 import { normalizeRemoteRunnerBackendState } from '../adapters/backend/remote-runner-protocol.js';
+import { sandboxEnabled } from '../adapters/backend/sandbox.js';
+import { codexRpcEligible } from '../codex-rpc-lifecycle.js';
 import type { AcceptedCommandInput, ChatContext, CliTurnPayload, CodexAppAdditionalContextEntry, CodexAppTurnInput, LarkAttachment, LarkMention, ScheduledTask, Session, SubstituteTrigger } from '../types.js';
 import { trustedCallerForScheduledTask } from './scheduled-turn-provenance.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
@@ -90,11 +94,6 @@ import {
   larkTransportEnabled,
 } from './types.js';
 import type { DaemonSession, GroupJoinContext } from './types.js';
-import { setSessionWorkingDirMetadata, type SessionWorkingDirMutation } from './session-cwd.js';
-import { GroupWorkspaceStore } from '../services/group-workspace-store.js';
-import { resolveGroupWorkspaceCwd } from './group-workspace-policy.js';
-import { probePathUsability } from './path-usability.js';
-import type { WorkspaceIdentity } from './turn-admission.js';
 import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime } from './pending-repo-journal.js';
 import { announceSessionRow, clearAgentAttention, markSessionActivity, stampHumanActivity, announcePendingRepoSession } from './session-activity.js';
 import { applyFollowActive, followActiveOpenedFreshTopic, recordFollowActiveFreshTopic } from './schedule-follow-active.js';
@@ -143,66 +142,6 @@ export { getAttachmentsDir } from './attachment-path.js';
 type RefreshCliVersion = (
   botConfig: Pick<BotConfig, 'cliId' | 'cliRuntime' | 'cliPathOverride'>,
 ) => boolean;
-
-export type IngressWorkspaceResolution =
-  | { status: 'resolved'; workspace: WorkspaceIdentity; mutation: SessionWorkingDirMutation; groupRevision?: number }
-  | { status: 'unbound' }
-  | { status: 'store_unavailable' | 'invalid_dir' | 'inaccessible' | 'identity_changed'; detail: string };
-
-/** Shared host resolver for every business ingress. Resolver faults are terminal:
- * no caller may reinterpret an unreadable/invalid group binding as absence. */
-export async function resolveIngressWorkspace(input: {
-  larkAppId: string;
-  chatId: string;
-  chatType: 'group' | 'p2p';
-  dataDir: string;
-  explicitWorkingDir?: string;
-  oncall?: { workingDir: string; provenance?: 'oncall-explicit' | 'oncall-default-auto' };
-  botDefaultWorkingDir?: string;
-}): Promise<IngressWorkspaceResolution> {
-  const group = input.chatType === 'group'
-    ? await new GroupWorkspaceStore(input.dataDir).probeBoundDirectoryForConsumption(input.chatId)
-    : { status: 'available' as const, record: undefined };
-  const groupLayer = group.status === 'usable'
-    ? { status: 'usable' as const, workingDir: group.usability.normalizedPath,
-        revision: group.record.revision, directoryIdentity: group.record.directoryIdentity ?? group.usability.identity }
-    : group.status === 'unusable'
-      ? { status: group.usability.reason === 'inaccessible' ? 'inaccessible' as const : 'invalid' as const,
-          workingDir: group.record.directory.kind === 'bound' ? group.record.directory.workingDir : group.usability.normalizedPath,
-          revision: group.record.revision }
-      : group.status === 'store_unavailable'
-        ? { status: 'store-unavailable' as const }
-        : { status: 'unbound' as const };
-  const resolution = resolveGroupWorkspaceCwd({
-    explicitWorkingDir: input.explicitWorkingDir,
-    oncall: input.oncall,
-    group: groupLayer,
-    botDefaultWorkingDir: input.botDefaultWorkingDir,
-  });
-  if (resolution.status === 'store-unavailable') return { status: 'store_unavailable', detail: 'group workspace store unavailable' };
-  if (resolution.status === 'invalid' || resolution.status === 'inaccessible') {
-    return { status: resolution.status === 'invalid' ? 'invalid_dir' : 'inaccessible', detail: resolution.workingDir };
-  }
-  if (resolution.status === 'picker') return { status: 'unbound' };
-  if (resolution.status !== 'selected') return { status: 'store_unavailable', detail: 'unexpected workspace resolution' };
-  const proof = probePathUsability(resolution.workingDir,
-    resolution.source === 'group' && resolution.groupWorkspaceDirectoryIdentity
-      ? { expectedIdentity: resolution.groupWorkspaceDirectoryIdentity } : undefined);
-  if (!proof.ok) {
-    // An invalid optional Bot default still means "pick a repository". A bound
-    // group/oncall/explicit target is authoritative and therefore fails closed.
-    if (resolution.source === 'bot-default') return { status: 'unbound' };
-    if (proof.reason === 'changed') return { status: 'identity_changed', detail: resolution.workingDir };
-    return { status: proof.reason === 'inaccessible' ? 'inaccessible' : 'invalid_dir', detail: resolution.workingDir };
-  }
-  const workspace = { path: proof.normalizedPath, ...proof.identity };
-  const mutation: SessionWorkingDirMutation = resolution.source === 'group'
-    ? { workingDir: workspace.path, source: 'group', groupWorkspaceRevision: resolution.groupWorkspaceRevision!,
-        groupWorkspaceIdentity: workspace }
-    : { workingDir: workspace.path, source: resolution.source };
-  return { status: 'resolved', workspace, mutation,
-    ...(resolution.groupWorkspaceRevision === undefined ? {} : { groupRevision: resolution.groupWorkspaceRevision }) };
-}
 
 function sessionCreatedAtMs(session: { createdAt?: string }): number {
   return session.createdAt ? (Date.parse(session.createdAt) || Date.now()) : Date.now();
@@ -315,7 +254,7 @@ async function resumeRestoredPendingRepoSetup(
   ensureSessionWhiteboard(ds);
   if (setup.rawInput) {
     rememberLastCliInput(ds, setup.rawInput, setup.rawInput, setup.turnId);
-    if (forkWorker(ds, '', { resume: false, turnId: setup.turnId }) === false) return;
+    forkWorker(ds, '', { resume: false, turnId: setup.turnId });
   } else {
     const bot = getBot(ds.larkAppId);
     const availableBots = await getAvailableBots(ds.larkAppId, ds.chatId);
@@ -355,7 +294,7 @@ async function resumeRestoredPendingRepoSetup(
         bot.botOpenId,
       ));
     }
-    if (forkWorker(ds, input, { resume: false, turnId: setup.turnId }) === false) return;
+    forkWorker(ds, input, { resume: false, turnId: setup.turnId });
   }
   logger.info(`[${ds.session.sessionId.substring(0, 8)}] Resumed durable pending repo opening without selectable projects`);
 }
@@ -1081,7 +1020,7 @@ export function formatAttachmentsHint(attachments?: LarkAttachment[], locale?: L
 function renderRoleContextBlock(
   larkAppId: string | undefined,
   chatId: string | undefined,
-  opts?: { followUp?: boolean },
+  opts?: { followUp?: boolean; escapeTagLikeContent?: boolean },
 ): string {
   if (!larkAppId || !chatId) return '';
 
@@ -1094,7 +1033,10 @@ function renderRoleContextBlock(
   if (opts?.followUp && injectMode === 'once') return '';
 
   const ctx = roleSource === 'team' ? 'team' : 'group';
-  return `<role context="${ctx}" chat_id="${xmlEscape(chatId)}">\n${roleContent}\n</role>`;
+  const renderedRoleContent = opts?.escapeTagLikeContent
+    ? escapeXmlTagLikeTokens(roleContent)
+    : roleContent;
+  return `<role context="${ctx}" chat_id="${xmlEscape(chatId)}">\n${renderedRoleContent}\n</role>`;
 }
 
 export function renderProjectGroupModeBlock(
@@ -1143,7 +1085,7 @@ export function renderStewardContextBlock(larkAppId: string | undefined, chatId:
 function renderApplicationRoleBlock(
   larkAppId: string | undefined,
   chatId: string | undefined,
-  opts?: { followUp?: boolean },
+  opts?: { followUp?: boolean; escapeTagLikeContent?: boolean },
 ): string {
   return [
     renderRoleContextBlock(larkAppId, chatId, opts),
@@ -1274,8 +1216,8 @@ function renderAvailableBotsBlock(
 function buildCodexAppTurnInput(opts: {
   text: string;
   roleBlock?: string;
-  formattingBlock?: string;
   responseStyleBlock?: string;
+  formattingBlock?: string;
   whiteboardBlock?: string;
   senderBlock?: string;
   substitutePolicyBlock?: string;
@@ -1293,8 +1235,8 @@ function buildCodexAppTurnInput(opts: {
 }): CodexAppTurnInput {
   const additionalContext: Record<string, CodexAppAdditionalContextEntry> = {};
   addCodexAppContext(additionalContext, 'botmux_role', opts.roleBlock ?? '', 'application');
-  addCodexAppContext(additionalContext, 'botmux_formatting', opts.formattingBlock ?? '', 'application');
   addCodexAppContext(additionalContext, 'botmux_response_style', opts.responseStyleBlock ?? '', 'application');
+  addCodexAppContext(additionalContext, 'botmux_formatting', opts.formattingBlock ?? '', 'application');
   addCodexAppContext(additionalContext, 'botmux_whiteboard', opts.whiteboardBlock ?? '', 'application');
   addCodexAppContext(additionalContext, 'botmux_sender', opts.senderBlock ?? '', 'untrusted');
   addCodexAppContext(additionalContext, 'botmux_substitute_policy', opts.substitutePolicyBlock ?? '', 'application');
@@ -1522,12 +1464,75 @@ type NewTopicOpts = {
   solo?: boolean;
   /** solo 裸文本时用于剥掉开头的自 @（同 buildBridgeInputContent）。 */
   selfMention?: { name?: string | null; openId?: string | null };
+  /** Force the compact first-turn envelope for a TraeX RPC session. */
+  traexRpcContextEnabled?: boolean;
 };
 
 type NewTopicBlockKey = 'routing' | 'skill' | 'identity' | 'credentials' | 'sessionId' | 'role'
   | 'summaryMemory' | 'responseStyle' | 'whiteboard' | 'groupJoin' | 'chatContextPolicy' | 'chatContext' | 'groupHistory'
   | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments'
   | 'mentions' | 'availableBots';
+
+function buildCompactTraexRoutingHints(
+  locale: Locale | undefined,
+  noTransport: boolean,
+  replyDelivery: ReplyDelivery,
+): string[] {
+  const full = buildBotmuxShellHints(locale, noTransport, replyDelivery);
+  if (noTransport || replyDelivery === 'transcript') return full;
+
+  const verboseKeys = [
+    'ai.shell.intro',
+    'ai.shell.commands_are_shell',
+    'ai.shell.how_to_send',
+    'ai.shell.multiline_heredoc',
+    'ai.shell.heredoc_example',
+    'ai.shell.helpers',
+    'ai.shell.when_to_send',
+    'ai.shell.mention_gate',
+  ];
+  const replaced = new Set(verboseKeys.map(key => escapeXmlTagLikeTokens(t(key, undefined, locale))));
+  const preservedConditionalHints = full.filter(line => !replaced.has(line));
+  const en = (locale ?? getDefaultLocale()) === 'en';
+  const compact = en
+    ? [
+        'Lark session: terminal output is invisible; reply with the shell command `botmux send`.',
+        'For multiline text use quoted heredoc/stdin or UTF-8 `--content-file`; never pass literal \\n or JSON-escaped text. Attach with `--images`, `--files`, or `--videos` plus `--video-covers`.',
+        "Example:\n```bash\nbotmux send <<'EOF'\nline 1\nline 2\nEOF\n```",
+        'Helpers: `botmux history`; `botmux quoted <message_id>` only when the prompt says a message was quoted; `botmux bots list`.',
+        'Every `botmux send` must choose exactly one: `--mention <open_id:name>`, `--mention-back`, or `--no-mention`; collaboration with another bot requires `--mention`.',
+        'Respond to addressed messages at least once via `botmux send`; only unrelated messages use final `BOTMUX_NOTHING_TO_SEND`.',
+      ]
+    : [
+        '飞书会话中终端输出用户不可见；回复用 shell 命令 `botmux send`。',
+        '多行正文用 quoted heredoc/stdin 或 UTF-8 `--content-file`，不得传字面量 `\\n` 或 JSON 转义文本；附件用 `--images`/`--files`/`--videos` 及 `--video-covers`。',
+        "示例：\n```bash\nbotmux send <<'EOF'\n第一行\n第二行\nEOF\n```",
+        '辅助：`botmux history`；仅在 prompt 提示引用时用 `botmux quoted <message_id>`；查群内 bot 用 `botmux bots list`。',
+        '每次 `botmux send` 必须三选一：`--mention <open_id:名字>` / `--mention-back` / `--no-mention`；与其他 bot 协作必须 `--mention`。',
+        '发给你的消息至少用 `botmux send` 回应一次；只有完全无关的消息才在 final 输出 `BOTMUX_NOTHING_TO_SEND`。',
+      ];
+  return [...compact.map(escapeXmlTagLikeTokens), ...preservedConditionalHints];
+}
+
+function buildCompactTraexBuiltinSkillCatalog(
+  entries: BuiltinSkillEntry[],
+  locale: Locale | undefined,
+): string {
+  if (entries.length === 0) return '';
+  const instruction = (locale ?? getDefaultLocale()) === 'en'
+    ? 'Trigger index; run `botmux skill show <name>` before using a matching skill.'
+    : '技能触发索引；匹配后先运行 `botmux skill show <name>` 读取完整说明。';
+  const skills = entries.map((entry) => {
+    const trigger = compactSkillTriggerSummary(entry.description);
+    return `  <skill name="${xmlEscape(entry.name)}"${trigger ? ` trigger="${xmlEscape(trigger)}"` : ''} />`;
+  });
+  return [
+    '<botmux_builtin_skills>',
+    `  <instruction>${escapeXmlTagLikeTokens(instruction)}</instruction>`,
+    ...skills,
+    '</botmux_builtin_skills>',
+  ].join('\n');
+}
 
 /** opening 的 hook 模式（#794 后续）：whiteboard/sender/mentions 搬进 hook envelope，
  *  PTY 文本只剩用户正文（+ role/summaryMemory 等稳定上下文）。与 follow-up 同一套
@@ -1553,12 +1558,14 @@ function buildNewTopicBlocks(
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   if (adapter.inputEnvelope === 'service-user') {
     // service-user 适配器（ebsd）自带完整外壳，不参与分块：包成单块返回。
-    // 固定 non-command 前缀先行；宿主回复规则独立成块，诊断正文保持原样。
+    // 全局回复规则位于固定 non-command 安全前缀之后、用户诊断正文之前；hook 模式下
+    // 该块不在 ENVELOPE_KEYS 里，全部留在 PTY 文本（service-user 也不满足 hook 前置条件）。
     return [{
       key: 'userMessage',
       text: buildServiceUserPrompt(
         [opts?.sharedGroupContext, userMessage, ...(followUps ?? [])].filter(Boolean).join('\n\n'),
-        undefined, locale, sessionIsNoTransport(opts?.larkAppId, opts?.chatId),
+        locale,
+        sessionIsNoTransport(opts?.larkAppId, opts?.chatId),
       ),
     }];
   }
@@ -1572,7 +1579,17 @@ function buildNewTopicBlocks(
   // transcript + solo，首轮同样去壳。
   const noTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
   const replyDelivery: ReplyDelivery = noTransport ? 'send' : replyDeliveryFor(opts?.larkAppId, cliId, opts?.promptInjection);
-  const bare = replyDelivery === 'transcript' && opts?.solo === true;
+  let compactTraexRpcContext = false;
+  if (cliId === 'traex') {
+    try {
+      compactTraexRpcContext = opts?.traexRpcContextEnabled
+        ?? getBot(opts?.larkAppId ?? '').config.codexRpcInput
+        ?? config.codexRpcInputDefault;
+    } catch {
+      compactTraexRpcContext = opts?.traexRpcContextEnabled ?? config.codexRpcInputDefault;
+    }
+  }
+  const bare = replyDelivery === 'transcript' && opts?.solo === true && !compactTraexRpcContext;
   // Built by the daemon, whose own env never carries a session marker: the
   // session row decides (a legacy node worker never comes through here).
   const sessionKind: WorkflowSessionKind = opts?.workflowNodeSession ? 'botNode' : 'ordinary';
@@ -1580,7 +1597,9 @@ function buildNewTopicBlocks(
   // hint list is unchanged.
   const hints = adapter.injectsSessionContext
     ? []
-    : buildBotmuxShellHints(locale, noTransport, replyDelivery, cliId, { sessionKind, hideLocalAddresses: hideLocalAddressesFor(opts?.larkAppId) });
+    : compactTraexRpcContext
+      ? buildCompactTraexRoutingHints(locale, noTransport, replyDelivery)
+      : buildBotmuxShellHints(locale, noTransport, replyDelivery, cliId, { sessionKind, hideLocalAddresses: hideLocalAddressesFor(opts?.larkAppId) });
 
   const routingBlock = hints.length > 0
     ? `<botmux_routing>\n${hints.join('\n')}\n</botmux_routing>`
@@ -1618,7 +1637,9 @@ function buildNewTopicBlocks(
         excludeRoutingCovered: true,
         sessionKind,
       });
-      skillBlock = buildBuiltinSkillCatalogBlock(entries, locale);
+      skillBlock = compactTraexRpcContext
+        ? buildCompactTraexBuiltinSkillCatalog(entries, locale)
+        : buildBuiltinSkillCatalogBlock(entries, locale);
     } else if (mode === 'off') {
       skillBlock = builtinSkillHelpPointer(locale, { sessionKind });
     }
@@ -1646,7 +1667,9 @@ function buildNewTopicBlocks(
     ].join('\n');
   }
 
-  const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId);
+  const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId, {
+    escapeTagLikeContent: compactTraexRpcContext,
+  });
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport,
@@ -1822,6 +1845,7 @@ export function buildNewTopicCliInput(
     /** 见 NewTopicOpts 同名字段。 */
     solo?: boolean;
     selfMention?: { name?: string | null; openId?: string | null };
+    traexRpcContextEnabled?: boolean;
     /** opening 轮的权威 turnId（= 发给 worker 的 turnId，最终成为
      *  managedTurnOrigin.turnId）。hook 模式下用于 sidecar 绑定；缺失回退 inline。 */
     turnId?: string;
@@ -1990,6 +2014,11 @@ type FollowUpOpts = {
   /** 不注入 <botmux_reminder>（「至少回应一次」）：群秘书这类默认静默的回合用，
    *  否则提醒与「无事不发」直接矛盾。 */
   omitReminder?: boolean;
+  /** The session's frozen launch config writes through TraeX RPC: render the
+   *  self-contained compact envelope (role on every turn). Omitting blocks the
+   *  native thread already accepted happens only at the worker's RPC write
+   *  edge, never in a payload that is queued, persisted or re-forked. */
+  traexRpcContext?: true;
 };
 
 function buildFollowUpBlocks(
@@ -2010,8 +2039,11 @@ function buildFollowUpBlocks(
   // 采集关闭，按 live 改口不 send 会静默（见 replyDeliveryFor 注释）。
   const noTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
   const transcript = !noTransport && replyDeliveryFor(opts?.larkAppId, opts?.cliId, opts?.promptInjection, frozenSessionSandbox(sessionId)) === 'transcript';
-  const bare = transcript && opts?.solo === true;
-  const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
+  const bare = transcript && opts?.solo === true && !opts?.traexRpcContext;
+  const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId, {
+    followUp: !opts?.traexRpcContext,
+    escapeTagLikeContent: !!opts?.traexRpcContext,
+  });
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport,
@@ -2105,7 +2137,8 @@ function buildFollowUpBlocks(
       : hookMode ? content : `<user_message>\n${content}\n</user_message>`,
   });
   // transcript + solo keeps the historical contract that visible content starts
-  // with the user's text. Hook mode still extracts this block into its sidecar.
+  // with the user's text. Append Botmux-owned style/formatting context after it;
+  // submit fingerprinting strips both known envelope tags before matching.
   if (responseStyleBlock && bare) blocks.push({ key: 'responseStyle', text: responseStyleBlock });
   if (formattingBlock && bare) blocks.push({ key: 'formatting', text: formattingBlock });
 
@@ -2143,18 +2176,21 @@ export function buildFollowUpContent(
     && !zeroPromptInjectionForBot(opts.larkAppId, opts.cliId, opts.promptInjection)
     && createCliAdapterSync(opts.cliId, opts.cliPathOverride).inputEnvelope === 'service-user'
   ) {
-    const formattingGuidance = sessionIsNoTransport(opts.larkAppId, opts.chatId) || opts.cliId === 'mira'
+    const noTransport = sessionIsNoTransport(opts.larkAppId, opts.chatId);
+    const formattingGuidance = noTransport || opts.cliId === 'mira'
       ? undefined
       : feishuReplyPresentationGuidance(opts.locale, hideLocalAddressesFor(opts.larkAppId));
     return buildServiceUserPrompt(
       [opts?.sharedGroupContext, content].filter(Boolean).join('\n\n'),
-      formattingGuidance, opts.locale, sessionIsNoTransport(opts.larkAppId, opts.chatId),
+      opts.locale,
+      noTransport,
+      formattingGuidance,
     );
   }
   return buildFollowUpBlocks(content, sessionId, opts).map((b) => b.text).join('\n\n');
 }
 
-function buildServiceUserPrompt(content: string, formattingGuidance?: string, locale?: Locale, noTransport = false): string {
+function buildServiceUserPrompt(content: string, locale?: Locale, noTransport = false, formattingGuidance?: string): string {
   const responseStyleBlock = noTransport
     ? ''
     : `<botmux_response_style>${t('ai.response_style.contract', undefined, locale)}</botmux_response_style>`;
@@ -2414,11 +2450,11 @@ export function buildFollowUpCliInput(
     codexAppInput: buildCodexAppTurnInput({
       text: opts.codexAppText ?? content,
       roleBlock: [roleBlock, summaryMemoryBlock].filter(Boolean).join('\n\n'),
-      formattingBlock,
       responseStyleBlock: sessionIsNoTransport(opts.larkAppId, opts.chatId)
         || zeroPromptInjectionForBot(opts.larkAppId, opts.cliId, opts.promptInjection)
         ? ''
         : `<botmux_response_style>${t('ai.response_style.contract', undefined, opts.locale)}</botmux_response_style>`,
+      formattingBlock,
       whiteboardBlock,
       senderBlock,
       substitutePolicyBlock,
@@ -2533,7 +2569,19 @@ export function buildBridgeInputContent(
 const STREAM_CARD_SENTINEL = '__posting__';
 
 /** Structured refork variant. Adopted external CLIs intentionally remain on
- * their existing raw bridge path and never receive a Codex App sidecar. */
+ * their existing raw bridge path and never receive a Codex App sidecar.
+ *  The compact RPC envelope only applies to a session whose frozen launch config
+ *  actually engages RPC: paste/sandbox/isolation/wrapper/startup-command sessions
+ *  have no turn/start transport and keep the legacy envelope. */
+export function traexRpcContextForSession(
+  ds: DaemonSession,
+  cliId: string | undefined,
+): FollowUpOpts['traexRpcContext'] {
+  if (cliId !== 'traex' || ds.adoptedFrom || !ds.initConfig || !ds.session.cliSessionId) return undefined;
+  if (!codexRpcEligible(ds.initConfig, { sandboxForced: sandboxEnabled() })) return undefined;
+  return true;
+}
+
 export function buildReforkCliInput(
   ds: DaemonSession,
   content: string,
@@ -2589,6 +2637,7 @@ export function buildReforkCliInput(
     codexAppMessageContext: opts?.codexAppMessageContext,
     solo: ds.soloSession,
     selfMention: opts?.selfMention,
+    traexRpcContext: traexRpcContextForSession(ds, opts?.cliId),
   });
 }
 
@@ -3727,10 +3776,6 @@ export async function restoreActiveSessions(
     // registration Promise yielded. Its backing pane can still be starting, so
     // a missing probe is not zombie evidence and restore must leave it alone.
     if (!stillOwnsRestoreRegistration(ds) || ds.worker) continue;
-    // A workspace-follow journal owns replacement recovery. Ordinary persistent
-    // reattach/cold recovery must not race it; daemon startup reconciles the
-    // journal before opening ingress.
-    if (ds.session.groupWorkspaceFollow) continue;
     // External /adopt sessions use their discovered source target rather than
     // Botmux's deterministic managed backing name. They were already restored
     // through the adopt path above and must not enter the managed probe batch.
@@ -5153,17 +5198,6 @@ export async function executeScheduledTask(
         if (activeSessions.get(key) !== existing || existing.session.status !== 'active') {
           throw new Error(`scheduled continuation lost active session ${existing.session.sessionId}`);
         }
-        const { missingStartDir, MissingWorkingDirError, publishWorkingDirRecovery } = await import('./working-dir-recovery.js');
-        const missingContinuationDir = missingStartDir(existing);
-        if (missingContinuationDir) {
-          await publishWorkingDirRecovery(existing, missingContinuationDir, {
-            sessionReply: (_rootId, content, msgType = 'text') => existing.scope === 'thread'
-              ? replyMessage(existing.larkAppId, sessionAnchorId(existing), content, msgType, true)
-              : sendMessage(existing.larkAppId, existing.chatId, content, msgType),
-            lastRepoScan: new Map(),
-          });
-          throw new MissingWorkingDirError(missingContinuationDir);
-        }
         markSessionActivity(existing);
         if (runtime?.runId) {
           recordScheduledSessionRun(existing.session, { taskId: task.id, runId: runtime.runId, turnId: scheduledTurnId,
@@ -5201,24 +5235,38 @@ export async function executeScheduledTask(
         });
         rememberLastCliInput(existing, task.prompt, input, scheduledTurnId);
         if (silent) armSilentScheduledTurn(existing, scheduledTurnId);
-        try {
-          const accepted = await dispatchWorkspaceAdmittedBusinessTurn({
-            ds: existing,
-            turnId: scheduledTurnId,
-            payload: input,
-            resume: existing.hasHistory,
-            ...(scheduledTrustedCaller ? { trustedCaller: scheduledTrustedCaller } : {}),
-            markAttempting: async () => true,
-          });
-          if (!accepted) {
-            if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
-            throw new Error(`scheduled task ${task.id} workspace admission rejected`);
+        if (existing.worker && !existing.worker.killed) {
+          try {
+            // sendWorkerInput reads the identity from OPTS, never from the
+            // payload (unlike forkWorker, which reads payload ?? opts). Passing
+            // it on `input` alone type-checks and then silently drops it — and
+            // this is the steady-state path for a recurring task (first fire
+            // creates the session, every later fire injects into it), so the
+            // failure shape would be "worked once, silently identity-less after".
+            if (sendWorkerInput(
+              existing,
+              input,
+              scheduledTurnId,
+              scheduledTrustedCaller ? { trustedCaller: scheduledTrustedCaller } : {},
+            )) {
+              logger.info(`[scheduler] Task "${task.name}" injected into live session ${existing.session.sessionId}${silent ? ' (silent)' : ''}`);
+              return;
+            }
+          } catch (err: any) {
+            logger.warn(`[scheduler] Live injection threw (${err.message}); cold-resuming registered session`);
           }
+        }
+        if (activeSessions.get(key) !== existing || existing.session.status !== 'active') {
+          if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
+          throw new Error(`scheduled continuation lost active session ${existing.session.sessionId}`);
+        }
+        try {
+          forkWorker(existing, input, { resume: existing.hasHistory, turnId: scheduledTurnId });
         } catch (err) {
           if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
           throw err;
         }
-        logger.info(`[scheduler] Task "${task.name}" admitted in session ${existing.session.sessionId}${silent ? ' (silent)' : ''}`);
+        logger.info(`[scheduler] Task "${task.name}" cold-resumed session ${existing.session.sessionId}${silent ? ' (silent)' : ''}`);
         return;
       }
 
@@ -5270,38 +5318,6 @@ export async function executeScheduledTask(
       };
     }
     session.lastMessageAt = new Date(now).toISOString();
-    const scheduleBotDefault = effectiveDefaultWorkingDir(bot.config);
-    const scheduleWorkspace = await resolveIngressWorkspace({
-      larkAppId, chatId: task.chatId, chatType: task.chatType === 'p2p' ? 'p2p' : 'group',
-      dataDir: config.session.dataDir, explicitWorkingDir: task.workingDir,
-      oncall: findOncallChat(larkAppId, task.chatId),
-      botDefaultWorkingDir: scheduleBotDefault,
-    });
-    let missingScheduleWorkingDir: string | undefined;
-    if (scheduleWorkspace.status === 'invalid_dir'
-      || (scheduleWorkspace.status === 'unbound' && scheduleBotDefault && !existsSync(scheduleBotDefault))) {
-      // A retained scheduled task whose explicit directory was deleted remains a
-      // recoverable conversation: register it under the original anchor and show
-      // the repo picker, but never cross the worker boundary. Other resolver
-      // failures (store outage, inaccessible path, identity drift) stay fail-closed.
-      const missingPath = scheduleWorkspace.status === 'invalid_dir'
-        ? scheduleWorkspace.detail
-        : scheduleBotDefault!;
-      missingScheduleWorkingDir = missingPath;
-      setSessionWorkingDirMetadata(session, {
-        workingDir: missingPath,
-        source: 'explicit',
-      });
-      // This registered recovery placeholder is the scheduled conversation to
-      // resume after /repo or /cd repairs the path; do not let the next fire
-      // classify it as disposable command scaffolding and create a second row.
-      session.suspendedColdResume = true;
-    } else if (scheduleWorkspace.status === 'resolved') {
-      setSessionWorkingDirMetadata(session, scheduleWorkspace.mutation);
-    } else {
-      sessionStore.closeSession(session.sessionId);
-      throw new Error(`scheduled task ${task.id} workspace_${scheduleWorkspace.status}`);
-    }
     // Effort is persisted with the session (mirroring trigger-session): unlike
     // the model it is not re-resolved from the bot on every spawn, so a later
     // resume of this scheduled session must find it here.
@@ -5366,27 +5382,10 @@ export async function executeScheduledTask(
         (winner ? ` to ${winner.session.sessionId}` : ''),
       );
     }
-    if (missingScheduleWorkingDir) {
-      const { MissingWorkingDirError, publishWorkingDirRecovery } = await import('./working-dir-recovery.js');
-      await publishWorkingDirRecovery(ds, missingScheduleWorkingDir, {
-        sessionReply: (_rootId, content, msgType = 'text') => ds.scope === 'thread'
-          ? replyMessage(ds.larkAppId, anchor, content, msgType, true)
-          : sendMessage(ds.larkAppId, ds.chatId, content, msgType),
-        lastRepoScan: new Map(),
-      });
-      ds.initialStartPending = false;
-      ds.pendingPrompt = undefined;
-      throw new MissingWorkingDirError(missingScheduleWorkingDir);
-    }
     rememberLastCliInput(ds, task.prompt, prompt, scheduledTurnId);
     if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
     try {
-      const accepted = await dispatchWorkspaceAdmittedBusinessTurn({
-        ds, turnId: scheduledTurnId, payload: prompt, resume: false,
-        ...(scheduledTrustedCaller ? { trustedCaller: scheduledTrustedCaller } : {}),
-        markAttempting: async () => true,
-      });
-      if (!accepted) throw new Error(`scheduled task ${task.id} workspace admission rejected`);
+      forkWorker(ds, prompt, scheduledTurnId);
     } catch (err) {
       if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
       await releaseStartRefusedForMissingDir(ds, err);
@@ -5503,14 +5502,6 @@ export async function deliverOwnerBatchTurn(
     }
     return bannerId;
   };
-  const boardWorkspace = await resolveIngressWorkspace({
-    larkAppId, chatId, chatType, dataDir: config.session.dataDir,
-    oncall: findOncallChat(larkAppId, chatId),
-    botDefaultWorkingDir: effectiveDefaultWorkingDir(bot.config),
-  });
-  if (boardWorkspace.status !== 'resolved' && boardWorkspace.status !== 'unbound') {
-    throw new Error(`decision board workspace_${boardWorkspace.status}`);
-  }
   if (independentByMode) await postBanner();
   // 横幅发送失败时回落 chat 锚点（与定时任务 chat 级触发同形）。
   const opensIndependentTopic = independentByMode && !!bannerId;
@@ -5581,17 +5572,22 @@ export async function deliverOwnerBatchTurn(
         });
         rememberLastCliInput(existing, input.prompt, payload, turnId);
         if (input.silent) armSilentScheduledTurn(existing, turnId);
+        if (existing.worker && !existing.worker.killed) {
+          try {
+            if (sendWorkerInput(existing, payload, turnId, trustedCaller ? { trustedCaller } : {})) {
+              logger.info(`[decision-board] Batch turn ${turnId} injected into steward session ${existing.session.sessionId}`);
+              return { sessionId: existing.session.sessionId, created: false };
+            }
+          } catch (err: any) {
+            logger.warn(`[decision-board] Live injection threw (${err.message}); cold-resuming steward session`);
+          }
+        }
         if (activeSessions.get(key) !== existing || existing.session.status !== 'active') {
           if (input.silent) disarmSilentScheduledTurn(existing, turnId);
           throw new Error(`steward session ${existing.session.sessionId} is no longer active`);
         }
         try {
-          const accepted = await dispatchWorkspaceAdmittedBusinessTurn({
-            ds: existing, turnId, payload, resume: existing.hasHistory,
-            ...(trustedCaller ? { trustedCaller } : {}),
-            markAttempting: async () => activeSessions.get(key) === existing && existing.session.status === 'active',
-          });
-          if (!accepted) throw new Error(`steward session ${existing.session.sessionId} workspace admission rejected`);
+          forkWorker(existing, payload, { resume: existing.hasHistory, turnId });
         } catch (err) {
           if (input.silent) disarmSilentScheduledTurn(existing, turnId);
           throw err;
@@ -5619,7 +5615,6 @@ export async function deliverOwnerBatchTurn(
       if (!input.silent) stampHumanActivity(session, now);
     }
     session.lastMessageAt = new Date(now).toISOString();
-    if (boardWorkspace.status === 'resolved') setSessionWorkingDirMetadata(session, boardWorkspace.mutation);
     sessionStore.updateSession(session);
     messageQueue.ensureQueue(anchor);
     const ds: DaemonSession = {
@@ -5635,7 +5630,7 @@ export async function deliverOwnerBatchTurn(
       cliVersion: getCurrentCliVersion(),
       lastMessageAt: now,
       hasHistory: false,
-      workingDir: boardWorkspace.status === 'resolved' ? boardWorkspace.workspace.path : undefined,
+      workingDir: effectiveDefaultWorkingDir(bot.config),
       initialStartPending: true,
       pendingPrompt: input.prompt,
     };
@@ -5672,12 +5667,7 @@ export async function deliverOwnerBatchTurn(
     rememberLastCliInput(ds, input.prompt, prompt, turnId);
     if (input.silent) armSilentScheduledTurn(ds, turnId);
     try {
-      const accepted = await dispatchWorkspaceAdmittedBusinessTurn({
-        ds, turnId, payload: prompt, resume: false,
-        ...(trustedCaller ? { trustedCaller } : {}),
-        markAttempting: async () => activeSessions.get(key) === ds && ds.session.status === 'active',
-      });
-      if (!accepted) throw new Error(`decision board batch ${turnId} workspace admission rejected`);
+      forkWorker(ds, prompt, turnId);
     } catch (err) {
       if (input.silent) disarmSilentScheduledTurn(ds, turnId);
       await releaseStartRefusedForMissingDir(ds, err);
@@ -5853,13 +5843,16 @@ export async function deliverWorkflowNodeTurn(
  *  模式下的 defaultOncall 目录；校验是真目录）。都没有 → undefined，表示「不钉目录」，交给
  *  forkOrShowRepoCard 弹 /repo 卡片让用户在群里选。与普通新话题的 resolvePinnedWorkingDir
  *  同口径（少了 sibling 继承那层，新群无 sibling 可继承）。*/
-async function resolveDashboardWorkspace(larkAppId: string, chatId: string): Promise<IngressWorkspaceResolution> {
-  const bot = getBot(larkAppId);
-  return resolveIngressWorkspace({
-    larkAppId, chatId, chatType: 'group', dataDir: config.session.dataDir,
-    oncall: findOncallChat(larkAppId, chatId),
-    botDefaultWorkingDir: effectiveDefaultWorkingDir(bot.config),
-  });
+function resolveDashboardSpawnWorkingDir(larkAppId: string, chatId: string): string | undefined {
+  const oncall = findOncallChat(larkAppId, chatId)?.workingDir;
+  if (oncall) return oncall;
+  const raw = effectiveDefaultWorkingDir(getBot(larkAppId).config);
+  if (!raw) return undefined;
+  const resolved = expandHome(raw);
+  try {
+    if (statSync(resolved).isDirectory()) return resolved;
+  } catch { /* not a dir → 当作没配 */ }
+  return undefined;
 }
 
 /** forkOrShowRepoCard 的缺目录分支：首轮按选仓流程落盘，发缺目录形态的选仓卡（没有「直接开启
@@ -6035,12 +6028,7 @@ async function forkOrShowRepoCard(
   const prompt = buildPrompt();
   const openingTurnId = ds.pendingTurnId ?? `opening-${randomUUID()}`;
   rememberLastCliInput(ds, userContent, prompt, openingTurnId);
-  const accepted = await dispatchWorkspaceAdmittedBusinessTurn({
-    ds, turnId: openingTurnId, payload: prompt, resume: false,
-    ...(ds.pendingTrustedCaller ? { trustedCaller: ds.pendingTrustedCaller } : {}),
-    markAttempting: async () => true,
-  });
-  if (!accepted) throw new Error('dashboard opening workspace admission rejected');
+  forkWorker(ds, prompt, { turnId: openingTurnId });
   // forkWorker pre-accept is synchronous. Keep the reservation and all input
   // buffers intact if it throws; only expose the normal worker state after it
   // has accepted the first turn.
@@ -6125,12 +6113,6 @@ export async function spawnDashboardSession(
   }
 
   refreshCliVersion?.(bot.config);
-  // Resolve before any visible banner/image side effect. A broken group binding
-  // is a failed business ingress, not permission to announce work that cannot run.
-  const initialWorkspace = await resolveDashboardWorkspace(larkAppId, chatId);
-  if (initialWorkspace.status !== 'resolved' && initialWorkspace.status !== 'unbound') {
-    return { ok: false, error: `workspace_${initialWorkspace.status}` };
-  }
 
   // 可见任务横幅：只由 creator/lead 那次 spawn 发一条，给群成员交代这群是干嘛的。
   // 纯文本、不 @ 任何 bot，不会误触发其它 bot。rootMessageId 存它仅为留痕（chat-scope
@@ -6196,12 +6178,8 @@ export async function spawnDashboardSession(
       session.kanbanColumn = 'backlog';
     }
 
-    const workingDirResolution = initialWorkspace;
-    const workingDir = workingDirResolution.status === 'resolved'
-      ? workingDirResolution.workspace.path : undefined;
-    if (workingDirResolution.status === 'resolved') {
-      setSessionWorkingDirMetadata(session, workingDirResolution.mutation);
-    }
+    const workingDir = resolveDashboardSpawnWorkingDir(larkAppId, chatId);
+    if (workingDir) session.workingDir = workingDir;
     sessionStore.updateSession(session);
     messageQueue.ensureQueue(anchor);
 
@@ -6348,10 +6326,7 @@ export async function createHeadlessSession(
       ...(args.failureDiagnostics === true ? { failureDiagnostics: true as const } : {}),
     };
     session.lastMessageAt = nowIso;
-    setSessionWorkingDirMetadata(session, {
-      workingDir: wd.resolvedPath,
-      source: args.workingDir ? 'explicit' : 'bot-default',
-    });
+    session.workingDir = wd.resolvedPath;
     if (args.reasoningEffort) session.reasoningEffort = args.reasoningEffort;
     sessionStore.updateSession(session);
     messageQueue.ensureQueue(chatId);
@@ -6447,16 +6422,11 @@ export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: bo
     try {
       const exactRetry = ds.session.queuedActivationInput;
       if (exactRetry) {
-        const retryTurnId = ds.session.queuedActivationTurnId ?? ds.session.rootMessageId;
-        const accepted = await dispatchWorkspaceAdmittedBusinessTurn({
-          ds, turnId: retryTurnId, payload: exactRetry,
+        forkWorker(ds, exactRetry, {
           resume: ds.session.queuedActivationResume ?? ds.hasHistory,
-          ...(ds.session.queuedActivationDispatchAttempt === undefined ? {} : {
-            dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
-          }),
-          markAttempting: async () => true,
+          turnId: ds.session.queuedActivationTurnId,
+          dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
         });
-        if (!accepted) throw new Error('queued activation workspace admission rejected');
         outcome = 'forked';
       } else {
         outcome = await forkOrShowRepoCard(ds, content);

@@ -4,6 +4,7 @@ import { normalizeLongTaskReminderConfig, type LongTaskReminderConfig } from './
 import { normalizeVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 import { normalizeReplyFooter, parseReplyFooterEnv, type ReplyFooterPreferences } from './services/reply-footer.js';
 import { parseGroupCreationDefaults, type GroupCreationDefaults } from './services/group-creation-options.js';
+import { parseInviteConfig, type InviteConfig } from './services/invite-config.js';
 import { readGlobalConfig } from './global-config.js';
 import { getTurnResultRuntime } from './core/turn-result-runtime.js';
 import { parseSandboxNetworkPolicy } from './core/sandbox-network-policy.js';
@@ -1276,8 +1277,6 @@ export interface OncallChat {
   chatId: string;
   /** Default working directory used for every new topic spawned in this chat. */
   workingDir: string;
-  /** Missing means a legacy/manual binding and is treated conservatively as explicit. */
-  provenance?: 'oncall-explicit' | 'oncall-default-auto';
 }
 
 /**
@@ -1495,6 +1494,8 @@ export interface BotConfig {
   oncallGroup?: OncallGroupPolicy;
   /** Opt-in defaults for explicit /g group creation. */
   groupCreation?: GroupCreationDefaults;
+  /** Per-bot member defaults for /invite all, independent of /g. */
+  inviteConfig?: InviteConfig;
   /** Per-chat final-answer feedback overrides, scoped to this bot app id. */
   chatFeedbackPolicies?: Record<string, FeedbackPolicyInput>;
   feedbackWebhooks?: { destinations: FeedbackWebhookDestination[] };
@@ -3133,13 +3134,7 @@ function refreshRegisteredOncallChatsFromDisk(): void {
       if (Array.isArray(entry.oncallChats)) {
         for (const chat of entry.oncallChats) {
           if (chat && typeof chat.chatId === 'string' && typeof chat.workingDir === 'string') {
-            const normalized: OncallChat = {
-              chatId: chat.chatId,
-              workingDir: chat.workingDir,
-              ...(chat.provenance === 'oncall-explicit' || chat.provenance === 'oncall-default-auto'
-                ? { provenance: chat.provenance }
-                : {}),
-            };
+            const normalized = { chatId: chat.chatId, workingDir: chat.workingDir };
             botChats.push(normalized);
             chats.set(normalized.chatId, normalized);
           }
@@ -3984,9 +3979,6 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         .map((c: any) => ({
           chatId: c.chatId,
           workingDir: c.workingDir,
-          ...(c.provenance === 'oncall-explicit' || c.provenance === 'oncall-default-auto'
-            ? { provenance: c.provenance }
-            : {}),
         }));
     }
 
@@ -4338,6 +4330,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       linkRefs: normalizeLinkRefConfig(entry.linkRefs),
       apiOnly: entry.apiOnly === true || undefined,
       groupCreation: entry.groupCreation === undefined ? undefined : parseGroupCreationDefaults(entry.groupCreation),
+      inviteConfig: entry.inviteConfig === undefined ? undefined : parseInviteConfig(entry.inviteConfig),
       oncallGroup: entry.oncallGroup === undefined ? undefined : normalizeOncallGroupPolicy(entry.oncallGroup),
       dispatchLaunchPolicy: (() => {
         if (!entry.dispatchLaunchPolicy || typeof entry.dispatchLaunchPolicy !== 'object') return undefined;

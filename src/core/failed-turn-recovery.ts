@@ -4,6 +4,7 @@ import type { DaemonSession } from './types.js';
 import { activeSessionKey } from './types.js';
 import * as store from '../services/session-store.js';
 import { buildFailedTurnRecord } from '../services/failed-turn-retry.js';
+import { turnAnswersInChat } from './failed-turn-rewind.js';
 import { isAutoCompactSafeComposerRefusal } from './auto-compact.js';
 import { canTalk } from '../im/lark/event-dispatcher.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
@@ -15,9 +16,8 @@ import { localeForBot } from '../i18n/index.js';
 import { inheritSessionLaunchConfiguration } from './session-launch-inheritance.js';
 import { armSilentScheduledTurn, disarmSilentScheduledTurn, isSilentScheduledTurn } from './silent-schedule-turns.js';
 import {
-  findActiveBySessionId, closeSessionForBackgroundCleanup,
+  findActiveBySessionId, closeSessionForBackgroundCleanup, forkWorker, sendWorkerInput,
   getActiveSessionsRegistry, setActiveSessionIfActive, prepareFailedTurnRecoveryIdentity,
-  dispatchWorkspaceAdmittedBusinessTurn,
 } from './worker-pool.js';
 
 export interface FailedTurnRecoveryRequest {
@@ -100,7 +100,7 @@ export function clearLimitedFailedTurn(ds: DaemonSession, turnId?: string): void
  * active turn; a late terminal must not erase an already-claimed receipt. */
 export function recordFailedTurnTerminal(
   ds: DaemonSession,
-  terminal: { turnId: string; status: string; errorCode?: string },
+  terminal: { turnId: string; status: string; errorCode?: string; retryable?: boolean; directFailure?: true },
   context: { workerGeneration: number; caller: TrustedCaller | undefined; silent: boolean },
 ): void {
   if (terminal.status === 'completed' && ds.session.workerGeneration === context.workerGeneration) {
@@ -119,6 +119,9 @@ export function recordFailedTurnTerminal(
     originalTurnId: ds.session.failedTurnRecovery?.turnId === terminal.turnId
       ? ds.session.failedTurnRecovery.originalTurnId : terminal.turnId,
   });
+  // Where its answer was to go is known only now (HTTP and suppression state
+  // is dropped once the terminal settles): freeze it for the rewind decision.
+  if (record?.directFailure && !context.silent && turnAnswersInChat(ds, terminal.turnId)) record.answersInChat = true;
   if (record) { ds.session.lastFailedTurn = record; store.updateSession(ds.session); }
 }
 
@@ -193,9 +196,7 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
         ds.session.lastFailedTurn = record;
         store.updateSession(ds.session);
       };
-      // Persist the claim before fresh teardown. This is not business
-      // `attempting`; the admitted callback below persists that state again only
-      // after workspace proof and a typed permit, immediately before IPC.
+      // Throws before close/IPC when persistence is unavailable.
       persistRecord();
       const setState = (state: NonNullable<FailedTurnRecord['recovery']>['state']) => {
         record.recovery!.state = state;
@@ -229,7 +230,7 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
           const created = store.createSession(ds.chatId, ds.session.rootMessageId, ds.session.title,
             ds.chatType, ds.scope, { source: 'other', inherit: ds.session });
           created.larkAppId = ds.larkAppId;
-          inheritSessionLaunchConfiguration(ds.session, created, ds.workingDir ?? ds.session.workingDir);
+          inheritSessionLaunchConfiguration(ds.session, created);
           for (const name of ['ownerOpenId', 'ownerUnionId', 'creatorOpenId', 'lastCallerOpenId',
             'larkThreadId', 'whiteboardId', 'quoteTargetId',
             'quoteTargetSenderOpenId', 'quoteTargetSenderIsBot'] as const) {
@@ -278,34 +279,20 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
             ...(codexAppInput.localImages ? { localImages: structuredClone(codexAppInput.localImages) } : {}) };
         }
         store.updateSession(target.session);
+        persistRecord();
         await prepareFailedTurnRecoveryIdentity(target, turnId);
         if (record.silent) armSilentScheduledTurn(target, turnId);
         // Synchronous final check + worker admission is the linearization edge.
         if (transaction.cancelled) { abandonUndispatched(); return setState('cancelled'); }
-        const accepted = await dispatchWorkspaceAdmittedBusinessTurn({
-          ds: target,
-          turnId,
-          payload: input,
-          resume: request.mode === 'retry' && target.hasHistory,
-          trustedCaller: recoveredCaller,
-          atMostOnce: true,
-          markAttempting: async () => {
-            if (transaction.cancelled) return false;
-            persistRecord();
-            ipcAttempted = true;
-            return true;
-          },
-        });
-        if (!accepted) {
-          if (ipcAttempted) return setState('dispatch_unknown');
-          if (transaction.cancelled) return setState('cancelled');
-          // Admission rejected before IPC: release this claim so the same failed
-          // turn remains retryable after the workspace/follow condition heals.
-          record.recovery = undefined;
-          persistRecord();
-          abandonUndispatched();
-          return { ok: false, error: 'workspace_admission_rejected' };
-        }
+        let rejected = false;
+        ipcAttempted = true;
+        const accepted = target.worker && !target.worker.killed
+          ? sendWorkerInput(target, input, turnId, { trustedCaller: recoveredCaller, atMostOnce: true })
+          : forkWorker(target, input, { resume: request.mode === 'retry' && target.hasHistory,
+            turnId, trustedCaller: recoveredCaller, atMostOnce: true }, {
+            onAdmission: admission => { rejected = admission === 'rejected'; },
+          });
+        if (!accepted || rejected) return setState('dispatch_unknown');
         rememberLastCliInput(target, record.userPrompt, input, turnId);
         store.updateSession(target.session);
         return setState('accepted');

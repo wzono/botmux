@@ -15,14 +15,17 @@ import { getBot, effectiveDefaultWorkingDir } from '../bot-registry.js';
 import { getChatMode, getMessageChatId, sendMessage, replyMessage, type ChatMode } from '../im/lark/client.js';
 import { resolveRegularGroupMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import { localeForBot, t } from '../i18n/index.js';
-import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput, resolveIngressWorkspace } from './session-manager.js';
+import { validateWorkingDir } from './working-dir.js';
+import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput } from './session-manager.js';
 import { markSessionActivity } from './session-activity.js';
+import { excludedTurnActivityAt } from './turn-outcome.js';
 import {
   closeSessionForBackgroundCleanup,
+  forkWorker,
   getCurrentCliVersion,
   getDaemonBootId,
   hasQueuedActivationAdmissionGate,
-  dispatchWorkspaceAdmittedBusinessTurn,
+  sendWorkerInput,
   setActiveSessionIfActive,
   withActiveSessionKeyLock,
 } from './worker-pool.js';
@@ -42,7 +45,6 @@ import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.j
 import { cliModelSupportsReasoningEffort } from '../services/codex-reasoning-effort.js';
 import { allowsTaskModelOverride } from './launch-model-capability.js';
 import { headlessChatId, isHeadlessId, newHeadlessId, saveHeadlessSession, updateHeadlessSession } from '../services/headless-session-store.js';
-import { setSessionWorkingDirMetadata, type SessionWorkingDirMutation } from './session-cwd.js';
 
 export interface TriggerSessionDeps {
   larkAppId: string;
@@ -195,6 +197,20 @@ export function trustedPayloadSessionInScope(requestChatId: string | undefined, 
   return sessionChatId.startsWith('http_async_') || sessionChatId.startsWith('http_wait_');
 }
 
+/** Zero-injection prompt of an external trigger: the caller's instruction,
+ *  then the event data as-is. An event without data (no rawText, payload
+ *  absent or `{}`) sends the instruction alone — rendering the missing payload
+ *  as `{}` put a stray "{}" line under every bare "继续" a connector sent. A
+ *  request with neither still renders its (empty) payload, as before: an empty
+ *  input is not a turn the CLI would start. */
+export function buildZeroInjectionTriggerPrompt(req: Pick<TriggerRequest, 'instruction' | 'envelope'>): string {
+  const { rawText, payload } = req.envelope;
+  const emptyPayload = payload === undefined || payload === null
+    || (typeof payload === 'object' && !Array.isArray(payload) && Object.keys(payload).length === 0);
+  const data = rawText ?? (emptyPayload ? undefined : JSON.stringify(payload));
+  return [req.instruction, data].filter(Boolean).join('\n\n') || JSON.stringify(payload ?? {});
+}
+
 export function buildUntrustedEventPrompt(req: TriggerRequest, triggerId: string): string {
   const applicationContext = buildExternalEventApplicationContext(req);
   const eventData = buildExternalEventDataContext(req, triggerId);
@@ -302,26 +318,18 @@ export function externalEventOpensOwnTopic(chatMode: ChatMode, regularGroupMode:
   return chatMode === 'topic' || regularGroupMode === 'new-topic';
 }
 
-async function resolveTriggerWorkspace(larkAppId: string, chatId: string): Promise<
-  { ok: true; mutation: SessionWorkingDirMutation; fromBotDefault: boolean }
-  | { ok: false; error: string }
-> {
+function resolveWorkingDir(larkAppId: string, chatId: string): { ok: true; workingDir: string; fromBotDefault: boolean } | { ok: false; error: string } {
   const bot = getBot(larkAppId);
-  const oncall = oncallStore.getOncallStatus(larkAppId, chatId);
-  const botDefaultWorkingDir = effectiveDefaultWorkingDir(bot.config) ?? bot.config.workingDir ?? '~';
-  const chatType = isHttpVirtualSession(chatId) ? 'p2p' : (await getChatMode(larkAppId, chatId)) === 'p2p' ? 'p2p' : 'group';
-  const resolution = await resolveIngressWorkspace({
-    larkAppId, chatId, chatType, dataDir: config.session.dataDir,
-    oncall, botDefaultWorkingDir,
-  });
-  if (resolution.status !== 'resolved') {
-    return { ok: false, error: `workspace_${resolution.status}: ${'detail' in resolution ? resolution.detail : ''}` };
-  }
-  return {
-    ok: true,
-    mutation: resolution.mutation,
-    fromBotDefault: resolution.mutation.source === 'bot-default',
-  };
+  const oncall = oncallStore.getOncallStatus(larkAppId, chatId)?.workingDir;
+  const botDefault = effectiveDefaultWorkingDir(bot.config);
+  const candidate = oncall || botDefault || bot.config.workingDir || '~';
+  const v = validateWorkingDir(candidate, localeForBot(larkAppId));
+  if (!v.ok) return { ok: false, error: v.error };
+  // 仅当命中本 bot 自己的 defaultWorkingDir（layer 3，非 oncall 绑定）时才允许 auto-worktree。
+  // 无 oncall 时 candidate 就是 botDefault（它排在 bot.config.workingDir/'~' 之前），故
+  // `!oncall && botDefault` 即可刻画"来自本 bot 默认目录"。
+  const fromBotDefault = !oncall && !!botDefault;
+  return { ok: true, workingDir: v.resolvedPath, fromBotDefault };
 }
 
 function activeBySessionId(activeSessions: Map<string, DaemonSession>, sessionId: string): DaemonSession | undefined {
@@ -741,6 +749,7 @@ function waitForSessionFinalOutput(
       resolve({ ok: false, triggerId, errorCode: 'wait_timeout', error: `wait timeout after ${timeoutMs}ms` });
     }, timeoutMs);
     ds.pendingWaitPromises!.set(triggerId, {
+      createdAt: Date.now(),
       resolve: (text: string) => {
         clearTimeout(timer);
         ds.pendingWaitPromises?.delete(triggerId);
@@ -1016,7 +1025,7 @@ async function triggerSessionTurnAdmitted(
   const dryRun = !!req.options?.dryRun;
   const promptForSession = (target?: DaemonSession) => zeroPromptInjectionForBot(larkAppId, undefined,
     target ? sessionPromptInjection(target) : undefined)
-    ? [req.instruction, req.envelope.rawText ?? JSON.stringify(req.envelope.payload ?? {})].filter(Boolean).join('\n\n')
+    ? buildZeroInjectionTriggerPrompt(req)
     : buildUntrustedEventPrompt(req, triggerId);
   const prompt = promptForSession();
   const topicMessage = buildExternalEventTopicMessage(req, larkAppId);
@@ -1415,7 +1424,12 @@ async function triggerSessionTurnAdmitted(
     const queuedBehindActivation = workerIsLive
       && hasQueuedActivationAdmissionGate(target);
     const recordAcceptedInput = (): void => {
-      markSessionActivity(target);
+      // Registration and accepted-input publication can cross a millisecond
+      // boundary. Reuse the exact per-turn timestamp that the excluded-terminal
+      // hold will read, so this round cannot stay pending behind its own later
+      // wall-clock acceptance time. Never take max(lastMessageAt): a subsequent
+      // human input owns that later timestamp.
+      markSessionActivity(target, excludedTurnActivityAt(target, triggerId) ?? Date.now());
       rememberInput(target, prompt, content);
     };
 
@@ -1559,20 +1573,6 @@ async function triggerSessionTurnAdmitted(
       }
     };
 
-    const dispatchAdmittedTrigger = (payload: string | CliTurnPayload, options: {
-      dispatchAttempt?: number; atMostOnce?: true; codexAppSteerable?: true;
-    } = {}) => dispatchWorkspaceAdmittedBusinessTurn({
-      ds: target,
-      turnId: triggerId,
-      payload,
-      resume: target.hasHistory,
-      markAttempting: async () => true,
-      ...(internal?.queueAfterActiveTurn ? { queueAfterActiveTurn: true as const } : {}),
-      ...(options.dispatchAttempt === undefined ? {} : { dispatchAttempt: options.dispatchAttempt }),
-      ...(options.codexAppSteerable ? { codexAppSteerable: true as const } : {}),
-      ...(options.atMostOnce ? { atMostOnce: true as const } : {}),
-    });
-
     if (workerIsLive) {
       if (req.options?.waitForFinalOutput) {
         return waitForSessionFinalOutput(
@@ -1588,16 +1588,14 @@ async function triggerSessionTurnAdmitted(
             message: 'delivered to existing session and completed',
           }),
           () => {
-            void (async () => {
-              const dispatchAttempt = prepareStableDispatch(target, false);
-              armFinalOutputSuppression(target, dispatchAttempt);
-              const accepted = await dispatchAdmittedTrigger(content, {
-                ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-                ...(steerRequested ? { codexAppSteerable: true as const } : {}),
-              });
-              if (!accepted) throw new Error('worker refused trigger input before acceptance');
-              recordAcceptedInput();
-            })().catch(error => target.pendingWaitPromises?.get(triggerId)?.reject?.(error instanceof Error ? error : new Error(String(error))));
+            const dispatchAttempt = prepareStableDispatch(target, false);
+            armFinalOutputSuppression(target, dispatchAttempt);
+            const accepted = sendWorkerInput(target, content, triggerId, {
+              ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+              ...(steerRequested ? { codexAppSteerable: true as const } : {}),
+            });
+            if (!accepted) throw new Error('worker refused trigger input before acceptance');
+            recordAcceptedInput();
           },
         );
       }
@@ -1633,9 +1631,13 @@ async function triggerSessionTurnAdmitted(
           beginAsyncTrigger(target, triggerId);
           const dispatchAttempt = prepareStableDispatch(target, false);
           armFinalOutputSuppression(target, dispatchAttempt);
-          accepted = await dispatchAdmittedTrigger(content, {
+          accepted = sendWorkerInput(target, content, triggerId, {
             ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-            ...(turnLease ? { atMostOnce: true as const } : {}),
+            // At-most-once: a keyed follow-up delivered to a LIVE worker must be
+            // tagged so a CLI crash never replays it onto the auto-restarted CLI
+            // after the daemon has already terminalized it (dispatch_unknown). The
+            // dormant-fork branch rides atMostOnce on the fork init instead.
+            ...(turnLease ? { atMostOnce: true } : {}),
             ...(steerRequested ? { codexAppSteerable: true as const } : {}),
           });
         } catch (err) {
@@ -1689,9 +1691,9 @@ async function triggerSessionTurnAdmitted(
       const dispatchAttempt = prepareStableDispatch(target, false);
       armFinalOutputSuppression(target, dispatchAttempt);
       armLoudFinalSuppression(target);
-      const accepted = await dispatchAdmittedTrigger(content, {
+      const accepted = sendWorkerInput(target, content, triggerId, {
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-        ...(internal?.atMostOnce ? { atMostOnce: true as const } : {}),
+        ...(internal?.atMostOnce ? { atMostOnce: true } : {}),
         ...(steerRequested ? { codexAppSteerable: true as const } : {}),
         ...(internal?.queueAfterActiveTurn ? { queueAfterActiveTurn: true as const } : {}),
       });
@@ -1737,14 +1739,13 @@ async function triggerSessionTurnAdmitted(
           message: 'delivered to existing session and completed',
         }),
         () => {
-          void (async () => {
-            const dispatchAttempt = prepareStableDispatch(target, true);
-            armFinalOutputSuppression(target, dispatchAttempt);
-            if (!await dispatchAdmittedTrigger(withSteer(content), {
-              ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-              ...(steerRequested ? { codexAppSteerable: true as const } : {}),
-            })) throw new Error('workspace admission rejected');
-          })().catch(error => target.pendingWaitPromises?.get(triggerId)?.reject?.(error instanceof Error ? error : new Error(String(error))));
+          const dispatchAttempt = prepareStableDispatch(target, true);
+          armFinalOutputSuppression(target, dispatchAttempt);
+          forkWorker(target, withSteer(content), {
+            resume: target.hasHistory,
+            turnId: triggerId,
+            ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+          });
         },
       );
     }
@@ -1779,11 +1780,12 @@ async function triggerSessionTurnAdmitted(
         beginAsyncTrigger(target, triggerId);
         const dispatchAttempt = prepareStableDispatch(target, true);
         armFinalOutputSuppression(target, dispatchAttempt);
-        if (!await dispatchAdmittedTrigger(withSteer(content), {
+        forkWorker(target, withSteer(content), {
+          resume: target.hasHistory,
+          turnId: triggerId,
           ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
-          ...(atMostOnce ? { atMostOnce: true as const } : {}),
-          ...(steerRequested ? { codexAppSteerable: true as const } : {}),
-        })) throw new Error('workspace admission rejected');
+          ...(atMostOnce ? { atMostOnce: true } : {}),
+        });
         recordHeadlessTurn(target);
       } catch (err) {
         // A throw AFTER the attempting barrier (begin/prepare/fork). Terminalize
@@ -1815,11 +1817,12 @@ async function triggerSessionTurnAdmitted(
     const dispatchAttempt = prepareStableDispatch(target, true);
     armFinalOutputSuppression(target, dispatchAttempt);
     armLoudFinalSuppression(target);
-    const admitted = await dispatchAdmittedTrigger(withSteer(content), {
-      ...(internal?.atMostOnce ? { atMostOnce: true as const } : {}),
+    forkWorker(target, withSteer(content), {
+      resume: target.hasHistory,
+      turnId: triggerId,
+      ...(internal?.atMostOnce ? { atMostOnce: true } : {}),
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     });
-    if (!admitted) return { ok: false, triggerId, errorCode: 'trigger_failed', error: 'workspace admission rejected' };
     return {
       ok: true,
       triggerId,
@@ -1831,7 +1834,7 @@ async function triggerSessionTurnAdmitted(
 
   if (ds) return deliverToExisting(ds);
 
-  const wd = await resolveTriggerWorkspace(larkAppId, chatId);
+  const wd = resolveWorkingDir(larkAppId, chatId);
   if (!wd.ok) {
     return { ok: false, errorCode: 'trigger_failed', error: wd.error };
   }
@@ -1912,7 +1915,7 @@ async function triggerSessionTurnAdmitted(
       };
     }
     session.lastMessageAt = nowIso;
-    setSessionWorkingDirMetadata(session, wd.mutation);
+    session.workingDir = wd.workingDir;
     session.cliId = bot.config.cliId;
     // Per-turn model / reasoning-effort overrides follow the same explicit CLI
     // policy as schedules, independently of bot-level effort configuration.
@@ -1939,7 +1942,7 @@ async function triggerSessionTurnAdmitted(
         sessionId: session.sessionId,
         larkAppId,
         title: session.title,
-        workingDir: wd.mutation.workingDir,
+        workingDir: wd.workingDir,
         model: req.options?.model,
         reasoningEffort: req.options?.reasoningEffort,
         createdAt: nowIso,
@@ -1963,7 +1966,7 @@ async function triggerSessionTurnAdmitted(
       cliVersion: getCurrentCliVersion(),
       lastMessageAt: now,
       hasHistory: false,
-      workingDir: wd.mutation.workingDir,
+      workingDir: wd.workingDir,
       ...(triggerModelOverride ? { spawnModelOverride: triggerModelOverride } : {}),
     };
     // Retain the complete opening input until a worker or repo workflow has
@@ -1978,7 +1981,7 @@ async function triggerSessionTurnAdmitted(
       try {
         stagePendingRepoSetup(newDs, {
           mode: 'auto_worktree',
-          baseDir: wd.mutation.workingDir,
+          baseDir: wd.workingDir,
           turnId: triggerId,
         });
       } catch (err) {
@@ -2036,7 +2039,7 @@ async function triggerSessionTurnAdmitted(
     armLoudFinalSuppression(newDs);
     const { runAutoWorktreeCommit } = await import('../im/lark/card-handler.js');
     void runAutoWorktreeCommit({
-      ds: newDs, anchor, larkAppId, baseDir: wd.mutation.workingDir, title: triggerTitle(req),
+      ds: newDs, anchor, larkAppId, baseDir: wd.workingDir, title: triggerTitle(req),
       operatorOpenId: session.ownerOpenId, activeSessions: deps.activeSessions,
       // Thread-scope anchor is a topic-root message id (om_…) → reply-in-thread;
       // chat-scope anchor is a chat_id → plain send. (Fixes the om_→chat_id misroute.)
@@ -2176,20 +2179,6 @@ async function triggerSessionTurnAdmitted(
     }
   }
 
-  const dispatchNewAdmitted = (options: {
-    dispatchAttempt?: number; atMostOnce?: true; codexAppSteerable?: true;
-    markAttempting?: () => Promise<boolean>;
-  } = {}) => dispatchWorkspaceAdmittedBusinessTurn({
-    ds: newDs,
-    turnId: triggerId,
-    payload: promptInput,
-    resume: false,
-    markAttempting: options.markAttempting ?? (async () => true),
-    ...(options.dispatchAttempt === undefined ? {} : { dispatchAttempt: options.dispatchAttempt }),
-    ...(options.atMostOnce ? { atMostOnce: true as const } : {}),
-    ...(options.codexAppSteerable ? { codexAppSteerable: true as const } : {}),
-  });
-
   // CAS the lease reserved→attempting immediately before dispatch (commit-unknown
   // barrier). Throws → caller rolls back (releases the reserved lease).
   const markAttemptingBeforeDispatch = (): void => {
@@ -2214,14 +2203,12 @@ async function triggerSessionTurnAdmitted(
         message: 'queued new session turn and completed',
       }),
       () => {
-        void (async () => {
-          const dispatchAttempt = prepareStableDispatch(newDs, true);
-          armFinalOutputSuppression(newDs, dispatchAttempt);
-          if (!await dispatchNewAdmitted({ ...(dispatchAttempt === undefined ? {} : { dispatchAttempt }) })) {
-            throw new Error('workspace admission rejected');
-          }
-          releaseInitialReservation();
-        })().catch(error => newDs.pendingWaitPromises?.get(triggerId)?.reject?.(error instanceof Error ? error : new Error(String(error))));
+        const dispatchAttempt = prepareStableDispatch(newDs, true);
+        armFinalOutputSuppression(newDs, dispatchAttempt);
+        forkWorker(newDs, promptInput, dispatchAttempt === undefined
+          ? triggerId
+          : { turnId: triggerId, dispatchAttempt });
+        releaseInitialReservation();
       },
     );
   }
@@ -2329,10 +2316,10 @@ async function triggerSessionTurnAdmitted(
       // object form so `atMostOnce` rides the init message even when there's no
       // dispatchAttempt (keyed turns have none).
       const atMostOnce = !!(idempotencyKey && idempotencyLease);
-      if (!await dispatchNewAdmitted({
-        ...(dispatchAttempt === undefined ? {} : { dispatchAttempt }),
-        ...(atMostOnce ? { atMostOnce: true as const } : {}),
-      })) throw new Error('workspace admission rejected');
+      const forkArg = (dispatchAttempt === undefined && !atMostOnce)
+        ? triggerId
+        : { turnId: triggerId, ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}), ...(atMostOnce ? { atMostOnce: true } : {}) };
+      forkWorker(newDs, promptInput, forkArg);
       releaseInitialReservation();
     } catch (err) {
       // The ONLY thing that lets us honestly report a terminal `failed` is a
@@ -2383,23 +2370,19 @@ async function triggerSessionTurnAdmitted(
   if (stableTurnId) {
     const dispatchAttempt = prepareStableDispatch(newDs, true);
     armFinalOutputSuppression(newDs, dispatchAttempt);
-    if (!await dispatchNewAdmitted({ ...(dispatchAttempt === undefined ? {} : { dispatchAttempt }) })) {
-      return { ok: false, triggerId, errorCode: 'trigger_failed', error: 'workspace admission rejected' };
-    }
+    forkWorker(newDs, promptInput, dispatchAttempt === undefined
+      ? triggerId
+      : { turnId: triggerId, dispatchAttempt });
     releaseInitialReservation();
   }
   else if (loudTurnId) {
     prepareTriggerPresentation(newDs, true);
     armLoudFinalSuppression(newDs);
-    if (!await dispatchNewAdmitted()) {
-      return { ok: false, triggerId, errorCode: 'trigger_failed', error: 'workspace admission rejected' };
-    }
+    forkWorker(newDs, promptInput, loudTurnId);
     releaseInitialReservation();
   }
   else {
-    if (!await dispatchNewAdmitted()) {
-      return { ok: false, triggerId, errorCode: 'trigger_failed', error: 'workspace admission rejected' };
-    }
+    forkWorker(newDs, promptInput, triggerId);
     releaseInitialReservation();
   }
 

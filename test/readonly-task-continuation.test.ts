@@ -49,24 +49,7 @@ afterEach(() => {
 });
 
 describe('ReadonlyTaskContinuationCoordinator', () => {
-  it('does not consume or churn continuation identity while admission keeps rejecting', async () => {
-    const timers: Array<() => void | Promise<void>> = [];
-    const enqueue = vi.fn(async () => false as const);
-    const coordinator = new ReadonlyTaskContinuationCoordinator({
-      schedule: (_delayMs, run) => { timers.push(run); return run; }, cancel: vi.fn(),
-      persist: vi.fn(), enqueue, warn: vi.fn(), enabled: () => true,
-      now: () => 2_000, randomId: () => 'same', delayMs: 1,
-    });
-    coordinator.restore(state());
-    coordinator.onTerminal(state(), { turnId: 'om_original', status: 'completed', workerGeneration: 1 });
-    const firstRetry = timers.at(-1)!;
-    await firstRetry();
-    expect((coordinator as any).state).toMatchObject({ continuationsStarted: 0, currentTurnId: 'om_original', status: 'backoff' });
-    await timers.at(-1)!();
-    expect((coordinator as any).state).toMatchObject({ continuationsStarted: 0, currentTurnId: 'om_original', status: 'backoff' });
-    expect(enqueue).toHaveBeenCalledTimes(2);
-  });
-  it('continues a completed turn without replaying the original prompt', async () => {
+  it('continues a completed turn without replaying the original prompt', () => {
     const timers: Array<() => void> = [];
     const enqueue = vi.fn(() => 7);
     const coordinator = new ReadonlyTaskContinuationCoordinator({
@@ -87,11 +70,10 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
       status: 'completed',
       workerGeneration: 1,
     }).status).toBe('backoff');
-    await timers.at(-1)!();
+    timers.at(-1)!();
     expect((coordinator as any).state).toMatchObject({ currentWorkerGeneration: 7 });
 
     expect(enqueue).toHaveBeenCalledWith({
-      leaseId: 'readonly-lease',
       logicalTurnId: 'om_original',
       turnId: 'bmx-continuation-next',
       dispatchAttempt: 1,
@@ -330,7 +312,7 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
     expect(timers.at(-1)?.delayMs).toBe(5_000);
   });
 
-  it('continues only the exact allowlisted failed terminal', async () => {
+  it('continues only the exact allowlisted failed terminal', () => {
     const timers: Array<() => void> = [];
     const coordinator = new ReadonlyTaskContinuationCoordinator({
       schedule: (_delayMs, run) => { timers.push(run); return run; },
@@ -458,7 +440,7 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
     TASK_CONTINUATION_RATE_LIMIT_CODE,
     TASK_CONTINUATION_CONNECTION_CODE,
     TASK_CONTINUATION_UPSTREAM_CODE,
-  ])('restores the allowlisted persisted backoff %s', async errorCode => {
+  ])('restores the allowlisted persisted backoff %s', errorCode => {
     const timers: Array<() => void> = [];
     const enqueue = vi.fn(() => 2);
     const coordinator = new ReadonlyTaskContinuationCoordinator({
@@ -477,7 +459,7 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
       nextAttemptAt: 3_000,
       lastErrorCode: errorCode,
     }));
-    await timers.at(-1)!();
+    timers.at(-1)!();
 
     expect(enqueue).toHaveBeenCalledOnce();
     expect(enqueue).toHaveBeenCalledWith(expect.objectContaining({
@@ -589,7 +571,7 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
     }));
   });
 
-  it('waits for worker/RPC readiness without consuming a continuation attempt', async () => {
+  it('waits for worker/RPC readiness without consuming a continuation attempt', () => {
     const timers: Array<() => void> = [];
     let ready = false;
     const enqueue = vi.fn(() => 9);
@@ -610,14 +592,14 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
       turnId: 'om_original', status: 'completed', workerGeneration: 1,
     });
 
-    await timers.at(-1)!();
+    timers.at(-1)!();
     expect(enqueue).not.toHaveBeenCalled();
     expect((coordinator as any).state).toMatchObject({
       status: 'backoff', continuationsStarted: 0, nextAttemptAt: 3_000,
     });
 
     ready = true;
-    await timers.at(-1)!();
+    timers.at(-1)!();
     expect(enqueue).toHaveBeenCalledOnce();
     expect((coordinator as any).state).toMatchObject({
       status: 'active', continuationsStarted: 1, currentWorkerGeneration: 9,
@@ -762,7 +744,7 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
     }).status).toBe('cancelled');
   });
 
-  it('expires an active lease even when the CLI never emits another terminal', async () => {
+  it('expires an active lease even when the CLI never emits another terminal', () => {
     const timers: Array<() => void> = [];
     let now = 1_000;
     const warn = vi.fn();
@@ -787,7 +769,7 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
     }).status).toBe('active');
     expect(timers).toHaveLength(1);
     now = 6_000;
-    await timers.at(-1)!();
+    timers.at(-1)!();
     expect(persist).toHaveBeenLastCalledWith(expect.objectContaining({
       status: 'expired',
       lastErrorCode: 'readonly_continuation_expired',
@@ -885,7 +867,7 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
-  it('fails closed without crashing when activation persistence fails after enqueue', async () => {
+  it('fails closed without crashing when activation persistence fails after enqueue', () => {
     const timers: Array<() => void> = [];
     let persistCalls = 0;
     const warn = vi.fn();
@@ -905,7 +887,7 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
     coordinator.restore(state());
     coordinator.onTerminal(state(), { turnId: 'om_original', status: 'completed', workerGeneration: 1 });
 
-    await expect(timers.at(-1)!()).resolves.toBeUndefined();
+    expect(() => timers.at(-1)!()).not.toThrow();
     expect(warn).toHaveBeenCalledWith(expect.objectContaining({
       status: 'failed',
       lastErrorCode: 'readonly_continuation_activation_persist_failed',
@@ -1053,7 +1035,7 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
-  it('keeps retrying a pending warning until its delivery window expires', async () => {
+  it('keeps retrying a pending warning until its delivery window expires', () => {
     const timers: Array<() => void> = [];
     let now = 2_000;
     const warn = vi.fn();
@@ -1083,7 +1065,7 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
       nextAttemptAt: 62_000,
     });
     now = 62_000;
-    await timers.at(-1)!();
+    timers.at(-1)!();
     expect(warn).toHaveBeenCalledTimes(2);
 
     now = 1_500 + 55 * 60_000;
@@ -1096,7 +1078,7 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
 });
 
 describe('attached task continuation', () => {
-  it('persists the lease, copies routing context, and exposes explicit terminal controls', async () => {
+  it('persists the lease, copies routing context, and exposes explicit terminal controls', () => {
     const session: ReadonlyTaskContinuationSession = {
       sessionId: 'session',
       turnReplyContexts: { om_original: { inThread: true } },
@@ -1123,7 +1105,7 @@ describe('attached task continuation', () => {
     expect(handleReadonlyTaskContinuationTerminal(session, {
       turnId: 'om_original', status: 'completed', workerGeneration: 1,
     })?.status).toBe('backoff');
-    await timers.at(-1)!();
+    timers.at(-1)!();
     expect(session.turnReplyContexts?.['bmx-continuation-next']).toEqual({ inThread: true });
     expect(session.replyTargets?.['bmx-continuation-next']).toEqual({ rootMessageId: 'om_root' });
     expect(enqueue).toHaveBeenCalledOnce();

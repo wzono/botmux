@@ -32,13 +32,6 @@ vi.mock('../src/core/worker-pool.js', () => ({
   dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   forkWorker: wp.forkWorker,
   sendWorkerInput: wp.sendWorkerInput,
-  dispatchWorkspaceAdmittedBusinessTurn: vi.fn(async (input: any) => {
-    if (!await input.markAttempting()) return false;
-    if (input.ds.worker && !input.ds.worker.killed) return wp.sendWorkerInput(input.ds, input.payload, input.turnId,
-      input.trustedCaller ? { trustedCaller: input.trustedCaller } : {});
-    wp.forkWorker(input.ds, input.payload, input.turnId);
-    return true;
-  }),
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
   withActiveSessionKeyLock: vi.fn(async (_map: Map<string, any>, _key: string, action: () => any) => action()),
   setActiveSessionIfActive: vi.fn((map: Map<string, any>, key: string, ds: any) => {
@@ -302,14 +295,13 @@ describe('静默回合（群秘书摘要）', () => {
     expect(JSON.stringify((wp.sendWorkerInput.mock.calls.at(-1) as any[])[1])).toContain('botmux_reminder');
   });
 
-  it('已有会话准入拒绝：撤销静默登记且不绕过准入重启 worker', async () => {
+  it('注入失败且冷启动也抛错：撤销静默登记', async () => {
     const map = new Map<string, any>();
     const ds = liveSession(map);
     wp.sendWorkerInput.mockReturnValueOnce(false);
-    await expect(deliverOwnerBatchTurn(SILENT, map, () => false)).rejects.toThrow(/workspace admission rejected/);
+    wp.forkWorker.mockImplementationOnce(() => { throw new Error('spawn failed'); });
+    await expect(deliverOwnerBatchTurn(SILENT, map, () => false)).rejects.toThrow(/spawn failed/);
     expect(isSilentScheduledTurn(ds as any, SILENT.turnId)).toBe(false);
-    expect(wp.forkWorker).not.toHaveBeenCalled();
-    expect([...map.values()]).toContain(ds);
   });
 
   it('话题群没有会话：不发横幅，回落到 chat 锚点新建静默会话，不写人活动钟', async () => {

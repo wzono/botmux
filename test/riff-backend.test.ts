@@ -6,8 +6,7 @@
  * Run:  pnpm vitest run test/riff-backend.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -65,100 +64,6 @@ describe('RiffBackend', () => {
   }
 
   const flush = () => new Promise((r) => setTimeout(r, 0));
-  function makeGroupRepo(prefix: string): string {
-    const root = mkdtempSync(join(tmpdir(), prefix));
-    execFileSync('git', ['init', '-b', 'group-branch'], { cwd: root });
-    execFileSync('git', ['remote', 'add', 'origin', 'git@example.com:acme/repo.git'], { cwd: root });
-    writeFileSync(join(root, 'README'), 'x'); execFileSync('git', ['add', '.'], { cwd: root });
-    execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-m', 'x'], { cwd: root });
-    execFileSync('git', ['update-ref', 'refs/remotes/origin/group-branch', 'HEAD'], { cwd: root });
-    return root;
-  }
-
-  it('keeps the receipt pending through JWT prep and rejects a proof change before fetch', async () => {
-    const root = makeGroupRepo('riff-write-prep-barrier-');
-    const moved = `${root}-moved`;
-    const stat = statSync(root, { bigint: true });
-    const be = makeBackend();
-    be.spawn('', [], { cwd: root, expectedWorkingDirIdentity: { dev: String(stat.dev), ino: String(stat.ino) } } as never);
-    let releaseJwt!: () => void;
-    (be as any).getJwt = vi.fn(() => new Promise<string>(resolve => { releaseJwt = () => resolve('test-jwt'); }));
-    try {
-      let settled = false;
-      const receipt = be.writeBusinessInput('barrier prompt').then(value => { settled = true; return value; });
-      await vi.waitFor(() => expect(releaseJwt).toBeTypeOf('function'));
-      expect(settled).toBe(false);
-      renameSync(root, moved); mkdirSync(root);
-      releaseJwt();
-      await expect(receipt).resolves.toBe('retryable_pre_dispatch_rejection');
-      expect(calls.filter(call => call.url.includes('/api/task-execute'))).toHaveLength(0);
-    } finally {
-      be.kill(); rmSync(root, { recursive: true, force: true }); rmSync(moved, { recursive: true, force: true });
-    }
-  });
-
-  it('rejects same-repository same-branch inode replacement during JWT prep', async () => {
-    const root = makeGroupRepo('riff-write-same-repo-replacement-');
-    const moved = `${root}-moved`;
-    const stat = statSync(root, { bigint: true });
-    const be = makeBackend();
-    be.spawn('', [], { cwd: root, expectedWorkingDirIdentity: { dev: String(stat.dev), ino: String(stat.ino) } } as never);
-    let releaseJwt!: () => void;
-    (be as any).getJwt = vi.fn(() => new Promise<string>(resolve => { releaseJwt = () => resolve('test-jwt'); }));
-    try {
-      const receipt = be.writeBusinessInput('same repo replacement');
-      await vi.waitFor(() => expect(releaseJwt).toBeTypeOf('function'));
-      renameSync(root, moved);
-      execFileSync('git', ['clone', '-q', '-b', 'group-branch', moved, root]);
-      execFileSync('git', ['remote', 'set-url', 'origin', 'git@example.com:acme/repo.git'], { cwd: root });
-      execFileSync('git', ['update-ref', 'refs/remotes/origin/group-branch', 'HEAD'], { cwd: root });
-      releaseJwt();
-      await expect(receipt).resolves.toBe('retryable_pre_dispatch_rejection');
-      expect(calls.filter(call => call.url.includes('/api/task-execute'))).toHaveLength(0);
-    } finally {
-      be.kill(); rmSync(root, { recursive: true, force: true }); rmSync(moved, { recursive: true, force: true });
-    }
-  });
-
-  it('resolves submitted only after the HTTP fetch boundary is crossed', async () => {
-    const root = makeGroupRepo('riff-write-fetch-boundary-');
-    const stat = statSync(root, { bigint: true });
-    const be = makeBackend();
-    be.spawn('', [], { cwd: root, expectedWorkingDirIdentity: { dev: String(stat.dev), ino: String(stat.ino) } } as never);
-    try {
-      const receipt = be.writeBusinessInput('fetch boundary prompt');
-      await expect(receipt).resolves.toBe('submitted');
-      expect(calls.filter(call => call.url.includes('/api/task-execute'))).toHaveLength(1);
-      expect(resolvers).toHaveLength(1);
-    } finally { be.kill(); rmSync(root, { recursive: true, force: true }); }
-  });
-
-  it('rejects at the serialized dispatch edge when the host directory identity changes', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'riff-write-contract-'));
-    const moved = `${root}-moved`;
-    const stat = statSync(root, { bigint: true });
-    const be = makeBackend();
-    be.spawn('', [], { cwd: root, expectedWorkingDirIdentity: { dev: String(stat.dev), ino: String(stat.ino) } } as never);
-    let release!: () => void;
-    (be as any).writeChain = new Promise<void>(resolve => { release = resolve; });
-    try {
-      const pending = be.writeBusinessInput('retained prompt');
-      renameSync(root, moved);
-      mkdirSync(root);
-      release();
-      await expect(pending).resolves.toBe('retryable_pre_dispatch_rejection');
-      expect(calls.filter(call => call.url.includes('/api/task-execute'))).toHaveLength(0);
-      rmSync(root, { recursive: true, force: true });
-      renameSync(moved, root);
-      await expect(be.writeBusinessInput('retained prompt')).resolves.toBe('retryable_pre_dispatch_rejection');
-      await flush();
-      expect(calls.filter(call => call.url.includes('/api/task-execute'))).toHaveLength(0);
-    } finally {
-      be.kill();
-      rmSync(root, { recursive: true, force: true });
-      rmSync(moved, { recursive: true, force: true });
-    }
-  });
 
   it('refreshes the host-tools binding on follow-ups instead of reusing creation env', async () => {
     let turn = 0;

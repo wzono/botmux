@@ -67,8 +67,6 @@ const mockCloseSession = vi.fn(async () => ({ ok: true, alreadyClosed: false, kn
 vi.mock('../src/core/worker-pool.js', () => ({
   dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   forkWorker: (...a: any[]) => mockForkWorker(...a),
-  dispatchWorkspaceAdmittedBusinessTurn: async (input: any) =>
-    (await import('./helpers/workspace-dispatch-spy.js')).dispatchWorkspaceThroughWorkerSpy(input),
   sendWorkerInput: (...a: any[]) => mockSendWorkerInput(...a),
   getCurrentCliVersion: vi.fn(() => 'test'),
   setActiveSessionIfActive: (map: Map<string, any>, key: string, ds: any) => { map.set(key, ds); return true; },

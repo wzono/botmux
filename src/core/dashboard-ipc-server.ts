@@ -27,7 +27,6 @@ import { readTurnRegistration } from './trigger-registration.js';
 import { lookupTurnResultRequest } from './turn-result-routes.js';
 import { normalizeCalendarBinding, normalizeCalendarDayType, listWorkCalendars, previewTaskCalendar } from '../services/work-calendar.js';
 import { resolveWorkspace } from './workspace-metadata.js';
-import { frozenSessionWorkspace } from './admitted-turn-dispatch.js';
 // src/core/dashboard-ipc-server.ts
 import { canOperate } from '../im/lark/event-dispatcher.js';
 import {
@@ -269,7 +268,7 @@ import {
   updateTaskWithOptionalPrecondition,
   type SchedulePreconditionMutation,
 } from './schedule-precondition-config.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, suspendWorkerAsync, killWorker, requestSessionRestart, isSessionRestartInFlight, getDaemonReplyCardUsageSnapshot, getDaemonReplyCardRenderSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached, isSessionEffortChangeInFlight, scheduleActiveRuntimePatch, updateHandoffLiveCard, isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery, manualSuspendWaits, queueManualSuspend, identityStorageModelForDaemonSession, identityDecisionConflict, identityModelRefusalReason, dshRuntimeForSession, setWorkspaceAdmittedBusinessTurnDispatcher } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, suspendWorkerAsync, killWorker, requestSessionRestart, isSessionRestartInFlight, getDaemonReplyCardUsageSnapshot, getDaemonReplyCardRenderSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached, isSessionEffortChangeInFlight, scheduleActiveRuntimePatch, updateHandoffLiveCard, isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery, manualSuspendWaits, queueManualSuspend, identityStorageModelForDaemonSession, identityDecisionConflict, identityModelRefusalReason, dshRuntimeForSession } from './worker-pool.js';
 import {
   awaitReadonlyTaskContinuationUser,
   cancelReadonlyTaskContinuationExplicit,
@@ -286,7 +285,7 @@ import { deliverAuthLink, type AuthLinkDelivery } from './auth-link-delivery.js'
 import { AUTH_PROVIDERS, PROVIDER_LABEL, deliverProviderLink, platformAuthLink, requestProviderAuth, type AuthProvider, type ProviderAuthResult } from './provider-auth-request.js';
 import { requestMeegoLogin } from '../services/meego-auth.js';
 import { MEEGO_TENANTS, type MeegoTenant } from '../services/bytedcli-home.js';
-import { beginBytedcliLogin, completeBytedcliLogin, describeBytedcliAuth, pendingBytedcliChallenge } from '../services/bytedcli-auth.js';
+import { completeBytedcliLogin, describeBytedcliAuth, pendingBytedcliChallenge, startBytedcliLogin } from '../services/bytedcli-auth.js';
 import { safeRequirementUrl } from './dispatch-task-tree.js';
 import { createDispatchTaskTreeCards, isTaskTreeCardGone, type TaskTreeOrchestrator } from '../services/dispatch-task-tree-card.js';
 import { listDispatchTreeSessionRows } from '../services/dispatch-task-tree-sessions.js';
@@ -4673,7 +4672,7 @@ async function handleProviderAuthRequest(
       const { state } = await describeBytedcliAuth(person);
       return state === 'unknown' ? 'unknown' : state === 'authorized';
     },
-    beginBytedcliLogin,
+    startBytedcliLogin,
     adoptBytedcliForTurn: person => adoptLocalBytedcliAuthorization({
       sessionDataDir: config.session.dataDir, sessionId, turnId: publishedTurnId,
       botConfig: cfg, senderOpenId: person,
@@ -5905,13 +5904,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/continuation', async (req, res, param
         || proof?.workerGeneration !== generation) {
         return jsonRes(res, 409, { ok: false, error: 'continuation_rpc_required' });
       }
-      const frozenWorkspace = frozenSessionWorkspace(ds);
-      if (!frozenWorkspace) return jsonRes(res, 409, { ok: false, error: 'continuation_workspace_required' });
       state = startReadonlyTaskContinuation(ds.session, {
         turnId,
         workerGeneration: generation!,
-        workspaceIdentity: frozenWorkspace.workspace,
-        ...(frozenWorkspace.groupRevision === undefined ? {} : { groupRevision: frozenWorkspace.groupRevision }),
         authorizationMode: 'inherited',
         startMode: 'explicit',
         trustedCaller: inheritedAuthority.caller,
@@ -6061,7 +6056,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
     }
     return jsonRes(res, forbidden ? 403 : 400, { ok: false, error: v.error });
   }
-  repinSessionWorkingDir(ds, { workingDir: v.resolvedPath, source: 'explicit' });
+  repinSessionWorkingDir(ds, v.resolvedPath);
   // ds.initConfig 与 repin 同步，且**无条件**（不只在 live-worker 分支里）：下次
   // forkWorker 用 initConfig 重建 init 消息，只在有活 worker 时更新的话，no-worker /
   // worker.killed 两条分支会留下「记录新、initConfig 旧」的分裂状态，冷启动把会话
@@ -7439,8 +7434,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   // materializes its provider immediately inside resumeSession, so an optional
   // wake request only applies when that path did not already create a worker.
   const woke = wake && (!ds.worker || ds.worker.killed);
-  if (woke && forkWorker(ds, '', true) === false) {
-    return jsonRes(res, 409, { ok: false, error: 'wake_refused' });
+  if (woke) {
+    forkWorker(ds, '', true);
   }
 
   jsonRes(res, 200, {
@@ -13540,9 +13535,6 @@ ipcRoute('GET', '/api/events', (_req, res) => {
 export function startIpcServer(opts: {
   port: number;
   host: string;
-  /** Test/embedded seam for the daemon-owned typed admission callback. Production
-   * already installs it through initWorkerPool before this server starts. */
-  dispatchAdmittedBusinessTurn?: import('./worker-pool.js').WorkerPoolCallbacks['dispatchAdmittedBusinessTurn'];
   /** Enable the production trusted-host boundary. The verifier reloads the
    * tiny secret file for each request so concurrent fleet bootstrap or a
    * deliberate secret repair cannot strand a daemon on a stale cached key.
@@ -13573,9 +13565,6 @@ export function startIpcServer(opts: {
       }
     },
   });
-  const restoreWorkspaceDispatcher = opts.dispatchAdmittedBusinessTurn
-    ? setWorkspaceAdmittedBusinessTurnDispatcher(opts.dispatchAdmittedBusinessTurn)
-    : undefined;
   let boundPort = opts.port;
   const server: Server = createServer(async (req, res) => {
     try {
@@ -13604,14 +13593,7 @@ export function startIpcServer(opts: {
           return jsonRes(res, 401, { ok: false, error: 'unauthorized', reason: auth.reason });
         }
       }
-      // Ask hooks need a retryable response while startup reconciliation is in
-      // flight; holding the HTTP connection here hides the daemon's exact-target
-      // readiness guard and can strand native pickers behind a long restore.
-      // Let only ask registration reach its handler early. Every other
-      // state-bearing IPC route remains behind the process readiness barrier.
-      const startupAwareAskRoute = method === 'POST'
-        && (url.pathname === '/api/asks' || url.pathname === '/api/asks/form-v1');
-      if (!publicRoute && opts.ready && !startupAwareAskRoute) await opts.ready;
+      if (!publicRoute && opts.ready) await opts.ready;
       for (const r of routes) {
         if (r.method !== req.method) continue;
         const m = r.pattern.exec(url.pathname);
@@ -13667,10 +13649,7 @@ export function startIpcServer(opts: {
     // sockets down for the same reason.
     close: () => new Promise<void>(r => {
       server.closeAllConnections?.();
-      server.close(() => {
-        restoreWorkspaceDispatcher?.();
-        r();
-      });
+      server.close(() => r());
     }),
   };
   });
