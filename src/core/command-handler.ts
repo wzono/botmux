@@ -122,7 +122,7 @@ import { clearChatReplyMode, resolveRegularGroupMode, setChatReplyMode } from '.
 import { setChatStreamingCardPin } from '../services/pin-streaming-card-mode-store.js';
 import { setCotMode } from '../services/cot-mode-store.js';
 import { handleCotThinkingUpdate } from '../im/lark/cot-message.js';
-import { canOperate, isKnownPeerBot, isPlatformTeamBotTrustedForReceiver } from '../im/lark/event-dispatcher.js';
+import { canOperate, canOperateBotSender, isKnownPeerBot, isPlatformTeamBotTrustedForReceiver } from '../im/lark/event-dispatcher.js';
 import { IDLE_AUTO_COMPACT_MIN_CONTEXT_TOKENS, applyIdleAutoCompactSetting, idleAutoCompactMinutes, isIdleAutoCompactEnabled, parseIdleAutoCompactCommand } from './idle-auto-compact.js';
 import { buildSafeInsightReport } from '../services/insight/report.js';
 import type { SafeInsightReport } from '../services/insight/types.js';
@@ -150,6 +150,7 @@ import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { modelPinText } from './model-pin.js';
 import { writeSessionModelPin, sessionAcceptsDirectCommand, recordTurnExplicitMention } from './worker-pool.js';
+import { loadSessionCodexReasoningCatalog } from '../services/codex-bot-reasoning-catalog.js';
 import { failedTurnRewindInFlight } from './failed-turn-rewind.js';
 import { messageMentionsBot } from '../im/lark/message-parser.js';
 import { updateSessionTitle } from './session-title.js';
@@ -158,6 +159,7 @@ import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { withBotTurnMutation, runDetachedBotTurnAdmission } from './bot-turn-mutation-gate.js';
 import { REWIND_CHECKPOINT_LIMIT, findCheckpoint, scanClaudeTranscriptCheckpoints, waitForTranscriptQuiet, withOpenTranscript, type RewindCheckpoint, type RewindResult } from './context-rewind.js';
+import { REWIND_BACKUP_RETENTION, pruneRewindBackupsBeside, registerRewindBackup, rewindBackupDirForSession } from './rewind-backup-retention.js';
 import { trackProcessExited, waitAllWithin } from './producer-quiescence.js';
 import { clearBridgeTurnJournal } from '../services/bridge-turn-journal.js';
 import { resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
@@ -1912,6 +1914,14 @@ export function resetPendingRewindPreviewsForTest(): void {
   pendingRewindPreviews.clear();
 }
 
+function canOperateForCommandMessage(larkAppId: string, chatId: string | undefined, message: LarkMessage): boolean {
+  // external roster 只能走 bot 专用 operate；真人/卡片 union 即使与外部条目相同，
+  // 也只能走通用 canOperate，不能借手填 union 变成 operator。
+  return message.senderType === 'app' || message.senderType === 'bot'
+    ? canOperateBotSender(larkAppId, chatId, message.senderId, message.senderUnionId, message.senderAppId)
+    : canOperate(larkAppId, chatId, message.senderId, message.senderUnionId);
+}
+
 export async function handleCommand(
   cmd: string,
   rootId: string,
@@ -1938,7 +1948,7 @@ export async function handleCommand(
     switch (cmd) {
       case '/modelpin': {
         if (!ds) { await replyNoSession(replyHere, loc); break; }
-        if (!message.senderId || !canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId)) {
+        if (!message.senderId || !canOperateForCommandMessage(ds.larkAppId, ds.chatId, message)) {
           await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd }, loc)); break;
         }
         const args = message.content.trim().split(/\s+/).slice(1);
@@ -1951,10 +1961,15 @@ export async function handleCommand(
         // Do not interrupt a business turn just to change its next launch.
         try {
           const beforeView = resolveSessionModelPinView(ds, getBot(ds.larkAppId).config);
+          // A pinned Codex level is judged against the live catalogue of the
+          // runtime this session launches (its frozen CLI/runtime/profile).
+          const reasoningCatalog = args[0] !== '--follow-bot' && args[1]
+            ? await loadSessionCodexReasoningCatalog(ds.session, getBot(ds.larkAppId).config)
+            : null;
           const changed = writeSessionModelPin(ds, args[0] === '--follow-bot' ? undefined : {
             model: args[0]!, ...(args[1] ? { effort: args[1] as import('../services/codex-reasoning-effort.js').CodexReasoningEffort } : {}),
             source: 'command', setBy: message.senderId, setAt: new Date().toISOString(),
-          });
+          }, { reasoningCatalog });
           if (changed === false) { await sessionReply(rootId, '本话题未固定，无需解除。'); break; }
           const view = resolveSessionModelPinView(ds, getBot(ds.larkAppId).config);
           if (!ds.session.modelPin && beforeView?.shadowedBy) {
@@ -1980,7 +1995,7 @@ export async function handleCommand(
             await replyNoSession(replyHere, loc);
             break;
           }
-          if (!canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId)) {
+          if (!canOperateForCommandMessage(ds.larkAppId, ds.chatId, message)) {
             await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd }, loc));
             break;
           }
@@ -2040,7 +2055,7 @@ export async function handleCommand(
           await replyNoSession(replyHere, loc);
           break;
         }
-        if (!canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId)) {
+        if (!canOperateForCommandMessage(ds.larkAppId, ds.chatId, message)) {
           await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd }, loc));
           break;
         }
@@ -2094,7 +2109,7 @@ export async function handleCommand(
         }
         const result: import('../types.js').CodexAppEffortResult = confirmation
           ? { status: 'future_only', reason: cliId === 'codex' ? 'cli_next_turn' : undefined }
-          : await (cliId === 'codex' ? updateCodexCliEffort : updateCodexAppEffort)(ds, effort, undefined, () => current() && canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId), { source: 'command', setBy: message.senderId });
+          : await (cliId === 'codex' ? updateCodexCliEffort : updateCodexAppEffort)(ds, effort, undefined, () => current() && canOperateForCommandMessage(ds.larkAppId, ds.chatId, message), { source: 'command', setBy: message.senderId });
         const saved = result.status === 'applied' || result.status === 'future_only';
         if (replay && saved && current()) {
           try {
@@ -2159,7 +2174,7 @@ export async function handleCommand(
           break;
         }
         const selectedCliId = requested.cliId;
-        if (!canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId)) {
+        if (!canOperateForCommandMessage(ds.larkAppId, ds.chatId, message)) {
           await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd: '/cli' }, loc));
           break;
         }
@@ -2196,7 +2211,7 @@ export async function handleCommand(
           await sessionReply(rootId, '用法：`/cleanup-wt <id>`');
           break;
         }
-        if (!canOperate(appId, message.chatId ?? ds?.chatId, message.senderId, message.senderUnionId)) {
+        if (!canOperateForCommandMessage(appId, message.chatId ?? ds?.chatId, message)) {
           await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd: '/cleanup-wt' }, loc));
           break;
         }
@@ -2498,7 +2513,7 @@ export async function handleCommand(
         const appId = larkAppId ?? ds?.larkAppId;
         const chatId = message.chatId ?? ds?.chatId;
         if (!appId || !chatId || message.senderType !== 'user' || !message.senderId
-          || !canOperate(appId, chatId, message.senderId, message.senderUnionId)) {
+          || !canOperateForCommandMessage(appId, chatId, message)) {
           await sessionReply(rootId, t(chatId && !isSessionGroup(chatId) ? 'cmd.dismiss.operator_only' : 'cmd.dismiss.owner_only', undefined, loc));
           break;
         }
@@ -2782,7 +2797,7 @@ export async function handleCommand(
                 command: '/close', args: '',
                 chat: { chatId: closed.current.chatId, chatType: closed.current.session.chatType ?? message.chatType ?? null, anchor: rootId },
                 sender: { openId: message.senderId ?? null, unionId: message.senderUnionId ?? null },
-                privileges: { canTalk: true, canOperate: canOperate(closed.current.larkAppId, closed.current.chatId, message.senderId, message.senderUnionId) },
+                privileges: { canTalk: true, canOperate: canOperateForCommandMessage(closed.current.larkAppId, closed.current.chatId, message) },
                 locale: loc,
               });
               for (const outcome of outcomes) {
@@ -3941,7 +3956,7 @@ export async function handleCommand(
           await replyNoSession(replyHere, loc);
           break;
         }
-        if (!canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId)) {
+        if (!canOperateForCommandMessage(ds.larkAppId, ds.chatId, message)) {
           await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd }, loc));
           break;
         }
@@ -4027,7 +4042,7 @@ export async function handleCommand(
         const rewindScope = rewindTranscript?.writableTreeRoot
           ? {
               writableTreeRoot: rewindTranscript.writableTreeRoot,
-              backupDir: join(config.session.dataDir, 'rewind-backups', ds.session.sessionId),
+              backupDir: rewindBackupDirForSession(config.session.dataDir, ds.session.sessionId),
             }
           : {};
         if (!rewindJsonl) {
@@ -4225,6 +4240,9 @@ export async function handleCommand(
               });
               if (!cut.ok) return cut;
               const result: RewindResult = cut.result;
+              // A backup next to the transcript is registered at once, so the
+              // periodic sweep reaches its directory whatever happens next.
+              registerRewindBackup(result.backupPath, config.session.dataDir, note => logger.warn(`[${logTag}] ${note}`));
               // The CLI will cold-resume from the truncated transcript under the SAME
               // native session id, so group-context coverage still marks the dropped
               // turn's background as delivered and it is not re-injected.
@@ -4262,17 +4280,24 @@ export async function handleCommand(
           logger.info(
             `[${logTag}] /rewind rolled back to checkpoint ${rewindIndex}, removed ${rewindOutcome.removedBytes} bytes, backup ${rewindOutcome.backupPath}`,
           );
+          // How long the backup stays (rewind-backup-retention.ts).
+          const backupRetention = {
+            days: Math.round(REWIND_BACKUP_RETENTION.maxAgeMs / 86_400_000),
+            keep: REWIND_BACKUP_RETENTION.maxPerTranscript,
+          };
           const rewindDoneMessage = rewindOutcome.cleanupError
             ? t('cmd.rewind.done_cleanup_warn', {
               turns: rewindIndex,
               bytes: rewindOutcome.removedBytes,
               backup: rewindOutcome.backupPath,
+              ...backupRetention,
               error: rewindOutcome.cleanupError,
             }, loc)
             : t('cmd.rewind.done', {
               turns: rewindIndex,
               bytes: rewindOutcome.removedBytes,
               backup: rewindOutcome.backupPath,
+              ...backupRetention,
             }, loc);
           // The truncation + backup are already durable here, and this notice
           // is the ONLY message carrying the backup path. A send failure
@@ -4286,11 +4311,18 @@ export async function handleCommand(
           } catch (sendErr) {
             logger.warn(`[${logTag}] /rewind succeeded but the done reply failed: ${sendErr instanceof Error ? sendErr.message : String(sendErr)}; backup ${rewindOutcome.backupPath}`);
             try {
-              await sessionReply(rootId, t('cmd.rewind.done_plain', { backup: rewindOutcome.backupPath }, loc));
+              await sessionReply(rootId, t('cmd.rewind.done_plain', { backup: rewindOutcome.backupPath, ...backupRetention }, loc));
             } catch (fallbackErr) {
               logger.warn(`[${logTag}] /rewind plain-text fallback reply also failed: ${fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)}; backup ${rewindOutcome.backupPath}`);
             }
           }
+          // The rewind is settled and reported: prune the directory its backup
+          // went to, this backup left alone (rewind-backup-retention.ts). Not
+          // awaited — nothing waits on it.
+          void pruneRewindBackupsBeside(rewindOutcome.backupPath, {
+            dataDir: config.session.dataDir,
+            log: note => logger.info(`[${logTag}] ${note}`),
+          });
         } catch (err) {
           const errorText = err instanceof Error ? err.message : String(err);
           const errnoCode = (err as NodeJS.ErrnoException | null)?.code;

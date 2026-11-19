@@ -79,6 +79,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     fieldKeys: [
       'botDefaults.groupWorkingDir', 'botDefaults.autoWorktree', 'botDefaults.autoStartJoin',
       'botDefaults.autoStartJoinSeed', 'botDefaults.autoStartTopic', 'botDefaults.autoInviteOwnerOnGroupAdd',
+      'botDefaults.ownerGroupFollow', 'botDefaults.ownerGroupFollowEnabled', 'botDefaults.ownerGroupFollowExcluded',
       'botDefaults.groupJoinCommand', 'botDefaults.groupJoinCommandField',
       'botDefaults.workingDirField', 'botDefaults.autoStartJoinPrompt',
     ],
@@ -350,6 +351,8 @@ export type BotDefaultsRow = {
   larkAppId: string;
   botName?: string;
   cliId?: string;
+  /** Local/core-only bots have no Feishu transport. */
+  apiOnly?: boolean;
   /** 租户品牌，决定飞书后台深链的 host（feishu.cn vs larksuite.com）。
    *  缺省（旧 payload / 未注册）→ larkConsoleUrl 内 normalizeBrand 兜底 feishu。 */
   brand?: string;
@@ -578,6 +581,7 @@ export type BotDefaultsRow = {
   herdr?: import('../../adapters/backend/types.js').HerdrBackendConfig | null;
   /** 被动入群时自动把 owner 拉进群。缺省 ON —— 只有显式 false 表示关闭。 */
   autoInviteOwnerOnGroupAdd?: boolean;
+  ownerGroupFollow?: import('../../services/owner-group-follow-policy.js').OwnerGroupFollowConfig | null;
   autoStartOnGroupJoin?: boolean;
   autoStartOnGroupJoinPrompt?: string;
   autoStartOnGroupJoinSeed?: string;
@@ -677,6 +681,24 @@ export function mergeModelCandidates(
  * 按需探测某个 CLI 当前可用的模型列表（live 成功时权威，失败时回退静态）。
  * fail-soft：任何错误（网络/404/400/形状异常）都返回 null，调用方回退静态候选。
  */
+/**
+ * Levels the live catalogue reported for a Codex model (`reasoningEffortsByModel`
+ * from /api/cli-options/models), matched like the server-side judgment: exact
+ * slug first, then case-insensitively. undefined = the catalogue has no word on
+ * this model, and the static table applies.
+ */
+export function liveCodexReasoningEfforts(
+  byModel: Readonly<Record<string, readonly string[]>> | undefined,
+  model: string,
+): readonly string[] | undefined {
+  const name = model.trim();
+  if (!byModel || !name) return undefined;
+  if (Object.prototype.hasOwnProperty.call(byModel, name)) return byModel[name];
+  const lower = name.toLowerCase();
+  const key = Object.keys(byModel).find(slug => slug.trim().toLowerCase() === lower);
+  return key === undefined ? undefined : byModel[key];
+}
+
 export async function fetchDetectedModels(
   key: string,
   appId?: string,
