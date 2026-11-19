@@ -113,6 +113,7 @@ import {
   readPrincipalLaneTurnBinding,
 } from '../src/core/principal-lane-turn.js';
 import {
+  __testOnly_resetOrdinaryImDeliveries,
   __testOnly_setupWorkerHandlers,
   initWorkerPool,
   setActiveSessionsRegistry,
@@ -341,6 +342,9 @@ describe('principal lane production live acceptance', () => {
 
   afterEach(() => {
     process.env.BOTMUX_XPI_ENABLED = 'true';
+    // Release receipt-retry timers before destroying their session and bot
+    // fixtures; a late retry must not outlive this test's registered bot.
+    __testOnly_resetOrdinaryImDeliveries();
     activeSessions.clear();
     sessionStore.init(appId);
     __resetPeerCrossRefCacheForTest();

@@ -216,9 +216,8 @@ function issuerOver(activeSessions: Map<string, DaemonSession>, clock = { t: 1_0
     retryMs: 1_000,
     setTimer: (fn) => { timers.push(fn); return {}; },
   });
-  const tick = async () => {
+  const tick = () => {
     for (const fn of timers.splice(0)) fn();
-    await new Promise((resolve) => setTimeout(resolve, 20));
   };
   return { wake, warnings, tick };
 }
@@ -253,10 +252,13 @@ describe('main-bot wake through the real trigger', () => {
     // The running turn ends.
     (ds as any).lastScreenStatus = 'idle';
     wake.onScreenStatus('sess_main', { status: 'idle', prevStatus: 'working', turnId: 'om_member_running' });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(send).toHaveBeenCalledTimes(1);
-    expect(sentInputs.calls).toEqual([{ turnId: 'workflow-event:wake-trig-run:3', opts: expect.objectContaining({ queueAfterActiveTurn: true }) }]);
-    expect(readV3MainWakeIssued(runDir, 3)).toMatchObject({ sessionId: 'sess_main', turnPointersAtIssue: { quoteTargetId: 'om_member_running' } });
+    // The status callback schedules an async scan, including the real ledger
+    // and the lazy dispatch adapter. Wait for its observable completion.
+    await vi.waitFor(() => {
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(sentInputs.calls).toEqual([{ turnId: 'workflow-event:wake-trig-run:3', opts: expect.objectContaining({ queueAfterActiveTurn: true }) }]);
+      expect(readV3MainWakeIssued(runDir, 3)).toMatchObject({ sessionId: 'sess_main', turnPointersAtIssue: { quoteTargetId: 'om_member_running' } });
+    });
   });
 
   it('no live session: a new session in the main topic, its first turn the wake', async () => {
@@ -281,8 +283,10 @@ describe('main-bot wake through the real trigger', () => {
     expect(warnings.join('\n')).toContain('retry 1/');
     sentInputs.refuse = false;
     clock.t += 1_000;
-    await tick();
-    expect(send).toHaveBeenCalledTimes(1);
-    expect(readV3MainWakeIssued(runDir, 3)).toBeDefined();
+    tick();
+    await vi.waitFor(() => {
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(readV3MainWakeIssued(runDir, 3)).toBeDefined();
+    });
   });
 });
