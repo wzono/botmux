@@ -1871,6 +1871,16 @@ export interface BotConfig {
   sandboxNetwork?: boolean;
   sandboxNetworkPolicy?: import('./core/sandbox-network-policy.js').SandboxNetworkPolicy;
   /**
+   * Keep this bot's Lark app secret out of the file sandbox. The worker still
+   * writes `<BOT_HOME>/send-cred.json` for host-side use, but the sandbox policy
+   * denies it, and the sandboxed `botmux send` / `history` / `quoted` go through
+   * the host relay (outbox) instead of calling Lark directly. On macOS this also
+   * gives the oncall Seatbelt sandbox the outbox relay Linux already has.
+   * Default off: today the secret is readable inside the sandbox, which lets an
+   * agent mint the tenant token itself.
+   */
+  sandboxWithholdBotSecret?: boolean;
+  /**
    * LEGACY read-isolation flag (pre fs-policy). The unified sandbox is
    * deny-by-default, so cross-bot read isolation is inherent — this flag is
    * auto-migrated to `sandbox: true` at daemon startup and kept on disk only
@@ -2080,6 +2090,16 @@ export interface BotConfig {
    */
   p2pOpen?: boolean;
   /**
+   * 允许只有对话权限（canTalk，非管理员）的真人在对话里为**自己**创建定时任务。
+   * 默认关（undefined = 关），只落显式 true。开启后任务归发起人本人：只能投到当前会话、
+   * 不带任何委托/持久 run scope、每轮最多 1 个、每人最多 `scheduleTalkerMaxTasks` 个
+   * 存活任务；到点前复核「开关仍开 + 本人仍能在该群对话 + 仍是群成员」，任一不满足即
+   * 拒跑；只能由本人或管理员管理。见 core/schedule-talker.ts。
+   */
+  scheduleCreateByTalkers?: boolean;
+  /** 每位对话用户在本 bot 最多保留的存活（启用或暂停）talker 任务数；1–100，缺省 5。 */
+  scheduleTalkerMaxTasks?: number;
+  /**
    * 是否接受**其他 bot** 通过 `botmux send --slash` 发来的原生斜杠命令
    * （/clear、/model、/close…）。默认开（undefined = 开）；只有显式 false 才关。
    *
@@ -2185,6 +2205,13 @@ export interface BotConfig {
    */
   canTalkDaemonCommands?: string[];
   /**
+   * 不带标题的 `/rename` 交给 CLI 自己起名（默认关）。开启后，会话 CLI 声明了
+   * `sessionAutoRenameCommand`（目前只有 Claude Code 的裸 `/rename`）时，daemon 不再回
+   * 用法提示，而是把该命令作为透传 turn 原样送进 CLI；Botmux 会话标题不变。
+   * 关闭（undefined）→ 裸 `/rename` 只回用法提示（原行为）。带标题的 `/rename` 不受影响。
+   */
+  bareRenamePassthrough?: boolean;
+  /**
    * Optional per-bot startup commands: slash-command lines the worker types into
    * a freshly spawned CLI right after it's ready, BEFORE the user's first prompt
    * (e.g. `/effort ultracode`, `/model opus`). Sent in order, one submit each,
@@ -2282,6 +2309,8 @@ export interface BotConfig {
   replyCardMode?: import('./services/turn-reply-card.js').ReplyCardMode;
   /** Main controls omitted from live streaming cards. Missing means show all. */
   hiddenStreamingCardButtons?: StreamingCardButtonId[];
+  /** Fold low-frequency live-card controls. Default on; false restores the classic layout. */
+  streamingCardFoldedLayout?: boolean;
   /**
    * Pin the current public streaming card. Default false; best-effort only.
    */
@@ -2391,17 +2420,11 @@ export interface BotConfig {
   replyCardNextStep?: boolean;
   /**
    * Per-bot opt-in for the collapsed「本轮回顾」panel above the last reply
-   * card's footer: files edited and commands run, plus the CLI's own recap
-   * (Claude Code's transcript away summary) once it writes one. Default
-   * (undefined) keeps reply cards unchanged.
+   * card's footer, holding the CLI's own recap of the turn (Claude Code's
+   * transcript away summary). A turn the CLI does not recap gets no panel.
+   * Default (undefined) keeps reply cards unchanged.
    */
   replyCardRecap?: boolean;
-  /**
-   * With replyCardRecap on, also let a small model write the recap for a turn
-   * the CLI left without one (one extra model call per such turn, billed to
-   * the CLI's own credentials; Claude Code only). Default (undefined) off.
-   */
-  replyCardRecapModel?: boolean;
   /**
    * bot@bot 同目录拉起 (cross-bot working-dir inheritance). When a bot is @-ed
    * into a chat/thread where a sibling bot already has an active session, it
@@ -3038,11 +3061,14 @@ export function getConfiguredOwnerOpenId(larkAppId: string): string | undefined 
 export function getOwnerOpenId(larkAppId: string): string | undefined {
   const bot = bots.get(larkAppId);
   if (!bot) return undefined;
+  return getStrictOwnerOpenId(larkAppId) ?? bot.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
+}
+
+export function getStrictOwnerOpenId(larkAppId: string): string | undefined {
   const configuredOwner = getConfiguredOwnerOpenId(larkAppId);
-  if (configuredOwner && bot.resolvedAllowedUsers.includes(configuredOwner)) {
+  if (configuredOwner && bots.get(larkAppId)?.resolvedAllowedUsers.includes(configuredOwner)) {
     return configuredOwner;
   }
-  return bot.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
 }
 
 /** Per-bot 最终回复投递方式的**显式**配置值；未配置 / 未注册的 bot 返回 undefined，
@@ -3936,6 +3962,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     if (entry.sandboxNetwork != null && typeof entry.sandboxNetwork !== 'boolean') {
       throw new Error(`Bot config [${i}]: sandboxNetwork must be true or false, got ${JSON.stringify(entry.sandboxNetwork)}`);
     }
+    if (entry.sandboxWithholdBotSecret != null && typeof entry.sandboxWithholdBotSecret !== 'boolean') {
+      throw new Error(`Bot config [${i}]: sandboxWithholdBotSecret must be true or false, got ${JSON.stringify(entry.sandboxWithholdBotSecret)}`);
+    }
     validateCliLaunchModeConfig({
       cliId: entryCliId,
       cliLaunchMode,
@@ -4491,6 +4520,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       sandboxHidePaths: normalizeStringList(entry.sandboxHidePaths),
       sandboxReadonlyPaths: normalizeStringList(entry.sandboxReadonlyPaths),
       sandboxNetwork: typeof entry.sandboxNetwork === 'boolean' ? entry.sandboxNetwork : undefined,
+      ...(entry.sandboxWithholdBotSecret === true ? { sandboxWithholdBotSecret: true } : {}),
       ...(entry.sandboxNetworkPolicy !== undefined ? { sandboxNetworkPolicy: parseSandboxNetworkPolicy(entry.sandboxNetworkPolicy) } : {}),
       readIsolation: entry.readIsolation === true,
       readDenyExtraPaths: normalizeStringList(entry.readDenyExtraPaths),
@@ -4559,6 +4589,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       globalGrants,
       // 只落显式 true（undefined = 关），与 restrictGrantCommands 同款，保持 bots.json 干净。
       p2pOpen: entry.p2pOpen === true || undefined,
+      scheduleCreateByTalkers: entry.scheduleCreateByTalkers === true || undefined,
+      scheduleTalkerMaxTasks: typeof entry.scheduleTalkerMaxTasks === 'number'
+        && Number.isInteger(entry.scheduleTalkerMaxTasks)
+        && entry.scheduleTalkerMaxTasks >= 1 && entry.scheduleTalkerMaxTasks <= 100
+        ? entry.scheduleTalkerMaxTasks
+        : undefined,
       messageQuota,
       grantDefaultDurationMs,
       quotaState,
@@ -4576,6 +4612,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       acceptSlashFromBots: entry.acceptSlashFromBots === false ? false : undefined,
       customPassthroughCommands,
       canTalkDaemonCommands,
+      // 默认关，只落显式 true。
+      bareRenamePassthrough: entry.bareRenamePassthrough === true || undefined,
       tuiSlashAllow,
       startupCommands,
       env,
@@ -4611,6 +4649,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       replyCardShowTools: entry.replyCardShowTools === false ? false : undefined,
       replyCardNativeCot: entry.replyCardNativeCot === true ? true : undefined,
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons),
+      streamingCardFoldedLayout: entry.streamingCardFoldedLayout === false ? false : undefined,
       pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       cotEnabled: normalizeCotEnabled(entry) ? undefined : false,
@@ -4652,7 +4691,6 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       replyCardActions: entry.replyCardActions === true || undefined,
       replyCardNextStep: entry.replyCardNextStep === true || undefined,
       replyCardRecap: entry.replyCardRecap === true || undefined,
-      replyCardRecapModel: entry.replyCardRecapModel === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       botToBotSameDir: entry.botToBotSameDir === false ? false : undefined,
       // 平台团队展示默认 ON：只有显式 false 有意义/落盘（undefined = 展示）。

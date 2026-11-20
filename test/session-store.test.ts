@@ -741,6 +741,7 @@ describe('principal lane durable store', () => {
     source.backendType = 'pty';
     source.sandbox = true;
     source.sandboxNetwork = true;
+    source.sandboxWithholdBotSecret = true;
     source.sandboxNetworkPolicy = {
       version: 1, public: { mode: 'allow' },
       private: { mode: 'allowlist', rules: [{ cidr: '10.77.0.1', protocol: 'tcp', ports: [443] }] },
@@ -776,6 +777,7 @@ describe('principal lane durable store', () => {
     expect(shadow.session).toMatchObject({
       sandbox: true,
       sandboxNetwork: true,
+      sandboxWithholdBotSecret: true,
       sandboxNetworkPolicy: frozen,
       protectedHttpEgressPolicy: frozenProtectedEgress,
     });
@@ -3334,6 +3336,17 @@ describe('closeSession()', () => {
 });
 
 describe('reactivateClosedSession()', () => {
+  it('still reactivates when the structured session turns side-store is unreadable', () => {
+    const session = createSession('chat-turns-corrupt', 'root-turns-corrupt', 'Corrupt Turns Store');
+    closeSession(session.sessionId);
+    // Emulate a torn write / disk fault in the non-essential read model store.
+    writeFileSync(join(tempDir, 'session-turns', 'turns.sqlite'), `not a database${'x'.repeat(256)}`);
+    const result = reactivateClosedSession(session.sessionId);
+    expect(result.ok).toBe(true);
+    init('test-app');
+    expect(getSession(session.sessionId)?.status).toBe('active');
+  });
+
   it.each(['awaiting_classification', 'terminal_notice_pending'] as const)(
     'does not revive %s XPI work left on a legacy closed row', (phase) => {
       const session = createSession('chat-xpi-resume', 'root-xpi-resume', 'Legacy Closed XPI');
