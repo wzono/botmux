@@ -66,6 +66,18 @@ describe('Codex model-aware reasoning efforts', () => {
     expect(codexModelSupportsReasoningEffort('gpt-5.6-luna', 'ultra')).toBe(false);
   });
 
+  it('adds native Seed Ultra orchestration without inventing a Max inference tier', () => {
+    for (const model of ['seed-evolving', 'seed-2.1-pro', 'seed-2.1-turbo']) {
+      for (const cliId of ['codex', 'codex-app']) {
+        expect(reasoningEffortsForCliModel(cliId, model)).toContain('ultra');
+        expect(cliModelSupportsReasoningEffort(cliId, model, 'max')).toBe(false);
+      }
+    }
+    expect(codexReasoningEffortsForModel(' SEED-2.1-PRO ')).toContain('ultra');
+    expect(codexReasoningEffortsForModel('seed-custom')).not.toContain('ultra');
+    expect(reasoningEffortsForCliModel('traex', 'seed-2.1-pro')).not.toContain('ultra');
+  });
+
   it('fails closed to the four-level common intersection for unknown models', () => {
     expect(codexReasoningEffortsForModel('custom-model')).toEqual(['low', 'medium', 'high', 'xhigh']);
     expect(codexModelSupportsReasoningEffort('', 'max')).toBe(false);
