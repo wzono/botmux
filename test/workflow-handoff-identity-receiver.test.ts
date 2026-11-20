@@ -39,7 +39,7 @@ vi.mock('../src/services/lark-cli-auth.js', async (importOriginal) => ({
 
 const ts = (await import('typescript')).default;
 const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
-const { isUnattendedIdentityTurnId } = await import('../src/core/workflow-event-turn.js');
+const { allowsPersonalIdentityForTurn, isOwnerActorTurnId, isUnattendedIdentityTurnId } = await import('../src/core/workflow-event-turn.js');
 const { clearRestoredLapses, unattendedTask } = await import('../src/core/capability-authorization.js');
 const { recallProvenIdentityContent, renderIdentityWrapper, publishActiveTurn } = await import('../src/core/cli-identity.js');
 const { execFileSync } = await import('node:child_process');
@@ -71,7 +71,7 @@ afterEach(() => cleanupBotRuns());
 
 const DAEMON_FUNCTIONS = [
   'triggerUserAuthEnabledFor', 'prepareTurnCliIdentity', 'dispatchUserForTurn', 'workflowDelegationRefusalFor',
-  'targetUserForDelegation', 'refreshTurnCliIdentity', 'identityPublicationConflicted', 'identityModelForPublication',
+  'targetUserForDelegation', 'checkDelegationRecipient', 'refreshTurnCliIdentity', 'identityPublicationConflicted', 'identityModelForPublication',
   'workflowHandoffIdentityCheck', 'withdrawWorkflowHandoffIdentity',
 ];
 
@@ -134,9 +134,10 @@ async function receiver(opts: { self?: boolean; alsoApproved?: string[]; main?: 
     resolveTargetAppOpenId: vi.fn(async (app: string, unionId: string) => unionId === INITIATOR_UNION
       ? { status: 'resolved', openId: INITIATOR_OU_IN[app] } : { status: 'definitive' }),
     evaluateTalk: () => ({ allowed: true }),
-    listChatMemberOpenIds: vi.fn(async () => [...members]),
+    findCurrentChatUserMembers: vi.fn(async () => new Set(members)),
     publishTurnCliIdentity, localeForBot: () => 'en',
-    isUnattendedIdentityTurnId, clearRestoredLapses, unattendedTask,
+    isUnattendedIdentityTurnId, allowsPersonalIdentityForTurn, isOwnerActorTurnId, clearRestoredLapses, unattendedTask,
+    getStrictOwnerOpenId: () => undefined,
     logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() },
     identityStorageModelForDaemonSession: () => 'proven',
     identityDecisionConflict: () => undefined,
@@ -292,7 +293,7 @@ describe('the pre-handoff check runs the dispatch delegation check of this bot',
     const h = await receiver();
     h.members.clear();
     expect(await h.fns.workflowHandoffIdentityCheck(request)).toEqual({ status: 'denied', reason: 'target_access_denied' });
-    h.scope.listChatMemberOpenIds.mockRejectedValueOnce(new Error('member list exceeds 2000 members'));
+    h.scope.findCurrentChatUserMembers.mockRejectedValueOnce(new Error('member list exceeds 2000 members'));
     expect(await h.fns.workflowHandoffIdentityCheck(request)).toMatchObject({ status: 'unavailable' });
     h.scope.getBot = () => ({ config: botConfig('cli_a', null) });
     expect(await h.fns.workflowHandoffIdentityCheck(request)).toEqual({ status: 'not_required' });

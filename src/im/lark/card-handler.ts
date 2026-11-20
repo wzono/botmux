@@ -1,3 +1,5 @@
+import { answerDispatchTaskConsent, TASK_CONSENT_ACTION } from './dispatch-task-consent.js';
+import { readDispatchReportBindingSecret } from '../../core/dispatch-report-binding.js';
 import { modelPinText } from '../../core/model-pin.js';
 import { resolveSessionModelPinView } from '../../core/session-model.js';
 import { sessionContractPrimary } from '../../core/session-contract-primary.js';
@@ -23,7 +25,7 @@ import { TurnReplyCardStore, replyCardIsTerminal } from '../../services/turn-rep
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { NEXT_STEP_CLICK_NOTICE } from './next-step-card.js';
 import { noteReplyCardTurnStarted } from '../../core/reply-card-turn-start.js';
-import { resolveHiddenStreamingCardButtons } from './streaming-card-buttons.js';
+import { resolveHiddenStreamingCardButtons, resolveStreamingCardFoldedLayout } from './streaming-card-buttons.js';
 import { writeSessionModelPin, recordTurnExplicitMention } from '../../core/worker-pool.js';
 import { failedTurnRewindInFlight } from '../../core/failed-turn-rewind.js';
 import { messageMentionsBot } from './message-parser.js';
@@ -2232,6 +2234,14 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     return result;
   }
 
+  if (value?.action === TASK_CONSENT_ACTION && larkAppId) {
+    const secret = readDispatchReportBindingSecret(config.session.dataDir);
+    const ok = secret && await answerDispatchTaskConsent(config.session.dataDir, secret, larkAppId, data);
+    return { toast: { type: ok ? 'success' : 'error', content: ok
+      ? value.choice === 'approve' ? '已授权本任务' : '已停止本任务的后续授权'
+      : '仅发起人可在原话题的有效授权卡上操作。' } };
+  }
+
   if (
     (value?.action === 'codex_notifier_continue' || value?.action === 'codex_notifier_open_app')
     && larkAppId
@@ -4305,6 +4315,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
           codexAppStopCardTarget(ds),
+          resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
         );
         scheduleCardPatch(ds, cardJson);
       }
@@ -5015,6 +5026,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
           codexAppStopCardTarget(ds),
+          resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
         );
         return { cardJson, unavailable };
       };
@@ -5250,6 +5262,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
           codexAppStopCardTarget(ds),
+          resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -5348,6 +5361,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
           codexAppStopCardTarget(ds),
+          resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
         );
         return {
           toast: { type: 'success', content: t('card.action.stop_sent', { cliName: sessionCliDisplayName(ds) }, locDs) },
@@ -5656,6 +5670,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
           codexAppStopCardTarget(ds),
+          resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }

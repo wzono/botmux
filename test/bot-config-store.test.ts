@@ -995,6 +995,25 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.model).toBeUndefined();
   });
 
+  it('bareRenamePassthrough is off by default, persists only true and applies without restart', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('bareRenamePassthrough')!;
+    expect(spec.effect).toBe('immediate');
+    expect(registry.getBot('app_default').config.bareRenamePassthrough).toBeUndefined();
+
+    expect((await store.applyConfigField('app_default', spec, true)).ok).toBe(true);
+    expect(readConfig().bareRenamePassthrough).toBe(true);
+    expect(registry.getBot('app_default').config.bareRenamePassthrough).toBe(true);
+    const [reloaded] = registry.parseBotConfigsFromText(readFileSync(configPath, 'utf8'));
+    expect(reloaded.bareRenamePassthrough).toBe(true);
+
+    expect((await store.applyConfigField('app_default', spec, false)).ok).toBe(true);
+    expect(readConfig()).not.toHaveProperty('bareRenamePassthrough');
+    expect(registry.getBot('app_default').config.bareRenamePassthrough).toBeUndefined();
+    const [invalid] = registry.parseBotConfigsFromText(JSON.stringify([{ ...readConfig(), bareRenamePassthrough: 'true' }]));
+    expect(invalid.bareRenamePassthrough).toBeUndefined();
+  });
+
   it('archiveCodex preserves both overrides across reload and unset restores inheritance', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('archiveCodex')!;
@@ -1431,6 +1450,29 @@ describe('bot-config store', () => {
     expect(r3.ok).toBe(true);
     if (r3.ok) expect(r3.newText).toBe('on');
     expect(readConfig().replyCardShowTools).toBeUndefined();
+  });
+
+  it('defaultOn boolean (streamingCardFoldedLayout): inverted persistence — only explicit false is written', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('streamingCardFoldedLayout')!;
+
+    const r1 = await store.applyConfigField('app_default', spec, false);
+    expect(r1.ok).toBe(true);
+    if (r1.ok) { expect(r1.oldText).toBe('on'); expect(r1.newText).toBe('off'); }
+    expect(readConfig().streamingCardFoldedLayout).toBe(false);
+    expect(registry.getBot('app_default').config.streamingCardFoldedLayout).toBe(false);
+
+    const r2 = await store.applyConfigField('app_default', spec, true);
+    expect(r2.ok).toBe(true);
+    if (r2.ok) { expect(r2.oldText).toBe('off'); expect(r2.newText).toBe('on'); }
+    expect(readConfig().streamingCardFoldedLayout).toBeUndefined();
+    expect(registry.getBot('app_default').config.streamingCardFoldedLayout).toBeUndefined();
+
+    await store.applyConfigField('app_default', spec, false);
+    const r3 = await store.applyConfigField('app_default', spec, null);
+    expect(r3.ok).toBe(true);
+    if (r3.ok) expect(r3.newText).toBe('on');
+    expect(readConfig().streamingCardFoldedLayout).toBeUndefined();
   });
 
   it('usageDisplay is an immediate three-state enum persisted verbatim, cleared via unset', async () => {

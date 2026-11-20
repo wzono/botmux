@@ -148,7 +148,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     tab: 'security',
     titleKey: 'botDefaults.sectionGrant',
     fieldKeys: [
-      'botDefaults.p2pOpen', 'botDefaults.restrictGrant', 'botDefaults.autoGrantCard',
+      'botDefaults.p2pOpen', 'botDefaults.scheduleCreateByTalkers', 'botDefaults.restrictGrant', 'botDefaults.autoGrantCard',
       'botDefaults.grantRequestToOwnerDm', 'botDefaults.trustSameOwnerBots', 'botDefaults.grantDelegateBots',
       'botDefaults.grantDurationDefault', 'botDefaults.quotaDefault',
     ],
@@ -158,7 +158,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     id: 'slash-commands',
     tab: 'security',
     titleKey: 'botDefaults.sectionSlashCommands',
-    fieldKeys: ['botDefaults.nativeSlashTitle', 'botDefaults.canTalkDaemon', 'botDefaults.customPassthrough'],
+    fieldKeys: ['botDefaults.nativeSlashTitle', 'botDefaults.canTalkDaemon', 'botDefaults.customPassthrough', 'botDefaults.bareRenamePassthrough'],
   },
   {
     id: 'card-behavior',
@@ -168,7 +168,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.replyCardMode', 'botDefaults.autoStreaming', 'botDefaults.goalStatusCard', 'botDefaults.pinStreamingCard',
       'botDefaults.privateCard', 'botDefaults.writableLink', 'botDefaults.footerTiming',
       'botDefaults.usageDisplay', 'botDefaults.silentTurnReactions', 'botDefaults.replyCardActions', 'botDefaults.replyCardNextStep',
-      'botDefaults.replyCardRecap', 'botDefaults.replyCardRecapModel',
+      'botDefaults.replyCardRecap',
       'botDefaults.cotEnabled', 'botDefaults.replyCardTools', 'botDefaults.replyCardShowTools',
       'botDefaults.replyFooterEnabled', 'botDefaults.replyFooterBrand', 'botDefaults.replyFooterModel',
       'botDefaults.replyFooterUsage', 'botDefaults.replyFooterRecipients', 'botDefaults.replyFooterVoice',
@@ -176,6 +176,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.streamingButton.writeLink', 'botDefaults.streamingButton.compact',
       'botDefaults.streamingButton.stop', 'botDefaults.streamingButton.close',
       'botDefaults.streamingButton.substitute',
+      'botDefaults.streamingCardFoldedLayout',
       'quietPreset.title', 'quietPreset.switch',
     ],
   },
@@ -488,6 +489,7 @@ export type BotDefaultsRow = {
   disableStreamingCard?: boolean;
   replyCardMode?: 'legacy' | 'unified';
   hiddenStreamingCardButtons?: StreamingCardButtonId[];
+  streamingCardFoldedLayout?: boolean;
   pinStreamingCard?: boolean;
   silentTurnReactions?: boolean;
   codexAppCleanInput?: boolean;
@@ -499,7 +501,6 @@ export type BotDefaultsRow = {
   replyCardActions?: boolean;
   replyCardNextStep?: boolean;
   replyCardRecap?: boolean;
-  replyCardRecapModel?: boolean;
   /** Bot-level master switch for the native CoT (thinking process) message.
    *  Default ON — only an explicit false means disabled. */
   cotEnabled?: boolean;
@@ -572,6 +573,8 @@ export type BotDefaultsRow = {
   customPassthroughCommands?: string;
   defaultPassthroughCommands?: string[];
   canTalkDaemonCommands?: string;
+  /** Bare `/rename` goes to the CLI to name the session itself (default off). */
+  bareRenamePassthrough?: boolean;
   launchShell?: string;
   env?: string;
   envKeys?: string[];
@@ -597,6 +600,7 @@ export type BotDefaultsRow = {
   autoGrantRequestCards?: boolean;
   restrictGrantCommands?: boolean;
   p2pOpen?: boolean;
+  scheduleCreateByTalkers?: boolean;
   grantRequestToOwnerDm?: boolean;
   trustSameOwnerBots?: boolean;
   grantDelegateBots?: string[];
