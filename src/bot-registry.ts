@@ -1708,12 +1708,12 @@ export interface BotConfig {
    * 最终回复投递方式。`send`：模型必须自己执行 `botmux send` 把回复发到飞书，
    * 系统提示与每轮 reminder 都这么要求。`transcript`：daemon 从 CLI 转写自动取
    * 本轮最后的 assistant 文本发最终回复卡（即原来的 bridge fallback 升为主通道），
-   * 系统提示不再提及 `botmux send`、不再注入每轮 reminder；solo 会话（私聊 / 仅
-   * owner 的 1v1 群）还会去掉 `<user_message>` 壳与 `<sender/>`。只对有转写采集
-   * 的 CLI 有效（见 core/reply-delivery.ts），不支持的 CLI 运行时自动回落 send。
-   * 缺省见 `defaultReplyDeliveryFor`（doubao 缺省 transcript，其余 CLI 缺省 send）；
-   * 显式 `'send'` / `'transcript'` 都持久化。系统提示部分需 /restart 生效，逐轮
-   * 信封立即生效。
+   * 系统提示只把 `botmux send` 留给协作 / 附件 / 跨群话题、不再注入每轮 reminder；
+   * solo 会话（私聊 / 仅 owner 的 1v1 群）还会去掉 `<user_message>` 壳与 `<sender/>`。
+   * 只对有转写采集的 CLI 有效（见 core/reply-delivery.ts），不支持的 CLI 运行时自动
+   * 回落 send。缺省见 `defaultReplyDeliveryFor`（有转写采集的 CLI 缺省 transcript，
+   * 其余缺省 send）；显式 `'send'` / `'transcript'` 都持久化、不被缺省覆盖。系统提示
+   * 部分需 /restart 生效，逐轮信封立即生效。
    */
   replyDelivery?: 'send' | 'transcript';
   turnResults?: { enabled: boolean };
@@ -2099,6 +2099,19 @@ export interface BotConfig {
   scheduleCreateByTalkers?: boolean;
   /** 每位对话用户在本 bot 最多保留的存活（启用或暂停）talker 任务数；1–100，缺省 5。 */
   scheduleTalkerMaxTasks?: number;
+  /**
+   * 个人助理模式：每个会话有且只有一个 owner（私聊 = 发消息的人；群 = 把 bot 拉进群
+   * 的人，记在 assistant-owners 表；查不到 owner 的群不服务，等 `/assistant claim`）。
+   * owner 决定一切：cwd = `<BOT_HOME>/users/<owner>/work`，CLI 数据目录 =
+   * `<BOT_HOME>/users/<owner>/claude`，沙盒只授这棵子树，角色库不授，`botmux quoted /
+   * history / list` 只认同 owner，`lark-cli --as bot` 一律拒绝。**必须配合 oncall 沙盒**
+   * （worker spawn 处 fail-closed）。不支持角色系统（role switch / cd / repo 拒绝）。
+   * 设计：docs/design/2026-11-20-assistant-mode.md。
+   */
+  assistantMode?: boolean;
+  /** 助理模式的人设模板目录：每次 spawn 覆盖同步进 owner 的 work/（模板有的覆盖、
+   *  用户自己的文件保留）。缺省 = effectiveDefaultWorkingDir。 */
+  assistantTemplateDir?: string;
   /**
    * 是否接受**其他 bot** 通过 `botmux send --slash` 发来的原生斜杠命令
    * （/clear、/model、/close…）。默认开（undefined = 开）；只有显式 false 才关。
@@ -3072,8 +3085,8 @@ export function getStrictOwnerOpenId(larkAppId: string): string | undefined {
 }
 
 /** Per-bot 最终回复投递方式的**显式**配置值；未配置 / 未注册的 bot 返回 undefined，
- *  由 core/reply-delivery.ts 的 effectiveReplyDelivery 按 CLI 补缺省（doubao 缺省
- *  transcript，其余缺省 send）。只读内存
+ *  由 core/reply-delivery.ts 的 effectiveReplyDelivery 按 CLI 补缺省（有转写采集的
+ *  CLI 缺省 transcript，其余缺省 send）。只读内存
  *  registry：worker 通过 init IPC 拿冻结值，不需要磁盘 mtime 缓存。 */
 export function resolveReplyDelivery(larkAppId: string): 'send' | 'transcript' | undefined {
   const v = bots.get(larkAppId)?.config.replyDelivery;
@@ -4520,7 +4533,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       sandboxHidePaths: normalizeStringList(entry.sandboxHidePaths),
       sandboxReadonlyPaths: normalizeStringList(entry.sandboxReadonlyPaths),
       sandboxNetwork: typeof entry.sandboxNetwork === 'boolean' ? entry.sandboxNetwork : undefined,
-      ...(entry.sandboxWithholdBotSecret === true ? { sandboxWithholdBotSecret: true } : {}),
+      // assistantMode implies it (see sandboxWithholdsBotSecret)
+      ...(entry.sandboxWithholdBotSecret === true || entry.assistantMode === true ? { sandboxWithholdBotSecret: true } : {}),
       ...(entry.sandboxNetworkPolicy !== undefined ? { sandboxNetworkPolicy: parseSandboxNetworkPolicy(entry.sandboxNetworkPolicy) } : {}),
       readIsolation: entry.readIsolation === true,
       readDenyExtraPaths: normalizeStringList(entry.readDenyExtraPaths),
@@ -4594,6 +4608,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         && Number.isInteger(entry.scheduleTalkerMaxTasks)
         && entry.scheduleTalkerMaxTasks >= 1 && entry.scheduleTalkerMaxTasks <= 100
         ? entry.scheduleTalkerMaxTasks
+        : undefined,
+      assistantMode: entry.assistantMode === true || undefined,
+      assistantTemplateDir: typeof entry.assistantTemplateDir === 'string' && entry.assistantTemplateDir.trim()
+        ? entry.assistantTemplateDir.trim()
         : undefined,
       messageQuota,
       grantDefaultDurationMs,

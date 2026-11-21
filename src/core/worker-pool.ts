@@ -1,4 +1,6 @@
+import { configuredCliExecutionMode, isWorkerCliExecution, type WorkerCliExecution } from './cli-execution-mode.js';
 import { isLeadOnlySession } from './lead-only.js';
+import { decideAssistantAdmission, decideAssistantLiveInputAdmission } from './assistant-spawn.js';
 import { controllerForSession, type WorkerContractContext } from './session-controller.js';
 import { sameWorker, sameRuntime, sameExecution, executionObserverSupported, contractTerminalStatus } from '../services/session-contract.js';
 import { runtimeStartRefusal } from '../services/runtime-reservation.js';
@@ -129,8 +131,8 @@ import {
   initialNativeRenameStartupCommand,
   initialPiLaunchSessionTitle,
 } from './initial-native-rename.js';
-import { effectiveReplyDelivery } from './reply-delivery.js';
-import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, normalizeBackgroundTaskPins, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
+import { effectiveReplyDelivery, resolveLegacyReplyDeliveryForSession } from './reply-delivery.js';
+import { fallbackTurnId, frozenReplyContextForTurn, inheritTurnReplyRouting, isSubstituteTurn, normalizeBackgroundTaskPins, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
 import { updateMessage, deleteMessage, listChatMessages, listThreadMessages, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildTurnTerminalFooterPatch, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildStuckPageCard, buildStuckKeyResultCard, buildInputNotSubmittedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildRecoveryFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type StreamCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
@@ -141,7 +143,8 @@ import { cliModelMayKeepReasoningEffort, cliModelSupportsReasoningEffort, isBack
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { resolveCodexRpcInput } from '../services/codex-rpc-input-policy.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
-import { refundRetryAttempt } from '../services/failed-turn-retry.js';
+import { markRetryAttempt, refundRetryAttempt } from '../services/failed-turn-retry.js';
+import { noteReplyCardTurnStarted } from './reply-card-turn-start.js';
 import { takePurgeClickRollback } from '../services/image-purge-recovery.js';
 import { hashUrlForLog, type RiffBackendConfig } from '../adapters/backend/riff-backend.js';
 import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
@@ -273,6 +276,7 @@ import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
 import { getBot, getAllBots, getBotBrand, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
+import { assistantInitFields } from './assistant-mode.js';
 import { resolveHiddenStreamingCardButtons, resolveStreamingCardFoldedLayout } from '../im/lark/streaming-card-buttons.js';
 import { resolveSubstituteCardControl, type SubstituteCardControl } from '../im/lark/substitute-card-control.js';
 import { isLarkContentAuditError, larkErrorCode } from '../im/lark/content-audit.js';
@@ -1086,6 +1090,17 @@ import { sameTrustedPrincipal } from './active-turn-authority.js';
 import { usageLimitStateKey, reconcileUsageLimitState, isActiveWorkRuntimeStatus, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
 import { isAntigravityWorkingScreen, rememberAntigravityQuota } from '../adapters/cli/antigravity.js';
 import {
+  inspectAntigravityAccounts,
+  maskAntigravityEmail,
+  rotateAntigravityAccountOnQuotaLimit,
+} from '../services/antigravity-accounts.js';
+import {
+  cancelAntigravityRotationReplay,
+  clearInFlightAntigravityRotation,
+  formatAntigravityCooldown,
+  tryAntigravityQuotaAutoRotate,
+} from './antigravity-rotation.js';
+import {
   evaluateVcMeetingManagedSend,
   resolveVcMeetingImTurnOrigin,
 } from '../services/vc-meeting-send-policy.js';
@@ -1886,6 +1901,9 @@ export function identityDecisionConflict(ds: DaemonSession): string | undefined 
   const report = ds.reportedIdentityModel;
   if (!report) return undefined;
   if (report.conflict) return report.conflict;
+  if (report.cliExecution && report.cliExecution.mode !== configuredCliExecutionMode(getBot(ds.larkAppId).config)) {
+    return 'CLI execution mode changed; restart the session before using tool credentials';
+  }
   if (report.model === 'proven' && !provenStructurallyPossible(ds)) {
     return 'worker reported the proven identity model for a session that structurally cannot run proven';
   }
@@ -1901,7 +1919,7 @@ export function recordWorkerIdentityDecision(
   ds: DaemonSession,
   worker: ChildProcess,
   workerGeneration: number,
-  report: { model: IdentityStorageModel; sandboxEngaged: boolean; loopbackShared: boolean },
+  report: { model: IdentityStorageModel; sandboxEngaged: boolean; loopbackShared: boolean; cliExecution?: WorkerCliExecution },
 ): { model: IdentityStorageModel; flipped: boolean } {
   let conflict: string | undefined;
   if (report.model !== 'single' && report.model !== 'proven') {
@@ -1924,6 +1942,7 @@ export function recordWorkerIdentityDecision(
     workerPid: worker.pid ?? -1,
     workerGeneration,
     reportedAt: Date.now(),
+    ...(isWorkerCliExecution(report.cliExecution) ? { cliExecution: { ...report.cliExecution, executor: { ...report.cliExecution.executor } } } : {}),
     ...(conflict ? { conflict } : {}),
   };
   return { model, flipped };
@@ -4104,6 +4123,7 @@ export function ensureReadonlyTaskContinuationAttached(
           turnId: dispatch.turnId,
           dispatchAttempt: dispatch.dispatchAttempt,
           ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds), ...latestLaunchCommandsForRespawn(ds), ...latestPinEffortForRespawn(ds) } : {}),
+          ...(ds.crashDiagnosticParked ? { replyDelivery: latestReplyDeliveryForRespawn(ds) } : {}),
           trustedCaller: current.trustedCaller,
           ...(turnCallerOpenIdFor(ds, dispatch.turnId)
             ? { turnCallerOpenId: turnCallerOpenIdFor(ds, dispatch.turnId)! }
@@ -8775,6 +8795,7 @@ export function killWorker(
   }
   restartCoordinator.cancelSession(ds.session.sessionId);
   resetStartingCardHealth(ds);
+  ds.antigravityRotation = undefined;
   try {
     clearUsageLimitState(ds);
   } catch (error) {
@@ -8871,6 +8892,7 @@ export function killWorker(
 export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void {
   restartCoordinator.cancelSession(ds.session.sessionId);
   resetStartingCardHealth(ds);
+  ds.antigravityRotation = undefined;
   clearUsageLimitState(ds);
   ds.workerReady = false;
   // SIGTERM below makes the worker killCli() — the CLI prompt is gone.
@@ -8903,6 +8925,7 @@ function clearTransferWorkerState(
 ): void {
   restartCoordinator.cancelSession(ds.session.sessionId);
   resetStartingCardHealth(ds);
+  ds.antigravityRotation = undefined;
   clearUsageLimitState(ds);
   ds.workerReady = false;
   // The transfer detaches this worker/CLI pair; the replacement must re-prove
@@ -9418,6 +9441,26 @@ function latestCodexRpcInputForRespawn(ds: DaemonSession): boolean | undefined {
  * Live-worker /restart 或崩溃恢复携带的最新 larkToolBinding 开关。
  * 三分态返回：true = 开启/默认（未配置视为开启）；null = 明确关闭；undefined = 异常保持快照不动。
  */
+/** 与应用绑定一起随每次 CLI respawn 更新，查不到时保留旧快照。 */
+export function latestTriggerUserAuthForRespawn(ds: DaemonSession): import('../services/trigger-user-auth.js').TriggerUserAuthConfig | null | undefined {
+  try { return getBot(ds.larkAppId).config.triggerUserAuth ?? null; }
+  catch { return undefined; }
+}
+
+/** replyDelivery for an in-worker respawn (`/restart`): the replacement CLI's
+ *  prompt and the worker gate follow today's config, like a re-fork would.
+ *  Undefined (lookup failed) keeps the worker's snapshot. */
+export function latestReplyDeliveryForRespawn(ds: DaemonSession): 'send' | 'transcript' | undefined {
+  try {
+    const botCfg = getBot(ds.larkAppId).config;
+    return effectiveReplyDelivery(ds.larkAppId, sessionCliId(ds, botCfg), sessionPromptInjection(ds),
+      { sessionSandbox: ds.session.sandbox });
+  } catch {
+    return undefined;
+  }
+}
+
+
 export function latestLarkToolBindingForRespawn(ds: DaemonSession): boolean | null | undefined {
   try {
     const binding = getBot(ds.larkAppId).config.larkToolBinding;
@@ -9499,9 +9542,10 @@ export interface SessionRestartRequest {
  * restart stays distinguishable from IM `/restart` in the worker's message.
  * The worker does not branch on it.
  */
-function restartIpcReason(source: RestartSource): { reason?: 'operator' | 'cli_crash' } {
+function restartIpcReason(source: RestartSource): { reason?: 'operator' | 'cli_crash' | 'account_rotation' } {
   if (source === 'cli_crash') return { reason: 'cli_crash' };
   if (source === 'dashboard') return { reason: 'operator' };
+  if (source === 'account_rotation') return { reason: 'account_rotation' };
   return {};
 }
 
@@ -9570,6 +9614,8 @@ export function requestSessionRestart(
             traexAutoModel: opts.topicEffort ? null : latestTraexAutoModelForRespawn(ds),
             ...(opts.topicEffort ? {} : { codexRpcInput: latestCodexRpcInputForRespawn(ds),
               larkToolBinding: latestLarkToolBindingForRespawn(ds),
+              triggerUserAuth: latestTriggerUserAuthForRespawn(ds),
+              replyDelivery: latestReplyDeliveryForRespawn(ds),
               ...latestLaunchCommandsForRespawn(ds),
               ...(nextStatuslineLaunchGen ? { statuslineLaunchGen: nextStatuslineLaunchGen } : {}) }) } as DaemonToWorker);
         } catch (sendError) {
@@ -12767,6 +12813,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stil
   // This worker generation is being retired: an in-flight restart of it can
   // no longer report a result. Same as killWorker / retireWorkerProcessOnly.
   restartCoordinator.cancelSession(ds.session.sessionId);
+  ds.antigravityRotation = clearInFlightAntigravityRotation(ds.antigravityRotation);
   try {
     w.send({ type: 'suspend' } as DaemonToWorker);
   } catch {
@@ -15000,6 +15047,14 @@ function sendOrdinaryImDeliveryAttempt(record: OrdinaryImDelivery): boolean {
     });
   }
 
+  // IPC bootstrap / 重试可能跨越 owner 改绑。实际发送前再查一次；入口处的
+  // allow 不能授权这个较晚的投递点。拒绝由共用闸提示重发并退役，清掉投递
+  // 记录以免传输超时再补一张含义不准确的失败卡。
+  if (!assistantLiveInputAdmission(record.ds, record.turnId, { context: 'worker IPC delivery' })) {
+    clearOrdinaryImDelivery(record);
+    return false;
+  }
+
   if (record.timer) clearTimeout(record.timer);
   record.timer = undefined;
   record.received = false;
@@ -15442,6 +15497,18 @@ function withTurnCaller(ds: DaemonSession, message: TransferBufferedInput): Tran
   return { ...message, turnCallerOpenId: openId } as TransferBufferedInput;
 }
 
+/** Content input must be re-authorized at the actual IPC boundary. Control-only
+ * messages deliberately avoid getBot: teardown and unregistered-app IPC rely on
+ * their cheap no-registry path. */
+function assistantTransferInputDeliveryAllowed(
+  ds: DaemonSession,
+  message: TransferBufferedInput,
+  context: string,
+): boolean {
+  if (message.type !== 'message' && message.type !== 'raw_input' && message.type !== 'inject_command') return true;
+  return assistantLiveInputAdmission(ds, 'turnId' in message ? message.turnId : undefined, { context });
+}
+
 /** Route user/automation input through the transfer fence. Messages accepted
  * during detach are replayed byte-for-byte to the replacement generation. */
 export function sendWorkerSessionInput(
@@ -15477,6 +15544,7 @@ export function sendWorkerSessionInput(
     ? { ...message, sessionCommand: { version: 2 as const, execution: controller.admitInput(message.turnId, message.dispatchAttempt) } }
     : message;
   const annotated = withTurnCaller(ds, scoped);
+  if (!assistantTransferInputDeliveryAllowed(ds, annotated, 'worker session input')) return false;
   if (bufferTransferInput(ds, annotated)) {
     if (onIpcDispatched) transferInputDispatchCallbacks.set(annotated, onIpcDispatched);
     return true;
@@ -15484,6 +15552,7 @@ export function sendWorkerSessionInput(
   const worker = ds.worker;
   if (!worker || worker.killed) return false;
   return afterWorkerIpcBootstrap(worker, () => {
+    if (!assistantTransferInputDeliveryAllowed(ds, annotated, 'worker session input after bootstrap')) return;
     const sent = worker.send(annotated);
     if (onIpcDispatched && sent !== false && ds.worker === worker && canForkRegisteredSession(ds)) onIpcDispatched();
     return sent;
@@ -15901,6 +15970,7 @@ function releaseTransferInputGate(
           }
         } else {
           if (!afterWorkerIpcBootstrap(worker, () => {
+            if (!assistantTransferInputDeliveryAllowed(ds, message, 'transfer replay after bootstrap')) return;
             const sent = worker.send(message);
             if (onIpcDispatched && sent !== false && ds.worker === worker && canForkRegisteredSession(ds)) {
               onIpcDispatched();
@@ -16704,6 +16774,8 @@ async function forkFromSource(
     childSession.cliId = ds.session.cliId;
     childSession.workingDir = ds.workingDir ?? ds.session.workingDir;
     childSession.ownerOpenId = opts?.childOwnerOpenId ?? ds.session.ownerOpenId;
+    // 个人助理模式：fork 出来的会话仍在同一 chat，归属同一个助理主人。
+    if (ds.session.assistantOwnerOpenId) childSession.assistantOwnerOpenId = ds.session.assistantOwnerOpenId;
     childSession.backendType = ds.session.backendType;
     // Bot identity on the PERSISTED row. Every other createSession caller sets
     // this immediately after minting (trigger-session / session-manager /
@@ -16928,6 +17000,7 @@ function acceptCodexAppDispatch(
     quoteTargetId?: string;
     replyTargetSenderOpenId?: string;
     replyTargetSenderIsBot?: boolean;
+    crossChatOrigin?: CodexAppDispatchLedgerEntry['crossChatOrigin'];
     queuedActivationToken?: string;
     codexAppSteerable?: true;
     linkRefMode?: 'observe' | 'enabled';
@@ -16961,6 +17034,7 @@ function acceptCodexAppDispatch(
       ...(payload.replyTargetSenderIsBot !== undefined
         ? { replyTargetSenderIsBot: payload.replyTargetSenderIsBot }
         : {}),
+      ...(payload.crossChatOrigin ? { crossChatOrigin: payload.crossChatOrigin } : {}),
       deliverySink: codexAppDeliverySinkForTurn(ds, turnId, dispatchAttempt),
       ...(payload.codexAppSteerable ? { codexAppSteerable: true } : {}),
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
@@ -17374,6 +17448,8 @@ function forgetScheduledTurnCaller(ds: DaemonSession, turnId: string | undefined
   if (ds.scheduledTurnCallers?.size === 0) ds.scheduledTurnCallers = undefined;
   ds.scheduledToolActors?.delete(turnId);
   if (ds.scheduledToolActors?.size === 0) ds.scheduledToolActors = undefined;
+  ds.scheduledControlActors?.delete(turnId);
+  if (ds.scheduledControlActors?.size === 0) ds.scheduledControlActors = undefined;
 }
 
 /** Reuse the daemon's normal per-turn credential publication, including scheduled authority checks. */
@@ -17569,6 +17645,37 @@ export function applyFailedTurnRewindResult(
   }
 }
 
+/** 现有会话接收任何输入前的统一助理归属闸。队列写入、journal promotion、
+ * 普通 IPC 与 bootstrap 后的 init 都必须在各自实际边界重新调用，不能只靠入口检查。 */
+export function assistantLiveInputAdmission(
+  ds: DaemonSession,
+  turnId: string | undefined,
+  opts: {
+    notifyRejection?: false;
+    context?: string;
+    bot?: ReturnType<typeof getBot>;
+  } = {},
+): boolean {
+  const bot = opts.bot ?? getBot(ds.larkAppId);
+  if (bot.config.assistantMode !== true) return true;
+  const decision = decideAssistantLiveInputAdmission(ds.larkAppId, {
+    chatId: ds.chatId,
+    chatType: ds.session.chatType === 'p2p' ? 'p2p' : 'group',
+    ownerOpenId: ds.session.ownerOpenId,
+    assistantOwnerOpenId: ds.session.assistantOwnerOpenId,
+    sandboxWithholdBotSecret: ds.session.sandboxWithholdBotSecret,
+  });
+  if (decision.kind === 'allow') return true;
+  const context = opts.context ?? 'input';
+  logger.warn(`[${tag(ds)}] assistant-mode: refusing ${context} ${turnId ?? '?'} to a session not owned by the current owner; retiring it`);
+  if (opts.notifyRejection !== false) void callbacks?.sessionReply(
+    sessionAnchorId(ds), tr('worker.assistant.session_retired', {}, localeForBot(ds.larkAppId)), 'text', ds.larkAppId, turnId,
+  ).catch(err => logger.warn(`[${tag(ds)}] assistant-mode: failed to report retired session: ${String(err)}`));
+  void closeSessionForBackgroundCleanup(ds.session.sessionId, `assistant-mode ${context} to unowned session`).catch(err =>
+    logger.warn(`[${tag(ds)}] assistant-mode: retire failed: ${(err as Error).message}`));
+  return false;
+}
+
 export function sendWorkerInput(
   ds: DaemonSession,
   payload: string | CliTurnPayload,
@@ -17642,6 +17749,8 @@ export function sendWorkerInput(
   let normalized = typeof payload === 'string' ? { content: payload } : payload;
   const trustedController = trustedSessionController(ds);
   const bot = getBot(ds.larkAppId);
+  // 个人助理模式：活着的 worker 也要按当前归属核对（开模式时没能退役的存量会话、主人已变）。
+  if (!assistantLiveInputAdmission(ds, turnId, { notifyRejection: opts.notifyRejection, bot })) return false;
   const effectiveCliId = sessionCliId(ds, bot.config);
   const effectiveTurnId = turnId ?? (isCodexAppCliId(effectiveCliId)
     ? `codex-app-dispatch-${randomUUID()}`
@@ -17658,7 +17767,7 @@ export function sendWorkerInput(
       ?? routingTurnId
       ?? `queued-activation-followup-${randomUUID()}`;
     try {
-      admitQueuedActivationTail(ds, {
+      const admitted = admitQueuedActivationTail(ds, {
         userPrompt: normalized.content,
         cliInput: {
           content: normalized.content,
@@ -17678,6 +17787,7 @@ export function sendWorkerInput(
           ? { dispatchAttempt: opts.dispatchAttempt }
           : {}),
       });
+      if (!admitted) return false;
       logger.info(
         `[${tag(ds)}] Staged turn ${queuedTurnId} behind queued activation ACK`,
       );
@@ -17734,6 +17844,7 @@ export function sendWorkerInput(
       ...(replyContext.replyTargetSenderIsBot !== undefined
         ? { replyTargetSenderIsBot: replyContext.replyTargetSenderIsBot }
         : {}),
+      ...(replyContext.crossChatOrigin ? { crossChatOrigin: replyContext.crossChatOrigin } : {}),
       ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
       ...(admittedLinkRefs.mode === 'disabled'
         ? {}
@@ -17778,7 +17889,8 @@ export function sendWorkerInput(
     // itself. Only while parked: an ordinary turn changes no launch config, and
     // an unconditional field would be pure noise on every message.
     ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds), ...latestPinEffortForRespawn(ds) } : {}),
-    ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds) } : {}),
+    ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds), triggerUserAuth: latestTriggerUserAuthForRespawn(ds) } : {}),
+    ...(ds.crashDiagnosticParked ? { replyDelivery: latestReplyDeliveryForRespawn(ds) } : {}),
     ...(ds.crashDiagnosticParked ? latestLaunchCommandsForRespawn(ds) : {}),
     ...(codexAppInput ? { codexAppInput } : {}),
     ...(admittedLinkRefs.mode === 'disabled' ? {} : { linkRefMode: admittedLinkRefs.mode }),
@@ -18236,6 +18348,9 @@ export function promoteQueuedActivationTail(
     .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
   const head = ordered[0];
   if (!head) return false;
+  // owner 可能在 tail 落盘后、ACK promotion 前改变。必须在移动 journal 之前拒绝，
+  // 否则旧会话会把新主人的输入推进成自己的下一个持久化回合。
+  if (!assistantLiveInputAdmission(ds, head.turnId, { context: 'queued activation promotion' })) return false;
 
   const priorJournal = snapshotQueuedActivationJournal(ds.session);
   const priorTail = ds.session.queuedActivationTail?.map(entry => ({
@@ -18322,6 +18437,7 @@ export function promoteQueuedActivationTail(
         ...(replyContext.replyTargetSenderIsBot !== undefined
           ? { replyTargetSenderIsBot: replyContext.replyTargetSenderIsBot }
           : {}),
+        ...(replyContext.crossChatOrigin ? { crossChatOrigin: replyContext.crossChatOrigin } : {}),
         // R4-B1: COPY the frozen steer authorization from the promoted tail
         // entry's payload onto the accept-ledger (admission computed once; never
         // re-inferred at promote time).
@@ -18360,7 +18476,8 @@ export function promoteQueuedActivationTail(
       ...(promotedTitlePlan?.nativePrompt ? { nativeSessionTitlePrompt: promotedTitlePlan.nativePrompt } : {}),
       // Same parked-worker launch-snapshot refresh as the ordinary send.
       ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds), ...latestPinEffortForRespawn(ds) } : {}),
-      ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds) } : {}),
+      ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds), triggerUserAuth: latestTriggerUserAuthForRespawn(ds) } : {}),
+      ...(ds.crashDiagnosticParked ? { replyDelivery: latestReplyDeliveryForRespawn(ds) } : {}),
       ...(ds.crashDiagnosticParked ? latestLaunchCommandsForRespawn(ds) : {}),
       ...(codexAppInput ? { codexAppInput } : {}),
       ...(admittedLinkRefs.mode !== 'disabled'
@@ -18436,15 +18553,18 @@ export function reserveQueuedActivationTailAdmission(
 
 /** Admit one exact successor behind a queued activation. The response boundary
  * is the session-store write: callers must not report acceptance or use live
- * worker IPC unless this returns. `reservation` lets routes reserve FIFO order
+ * worker IPC unless this returns an entry. `reservation` lets routes reserve FIFO order
  * before asynchronous prompt construction without duplicating persistence
- * logic. */
+ * logic. A live assistant-owner mismatch returns undefined before any journal
+ * or FIFO-counter mutation, after the common retire/resend handling. */
 export function admitQueuedActivationTail(
   ds: DaemonSession,
   entry: Omit<QueuedActivationTailEntry, 'id' | 'order'>,
-  reservation: QueuedActivationTailReservation = reserveQueuedActivationTailAdmission(ds),
+  reservation?: QueuedActivationTailReservation,
   opts: { codexAppInputGateFrozen?: boolean } = {},
-): QueuedActivationTailEntry {
+): QueuedActivationTailEntry | undefined {
+  if (!assistantLiveInputAdmission(ds, entry.turnId, { context: 'queued activation input' })) return undefined;
+  const fifoReservation = reservation ?? reserveQueuedActivationTailAdmission(ds);
   const admittedLinkRefs = entry.cliInput.linkRefs
     ? freezeDeferredLinkRefPayload({
         ds,
@@ -18454,12 +18574,12 @@ export function admitQueuedActivationTail(
   const frozenInput = admittedLinkRefs.payload;
   const acceptedCodexAppInput = opts.codexAppInputGateFrozen === true
     ? cloneFrozenCodexAppInput(frozenInput.codexAppInput, entry.turnId)
-    : reservation.codexAppInputAccepted === true
+    : fifoReservation.codexAppInputAccepted === true
       ? cloneFrozenCodexAppInput(frozenInput.codexAppInput, entry.turnId)
       : undefined;
   const admitted: QueuedActivationTailEntry = {
-    id: reservation.id,
-    order: reservation.order,
+    id: fifoReservation.id,
+    order: fifoReservation.order,
     ...entry,
     cliInput: {
       content: frozenInput.content,
@@ -18939,6 +19059,10 @@ function queueBehindPendingProtectedHttpEgressFork(
           && resumeOrTurnId !== null
           && resumeOrTurnId.codexAppInputGateFrozen === true,
       });
+      if (!admitted) {
+        opts.onAdmission?.('rejected');
+        return true;
+      }
       queuedActivationTailId = admitted.id;
     } catch (error) {
       logger.error(
@@ -19444,7 +19568,7 @@ function forkWorkerPrepared(
       const turnId = initTurnId
         ?? ds.currentReplyTarget?.turnId
         ?? `queued-activation-followup-${randomUUID()}`;
-      admitQueuedActivationTail(ds, {
+      const admitted = admitQueuedActivationTail(ds, {
         userPrompt: prompt,
         cliInput: {
           content: prompt,
@@ -19463,6 +19587,10 @@ function forkWorkerPrepared(
           ? { dispatchAttempt: initDispatchAttempt }
           : {}),
       });
+      if (!admitted) {
+        reportAdmission('rejected');
+        return true;
+      }
       logger.info(
         `[${tag(ds)}] Staged double-fork prompt behind queued activation ACK `
         + `(turn=${turnId})`,
@@ -19515,6 +19643,45 @@ function forkWorkerPrepared(
     }
     reportAdmission('rejected');
     return true;
+  }
+  // 个人助理模式：每次起 worker 都重新核对归属（判定见 core/assistant-spawn.ts）。这是最后
+  // 一道闸：这里放过去，worker 就会拿共享 BOT_HOME 和默认 cwd 起来。
+  if (botCfg.assistantMode === true) {
+    const decision = decideAssistantAdmission(ds.larkAppId, {
+      chatId: ds.chatId,
+      chatType: ds.session.chatType === 'p2p' ? 'p2p' : 'group',
+      ownerOpenId: ds.session.ownerOpenId,
+      assistantOwnerOpenId: ds.session.assistantOwnerOpenId,
+      everRan: ds.hasHistory || !!ds.session.cliSessionId,
+      sandboxFrozenWithoutWithhold: ds.session.sandbox !== undefined && ds.session.sandboxWithholdBotSecret !== true,
+    });
+    if (decision.kind === 'adopt') {
+      ds.session.assistantOwnerOpenId = decision.openId;
+      ds.session.workingDir = decision.workDir;
+      ds.workingDir = decision.workDir;
+      sessionStore.updateSession(ds.session);
+      logger.info(`[${tag(ds)}] assistant-mode: new session adopted by its chat owner`);
+    } else if (decision.kind === 'reject') {
+      // 拒绝之外还要退役这个会话：chat-scope 会话会被后续消息一直复用，不退役就永远卡在
+      // 这里（换了主人 / 开模式前的存量会话都是这种）。关掉后下一条消息走新建路径，按
+      // 当前归属重新建会话。本条消息丢弃，由用户重发。
+      logger.warn(`[${tag(ds)}] assistant-mode: refusing to fork — session owner ${decision.have ?? '(none)'} vs resolved ${decision.expected ?? '(none)'}; retiring session`);
+      reportAdmission('rejected');
+      // 告诉用户这条没处理、要重发（否则消息静默丢失）。
+      const retiredTurnId = fallbackTurnId(ds, initTurnId);
+      const retiredNotice = tr('worker.assistant.session_retired', {}, botLocale(botCfg));
+      if (opts.onAdmissionBlocked) {
+        opts.onAdmissionBlocked({ content: retiredNotice, ...(retiredTurnId ? { turnId: retiredTurnId } : {}) });
+      } else if (prompt.length > 0 || initTurnId) {
+        void cb.sessionReply(sessionAnchorId(ds), retiredNotice, 'text', ds.larkAppId, retiredTurnId,
+          { sourceSessionId: ds.session.sessionId }).catch(error => logger.error(
+            `[${tag(ds)}] assistant-mode: failed to report retired session: ${String(error)}`,
+          ));
+      }
+      void closeSessionForBackgroundCleanup(ds.session.sessionId, 'assistant-mode owner mismatch').catch(err =>
+        logger.warn(`[${tag(ds)}] assistant-mode: retire failed: ${(err as Error).message}`));
+      return false;
+    }
   }
   const admission = checkWorkerAdmission(readGlobalConfig().worker);
   for (const warning of admission.pressure.warnings) {
@@ -20059,6 +20226,9 @@ function forkWorkerPrepared(
             ...(initReplyContext.replyTargetSenderIsBot !== undefined
               ? { replyTargetSenderIsBot: initReplyContext.replyTargetSenderIsBot }
               : {}),
+            ...(initReplyContext.crossChatOrigin
+              ? { crossChatOrigin: initReplyContext.crossChatOrigin }
+              : {}),
           } : {}),
           // R4-B1: COPY the frozen steer authorization onto the fork's
           // accept-ledger entry so a recovered/opening first turn is steerable
@@ -20295,6 +20465,10 @@ function forkWorkerPrepared(
     // Raw configured value; the worker normalizes + enforces the fail-closed
     // contract (services/cli-credential-source.ts).
     ...(botCfg.credentialsSourceDir ? { credentialsSourceDir: botCfg.credentialsSourceDir } : {}),
+    // 模板缺省 = bot 默认工作目录（同 effectiveDefaultWorkingDir；不从 bot-registry 引入，
+    // 大量单测对该模块做了白名单 mock）。
+    ...assistantInitFields(botCfg, ds.session.assistantOwnerOpenId,
+      botCfg.defaultWorkingDir || (botCfg.defaultOncall?.enabled ? botCfg.defaultOncall.workingDir : undefined)),
     cliInstanceBinding: ds.session.cliInstanceBinding,
     // Trigger-user CLI auth: the worker needs the policy to know which tools to
     // wrap at spawn. Absent → the worker installs nothing and PATH is untouched.
@@ -20432,6 +20606,15 @@ function forkWorkerPrepared(
     // injectsSessionContext 适配器选系统提示措辞；solo 由 daemon 在 fork 前按轮算好
     // 写在 ds 上（resolveSoloSessionForTurn），缺省非 solo。
     replyDelivery: effectiveReplyDelivery(botCfg.larkAppId, agentCfg.cliId, sessionPromptInjection(ds)),
+    // 旧版 botmux 起的 pane（环境里没有 REPLY_DELIVERY_ENV 快照）按当时的缺省起提示；
+    // 热重连时 worker 用它判这个 pane 的投递方式（services/pane-reply-delivery.ts）。
+    replyDeliveryLegacy: resolveLegacyReplyDeliveryForSession(
+      ds.session,
+      botCfg.larkAppId,
+      agentCfg.cliId,
+      sessionPromptInjection(ds),
+      () => sessionStore.updateSession(ds.session),
+    ),
     // 实验性、默认关闭：只有显式 true 才下发，worker 读不到即保持旧的失败通知。
     // adopt init 不带它：adopt 的失败兜底本就由 adoptMode 门禁抑制。
     ...(botCfg.suppressDeliveredFinalFailureNotice === true ? { suppressDeliveredFinalFailureNotice: true } : {}),
@@ -20597,8 +20780,11 @@ function forkWorkerPrepared(
     }
   } else {
     afterWorkerIpcBootstrap(worker, () => {
-      // Bootstrap may wait while a human stops or supersedes the task. A blank
-      // worker can still serve that new input, but must not inherit the claim.
+      // Bootstrap may wait while a human stops, supersedes the task, or rebinds
+      // the assistant owner. The fork-time admission does not cover this later
+      // IPC boundary; never release the old opening prompt into a stale worker.
+      if (!assistantLiveInputAdmission(ds, initAttributionTurnId, { context: 'worker init delivery' })) return;
+      // A blank worker can still serve a new input, but must not inherit the claim.
       if (!continuationStillAllowed()) delete initMsg.deploymentContinuation;
       onIpcDispatchAttempted?.();
       const sent = worker.send(initMsg);
@@ -20878,6 +21064,7 @@ function setupWorkerHandlers(
   }
   ds.taskContinuationRpcProof = undefined;
   ds.codexAppInterruptTarget = undefined;
+  ds.antigravityRotation = clearInFlightAntigravityRotation(ds.antigravityRotation);
   // 新 Node worker 代次绑定即作废旧崩溃连胜：上一 worker 代次（OOM/管控死亡、
   // 或 killWorker/retire 后由任务续跑/用户消息拉起的替代进程）锚定的 readyAt
   // 不能连坐新一代——否则新 CLI 在旧 readyAt 的 60s 窗口内第一次永久退出
@@ -21221,6 +21408,234 @@ function setupWorkerHandlers(
       if (managedAuxUiSuppressed(turnId, attempt)) return;
     }
     const limitKey = usageLimitStateKey(limit);
+    // Antigravity hosted-account auto-rotation: on genuine native quota
+    // exhaustion (`antigravity-error-composer`), rotate the host vault to
+    // the next healthy account, restart the worker in place (resuming
+    // `--conversation`), and automatically replay the interrupted turn.
+    // When rotation starts, suppress duplicate `@owner` limit spam and
+    // `quotaFallbackBot` handoff; when disabled or exhausted, fall through
+    // so existing notifications and backup-bot handoff run as before.
+    const effectiveCliId = sessionCliId(ds, botCfg);
+    // Only replay when the limited frame carries a proven `provenTurn`
+    // matching the exact recorded turn. Without `provenTurn` (e.g. a
+    // direct Web Terminal prompt), rotate + restart cleanly and ask the
+    // user to resend rather than replaying an older completed Lark turn.
+    const capturedFailedTurn = ds.session.lastFailedTurn;
+    const matchesFailedTurn = Boolean(
+      provenTurn && capturedFailedTurn && capturedFailedTurn.turnId === provenTurn,
+    );
+    // A matching turn ID proves ownership, NOT that replay is side-effect safe.
+    // Only a durable direct-failure observation (no assistant text/tool calls)
+    // may be re-sent unattended. agy does not currently expose that proof, so
+    // its native quota path rotates + resumes but asks for manual continuation
+    // instead of repeating a turn that may already have performed mutations.
+    const replayPayload = matchesFailedTurn
+      && capturedFailedTurn?.directFailure === true
+      && capturedFailedTurn.status === 'failed'
+      && !capturedFailedTurn.recovery
+      && !capturedFailedTurn.limitedSnapshot
+      && capturedFailedTurn.retryable !== false
+      && capturedFailedTurn.cliInput.trim()
+      ? {
+          sourceTurnId: capturedFailedTurn.turnId,
+          cliInput: capturedFailedTurn.cliInput,
+          userPrompt: capturedFailedTurn.userPrompt,
+        }
+      : undefined;
+    const formatAccountLabel = (id?: string, email?: string): string => {
+      const masked = maskAntigravityEmail(email);
+      if (id && masked) return `\`${id}\` (${masked})`;
+      if (id) return `\`${id}\``;
+      return masked ?? 'unknown';
+    };
+    const rotationDecision = tryAntigravityQuotaAutoRotate({
+      effectiveCliId,
+      usageLimit: limit,
+      suppressRecoveryCard: ds.suppressRecoveryCard,
+      isAdoptSession: isSharedAdoptSession(ds) || Boolean(ds.adoptedFrom || ds.initConfig?.adoptMode),
+      isRemoteBackend: isRemoteBackendSession(ds),
+      isTransferring: isSessionTransferring(ds),
+      hasProtectedMutation: hasProtectedSessionMutationOwnership(ds),
+      hasPendingFork: Boolean(ds.session.pendingForkSession),
+      restartInFlight: isSessionRestartInFlight(ds),
+      sessionAccountId: ds.antigravityAccountId ?? ds.session.antigravityAccountId,
+      screenTurnId: provenTurn,
+      lastCliInputTurnId: provenTurn ? ds.lastCliInputTurnId : undefined,
+      lastMessageAt: ds.lastMessageAt,
+      replayPayload,
+      getRotationState: () => ds.antigravityRotation,
+      setRotationState: state => { ds.antigravityRotation = state; },
+      rotateAccount: params => rotateAntigravityAccountOnQuotaLimit(params),
+      requestRestart: onSettled => {
+        const req = requestSessionRestart(ds, {
+          source: 'account_rotation',
+          notify: status => onSettled(status),
+        });
+        return { started: Boolean(req && !req.startFailure && !req.joined), attemptId: req?.attemptId };
+      },
+      isStillOwned: () => ownsLifecycleMutation() && ds.session.status === 'active',
+      isSessionActive: () => ds.session.status === 'active',
+      hasManualIntervention: (startedAtLastMessageAt, capturedTurnId) => (
+        ds.lastMessageAt > startedAtLastMessageAt
+        || Boolean(ds.pendingPrompt)
+        || Boolean(ds.pendingFollowUps?.length)
+        || Boolean(ds.pendingFollowUpTurnIds?.length)
+        || (capturedTurnId !== undefined && ds.lastCliInputTurnId !== undefined && ds.lastCliInputTurnId !== capturedTurnId)
+        || hasProtectedSessionMutationOwnership(ds)
+      ),
+      updateSessionAccount: accountId => {
+        ds.antigravityAccountId = accountId;
+        if (ds.session.antigravityAccountId !== accountId) {
+          ds.session.antigravityAccountId = accountId;
+          sessionStore.updateSession(ds.session);
+        }
+      },
+      clearUsageLimit: () => {
+        try {
+          clearUsageLimitState(ds);
+          if (ds.lastScreenStatus === 'limited') {
+            ds.lastScreenStatus = 'idle';
+          }
+        } catch (err: any) {
+          logger.warn(`[${t}] Failed to clear usage limit after antigravity rotation: ${err?.message ?? err}`);
+          // The outer state machine must stop before replay: a sticky limited
+          // frame would otherwise look like a fresh failure on the next edge.
+          throw err;
+        }
+      },
+      replayTurn: payload => {
+        if (!ds.worker || ds.worker.killed) return { accepted: false };
+        const retryTurnId = `agy-rotate-${randomUUID()}`;
+        let rollbackReplyRouting: (() => void) | undefined;
+        let accepted = false;
+        try {
+          rollbackReplyRouting = inheritTurnReplyRouting(ds, payload.sourceTurnId, retryTurnId);
+          accepted = sendWorkerInput(ds, { content: payload.cliInput }, retryTurnId);
+        } catch (err: any) {
+          logger.warn(`[${t}] Antigravity rotation auto-replay failed before acceptance: ${err?.message ?? err}`);
+        }
+        if (!accepted) {
+          rollbackReplyRouting?.();
+          try { sessionStore.updateSession(ds.session); } catch { /* the replay was not accepted */ }
+          return { accepted: false };
+        }
+        try {
+          if (payload.sourceTurnId && ds.session.lastFailedTurn?.turnId === payload.sourceTurnId) {
+            markRetryAttempt(ds.session);
+          }
+          rememberLastCliInput(ds, payload.userPrompt, { content: payload.cliInput }, retryTurnId);
+          noteReplyCardTurnStarted(ds, retryTurnId);
+          // Do NOT forge `ds.lastScreenStatus = 'working'` here: a prompt-ready
+          // idle frame arriving before agy enters busy mode would otherwise create
+          // a fake working -> idle completion edge (workflow settlement / ✅ mark).
+          ds.streamCardPending = true;
+          persistStreamCardState(ds);
+          sessionStore.updateSession(ds.session);
+          return { accepted: true, retryTurnId };
+        } catch (err: any) {
+          // The worker ALREADY accepted the input. Return the retry identity so
+          // the state machine can block a second attempt and notify uncertainty;
+          // throwing here would be swallowed by RestartCoordinator.notify().
+          return {
+            accepted: true,
+            retryTurnId,
+            persistenceError: err instanceof Error ? err.message : String(err),
+          };
+        }
+      },
+      notifySwitching: ({ fromId, toId, toEmail, alreadyRotated, willAutoReplay }) => {
+        const key = willAutoReplay ? 'worker.agy_rotate.switching' : 'worker.agy_rotate.switching_no_replay';
+        const text = tr(key, {
+          fromAccount: formatAccountLabel(fromId),
+          toAccount: formatAccountLabel(toId, toEmail),
+        }, loc);
+        logger.info(`[${t}] Antigravity quota auto-rotation: ${fromId ?? '?'} -> ${toId} (autoReplay=${willAutoReplay}, alreadyRotated=${alreadyRotated})`);
+        scopedReply(text, 'text', turnId).catch((err: any) => {
+          logger.debug(`[${t}] Failed to deliver antigravity rotation notice: ${err?.message ?? err}`);
+        });
+      },
+      notifyRestartFailed: ({ toId, toEmail, status }) => {
+        logger.warn(`[${t}] Antigravity rotation restart ${status} for target account ${toId}`);
+        const body = tr('worker.agy_rotate.restart_failed', {
+          toAccount: formatAccountLabel(toId, toEmail),
+        }, loc);
+        const ownerOpenId = ds.session.ownerOpenId;
+        const text = ownerOpenId ? `<at id=${ownerOpenId}></at> ${body}` : body;
+        scopedReply(text, 'text', turnId).catch((err: any) => {
+          logger.debug(`[${t}] Failed to deliver antigravity restart-failed notice: ${err?.message ?? err}`);
+        });
+      },
+      notifyManualReplayNeeded: ({ toId, toEmail }) => {
+        const text = tr('worker.agy_rotate.replay_manual', {
+          toAccount: formatAccountLabel(toId, toEmail),
+        }, loc);
+        scopedReply(text, 'text', turnId).catch((err: any) => {
+          logger.debug(`[${t}] Failed to deliver antigravity manual-replay notice: ${err?.message ?? err}`);
+        });
+      },
+      notifyReplayFailed: ({ toId, toEmail }) => {
+        const canRetryCommand = Boolean(
+          replayPayload?.sourceTurnId && ds.session.lastFailedTurn?.turnId === replayPayload.sourceTurnId,
+        );
+        const key = canRetryCommand ? 'worker.agy_rotate.replay_failed' : 'worker.agy_rotate.replay_failed_resend';
+        const text = tr(key, {
+          toAccount: formatAccountLabel(toId, toEmail),
+        }, loc);
+        scopedReply(text, 'text', turnId).catch((err: any) => {
+          logger.debug(`[${t}] Failed to deliver antigravity replay-failed notice: ${err?.message ?? err}`);
+        });
+      },
+      notifySettleFailed: ({ toId, toEmail, error }) => {
+        logger.warn(`[${t}] Antigravity rotation settlement failed for ${toId}: ${error}`);
+        const text = tr('worker.agy_rotate.settle_failed', {
+          toAccount: formatAccountLabel(toId, toEmail),
+        }, loc);
+        scopedReply(text, 'text', turnId).catch((err: any) => {
+          logger.debug(`[${t}] Failed to deliver antigravity settlement-failure notice: ${err?.message ?? err}`);
+        });
+      },
+      notifyReplayUncertain: ({ toId, toEmail, error }) => {
+        logger.warn(`[${t}] Antigravity rotation replay uncertain for ${toId}: ${error}`);
+        const text = tr('worker.agy_rotate.replay_uncertain', {
+          toAccount: formatAccountLabel(toId, toEmail),
+        }, loc);
+        scopedReply(text, 'text', turnId).catch((err: any) => {
+          logger.debug(`[${t}] Failed to deliver antigravity replay-uncertain notice: ${err?.message ?? err}`);
+        });
+      },
+    });
+
+    if (rotationDecision.outcome === 'started') {
+      return;
+    }
+    if (rotationDecision.outcome === 'exhausted' && ds.rateLimitNotifiedKey !== limitKey) {
+      let exhaustText: string;
+      if (rotationDecision.reason === 'turn_budget_exhausted') {
+        exhaustText = tr('worker.agy_rotate.turn_budget_exhausted', {}, loc);
+      } else {
+        const enabledCount = rotationDecision.enabledCount ?? inspectAntigravityAccounts().enabledCount;
+        const remainingMs = rotationDecision.earliestRecoveryMs !== undefined
+          ? Math.max(0, rotationDecision.earliestRecoveryMs - Date.now())
+          : undefined;
+        exhaustText = remainingMs !== undefined && remainingMs > 0
+          ? tr('worker.agy_rotate.exhausted', {
+              count: String(enabledCount),
+              recovery: formatAntigravityCooldown(remainingMs, loc),
+            }, loc)
+          : tr('worker.agy_rotate.exhausted_no_eta', {
+              count: String(enabledCount),
+            }, loc);
+      }
+      logger.warn(`[${t}] Antigravity account pool exhausted (${rotationDecision.reason})`);
+      scopedReply(exhaustText, 'text', turnId).catch((err: any) => {
+        logger.debug(`[${t}] Failed to deliver antigravity exhaustion notice: ${err?.message ?? err}`);
+      });
+    } else if (rotationDecision.outcome === 'write_failed') {
+      logger.error(`[${t}] Antigravity account rotation write failed: ${rotationDecision.error}`);
+    } else if (rotationDecision.outcome === 'identity_unknown') {
+      logger.warn(`[${t}] Antigravity quota rotation refused: session account identity is unknown`);
+    }
+
     if (ds.rateLimitNotifiedKey !== limitKey) {
       ds.rateLimitNotifiedKey = limitKey;
       const notifyBody = tr(
@@ -23207,6 +23622,29 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'antigravity_account': {
+        if (!ownsLifecycleMutation() || ds.worker !== worker) break;
+        if (ds.antigravityRotation?.inFlightToken) {
+          const expectedAttemptId = ds.antigravityRotation.restartAttemptId;
+          if (!expectedAttemptId || msg.attemptId !== expectedAttemptId) {
+            logger.warn(`[${t}] Ignored stale/uncorrelated Antigravity account report during rotation (attempt=${msg.attemptId ?? 'missing'})`);
+            break;
+          }
+          // Stash authoritative worker observation for the in-flight rotation;
+          // commit to ds/SQLite only when `restart_result: succeeded` lands so
+          // a failed restart never leaves SQLite claiming the new account.
+          ds.antigravityRotation.workerReportedAccountId = msg.accountId;
+          break;
+        }
+        const observedAccountId = msg.accountId ?? undefined;
+        ds.antigravityAccountId = observedAccountId;
+        if (ds.session.antigravityAccountId !== observedAccountId) {
+          ds.session.antigravityAccountId = observedAccountId;
+          sessionStore.updateSession(ds.session);
+        }
+        break;
+      }
+
       case 'cli_install_changed': {
         if (!ownsLifecycleMutation()) break;
         const cliId = sessionCliId(ds, getBot(ds.larkAppId).config);
@@ -23669,6 +24107,18 @@ function setupWorkerHandlers(
 
       case 'terminal_input': {
         if (!ownsLifecycleMutation()) break;
+        if (msg.submitted && ds.antigravityRotation) {
+          if (ds.antigravityRotation.inFlightToken) {
+            // Direct terminal input is human intervention just like a new IM
+            // message or /stop: adopt the restarted account, never replay the
+            // superseded task over the user's new submission.
+            cancelAntigravityRotationReplay(ds.antigravityRotation);
+          } else {
+            // A settled rotation belongs to the previous direct-input turn.
+            // Start a fresh logical-turn budget for this new submission.
+            ds.antigravityRotation = undefined;
+          }
+        }
         if (noteIdleAutoCompactDirectInput(ds)) {
           try { sessionStore.updateSession(ds.session); }
           catch (err) { logger.warn(`[${tag(ds)}] idle auto-compact direct-input save failed: ${err instanceof Error ? err.message : String(err)}`); }
@@ -25576,11 +26026,13 @@ function setupWorkerHandlers(
           });
           break;
         }
-        logger.warn(`[${t}] Worker user_notify: ${msg.message}`);
-        emitSessionLifecycleHook(ds, 'session.requires_attention', {
-          reason: 'user_notify',
-          message: msg.message,
-        });
+        if (msg.kind !== 'claude_permission_prompt') {
+          logger.warn(`[${t}] Worker user_notify: ${msg.message}`);
+          emitSessionLifecycleHook(ds, 'session.requires_attention', {
+            reason: 'user_notify',
+            message: msg.message,
+          });
+        }
         // What a resumed CLI lost to a backend outage goes on the topic's one
         // outage status card instead of a separate message.
         if (msg.kind === 'restart_interruption'
@@ -25589,11 +26041,27 @@ function setupWorkerHandlers(
         // The card already asks about this dialog. Fork agents and sessions
         // without the hook get no card and keep this notice.
         if (msg.kind === 'claude_permission_prompt') {
-          if (!permissionCardPending(ds)) await new Promise(resolve => setTimeout(resolve, PERMISSION_CARD_GRACE_MS));
+          const turn = ds.currentTurnId;
+          // New workers wait on fresh captures. Retain the grace for old workers.
+          if (!msg.permissionPromptStable && !permissionCardPending(ds)) {
+            await new Promise(resolve => setTimeout(resolve, PERMISSION_CARD_GRACE_MS));
+          }
+          if (!ownsLifecycleMutation()) break;
+          if (msg.turnId !== undefined) {
+            const attempt = ds.turnDispatchAttemptHighWater;
+            if (ds.currentTurnId !== turn || (turn !== undefined && turn !== msg.turnId)
+              || (msg.dispatchAttempt !== undefined && attempt?.turnId === msg.turnId
+                && attempt.dispatchAttempt > msg.dispatchAttempt)) break;
+          }
           if (permissionCardPending(ds)) {
             logger.info(`[${t}] Claude permission dialog notice skipped: PermissionRequest card pending`);
             break;
           }
+          logger.warn(`[${t}] Worker user_notify: ${msg.message}`);
+          emitSessionLifecycleHook(ds, 'session.requires_attention', {
+            reason: 'user_notify',
+            message: msg.message,
+          });
         }
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
         if (msg.kind === 'structured_turn_not_collected' && msg.turnId && ownsLifecycleMutation()) {
@@ -26847,6 +27315,7 @@ function setupWorkerHandlers(
           model: msg.model,
           sandboxEngaged: msg.sandboxEngaged,
           loopbackShared: msg.loopbackShared,
+          cliExecution: msg.cliExecution,
         });
         await cb.onIdentityDecision?.(ds, {
           model: decision.model, flipped: decision.flipped, turnId: msg.turnId,
@@ -27544,7 +28013,10 @@ function setupWorkerHandlers(
     // A stale takeover worker never clears the replacement — during takeover the
     // old worker's exit fires AFTER the new worker has been assigned.
     if (ds.worker === worker) {
-      restartCoordinator.failSession(ds.session.sessionId);
+      const failedActiveRestart = restartCoordinator.failSession(ds.session.sessionId);
+      if (!failedActiveRestart && ds.antigravityRotation?.inFlightToken) {
+        ds.antigravityRotation = clearInFlightAntigravityRotation(ds.antigravityRotation);
+      }
       if (ds.session.queuedActivationPending) {
         // Journal ownership is backend-independent. The next worker replays
         // this exact head with queuedActivationResume before durable tail N+1.
@@ -27581,6 +28053,7 @@ function setupWorkerHandlers(
       ds.managedTurnOrigin = undefined;
       ds.scheduledTurnCallers = undefined;
       ds.scheduledToolActors = undefined;
+      ds.scheduledControlActors = undefined;
       ds.taskContinuationRpcProof = undefined;
       ds.activeInteractiveTurn = undefined;
       if (ds.remoteCloseState) {
