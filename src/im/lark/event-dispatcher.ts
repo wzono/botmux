@@ -17,7 +17,7 @@ import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChat
 import * as larkClient from './client.js';
 import type { SubtopicMentionlessHandoff } from '../../services/subtopic-mentionless-handoff.js';
 import { listChats, type ChatBrief } from '../../services/groups-store.js';
-import { classifyLarkError } from './error-classify.js';
+import { classifyLarkError, extractLarkErrorShape } from './error-classify.js';
 import { ListenerCircuitBreaker } from '../../services/listener-circuit-breaker.js';
 import { messageListenerTaskAnchor } from '../../core/message-listener-silence.js';
 import { logger } from '../../utils/logger.js';
@@ -56,6 +56,8 @@ import {
   buildScopeDeepLink,
 } from '../../setup/verify-permissions.js';
 import { automateOpenPlatformSetup, MESSAGE_UPDATED_EVENT, MESSAGE_RECALLED_EVENT, CHAT_DISBANDED_EVENT, ensureAppEventSubscriptions, probeVcMeetingEventSubscription, readDefaultScopeManifest, filterScopeManifest, inspectUnderReviewConfigHints } from '../../setup/open-platform-automation.js';
+import { tryRegisterApp } from '../../setup/register-app.js';
+import { describeMissingScopes, diffScopeBuckets, readRegistrationScopes, registrationScopeBuckets, scopeBucketCount } from '../../setup/registration-manifest.js';
 import { type Brand, larkHosts, normalizeBrand } from './lark-hosts.js';
 import { isGrantTargetOnly, tryHandleGrantCommand } from './grant-command.js';
 import { applyDelegatedGrants } from './delegated-grant.js';
@@ -66,6 +68,7 @@ import { tryHandleChatTabsCommand } from './chat-tabs-command.js';
 import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { tryHandleSecretaryCommand } from './secretary-command.js';
 import { observeGroupSecretaryMessage } from '../../services/group-secretary-runtime.js';
+import { tryHandleAssistantCommand } from './assistant-command.js';
 import { isChatManager } from '../../services/chat-manager.js';
 import { resolveSubstituteAppMentions, substituteMentionIdentities } from './substitute-app-mentions.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
@@ -304,17 +307,30 @@ function getAdminOpenId(bot: BotState): string | undefined {
  * 先记「已通知」再发的话，一次网络失败就把那个版本永久节流掉，人再也收不到提醒，
  * 且是零信号的静默丢失。所以由这里如实回报，让**只有关心的那一处**去判断。
  */
-async function dmAdmin(larkAppId: string, adminOpenId: string, content: string, contextTag: string): Promise<boolean> {
+async function dmAdmin(
+  larkAppId: string, adminOpenId: string, content: string, contextTag: string, beforeWrite?: () => void,
+): Promise<boolean> {
   try {
-    await sendUserMessage(larkAppId, adminOpenId, content, 'text');
+    if (beforeWrite) await sendUserMessage(larkAppId, adminOpenId, content, 'text', undefined, undefined, { beforeWrite });
+    else await sendUserMessage(larkAppId, adminOpenId, content, 'text');
     logger.info(`[${larkAppId}] notified admin ${adminOpenId.substring(0, 12)} about ${contextTag}`);
     return true;
-  } catch (err: any) {
-    logger.warn(`[${larkAppId}] failed to DM admin about ${contextTag}: ${err?.message ?? err}`);
+  } catch (error) {
+    const { larkCode, httpStatus } = extractLarkErrorShape(error);
+    const code = (error as { code?: unknown } | undefined)?.code;
+    const reason = [
+      larkCode !== undefined && `Lark code=${larkCode}`,
+      httpStatus !== undefined && `HTTP ${httpStatus}`,
+      typeof code === 'string' && /^E[A-Z0-9_]{1,19}$/.test(code) && code,
+      error instanceof Error && error.message === 'scope_repair_owner_changed' && error.message,
+    ].filter(Boolean).join(', ');
+    logger.warn(`[${larkAppId}] failed to DM admin about ${contextTag}: ${reason || 'message delivery failed'}`);
     return false;
   }
 }
 
+// 有有效网页登录态时的静默补齐（与 master 一致，用户无需操作）。没有可用登录态、或网页补齐
+// 失败时，再由下面的 tryAutoFixScopes 私信 owner 一条飞书确认链接。
 /**
  * Try to auto-fix missing scopes using the same Open Platform web-session
  * automation that powers `botmux setup`. If ~/.botmux/feishu-session.json holds
@@ -348,7 +364,7 @@ async function dmAdmin(larkAppId: string, adminOpenId: string, content: string, 
  */
 type AutoFixOutcome = { kind: 'fixed' | 'under_review' | 'failed'; inReviewVersionId?: string };
 
-async function tryAutoFixScopes(
+async function tryWebAutoFixScopes(
   larkAppId: string,
   bot: BotState,
   brand: Brand,
@@ -531,13 +547,107 @@ async function tryAutoFixScopes(
   }
 }
 
+const activeScopeRepairs = new Map<string, { owner: string; cancel: AbortController }>();
+
+async function tryAutoFixScopes(
+  larkAppId: string,
+  bot: BotState,
+  brand: Brand,
+  names: string[],
+  granted?: { tenant: string[]; user: string[] },
+): Promise<boolean> {
+  const owner = getOwnerOpenId(larkAppId);
+  const active = activeScopeRepairs.get(larkAppId);
+  if (active && active.owner === owner && !active.cancel.signal.aborted) return true;
+  active?.cancel.abort();
+  if (!owner) return false;
+  const requested = registrationScopeBuckets(filterScopeManifest(readDefaultScopeManifest(), names));
+  const missing = granted ? diffScopeBuckets(requested, granted) : requested;
+  if (scopeBucketCount(missing) === 0) return false;
+
+  const cancel = new AbortController();
+  const repair = { owner, cancel };
+  activeScopeRepairs.set(larkAppId, repair);
+  const signal = AbortSignal.any([cancel.signal, AbortSignal.timeout(10 * 60_000)]);
+  const isCurrentOwner = () => getOwnerOpenId(larkAppId) === owner;
+  const assertCurrentOwner = () => {
+    if (signal.aborted || !isCurrentOwner()) throw new Error('scope_repair_owner_changed');
+  };
+  let delivered: Promise<boolean> | undefined;
+  try {
+    const result = await tryRegisterApp({
+      appId: larkAppId,
+      addons: { preset: false, scopes: missing },
+      signal,
+      onStatusChange: () => {},
+      onQRCodeReady: ({ url }) => {
+        if (signal.aborted || !isCurrentOwner()) {
+          cancel.abort();
+          return;
+        }
+        delivered = dmAdmin(larkAppId, owner,
+          `机器人「${bot.botName ?? larkAppId}」需要补齐以下权限。请打开飞书确认链接（10 分钟内），确认后 botmux 会再次回读：\n\n`
+          + `${describeMissingScopes(missing)}\n\n${url}`,
+          'scope repair confirmation',
+          assertCurrentOwner,
+        ).then(ok => {
+          if (!ok) cancel.abort();
+          return ok;
+        });
+      },
+    });
+    if (!await delivered) return !isCurrentOwner() || activeScopeRepairs.get(larkAppId) !== repair;
+    if (!result.ok || result.brand !== brand) {
+      logger.info(`[${larkAppId}] scope repair confirmation did not complete`);
+      return true;
+    }
+
+    // 使用当前配置的应用凭证回读，确认页的凭证不写入配置。
+    if (signal.aborted || !isCurrentOwner()) return true;
+    const currentBot = getBot(larkAppId);
+    const readback = await readRegistrationScopes({
+      appId: larkAppId, appSecret: currentBot.config.larkAppSecret, brand,
+    }, missing);
+    const detail = !readback
+      ? '飞书已返回确认结果，当前无法回读授权状态，请到开放平台检查。'
+      : scopeBucketCount(readback.missing) === 0
+        ? `已回读确认 ${readback.grantedCount} 项缺失权限全部补齐。`
+        : `授权回读仍缺失：${describeMissingScopes(readback.missing)}。请在开放平台检查租户可授权范围。`;
+    if (isCurrentOwner()) {
+      await dmAdmin(larkAppId, owner, detail, 'scope repair readback', assertCurrentOwner);
+    }
+    return true;
+  } finally {
+    cancel.abort();
+    if (activeScopeRepairs.get(larkAppId) === repair) activeScopeRepairs.delete(larkAppId);
+  }
+}
+
+const activeScopeChecks = new Map<string, { owner: string | undefined }>();
+
 export async function checkRequiredScopes(larkAppId: string): Promise<void> {
+  const owner = getOwnerOpenId(larkAppId);
+  const active = activeScopeChecks.get(larkAppId);
+  if (active && active.owner === owner) return;
+  activeScopeRepairs.get(larkAppId)?.cancel.abort();
+  const check = { owner };
+  activeScopeChecks.set(larkAppId, check);
+  const isCurrent = () => activeScopeChecks.get(larkAppId) === check && getOwnerOpenId(larkAppId) === owner;
+  try {
+    await checkRequiredScopesOnce(larkAppId, isCurrent);
+  } finally {
+    if (activeScopeChecks.get(larkAppId) === check) activeScopeChecks.delete(larkAppId);
+  }
+}
+
+async function checkRequiredScopesOnce(larkAppId: string, isCurrent: () => boolean): Promise<void> {
   const bot = getBot(larkAppId);
   const brand = normalizeBrand(bot.config.brand);
   const openApi = larkHosts(brand).openApi;
   try {
     const tokenRes = await fetch(`${openApi}/open-apis/auth/v3/tenant_access_token/internal`, {
       method: 'POST',
+      signal: AbortSignal.timeout(10_000),
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ app_id: bot.config.larkAppId, app_secret: bot.config.larkAppSecret }),
     });
@@ -548,27 +658,24 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     }
     const infoRes = await fetch(
       `${openApi}/open-apis/application/v6/applications/${bot.config.larkAppId}?lang=zh_cn`,
-      { headers: { Authorization: `Bearer ${tokenData.tenant_access_token}` } },
+      { headers: { Authorization: `Bearer ${tokenData.tenant_access_token}` }, signal: AbortSignal.timeout(10_000) },
     );
     const infoData = await infoRes.json() as any;
+    if (!isCurrent()) return;
 
     // 99991672 = 应用身份缺权限。最常见就是 admin:app.info:readonly /
     // application:application:self_manage 都没拿到，导致根本查不到自己的
     // scope 列表。这种"鸡生蛋"情况单独提示：让 admin 开通免审批的
     // self_manage 后下次重启就能自检了。
     if (infoData.code === LARK_CODE_APP_SCOPE_MISSING) {
-      // Chicken-and-egg: app lacks self_manage so we can't even check what scopes
-      // are missing. Try the Open Platform web-session auto-fix to add every
-      // botmux-required scope (including self_manage) in one shot — passing the
-      // full BOTMUX_REQUIRED_SCOPES so the next restart's self-check finds them
-      // all present, without over-applying the whole 300+ scope manifest.
+      // 有有效网页登录态时静默补齐全部必需权限，用户无需操作；审核中同样直接返回。
       if (brand === 'feishu') {
         const requiredNow = BOTMUX_REQUIRED_SCOPES.map(s => ({ name: s.name, desc: s.desc }));
-        const fixed = await tryAutoFixScopes(larkAppId, bot, brand, requiredNow, []);
-        // 审核中同样直接返回：这条路径下游是让管理员去点 self_manage 深链，而审核期间
-        // 写锁生效，点了也开不了——等审批通过下次重启自检即可。
-        if (fixed.kind !== 'failed') return;
+        const fixed = await tryWebAutoFixScopes(larkAppId, bot, brand, requiredNow, [], { disableQrLogin: true });
+        if (fixed.kind !== 'failed' || !isCurrent()) return;
       }
+      // 自查被拒时无法证明其他权限缺失，先只申请用于自查的权限。
+      if (await tryAutoFixScopes(larkAppId, bot, brand, [SELF_MANAGE_SCOPE]) || !isCurrent()) return;
       const selfManageAuthUrl = buildScopeDeepLink(bot.config.larkAppId, SELF_MANAGE_SCOPE, brand);
       const targetAuthUrl = buildScopeDeepLink(bot.config.larkAppId, REQUIRED_BOT_AT_SCOPE, brand);
       logger.warn(
@@ -596,26 +703,20 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       return;
     }
     // Lark 文档示例把 scopes 放在 data.app.scopes；为防响应结构变化，
-    // 同时兜底 data.scopes / data.application.scopes，取到的第一个非空数组为准。
+    // 同时兼容 data.scopes / data.application.scopes。空数组视为无法核验。
     const scopesRaw: any[] =
       infoData.data?.app?.scopes
       ?? infoData.data?.application?.scopes
-      ?? infoData.data?.scopes
-      ?? [];
+      ?? infoData.data?.scopes;
     if (!Array.isArray(scopesRaw) || scopesRaw.length === 0) {
-      logger.debug(`[${larkAppId}] scope check inconclusive: scopes array empty or shape unexpected — skipping`);
+      logger.debug(`[${larkAppId}] scope check inconclusive: scopes array unavailable — skipping`);
       return;
     }
     const grantedScopes = new Set(
       scopesRaw.map(s => typeof s === 'string' ? s : s?.scope).filter(Boolean) as string[],
     );
 
-    // 按 token 类型分桶的已授权集合，专供 automation 的「无变更短路」按桶做差用。
-    // application/v6 每个 scope 条目自带 token_types:(tenant|user)[]（SDK 类型可查）。
-    // 之所以不能复用上面的扁平 grantedScopes：约 121 个名字同时在 tenant/user 两桶，
-    // tenant/user 是两份独立授权；扁平集合会让「tenant 已授权」误伤 user 桶同名 scope，
-    // 把真正缺的 user 权限静默吞掉（PR #1044 R2）。缺 token_types 的条目**两桶都不放**，
-    // 退回保守近似（该名字照发 scope/update），宁可多发一版也不少发。
+    // 旧响应只带名称时无法确认桶归属。保留它已有授权的兼容判定。
     const grantedScopeBuckets = { tenant: [] as string[], user: [] as string[] };
     for (const s of scopesRaw) {
       const name = typeof s === 'string' ? s : s?.scope;
@@ -624,6 +725,9 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       if (Array.isArray(tokenTypes)) {
         if (tokenTypes.includes('tenant')) grantedScopeBuckets.tenant.push(name);
         if (tokenTypes.includes('user')) grantedScopeBuckets.user.push(name);
+      } else {
+        grantedScopeBuckets.tenant.push(name);
+        grantedScopeBuckets.user.push(name);
       }
     }
 
@@ -715,50 +819,61 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       logger.debug(`[${larkAppId}] vc-meeting readiness check errored: ${err?.message ?? err}`);
     }
 
-    // Diff against the canonical list. Critical-missing is the main signal;
-    // non-critical is mentioned only when something critical is also missing,
-    // so deployments don't get nagged about purely optional scopes like
-    // `application:application:self_manage`.
-    const missingCritical = BOTMUX_REQUIRED_SCOPES.filter(s => s.critical && !grantedScopes.has(s.name));
-    const missingOptional = BOTMUX_REQUIRED_SCOPES.filter(s => !s.critical && !grantedScopes.has(s.name));
+    if (!isCurrent()) return;
+    const required = registrationScopeBuckets(filterScopeManifest(
+      readDefaultScopeManifest(), BOTMUX_REQUIRED_SCOPES.map(scope => scope.name),
+    ));
+    const missingBuckets = diffScopeBuckets(required, grantedScopeBuckets);
+    const missingNames = new Set([...missingBuckets.tenant, ...missingBuckets.user]);
+    const missingCritical = BOTMUX_REQUIRED_SCOPES.filter(scope =>
+      scope.critical && (!grantedScopes.has(scope.name) || missingBuckets.tenant.includes(scope.name)),
+    );
+    const criticalNames = new Set(missingCritical.map(scope => scope.name));
+    const missingOptional = BOTMUX_REQUIRED_SCOPES.filter(scope => !criticalNames.has(scope.name)
+      && (missingNames.has(scope.name) || (!scope.critical && !grantedScopes.has(scope.name))),
+    );
+    // 网页静默补齐沿用 master 的判定：只补名字整项缺失的可选权限。只缺用户身份那一份的
+    // 不在此列，否则这类存量应用每次重启都会被静默提交一个新版本。
+    const wholeMissingOptional = BOTMUX_REQUIRED_SCOPES.filter(scope => !scope.critical && !grantedScopes.has(scope.name));
 
-    if (missingCritical.length === 0) {
-      // All critical scopes present. If an opt-in feature added a non-critical
-      // scope that isn't granted yet, top it up SILENTLY — but only when a cached
-      // Feishu web session already exists (disableQrLogin makes a missing session
-      // fail cleanly with no second QR code and no DM). This makes `botmux restart`
-      // actually pick up newly-declared optional scopes (e.g. the foreign-bot
-      // group-message scope) without the admin having to visit the Open Platform,
-      // while a bot with nothing missing — or no web session — behaves exactly as
-      // before (no API call / no prompt / no nag).
-      if (missingOptional.length > 0 && brand === 'feishu') {
-        const toppedUp = await tryAutoFixScopes(larkAppId, bot, brand, [], missingOptional,
-          { disableQrLogin: true, silent: true, grantedScopeNames: grantedScopeBuckets });
-        // 只有真的补上了才说「auto-topped-up」：审核中什么都没写进去（开放平台
-        // 连 scope/update 都拒），说补上了就是谎报。审核中静默跳过，等审批通过。
-        if (toppedUp.kind === 'fixed') {
-          logger.info(`[${larkAppId}] auto-topped-up ${missingOptional.length} optional scope(s): ${missingOptional.map(s => s.name).join('、')}`);
-          return;
+    const reviewVersion = infoData.data?.app?.unaudit_version_id;
+    let inReviewVersionId = typeof reviewVersion === 'string' && reviewVersion ? reviewVersion : undefined;
+    let underReview = inReviewVersionId !== undefined;
+    if (!underReview && missingCritical.length > 0) {
+      // 先用本机有效网页登录态静默补齐，用户无需操作；没有登录态时快速失败，不在 daemon 里弹码。
+      if (brand === 'feishu') {
+        const fixed = await tryWebAutoFixScopes(larkAppId, bot, brand, missingCritical, wholeMissingOptional,
+          { disableQrLogin: true, grantedScopeNames: grantedScopeBuckets });
+        if (fixed.kind === 'fixed' || !isCurrent()) return;
+        if (fixed.kind === 'under_review') {
+          underReview = true;
+          inReviewVersionId = fixed.inReviewVersionId;
         }
-        if (toppedUp.kind === 'under_review') return;
-        logger.debug(`[${larkAppId}] optional scope(s) missing (${missingOptional.map(s => s.name).join('、')}); no cached web session to auto-apply — leaving to opt-in feature owner`);
+      }
+      if (!underReview) {
+        const confirmed = await tryAutoFixScopes(larkAppId, bot, brand,
+          [...missingCritical, ...missingOptional].map(scope => scope.name), grantedScopeBuckets);
+        if (confirmed || !isCurrent()) return;
+      }
+    }
+    if (missingCritical.length === 0) {
+      if (missingOptional.length > 0) {
+        // 只缺可选权限：有有效网页登录态时静默补上整项缺失的那些（不发私信），否则只记日志。
+        if (brand === 'feishu' && wholeMissingOptional.length > 0) {
+          const toppedUp = await tryWebAutoFixScopes(larkAppId, bot, brand, [], wholeMissingOptional,
+            { disableQrLogin: true, silent: true, grantedScopeNames: grantedScopeBuckets });
+          if (toppedUp.kind === 'fixed') {
+            logger.info(`[${larkAppId}] auto-topped-up ${wholeMissingOptional.length} optional scope(s): ${wholeMissingOptional.map(s => s.name).join('、')}`);
+            return;
+          }
+          if (toppedUp.kind === 'under_review' || !isCurrent()) return;
+        }
+        logger.debug(`[${larkAppId}] optional scopes missing: ${missingOptional.map(scope => scope.name).join(', ')}`);
       }
       logger.info(`[${larkAppId}] all critical scopes granted (${BOTMUX_REQUIRED_SCOPES.filter(s => s.critical).length} checked)`);
       return;
     }
-
-    // Auto-fix: try the same Open Platform automation used by `botmux setup`.
-    // If a cached Feishu web session exists (~/.botmux/feishu-session.json), we can
-    // directly add missing scopes and publish a new version without user interaction.
-    // Falls through to manual DM warning if session is missing/expired.
-    const autoFixed = await tryAutoFixScopes(larkAppId, bot, brand, missingCritical, missingOptional,
-      { grantedScopeNames: grantedScopeBuckets });
-    if (autoFixed.kind === 'fixed') return;
-    // 审核中：**不推权限深链**（审核期间连 scope/update 都被拒，点了写不进去），
-    // 也**不说「等审批通过就好」**——触发审批通常意味着有配置不合规，那一版不会自己
-    // 通过（模板建的应用出生带「数据范围=全部」，正撞租户「非必要不申请全员数据」的
-    // 加签规则）。所以这里只做一件事：**如实告诉管理员卡在哪、为什么卡、怎么修**。
-    if (autoFixed.kind === 'under_review') {
+    if (underReview) {
       const summary = missingCritical.map(s => `${s.name} (${s.desc})`).join('、');
       logger.warn(
         `[${larkAppId}] 缺少 ${missingCritical.length} 项必需权限（${summary}），` +
@@ -771,7 +886,7 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       // key 用待审版本 id：对齐「事情有没有变化」而非「过了多久」——人撤回重提了新版本，
       // 该说；同一版还卡着，不必再说。拿不到 id 时**刻意不节流**（见 store 注释）。
       const alreadyNotified = wasPendingReviewNotified(
-        config.session.dataDir, larkAppId, autoFixed.inReviewVersionId,
+        config.session.dataDir, larkAppId, inReviewVersionId,
       );
       if (reviewAdmin && !alreadyNotified) {
         const rangeHint = await inspectUnderReviewConfigHints(bot.config.larkAppId, brand);
@@ -788,7 +903,7 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
           + `1. 开放平台 →「版本管理与发布」→ 点进审核中那一版的**版本详情**，看审批详情里被卡的项\n`
           + `2. 修掉不合规项（如把权限的数据范围从「全部」改成「与应用的可用范围一致」）\n`
           + `3. 在版本详情页点 **Withdraw** 撤回该版本\n`
-          + `4. 执行 \`botmux restart\` —— botmux 会自动补齐权限并重新提交\n\n`
+          + `4. 执行 \`botmux restart\`，botmux 会自动补齐权限（本机没有可用登录态时改发权限确认链接）\n\n`
           + `⚠️ 直接撤回重提**不管用**：不改配置的话同一条规则会再拦一次。\n`
           + `⚠️ 此时去权限管理页手动点开通也**无效**：审核期间飞书连「申请权限」都拒绝。`,
           `app under review, ${missingCritical.length} scopes deferred`,
@@ -796,11 +911,11 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
         // ⚠️ **发送成功才记账**。反了的话一次网络失败就把这个 versionId 永久节流掉，
         // 管理员再也收不到提醒，而且是零信号的静默丢失，比刷屏更难发现。
         if (delivered) {
-          markPendingReviewNotified(config.session.dataDir, larkAppId, autoFixed.inReviewVersionId);
+          markPendingReviewNotified(config.session.dataDir, larkAppId, inReviewVersionId);
         }
       } else if (alreadyNotified) {
         logger.info(
-          `[${larkAppId}] 待审版本 ${autoFixed.inReviewVersionId} 已通知过管理员，本次不重复打扰`,
+          `[${larkAppId}] 待审版本 ${inReviewVersionId} 已通知过管理员，本次不重复打扰`,
         );
       }
       return;
@@ -827,7 +942,7 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       `⚠️ botmux 启动检查发现机器人 "${bot.botName ?? larkAppId}" 缺少 ${missingCritical.length} 项必需权限\n\n` +
       `**操作步骤（点链接 → 申请开通 → 重启 daemon）**：\n\n` +
       `${criticalLines}\n\n` +
-      `开通完成后执行 \`botmux restart\`，botmux 会再次自检并把结果发到这里。${optionalBlock}`;
+      `开通完成后执行 \`botmux restart\`，botmux 会再次自检。${optionalBlock}`;
     await dmAdmin(larkAppId, adminOpenId, dm, `missing scopes: ${missingCritical.map(s => s.name).join(',')}`);
   } catch (err: any) {
     logger.debug(`[${larkAppId}] scope check errored: ${err?.message ?? err}`);
@@ -3263,6 +3378,9 @@ export interface RoutingContext {
   commandTrigger?: CommandTriggerMatch;
   /** This turn was triggered by a configured group message listener. */
   messageListener?: MessageListenerMatch;
+  /** This turn arrived in another group's thread on a message sent by this
+   *  bot's session in `sourceChatId` (follow-thread-at). */
+  crossChatThreadFollowUp?: import('../../services/cross-chat-thread-binding.js').CrossChatFollowedThreadMatch;
   /** Daemon-minted turn created after a requester accepted a Completion
    * Proposal. It has no native inbound Lark message, so consumers must not
    * emit message reactions, quote its synthetic turn id, or run unrelated
@@ -3939,6 +4057,12 @@ async function dispatchHumanMessageViaHandlers(
   if (key) pendingMessageTriggers.add(key);
   let completed = false;
   try {
+    if (payload.ctx.crossChatThreadFollowUp) {
+      const targetAnchor = payload.ctx.runtimeRoutingAnchor ?? payload.ctx.anchor;
+      await serializeByAnchor(targetAnchor, () => handlers.handleThreadReply(payload.data, payload.ctx), capMs);
+      completed = true;
+      return;
+    }
     const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId)
       ?? payload.ownsSession;
     if (handlers.handlePrincipalLaneMessage
@@ -4236,6 +4360,8 @@ export interface EventHandlers {
    *  from it (`im.chat.member.bot.deleted_v1`). Runs after the event ACK, once
    *  per event id. Each bot's daemon receives its own copy. */
   handleChatGone?: (chatId: string, larkAppId: string, reason: 'disbanded' | 'bot_removed') => Promise<void>;
+  /** 群成员退出（im.chat.member.user.deleted_v1）。个人助理模式用它判断 owner 是否退群。 */
+  handleChatMemberUserDeleted?: (chatId: string, userOpenIds: string[], larkAppId: string) => Promise<void> | void;
   /** Check if this bot owns an active session anchored at the given id
    *  (rootMessageId for thread-scope, chatId for chat-scope). */
   isSessionOwner?: (anchor: string, larkAppId: string) => boolean;
@@ -4250,6 +4376,14 @@ export interface EventHandlers {
   ) => SubtopicMentionlessHandoff | null | Promise<SubtopicMentionlessHandoff | null>;
   /** Resolve a persisted topic reply alias back to its owning chat-scope session. */
   resolveReplyThreadAlias?: (rootId: string, chatId: string, larkAppId: string) => { chatId: string; sessionId: string; anchor?: string } | null;
+  /** Resolve whether an inbound message in `chatId` under `candidateRootIds`
+   *  replies to a cross-chat message sent by an active session of `larkAppId`
+   *  in another chat. */
+  resolveCrossChatFollowedThread?: (
+    candidateRootIds: readonly string[],
+    chatId: string,
+    larkAppId: string,
+  ) => import('../../services/cross-chat-thread-binding.js').CrossChatFollowedThreadMatch | null;
   /** True when this chat's chat-scope session already answered `rootId` as a FLAT
    *  top-level turn. Identifies the "user @'d at top level, then opened a 话题 on
    *  that same message" case, where the regular-group fold must keep the turn in
@@ -5591,7 +5725,7 @@ export function createLarkEventDispatcherRuntime(
     if (!rawText) return false;
     const text = stripLeadingMentions(rawText.trim(), message?.mentions ?? []);
     if (/^\/introduce(?:\s|$)/i.test(text)) return true;
-    const match = /^\/(reply-mode|tabs?|mention-mode|secretary|substitute|grant|revoke|invite)(?:\s|$)/i.exec(text);
+    const match = /^\/(reply-mode|tabs?|mention-mode|secretary|assistant|substitute|grant|revoke|invite)(?:\s|$)/i.exec(text);
     if (!match) return false;
     const command = match[1]!.toLowerCase();
     if (message.chat_type !== 'p2p' && !isBotMentioned(larkAppId, message, senderOpenId)) {
@@ -5940,6 +6074,46 @@ export function createLarkEventDispatcherRuntime(
         if (botTalk.reason === 'sameOwnerBot') {
           learnSameOwnerSiblingCrossRef(config.session.dataDir, larkAppId, senderOpenId, senderUnionId);
         }
+        const botCrossChatCandidates = [message.root_id, message.parent_id]
+          .filter((id): id is string => typeof id === 'string' && id.startsWith('om_'));
+        const botCrossChatFollowUp = explicitlyMentionedThisBot
+          && !substituteTrigger
+          && chatType === 'group'
+          && botCrossChatCandidates.length > 0
+          && botTalk.reason !== 'blocked'
+          ? (handlers.resolveCrossChatFollowedThread?.(botCrossChatCandidates, chatId, larkAppId) ?? null)
+          : null;
+        if (botCrossChatFollowUp) {
+          logger.info(
+            `[cross-chat-thread:${larkAppId}] bot @mention in chat=${chatId.substring(0, 12)} `
+            + `root=${botCrossChatFollowUp.followedRootMessageId.substring(0, 12)} → `
+            + `sourceChat=${botCrossChatFollowUp.sourceChatId.substring(0, 12)} session=${botCrossChatFollowUp.sourceSessionId.substring(0, 8)}`,
+          );
+          const routedCtx: RoutingContext = {
+            scope: botCrossChatFollowUp.scope,
+            anchor: botCrossChatFollowUp.anchor,
+            ...(botCrossChatFollowUp.runtimeRoutingAnchor
+              ? { runtimeRoutingAnchor: botCrossChatFollowUp.runtimeRoutingAnchor }
+              : {}),
+            chatId: botCrossChatFollowUp.sourceChatId,
+            messageId,
+            chatType: 'group',
+            larkAppId,
+            crossChatThreadFollowUp: botCrossChatFollowUp,
+          };
+          const targetAnchor = routedCtx.runtimeRoutingAnchor ?? routedCtx.anchor;
+          if (primary) {
+            preparePrimaryRoutingContext(routedCtx, primary);
+            if (await assertPrimaryRouteOwner(routedCtx, primary) === 'retry') {
+              return primaryResult(routedCtx, primary);
+            }
+            await serializeByAnchor(targetAnchor, () => handlers.handleThreadReply(data, routedCtx), 0);
+            return primaryResult(routedCtx, primary);
+          }
+          void serializeByAnchor(targetAnchor, () => handlers.handleThreadReply(data, routedCtx), 0)
+            .catch(err => logger.error(`Error handling cross-chat bot @mention: ${err}`));
+          return;
+        }
         if (botTalk.allowed) {
           await promoteExplicitP2pTopicIfNeeded({
             larkAppId, chatId, chatType, message, routing: ctx, routingSource: decision.source,
@@ -6167,6 +6341,10 @@ export function createLarkEventDispatcherRuntime(
 
       if (await tryHandleSecretaryCommand(larkAppId, message, senderOpenId, isAllowed)) {
         return commandConsumed();
+      }
+
+      if (await tryHandleAssistantCommand(larkAppId, message, senderOpenId, isAllowed)) {
+        return;
       }
 
       if (await tryHandleSubstituteCommand(larkAppId, message, senderOpenId)) {
@@ -6548,10 +6726,34 @@ export function createLarkEventDispatcherRuntime(
 
       let ownsSession = handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false;
 
-      if (!importedTopicCoordinatorFolded && !yieldToImportedTopicHandler) {
-        const ownsThreadSessionBeforeFold = routing.scope === 'thread'
-          ? (handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false)
-          : false;
+      const ownsThreadSessionBeforeFold = routing.scope === 'thread'
+        ? (handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false)
+        : false;
+      const candidateCrossChatRoots = [message.root_id, message.parent_id]
+        .filter((id): id is string => typeof id === 'string' && id.startsWith('om_'));
+      const crossChatFollowUp = !forceTopicApplied
+        && !ownsThreadSessionBeforeFold
+        && !messageListener
+        && !substituteTrigger
+        && explicitlyMentionedThisBot
+        && chatType === 'group'
+        && candidateCrossChatRoots.length > 0
+        && evaluateTalk(larkAppId, chatId, senderOpenId, undefined, humanSenderUnionId, chatType).reason !== 'blocked'
+        ? (handlers.resolveCrossChatFollowedThread?.(candidateCrossChatRoots, chatId, larkAppId) ?? null)
+        : null;
+      if (crossChatFollowUp) {
+        isAllowed = true;
+        routing.scope = crossChatFollowUp.scope;
+        routing.anchor = crossChatFollowUp.anchor;
+        routingSource = crossChatFollowUp.scope === 'chat' ? 'regular-group-chat' : 'real-thread';
+        replyRootId = undefined;
+        ownsSession = true;
+        logger.info(
+          `[cross-chat-thread:${larkAppId}] human @mention in chat=${chatId.substring(0, 12)} `
+          + `root=${crossChatFollowUp.followedRootMessageId.substring(0, 12)} → `
+          + `sourceChat=${crossChatFollowUp.sourceChatId.substring(0, 12)} session=${crossChatFollowUp.sourceSessionId.substring(0, 8)}`,
+        );
+      } else if (!importedTopicCoordinatorFolded && !yieldToImportedTopicHandler) {
         const foldedReplyRootId = await maybeFoldMentionedRegularGroupThreadToChat({
           larkAppId, chatId, chatType, message, routing, forceTopicApplied, mentionedThisBot: explicitlyMentionedThisBot, ownsThreadSession: ownsThreadSessionBeforeFold,
           answeredRootAtTopLevel: root => handlers.chatSessionAnsweredRootAtTopLevel?.(root, chatId, larkAppId) ?? false,
@@ -6587,7 +6789,7 @@ export function createLarkEventDispatcherRuntime(
       // Skip p2p: a DM is always 'p2p' and can never be a topic group, so the
       // check can only waste a forceRefresh roundtrip (relevant now that
       // p2pMode==='chat' makes DMs land on chat-scope).
-      if (routing.scope === 'chat' && ownsSession && chatType !== 'p2p') {
+      if (!crossChatFollowUp && routing.scope === 'chat' && ownsSession && chatType !== 'p2p') {
         const freshMode = await getChatMode(larkAppId, chatId, { forceRefresh: true });
         if (freshMode === 'topic') {
           logger.info(
@@ -6606,7 +6808,7 @@ export function createLarkEventDispatcherRuntime(
         }
       }
 
-      const summaryCommandMatch = await resolveSummaryCommandMatch({
+      const summaryCommandMatch = crossChatFollowUp ? undefined : await resolveSummaryCommandMatch({
         larkAppId,
         chatId,
         chatType,
@@ -6645,7 +6847,7 @@ export function createLarkEventDispatcherRuntime(
       // stays in the buffer and flushes on its original timer. Paired seeds
       // only arise under never/ambient modes, where a legitimate merge always
       // requires isAllowed anyway.
-      if (!yieldToImportedTopicHandler && senderOpenId && isAllowed && message.root_id && !isControlCommand) {
+      if (!crossChatFollowUp && !yieldToImportedTopicHandler && senderOpenId && isAllowed && message.root_id && !isControlCommand) {
         await waitForSeedRoutingGate(message.root_id);
         const pairingInput = {
           larkAppId,
@@ -6751,7 +6953,7 @@ export function createLarkEventDispatcherRuntime(
         //     冲本 bot 来的，所以用 commandLeadsMessage 放行（见其定义处）。
         //   • 只认普通群顶层（regular-group-*）：话题群（topic-chat）与话题内回复
         //     （real-thread）各有自己的续话规则，不该被一条裸命令另开一路。
-        const commandTriggerCandidate = isAllowed
+        const commandTriggerCandidate = !crossChatFollowUp && isAllowed
           && (routingSource === 'regular-group-chat' || routingSource === 'regular-group-thread')
           && triggeredCommand
           ? matchCommandTrigger(larkAppId, chatId, triggeredCommand, resolvePassthroughCommands(larkAppId))
@@ -6832,7 +7034,8 @@ export function createLarkEventDispatcherRuntime(
           );
           return;
         }
-        const relax = (!!replyRootId && isAllowed)
+        const relax = !!crossChatFollowUp
+          || (!!replyRootId && isAllowed)
           || (!!substituteTrigger && isAllowed)
           || !!messageListener
           || (isAllowed && mentionMode === 'never')
@@ -6942,12 +7145,16 @@ export function createLarkEventDispatcherRuntime(
         );
       }
       const ctx: RoutingContext = {
-        chatId,
+        chatId: crossChatFollowUp?.sourceChatId ?? chatId,
         messageId,
         chatType,
         larkAppId,
         ...routing,
-        regularGroupTopLevel: routingSource === 'regular-group-chat' || routingSource === 'regular-group-thread',
+        ...(crossChatFollowUp?.runtimeRoutingAnchor
+          ? { runtimeRoutingAnchor: crossChatFollowUp.runtimeRoutingAnchor }
+          : {}),
+        ...(crossChatFollowUp ? { crossChatThreadFollowUp: crossChatFollowUp } : {}),
+        regularGroupTopLevel: !crossChatFollowUp && (routingSource === 'regular-group-chat' || routingSource === 'regular-group-thread'),
         replyRootId,
         promptOverride,
         commandTrigger,
@@ -6975,7 +7182,7 @@ export function createLarkEventDispatcherRuntime(
             : {}
         ),
       };
-      if (explicitlyMentionedThisBot) {
+      if (explicitlyMentionedThisBot && !crossChatFollowUp) {
         const before = await handlers.beforeSessionTurn?.(data, ctx, { senderOpenId, explicitlyMentionedThisBot });
         if (before?.block) return;
         if (before?.anchorOverride) ctx.anchor = before.anchorOverride;
@@ -7568,6 +7775,16 @@ export function createLarkEventDispatcherRuntime(
     'im.chat.member.user.deleted_v1': (data: any) => {
       const chatId: string | undefined = data?.chat_id;
       if (chatId) invalidateChatStats(larkAppId, chatId);
+      if (chatId && handlers.handleChatMemberUserDeleted) {
+        const users: unknown = data?.users;
+        const ids = (Array.isArray(users) ? users : [])
+          .map((u: any) => u?.user_id?.open_id)
+          .filter((v: unknown): v is string => typeof v === 'string' && v.length > 0);
+        if (ids.length) {
+          void Promise.resolve(handlers.handleChatMemberUserDeleted(chatId, ids, larkAppId))
+            .catch(err => logger.warn(`[event] handleChatMemberUserDeleted failed: ${String(err)}`));
+        }
+      }
     },
     // 文档评论入口（/watch-comment / /subscribe-lark-doc）。notice 事件主要覆盖 @Bot
     // 通知；普通评论由 daemon 应用身份轮询补齐，不依赖逐文件 subscribe API。

@@ -1,4 +1,7 @@
 import { selectSessionPage } from './dashboard/session-pagination.js';
+import { createSessionContentSearch } from './dashboard/session-content-search.js';
+import { TopicIndexError } from './services/topic-search/query.js';
+import { queryTopicSearchOffMainThread } from './dashboard/topic-search-client.js';
 import { proxySessionStopControl } from './dashboard/session-stop-control.js';
 // src/dashboard.ts
 import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -936,6 +939,15 @@ const previewGuardPage = createPreviewGuardPage({
   // 没权限」。这只是不渲染一个必然失败的入口，服务端门禁一分未松。
   canInteract: req => projectWorkbenchOperationCapabilities(dashboardRequestIdentity(req)).canInteract,
 });
+const sessionContentSearch = createSessionContentSearch({
+  search: (request, options) => {
+    if (process.env.BOTMUX_TOPIC_SEARCH === '0') throw new TopicIndexError('topic_search_disabled');
+    return queryTopicSearchOffMainThread(config.session.dataDir, request, options);
+  },
+  now: Date.now,
+  warn: reason => logger.warn(`[dashboard] content search unavailable: ${reason}`),
+});
+
 // Primary replicas need one shared route registry for Pod-local worker
 // terminals. Initialize it before the `/s/*` front proxy so a request landing
 // on a non-owner backend can resolve the current owner Dashboard NodePort.
@@ -4932,7 +4944,8 @@ const server = createServer(async (req, res) => {
       const groupPresentation = groupsMatrixSnapshot.peekPresentation();
       let page: ReturnType<typeof selectSessionPage<ReturnType<typeof aggregator.getSessions>[number]>>;
       try {
-        page = selectSessionPage(aggregator.getSessions(), url.searchParams, {
+        const rows = aggregator.getSessions();
+        page = selectSessionPage(rows, url.searchParams, {
           // ⌘K / Workbench search also matches the names the browser displays
           // beside a row: the current bot name and the group name.
           searchText: row => [
@@ -4940,6 +4953,9 @@ const server = createServer(async (req, res) => {
             typeof row.chatId === 'string' ? groupPresentation.get(row.chatId)?.name : undefined,
           ],
         });
+        if (url.searchParams.get('view') === 'content') {
+          page = await sessionContentSearch(url.searchParams.get('q') ?? '', sessionBoardAudience, rows);
+        }
       }
       catch (error) {
         return jsonRes(res, 400, { ok: false, error: error instanceof Error ? error.message : 'invalid_session_page' });
@@ -6364,14 +6380,12 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 400, { ok: false, error: 'invalid_app_name', message: '应用名称不能超过 64 个字符' });
       }
       const registrationModeRaw = typeof parsed.registrationMode === 'string' ? parsed.registrationMode.trim() : '';
-      if (registrationModeRaw && registrationModeRaw !== 'web' && registrationModeRaw !== 'compat' && registrationModeRaw !== 'local') {
-        return jsonRes(res, 400, { ok: false, error: 'invalid_registration_mode', message: 'registrationMode 必须是 web、compat 或 local' });
+      if (registrationModeRaw && registrationModeRaw !== 'sdk' && registrationModeRaw !== 'web' && registrationModeRaw !== 'compat' && registrationModeRaw !== 'local') {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_registration_mode', message: 'registrationMode 必须是 sdk、web、compat 或 local' });
       }
-      const registrationMode = registrationModeRaw === 'compat'
-        ? 'compat' as const
-        : registrationModeRaw === 'local'
-          ? 'local' as const
-          : 'web' as const;
+      // 缺省走网页会话流程（内置表单同样走网页流程）；sdk 只在调用方显式传入时使用。
+      const registrationMode = registrationModeRaw === 'sdk' || registrationModeRaw === 'compat' || registrationModeRaw === 'local'
+        ? registrationModeRaw : 'web';
       if (registrationMode === 'local' && typeof parsed.cloneSourceAppId === 'string' && parsed.cloneSourceAppId.trim()) {
         return jsonRes(res, 400, { ok: false, error: 'local_clone_unsupported', message: '本地模式不克隆飞书机器人。' });
       }

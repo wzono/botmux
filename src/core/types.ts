@@ -712,6 +712,8 @@ export interface DaemonSession {
    * scheduledTurnCallers, this does not authorize workflow or schedule
    * mutations and is never persisted. */
   scheduledToolActors?: Map<string, { openId: string; unionId: string }>;
+  /** 原生 scheduled turn 的已核验控制人，仅用于 Actor/操作权限证明，不用于个人凭据。 */
+  scheduledControlActors?: Map<string, { openId: string; unionId: string }>;
   /** Exact principal-lane turn/generation that still owns the worker until a
    * matching terminal or proven worker exit. Unlike activeInteractiveTurn,
    * the worker's earlier managed-origin revoke must not clear this FIFO fence,
@@ -910,6 +912,10 @@ export interface DaemonSession {
    * target lookup from posting after this episode cleared and a same-key later
    * episode started. Cross-session duplicate events use a daemon-wide TTL. */
   quotaFallbackAttemptToken?: string;
+  /** Host-managed Antigravity account alias active when this session's CLI spawned. */
+  antigravityAccountId?: string;
+  /** In-flight and per-turn state for Antigravity quota-limit auto-rotation. */
+  antigravityRotation?: import('./antigravity-rotation.js').AntigravitySessionRotationState;
   /** Interval that re-PATCHes the live streaming card with fresh Context/Token
    *  usage while a turn is executing (streaming display mode). Armed on the
    *  working edge, cleared on idle/turn-end/card removal. */
@@ -1057,6 +1063,7 @@ export interface DaemonSession {
    *  disabled after restart): identity publication is withheld on both models
    *  until a live worker reports again. */
   reportedIdentityModel?: {
+    cliExecution?: import('./cli-execution-mode.js').WorkerCliExecution;
     model: import('./lark-tool-binding.js').IdentityStorageModel;
     sandboxEngaged: boolean;
     loopbackShared: boolean;

@@ -5,6 +5,8 @@ import { sessionContractPrimary } from './session-contract-primary.js';
 import { forkManualTurn } from './manual-turn-dispatch.js';
 import { showDefaultModelPicker, showSessionModelPicker } from '../im/lark/session-model-picker.js';
 import { supportsCodexModelSelection } from '../services/codex-model-selection.js';
+import { inspectAntigravityAccounts } from '../services/antigravity-accounts.js';
+import { cancelAntigravityRotationReplay, formatAntigravityStatusLine } from './antigravity-rotation.js';
 import { resetSessionCodexModelSelection, dshRuntimeForSession } from './worker-pool.js';
 import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgents, resolveGroupDecorations, knownGroupBotMentions, knownGroupBotNames, type GroupCreationArgs } from '../services/group-creation-options.js';
 import { groupTaskForwardIds, groupTaskPlaceholder, groupTaskPrompt, groupTaskPromptAttachments, groupTaskQuoteId, groupTaskSenderIsBot, startGroupTask, type GroupTaskPromptAttachment, type GroupTaskStartResult } from './group-task-start.js';
@@ -3164,17 +3166,32 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.stop.unsupported', undefined, loc));
           break;
         }
+        const cancelledAgyReplay = cancelAntigravityRotationReplay(ds.antigravityRotation);
         if (!ds.worker || ds.worker.killed) {
+          if (cancelledAgyReplay) {
+            await sessionReply(rootId, t('worker.agy_rotate.stop_cancelled', undefined, loc));
+            break;
+          }
           await sessionReply(rootId, t('cmd.stop.no_worker', undefined, loc));
           break;
         }
         sendWorkerSessionInput(ds, { type: 'term_action', key: 'ctrlc' });
-        logger.info(`[${logTag}] /stop: ^C sent (session kept alive)`);
-        await sessionReply(rootId, t('cmd.stop.sent', { cliName: sessionCliDisplayName(ds) }, loc));
+        logger.info(`[${logTag}] /stop: ^C sent (session kept alive${cancelledAgyReplay ? ', cancelled in-flight agy rotation replay' : ''})`);
+        await sessionReply(
+          rootId,
+          cancelledAgyReplay
+            ? `${t('cmd.stop.sent', { cliName: sessionCliDisplayName(ds) }, loc)}\n${t('worker.agy_rotate.stop_cancelled', undefined, loc)}`
+            : t('cmd.stop.sent', { cliName: sessionCliDisplayName(ds) }, loc),
+        );
         break;
       }
 
       case '/cd': {
+        // 个人助理模式：cwd = owner 的 work/，不可换（换了就出 owner 子树）。
+        if (ds?.session.assistantOwnerOpenId) {
+          await sessionReply(rootId, t('cmd.assistant.cwd_locked', undefined, loc));
+          break;
+        }
         const targetPath = message.content.replace(/^\/cd\s*/, '').trim();
         if (!targetPath) {
           await sessionReply(rootId, t('cmd.cd.usage', undefined, loc));
@@ -3327,6 +3344,11 @@ export async function handleCommand(
         break;
       }
       case '/repo': {
+        // 个人助理模式：同 /cd，目录固定在 owner 的 work/。
+        if (ds?.session.assistantOwnerOpenId) {
+          await sessionReply(rootId, t('cmd.assistant.cwd_locked', undefined, loc));
+          break;
+        }
         // A live REMOTE generation (Riff or Mojo) must finish the explicit
         // /close protocol before its anchor can be reused. The generic
         // repo-switch path closes and immediately reforks; if remote
@@ -4438,10 +4460,18 @@ export async function handleCommand(
             cliRuntime: effectiveRuntime,
             cliPathOverride: effectivePath,
           }));
+          const effectiveCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId;
+          const agyAccountLine = effectiveCliId === 'antigravity'
+            ? formatAntigravityStatusLine({
+                sessionAccountId: ds.antigravityAccountId ?? ds.session.antigravityAccountId,
+                inspection: inspectAntigravityAccounts(),
+              })
+            : undefined;
           const lines = [
             `Session: ${ds.session.sessionId}`,
             ...[modelPinText(resolveSessionModelPinView(ds, botCfg))].filter((s): s is string => !!s),
             ...(ds.session.cliInstanceBinding ? [`Codex instance: ${ds.session.cliInstanceBinding.instanceId ?? 'legacy'} (${ds.session.cliInstanceBinding.source}; ${ds.session.creationSource ?? 'legacy'})`] : []),
+            ...(agyAccountLine ? [agyAccountLine] : []),
             `Status: ${alive ? t('cmd.status.running', undefined, loc) : t('cmd.status.waiting', undefined, loc)}`,
             `Terminal: ${termUrl}`,
             `CWD: ${getSessionWorkingDir(ds)}`,
