@@ -20,6 +20,7 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { withFileLockSync } from '../utils/file-lock.js';
 
 type FileEntry = { unionId: string; learnedAt: number };
 type FileShape = Record<string, FileEntry>;
@@ -59,11 +60,15 @@ export function recordBotUnionId(
   const app = (larkAppId ?? '').trim();
   const uid = (unionId ?? '').trim();
   if (!app || !uid) return false;
-  const data = readFile(dataDir);
-  if (data[app]?.unionId === uid) return false;
-  data[app] = { unionId: uid, learnedAt: now };
-  atomicWriteFileSync(filePath(dataDir), JSON.stringify(data, null, 2) + '\n');
-  return true;
+  const fp = filePath(dataDir);
+  return withFileLockSync(fp, () => {
+    const data = readFile(dataDir);
+    const current = data[app];
+    if (current?.unionId === uid || (current && current.learnedAt > now)) return false;
+    data[app] = { unionId: uid, learnedAt: now };
+    atomicWriteFileSync(fp, JSON.stringify(data, null, 2) + '\n');
+    return true;
+  });
 }
 
 /** A mention entry from a Lark message event (shape-tolerant subset). */
