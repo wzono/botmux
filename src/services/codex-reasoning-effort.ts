@@ -65,6 +65,9 @@ const SIX_LEVEL_MODELS = new Set([
   'gpt-5.6-sol', 'gpt-5.6-terra',
 ]);
 const FIVE_LEVEL_MODELS = new Set(['gpt-6-luna', 'gpt-5.6-luna']);
+// Seed Ultra is a verified Codex orchestration mode. It does not imply that
+// the fixed Seed High inference supports a separate Max reasoning budget.
+const SEED_ULTRA_MODELS = new Set(['seed-evolving', 'seed-2.1-pro', 'seed-2.1-turbo']);
 // Grok's model catalog advertises xhigh for both 4.7 variants too.
 const GROK_XHIGH_MODELS = new Set(['grok-4.6', 'grok-4.7', 'grok-4.7-build-fast']);
 const TRAEX_REASONING_EFFORTS_BY_MODEL = new Map<string, readonly CodexReasoningEffort[]>([
@@ -133,6 +136,7 @@ export function isCodexReasoningEffort(value: unknown): value is CodexReasoningE
  *  the table has no row for it. */
 function verifiedCodexReasoningEfforts(model: string | undefined): readonly CodexReasoningEffort[] | undefined {
   const normalized = model?.trim().toLowerCase() ?? '';
+  if (SEED_ULTRA_MODELS.has(normalized)) return [...CODEX_COMMON_REASONING_EFFORTS, 'ultra'];
   if (SIX_LEVEL_MODELS.has(normalized)) return CODEX_REASONING_EFFORTS;
   if (FIVE_LEVEL_MODELS.has(normalized)) return CODEX_REASONING_EFFORTS.slice(0, 5);
   return undefined;
