@@ -41,6 +41,10 @@ import {
 } from './core/cli-launch-mode.js';
 import { logger } from './utils/logger.js';
 import { isLocalBotId } from './setup/local-bot.js';
+import {
+  normalizeApprovalDeferredScopes,
+  type ApprovalDeferredScopeBuckets,
+} from './setup/approval-scope-resolver.js';
 import { createLarkUploadHttpPool } from './utils/lark-http-pool.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import { HIDE_LOCAL_ADDRESSES_ENV, setHideLocalAddressesResolver } from './im/lark/local-address-switch.js';
@@ -127,6 +131,10 @@ import {
   type QuotaFallbackBotConfig,
 } from './services/quota-fallback.js';
 import {
+  normalizeQuotaFallbackChainConfig,
+  type QuotaFallbackChainConfig,
+} from './services/quota-fallback-chain.js';
+import {
   normalizeTraexAutoModelConfig,
   TRAEX_AUTO_MODEL_ID,
   type TraexAutoModelConfig,
@@ -134,6 +142,7 @@ import {
 import { normalizeCardActionAckTimeoutMs } from './core/card-action-ack.js';
 import { cliConfigDirEnvKey, cliSupportsConfigDir, normalizeCliConfigDir } from './core/cli-config-dir.js';
 import { normalizeStewardConfig, type StewardConfig } from './core/decision-board/model.js';
+import { normalizeBotTaskRoutingConfig, type BotTaskRoutingConfig } from './core/task-routing/model.js';
 import type {
   VcMeetingConsumerAgentConfig,
   VcMeetingConsumerConfig,
@@ -1524,6 +1533,12 @@ export interface BotConfig {
    */
   extraScopesFile?: string;
   /**
+   * 建 bot / 开放平台配置阶段因命中飞书企业管理员审批而自动跳过、留待用户按需手动开通的权限。
+   * daemon 启动权限自愈跳过这些项，以免重启时又把它们补进草稿触发审批把应用锁死；
+   * 一旦用户在开放平台手动开通，线上已授权集合包含该权限，自愈不再将其视作缺失。
+   */
+  approvalDeferredScopes?: ApprovalDeferredScopeBuckets;
+  /**
    * Bot-level synchronous card-action ACK cutoff in milliseconds. When a card
    * handler is still running at this point, Botmux ACKs with a background-work
    * toast and applies a later card result via message.patch. Valid range is
@@ -1705,15 +1720,17 @@ export interface BotConfig {
    */
   envelopeInjection?: 'auto' | 'off';
   /**
-   * 最终回复投递方式。`send`：模型必须自己执行 `botmux send` 把回复发到飞书，
-   * 系统提示与每轮 reminder 都这么要求。`transcript`：daemon 从 CLI 转写自动取
-   * 本轮最后的 assistant 文本发最终回复卡（即原来的 bridge fallback 升为主通道），
-   * 系统提示只把 `botmux send` 留给协作 / 附件 / 跨群话题、不再注入每轮 reminder；
-   * solo 会话（私聊 / 仅 owner 的 1v1 群）还会去掉 `<user_message>` 壳与 `<sender/>`。
-   * 只对有转写采集的 CLI 有效（见 core/reply-delivery.ts），不支持的 CLI 运行时自动
-   * 回落 send。缺省见 `defaultReplyDeliveryFor`（有转写采集的 CLI 缺省 transcript，
-   * 其余缺省 send）；显式 `'send'` / `'transcript'` 都持久化、不被缺省覆盖。系统提示
-   * 部分需 /restart 生效，逐轮信封立即生效。
+   * 最终回复投递方式。`send`（除 doubao 外所有 CLI 的默认）：模型必须自己执行
+   * `botmux send` 把回复发到飞书，系统提示与每轮 reminder 都这么要求。`transcript`
+   * （自动转发最终回复，按需显式开启）：daemon 从 CLI 会话记录自动取本轮最后的
+   * assistant 文本发最终回复卡（即原来的 bridge fallback 升为主通道），系统提示不再
+   * 要求用 `botmux send` 回复、不再注入每轮 reminder（仅在多 bot 协作提示里保留
+   * `--mention` / `--mention-back`）；solo 会话（私聊 / 仅 owner 的 1v1 群）还会
+   * 去掉 `<user_message>` 壳与 `<sender/>`。只对支持读取会话记录的 CLI 有效（见
+   * core/reply-delivery.ts），不支持的 CLI 运行时自动回落 send。缺省见
+   * `defaultReplyDeliveryFor`（doubao 缺省 transcript，其余 CLI 缺省 send）；显式
+   * `'send'` / `'transcript'` 都持久化、不被缺省覆盖。系统提示部分需 /restart 生效，
+   * 逐轮信封立即生效。
    */
   replyDelivery?: 'send' | 'transcript';
   turnResults?: { enabled: boolean };
@@ -1813,6 +1830,15 @@ export interface BotConfig {
    * 显式关闭（false）：不安装托管包装器，完全沿用宿主机环境及按触发人鉴权规则。需 /restart 重启或新建会话生效。
    */
   larkToolBinding?: boolean;
+  /**
+   * 没有发起人时用主人的飞书身份（默认开启）。
+   * 绑定会话里 `lark-cli --as user` 原本只认本轮发起人；脚本、Webhook、平台、无创建人的定时任务、
+   * 发起人是主人的 bot 签名派发等回合没有可用的发起人，调用一律被拒。开启（未配置或 true）时这类回合改用
+   * bot 主人（getOwnerOpenId）对本应用的授权；有真人发起的回合仍用发起人自己的授权。
+   * 显式关闭（false）回到只认发起人的严格行为。triggerUserAuth 覆盖 lark-cli 时不生效。
+   * 每次调用实时读取，改完立即生效。见 core/lark-user-owner-fallback.ts。
+   */
+  larkUserOwnerFallback?: boolean;
   /**
    * Local file sandbox selection.
    *   true/"oncall" — per-session deny-by-default three-tier whitelist
@@ -1960,6 +1986,12 @@ export interface BotConfig {
    * Missing/invalid/disabled means no automatic handoff.
    */
   quotaFallbackBot?: QuotaFallbackBotConfig;
+  /**
+   * Optional same-bot CLI/model chain used before `quotaFallbackBot`: on a
+   * usage or rate limit the session restarts in place on the next step.
+   * Missing/invalid/disabled means sessions stay on the bot's own CLI.
+   */
+  quotaFallbackChain?: QuotaFallbackChainConfig;
   /**
    * When true, THIS bot's daemon watches host load/memory and DMs the bot owner
    * when the machine crosses into (and back out of) an overloaded state — a
@@ -2301,6 +2333,15 @@ export interface BotConfig {
    * `usageDisplay` set is read as `'off'` (see {@link resolveUsageDisplay}).
    */
   usageDisplay?: UsageDisplayMode;
+  /**
+   * Whether to show 5h / 7d rolling account quota percentages in the card usage
+   * line (streaming card body & reply-card footer). Default ON (absent = true);
+   * only an explicit `false` hides the 5h / 7d segments while keeping context
+   * usage (`ctx`), token counts, cache hit rate, custom extensions and model
+   * identity visible. Display only — statusline persistence and quota fallback
+   * are unaffected.
+   */
+  showUsageQuota?: boolean;
   replyFooterEnabled?: boolean;
   replyFooterBrand?: boolean;
   replyFooterModel?: boolean;
@@ -2572,6 +2613,12 @@ export interface BotConfig {
    * 校验与「等于默认不写盘」见 core/decision-board/model.ts 的 normalizeStewardConfig。
    */
   steward?: StewardConfig;
+  /**
+   * 任务分配（`botmux assign`）画像配置。默认关闭（未配置或不设 `enabled: true`
+   * 不参与自动分配池）；管家与 apiOnly bot 始终排除。
+   * 校验与稀疏存储见 core/task-routing/model.ts 的 normalizeBotTaskRoutingConfig。
+   */
+  taskRouting?: BotTaskRoutingConfig;
   /** Chat IDs excluded from group-join and new-topic auto-start (explicit requests still work). */
   autoStartExcludedChats?: string[];
   /** Bot-wide default listener. It applies to every joined group without an override. */
@@ -2627,6 +2674,11 @@ export interface BotConfig {
   regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
   /** Allow the single-human/single-bot group exception to the @ policy (default true). */
   soloGroupMentionBypass?: boolean;
+  /**
+   * 飞书开放平台版本提交前预判会进入企业管理员人工审批时，草稿态自动二分跳过需审权限（默认 true）。
+   * 设为 false 关闭该自动兼容逻辑，按原权限清单直接提交审批。
+   */
+  autoAvoidApproval?: boolean;
   /**
    * 允许 `botmux send --mention` @ 群内任意成员（用完整邮箱 / 手机号 / union_id /
    * open_id 指定），而不仅是本轮触发者（--mention-back）。默认 false：关闭时
@@ -2745,6 +2797,7 @@ export function __testOnly_resetBotRegistry(): void {
   brandLabelCache = null;
   cachedLarkUploadHttpPool = undefined;
   usageDisplayCache = null;
+  showUsageQuotaCache = null;
   replyStyleCache = null;
 }
 
@@ -3102,8 +3155,8 @@ export function getStrictOwnerOpenId(larkAppId: string): string | undefined {
 }
 
 /** Per-bot 最终回复投递方式的**显式**配置值；未配置 / 未注册的 bot 返回 undefined，
- *  由 core/reply-delivery.ts 的 effectiveReplyDelivery 按 CLI 补缺省（有转写采集的
- *  CLI 缺省 transcript，其余缺省 send）。只读内存
+ *  由 core/reply-delivery.ts 的 effectiveReplyDelivery 按 CLI 补缺省（doubao 缺省
+ *  transcript，其余缺省 send）。只读内存
  *  registry：worker 通过 init IPC 拿冻结值，不需要磁盘 mtime 缓存。 */
 export function resolveReplyDelivery(larkAppId: string): 'send' | 'transcript' | undefined {
   const v = bots.get(larkAppId)?.config.replyDelivery;
@@ -3286,7 +3339,13 @@ export function findOncallChatForAnyBot(chatId: string): OncallChat | undefined 
 // the configured value (undefined when the bot has no brandLabel key).
 let brandLabelCache: { mtimeMs: number; map: Map<string, string | undefined> } | null = null;
 let usageDisplayCache: { mtimeMs: number; map: Map<string, UsageDisplayMode> } | null = null;
+let showUsageQuotaCache: { mtimeMs: number; map: Map<string, boolean> } | null = null;
 let replyStyleCache: { mtimeMs: number; map: Map<string, ReplyStyleConfig | undefined> } | null = null;
+
+/** Default ON: only an explicit `false` hides the 5h / 7d quota segments. */
+export function normalizeShowUsageQuota(entry?: { showUsageQuota?: unknown }): boolean {
+  return entry?.showUsageQuota !== false;
+}
 
 /** Normalize a raw bots.json entry's usage-display intent to the enum, applying
  *  backward compat: an explicit `usageDisplay` wins; otherwise a legacy
@@ -3447,6 +3506,42 @@ export function resolveUsageDisplay(larkAppId: string): UsageDisplayMode {
   } catch {
     return DEFAULT_USAGE_DISPLAY;
   }
+}
+
+/**
+ * Whether to show 5h / 7d rolling account quota percentages in card usage
+ * lines (default ON). Live registry first, disk bots.json second (so host
+ * `botmux send` sees hot `/botconfig` updates), own-bot spawn env fallback for
+ * sandboxed / remote sessions where bots.json is unreadable.
+ */
+export function resolveShowUsageQuota(larkAppId: string): boolean {
+  const inMem = bots.get(larkAppId);
+  if (inMem) return normalizeShowUsageQuota(inMem.config);
+  const path = loadedConfigPath ?? botsConfigDiskPath();
+  if (path) {
+    try {
+      const stat = statSync(path);
+      if (!showUsageQuotaCache || showUsageQuotaCache.mtimeMs !== stat.mtimeMs) {
+        const raw = JSON.parse(readFileSync(path, 'utf-8'));
+        const map = new Map<string, boolean>();
+        if (Array.isArray(raw)) {
+          for (const entry of raw) {
+            if (entry && typeof entry.larkAppId === 'string') {
+              map.set(entry.larkAppId, normalizeShowUsageQuota(entry));
+            }
+          }
+        }
+        showUsageQuotaCache = { mtimeMs: stat.mtimeMs, map };
+      }
+      const configured = showUsageQuotaCache.map.get(larkAppId);
+      if (configured !== undefined) return configured;
+    } catch { /* isolated send: disk is intentionally unreadable */ }
+  }
+  if (process.env.BOTMUX_LARK_APP_ID === larkAppId
+    && process.env.BOTMUX_SHOW_USAGE_QUOTA === 'false') {
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -4346,6 +4441,18 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       ? (traexAutoModel ? TRAEX_AUTO_MODEL_ID : undefined)
       : requestedModel;
 
+    const normalizedQuotaFallbackChain = normalizeQuotaFallbackChainConfig(entry.quotaFallbackChain, {
+      cliId: entryCliId,
+      model,
+      backendType: typeof entry.backendType === 'string' ? entry.backendType : undefined,
+      codexRpcInput: entry.codexRpcInput === true,
+    });
+    if (normalizedQuotaFallbackChain.error) {
+      logger.warn(
+        `[bot-registry:${entry.larkAppId}] quotaFallbackChain ignored: ${normalizedQuotaFallbackChain.error}`,
+      );
+    }
+
     // Shared effort applies only where a model has no independent entry.
     const sharedEffortModels = traexAutoModel
       ? traexAutoModel.models.filter(id => !Object.prototype.hasOwnProperty.call(traexAutoModel.modelSettings ?? {}, id))
@@ -4466,6 +4573,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // brand：只认精确的 'lark'，其余 → undefined（下游 normalizeBrand 当
       // feishu）。feishu 故意存成 undefined，保持旧 bots.json 干净、不写死字段。
       brand: entry.brand === 'lark' ? 'lark' : undefined,
+      approvalDeferredScopes: normalizeApprovalDeferredScopes(entry.approvalDeferredScopes),
       cardActionAckTimeoutMs: normalizeCardActionAckTimeoutMs(entry.cardActionAckTimeoutMs),
       name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : undefined,
       displayName: typeof entry.displayName === 'string' && entry.displayName.trim() ? entry.displayName.trim() : undefined,
@@ -4534,6 +4642,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       codexInstancePool,
       ...(triggerUserAuth ? { triggerUserAuth } : {}),
       larkToolBinding: typeof entry.larkToolBinding === 'boolean' ? entry.larkToolBinding : undefined,
+      larkUserOwnerFallback: typeof entry.larkUserOwnerFallback === 'boolean' ? entry.larkUserOwnerFallback : undefined,
       // Wire representation stays backwards compatible: oncall = legacy `true`;
       // only scratch is a string; off serializes as false.
       sandbox: sandboxMode === 'oncall' ? true : sandboxMode === 'scratch' ? 'scratch' : false,
@@ -4581,6 +4690,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       sessionOwnerReminder: normalizeSessionOwnerReminderConfig(entry.sessionOwnerReminder),
       longTaskReminder: normalizeLongTaskReminderConfig(entry.longTaskReminder),
       quotaFallbackBot: normalizedQuotaFallback.config,
+      quotaFallbackChain: normalizedQuotaFallbackChain.config,
       // Only explicit true persisted (undefined = off), same as restrictGrantCommands.
       overloadAlert: entry.overloadAlert === true || undefined,
       vcMeetingAgent,
@@ -4675,6 +4785,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       usageDisplay: normalizeUsageDisplay(entry) === DEFAULT_USAGE_DISPLAY
         ? undefined
         : normalizeUsageDisplay(entry),
+      // Default ON: only an explicit false hides 5h / 7d quota segments.
+      showUsageQuota: entry.showUsageQuota === false ? false : undefined,
       ...normalizeReplyFooter(entry),
       showReplyTiming: entry.showReplyTiming === true || undefined,
       // Retired final-only preference must not opt into an extra terminal card.
@@ -4757,6 +4869,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         const parsed = normalizeStewardConfig(entry.steward);
         return parsed.ok ? parsed.value ?? undefined : undefined;
       })(),
+      // 非法的 taskRouting 配置按关处理（不阻断 bot 启动）；写入路径已校验。
+      taskRouting: (() => {
+        const parsed = normalizeBotTaskRoutingConfig(entry.taskRouting);
+        return parsed.ok ? parsed.value ?? undefined : undefined;
+      })(),
       autoStartExcludedChats: Array.isArray(entry.autoStartExcludedChats) ? entry.autoStartExcludedChats.filter((id: unknown): id is string => typeof id === 'string') : undefined,
       groupJoinCommandEnabled: entry.groupJoinCommandEnabled === true || undefined,
       groupJoinCommand: typeof entry.groupJoinCommand === 'string' && entry.groupJoinCommand.trim()
@@ -4792,6 +4909,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.regularGroupMentionMode
         : undefined,
       soloGroupMentionBypass: entry.soloGroupMentionBypass === false ? false : undefined,
+      autoAvoidApproval: entry.autoAvoidApproval === false ? false : undefined,
       substituteMode,
       // 文档订阅默认触发范围。只 'all' 有意义；'mention-only'（默认）归一化为
       // undefined 让 bots.json 保持干净。

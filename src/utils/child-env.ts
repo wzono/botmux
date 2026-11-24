@@ -399,6 +399,19 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_SESSION_ID',
   'BOTMUX_SESSION_SCOPE',
   'BOTMUX_CHAT_ID',
+  // Per-launch runtime binding the worker opened for THIS CLI process (spawnCli
+  // → WorkerSessionEventScope.beginRuntime). Session-scoped hooks carry it back
+  // so the daemon can prove which runtime is signalling: without it
+  // SessionController.nativeSignal() falls to its unbound path, which only a
+  // settled sole runtime may use — and a restart is by definition unsettled, so
+  // the SessionStart ready signal was dropped as `runtime_scope_unproven` and
+  // every `/restart` waited out the worker's 45s fallback before reporting a
+  // timeout (2026-11-23). It must be on THIS list, not only on childEnv: the
+  // pty backend inherits childEnv wholesale, but tmux/zellij panes only receive
+  // what buildBotmuxEnvAssignments forwards from here. Being listed also gets a
+  // stale id scrubbed from a shared tmux server and unset in co-tenant panes,
+  // which a per-launch value needs.
+  'BOTMUX_RUNTIME_BINDING_ID',
   // Session-scoped plugin MCP relay. The worker owns the credential-bearing
   // Gateway; the CLI and its native MCP launcher receive only this socket
   // capability plus a fail-closed marker.
@@ -448,9 +461,11 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_READ_ISOLATION',
   'BOTMUX_API_ONLY',
   // Per-bot display preference for Context / Token usage
-  // ('streaming' | 'footer' | 'off'). Injected explicitly so sandboxed offline
-  // fallback cannot drift to the default when bots.json is unreadable.
+  // ('streaming' | 'footer' | 'off') and 5h/7d quota visibility ('true' | 'false').
+  // Injected explicitly so sandboxed offline fallback cannot drift to defaults
+  // when bots.json is unreadable.
   'BOTMUX_USAGE_DISPLAY',
+  'BOTMUX_SHOW_USAGE_QUOTA',
   'BOTMUX_REPLY_FOOTER',
   // Per-bot local-address policy snapshot for a sandboxed `botmux send`.
   'BOTMUX_HIDE_LOCAL_ADDRESSES',
@@ -621,9 +636,10 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   'IS_SANDBOX',
   // Per-session display footer resolved from bots.json (never env-configured).
   'BOTMUX_BRAND_LABEL',
-  // Per-bot usage display, resolved via resolveUsageDisplay(cfg) per session;
-  // env is never a config input for it.
+  // Per-bot usage display & quota visibility, resolved per session;
+  // env is never a config input for them.
   'BOTMUX_USAGE_DISPLAY',
+  'BOTMUX_SHOW_USAGE_QUOTA',
   'BOTMUX_REPLY_FOOTER',
   // Per-bot local-address policy, from the worker's init snapshot per session.
   'BOTMUX_HIDE_LOCAL_ADDRESSES',

@@ -24,6 +24,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import ts from 'typescript';
+import { minimaxCompactQueueSuppressesPromptReady } from '../../src/core/inject-queue-policy.js';
 import { clearStatuslineSnapshot } from '../../src/services/statusline-snapshot.js';
 import { contractTerminalStatus, executionObserverSupported } from '../../src/services/session-contract.js';
 import * as runtimeReservation from '../../src/services/runtime-reservation.js';
@@ -50,6 +51,12 @@ import {
   resolveAntigravitySpawnStoreOptions,
 } from '../../src/services/antigravity-accounts.js';
 import { drainAntigravityTranscript } from '../../src/services/antigravity-transcript.js';
+import {
+  normalizeBackgroundTranscriptPath,
+  normalizeBackgroundTranscriptSegments,
+  readBackgroundTranscriptChain,
+  writeBackgroundTranscriptChain,
+} from '../../src/services/background-transcript-chain.js';
 
 /** Failed-turn rewind wiring that emitTurnTerminal, flushPending and
  *  handleTermAction call into (see src/worker.ts startFailedTurnRewind):
@@ -74,6 +81,7 @@ const TRAEX_QUESTION_FUNCTIONS = [
 /** Inert stand-in for the worker's TraexQuestionBridge instance (a const, not
  *  a function); a caller that observes it passes its own in `scope`. */
 const INERT_TRAEX_QUESTION_BRIDGE = { kick() {}, reset() {}, hasOpenCard: () => false, dispose() {} };
+const INERT_BACKGROUND_TASK_TRACKER = { backgroundWait: () => 0 };
 /** The worker's away-summary focus controller, doing nothing unless a test supplies its own. */
 const INERT_AWAY_SUMMARY_FOCUS = { request() {}, noteSuggestion() {}, beforeDaemonMessage() {}, noteRecap() {}, noteCliTurnStarted() {}, restore() {}, reset() {}, isBlurred: false, isActive: false };
 
@@ -147,6 +155,8 @@ function defaultScopedWorkerState(scope: Record<string, unknown>, key: string | 
   if (key === 'publishedActiveRuntimeSeeded') {
     return (scope.publishedActiveRuntimeSeeded ??= false);
   }
+  if (key === 'cliRestartEpoch') return (scope.cliRestartEpoch ??= 0);
+  if (key === 'deferredSessionReady') return (scope.deferredSessionReady ??= []);
   return undefined;
 }
 
@@ -177,9 +187,18 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
       return dependencies.get(key);
     }
     if (key === 'randomUUID') return randomUUID;
+    if (key === 'join') return join;
+    if (key === 'readBackgroundTranscriptChain') return readBackgroundTranscriptChain;
+    if (key === 'writeBackgroundTranscriptChain') return writeBackgroundTranscriptChain;
+    if (key === 'normalizeBackgroundTranscriptPath') return normalizeBackgroundTranscriptPath;
+    if (key === 'normalizeBackgroundTranscriptSegments') return normalizeBackgroundTranscriptSegments;
     if (key === 'clearStatuslineSnapshot') return clearStatuslineSnapshot;
     if (key === 'confirmedTerminalEffortChoice') return () => undefined;
     if (key === 'noteTerminalEffortInput') return () => {};
+    // Most extracted input-path fixtures never model a persistent respawn;
+    // keep the new reattach reconciliation inert unless a test loads it as
+    // the function under test with its own explicit backend/generation scope.
+    if (key === 'recoverSessionRenameAfterPersistentReattach') return () => false;
     if (key === 'recordStructuredInput') return () => {};
     if (key === 'updateSessionTurnNativeAnchor') return () => {};
     if (key === 'claudeEffortObserver') {
@@ -190,6 +209,7 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
       if (!dependencies.has(key)) dependencies.set(key, new TerminalEffortChoiceTracker());
       return dependencies.get(key);
     }
+    if (key === 'minimaxCompactQueueSuppressesPromptReady') return minimaxCompactQueueSuppressesPromptReady;
     if (key === 'config') return { terminalEffortWriteback: false };
     if (key === 'contractTerminalStatus') return contractTerminalStatus;
     if (key === 'executionObserverSupported') return executionObserverSupported;
@@ -235,8 +255,9 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'drainAntigravityTranscript') return drainAntigravityTranscript;
     if (key === 'traexQuestionBridge') return INERT_TRAEX_QUESTION_BRIDGE;
     if (key === 'awaySummaryFocus') return INERT_AWAY_SUMMARY_FOCUS;
+    if (key === 'backgroundTaskTracker') return INERT_BACKGROUND_TASK_TRACKER;
     if (key === 'awaySummaryFocusRefusal') return awaySummaryFocusRefusal;
-    if (typeof key === 'string' && ['retireAntigravityBridgeTurn', 'rebindAntigravityBridgeTurn', 'warnPromptReadySkipped', 'cancelTurnTerminalReadyRecovery', 'recoverDeferredPromptReadyAtTurnTerminal', 'markPromptReadyFromBusyProbe', 'traexNativeStartupInputIsPending', 'readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'spawnCliBody', 'setCaptureIdentity', 'cotEntryWithoutSentinel', 'clearCodexAppInterruptTarget', 'publishAppliedReasoningSelection', 'publishNativeReasoningFooter', 'publishNativeReasoningObservation', 'notifyTraexCatalogEmpty', 'admitTraexCatalogModelBeforeInput', 'requeueUnsubmittedQueuedActivation', 'prepareAntigravityAccountsCredentialMask', 'reconcileAntigravitySpawnAccount', 'confirmAntigravitySpawnAccount', ...TRAEX_QUESTION_FUNCTIONS, ...FAILED_TURN_REWIND_FUNCTIONS].includes(key)) {
+    if (typeof key === 'string' && ['retireAntigravityBridgeTurn', 'rebindAntigravityBridgeTurn', 'warnPromptReadySkipped', 'cancelTurnTerminalReadyRecovery', 'recoverDeferredPromptReadyAtTurnTerminal', 'markPromptReadyFromBusyProbe', 'traexNativeStartupInputIsPending', 'readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'backgroundTranscriptChainFilePath', 'persistBackgroundTranscriptChain', 'latestClosedTranscriptOffset', 'prepareBackgroundTranscriptReplay', 'recordBackgroundTranscriptRotation', 'spawnCliBody', 'deferSessionReadyUntilRuntimeAssigned', 'takeDeferredSessionReady', 'replayDeferredSessionReady', 'clearDeferredSessionReady', 'setCaptureIdentity', 'cotEntryWellFormed', 'cotEntryWithoutSentinel', 'clearCodexAppInterruptTarget', 'publishAppliedReasoningSelection', 'publishNativeReasoningFooter', 'publishNativeReasoningObservation', 'notifyTraexCatalogEmpty', 'admitTraexCatalogModelBeforeInput', 'requeueUnsubmittedQueuedActivation', 'prepareAntigravityAccountsCredentialMask', 'reconcileAntigravitySpawnAccount', 'confirmAntigravitySpawnAccount', ...TRAEX_QUESTION_FUNCTIONS, ...FAILED_TURN_REWIND_FUNCTIONS].includes(key)) {
       if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
       return dependencies.get(key);
     }
@@ -280,8 +301,10 @@ export function loadWorkerMessageHandler(name: string, scope: Record<string, unk
       const scopedDefault = defaultScopedWorkerState(scope, key);
       if (scopedDefault !== undefined) return scopedDefault;
       if (key === 'recordStructuredInput') return () => {};
+      if (key === 'recoverSessionRenameAfterPersistentReattach') return () => false;
       if (key === 'updateSessionTurnNativeAnchor') return () => {};
       if (key === 'revokePromptReadiness') return loadWorkerFunction('revokePromptReadiness', scope);
+      if (key === 'replayDeferredSessionReady') return loadWorkerFunction('replayDeferredSessionReady', scope);
       return (globalThis as any)[key];
     },
     set: (target, key, value) => { target[key as string] = value; return true; },
