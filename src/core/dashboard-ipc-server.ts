@@ -81,6 +81,7 @@ import { cliAuthBind, loadDashboardSecret, verifyHmac } from '../dashboard/auth.
 import { UnsafeHostAuthorityFileError } from '../platform/secure-host-file.js';
 import { WORKFLOW_DAEMON_IPC_ROUTE_PREFIX } from '../workflows/v3/daemon-ipc-auth.js';
 import { DISPATCH_LAUNCH_IPC_ROUTE_PREFIX } from './dispatch-launch-ipc-auth.js';
+import { COLLAB_IPC_ROUTE_PREFIX } from './collab-preflight-ipc.js';
 import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from '../workflows/v3/session-relay.js';
 import { REPORT_SESSION_RELAY_ROUTE } from './report-session-relay.js';
 import { WORKFLOW_NODE_REPORT_ROUTE } from './workflow-node-report.js';
@@ -147,6 +148,15 @@ import {
   SchedulePreconditionError,
 } from '../services/schedule-precondition-runner.js';
 import * as groupsStore from '../services/groups-store.js';
+import * as chatTopNotice from '../im/lark/chat-top-notice.js';
+import * as larkClient from '../im/lark/client.js';
+import {
+  isPlainJsonObject,
+  normalizeGroupLarkAppIds,
+  parseGroupCreateOptions,
+  parseGroupShareLinkRequest,
+  parseGroupTopNoticeRequest,
+} from './group-ipc-options.js';
 import { GROUP_SEND_BODY_MAX_BYTES, parseGroupSendBody, readRequestBoundGroupMessage, sendRequestBoundGroupMessage, sendRequestBoundMessage, type GroupSendInput } from '../services/request-bound-group-send.js';
 import { createGroupWithBots, transferGroupOwner } from '../services/group-creator.js';
 import * as oncallStore from '../services/oncall-store.js';
@@ -178,7 +188,7 @@ import {
   type StreamingCardButtonId,
 } from '../im/lark/streaming-card-buttons.js';
 import * as substituteModeStore from '../services/substitute-mode-store.js';
-import { claimPromptContext } from '../services/prompt-context-store.js';
+import { claimPromptContextAmongTurns } from '../services/prompt-context-store.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { normalizeCliRuntimeConfig, type CliRuntimeConfig } from '../adapters/cli/runtime.js';
 import { evaluateReadIsolationGate } from '../adapters/cli/read-isolation.js';
@@ -193,6 +203,8 @@ import {
   CURRENT_EXECUTION_IDENTITY_ROUTE,
   CURRENT_EXECUTION_IDENTITY_SCHEMA,
 } from '../cli/current-execution.js';
+import { isBytedcliOverseasRegion } from '../platform/bytedcli-grant-regions.js';
+import { GRANT_WAIT_CAP_MS } from '../platform/credential-grant-budget.js';
 import { resolveDaemonCurrentExecution } from './current-execution.js';
 import { configuredCliExecutionMode, sessionCliExecutionInfo } from './cli-execution-mode.js';
 import { getDashboardAdminOpenIds } from '../bot-registry.js';
@@ -626,7 +638,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, findOncallChat, listOncallChats, effectiveDefaultWorkingDir, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, findOncallChat, listOncallChats, effectiveDefaultWorkingDir, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, LarkTransportDisabledError, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, isUsableOpenId, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization, type UserAuthorizationPollResult } from '../utils/user-token.js';
 import { describeMissingUserScopes, type AppVersionReviewLookup } from '../utils/lark-app-version.js';
 import { queryTriggerUserAuthStatus } from '../services/trigger-user-auth-status.js';
@@ -667,6 +679,7 @@ import {
 } from './detached-scheduled-identity.js';
 import { noteSenderUnionId } from './platform-credential-source.js';
 import { larkToolBindingPath, readLarkToolBinding } from './lark-tool-binding.js';
+import { ProtectedResultStore } from '../services/protected-result-store.js';
 import { sessionAuthRequests } from './session-auth-requests.js';
 import { chooseTurnSpeaker, governedSpeakers } from './turn-speakers.js';
 import { resolveUserToken } from '../utils/user-token.js';
@@ -676,7 +689,7 @@ import { reasonTag, platformAuthorizeUrl } from './platform-credential-source.js
 import { askPlatformToAuthorize, type PlatformAuthorizationRequestResult } from './platform-authorization-request.js';
 import { hasReason, PLATFORM_WILL_NOT_ISSUE_REASONS } from './refusal-reasons.js';
 import { requestUnattendedAuthorization, noticeUnattendedLapse, clearUnattendedLapse, definitelyNotAuthorized, missingAuthorizationEntries, privateNoticeSender, unattendedTask, unattendedRefusalText, type UnattendedNoticeOutcome, type UnattendedProvider } from './capability-authorization.js';
-import { publishDelegationRefusal, adoptLocalBytedcliAuthorization, retryTransientTurnIdentity, awaitTurnIdentityPublication } from './turn-cli-identity.js';
+import { publishDelegationRefusal, adoptLocalBytedcliAuthorization, retryMissingRegionalGrant, retryTransientTurnIdentity, awaitTurnIdentityPublication } from './turn-cli-identity.js';
 import { platformAuthRequestRedirect, resolveBoundLarkUserCredential } from './lark-tool-platform-credential.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
 import {
@@ -1327,6 +1340,13 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
     if ((method === 'GET' && action === undefined)
         || (method === 'POST' && action !== undefined)) return true;
   }
+  // collab.preflight 与 dispatch-launch 同源：自带全 envelope HMAC，handler 认证。
+  if (method === 'POST' && pathname.match(new RegExp(`^${COLLAB_IPC_ROUTE_PREFIX}/[0-9a-f]{64}/preflight$`))) return true;
+  // collab.kickoff：prepare/start/cancel（POST）+ query（GET）。
+  if (pathname.match(new RegExp(`^${COLLAB_IPC_ROUTE_PREFIX}/[0-9a-f]{64}/kickoff/[0-9a-f]{64}(?:/(prepare|start|cancel))?$`))) {
+    const action = pathname.match(/[0-9a-f]{64}\/(prepare|start|cancel)$/)?.[1];
+    if ((method === 'GET' && action === undefined) || (method === 'POST' && action !== undefined)) return true;
+  }
   if (method === 'POST' && /^\/api\/sessions\/[^/]+\/lark-tool-identity$/.test(pathname)) return true;
   // The receiver action endpoint performs its own rotating worker-capability
   // verification and then enters the durable action ledger. Keeping this one
@@ -1754,6 +1774,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
   const blocked = (reason: string) => ({
     schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'blocked', error: 'current_execution_unverified', reason,
   });
+  const grantDeadline = Date.now() + GRANT_WAIT_CAP_MS;
   let body: unknown;
   try { body = await readBoundedJsonBody(req, 1024, 1000); }
   catch (error) {
@@ -1772,7 +1793,11 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
   const toolValue = typeof record?.tool === 'string' ? record.tool : '';
   const tool: IdentityRouteTool | '' = (identityRouteTools as readonly string[]).includes(toolValue)
     ? toolValue as IdentityRouteTool : '';
-  if (!sessionId || !tool || (record?.as !== undefined && typeof record.as !== 'string')) return jsonRes(res, 400, blocked('invalid_request'));
+  const region = record?.region;
+  if (!sessionId || !tool || (record?.as !== undefined && typeof record.as !== 'string')
+    || (region !== undefined && (tool !== 'bytedcli' || !isBytedcliOverseasRegion(region)))) {
+    return jsonRes(res, 400, blocked('invalid_request'));
+  }
   const requestedAs = record?.as as string | undefined;
   const peer = await resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
@@ -1835,14 +1860,36 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     // The policy is passed as a READER, not a config: a Dashboard edit replaces
     // the whole bot config object, so anything captured here would be a stale
     // snapshot that cannot see a change made while the re-ask is in flight —
-    // exactly the window in which the answer gets written to disk.
+    // exactly the window in which the answer gets published.
     const liveAppId = ds.larkAppId;
+    const dataDir = config.session.dataDir;
+    const currentPolicy = () => getBot(liveAppId).config.triggerUserAuth;
+    const worker = ds.worker;
+    const originCapability = ds.managedTurnOrigin?.capability;
+    const callerOpenId = ds.managedTurnOrigin?.callerOpenId;
+    const executionStillCurrent = () => {
+      const origin = ds.managedTurnOrigin;
+      if (findActiveBySessionId(sessionId) !== ds || ds.worker !== worker || !worker
+        || worker.killed || worker.connected === false || ds.workerGeneration !== document.workerGeneration
+        || !origin || origin.turnId !== document.turnId
+        || (origin.identityTurnId ?? origin.turnId) !== identityTurnId
+        || origin.capability !== originCapability || origin.callerOpenId !== callerOpenId
+        || origin.dispatchAttempt !== document.dispatchAttempt) return false;
+      try {
+        if (identityModelRefusalReason(ds)) return false;
+        if (requestedAs === undefined) return true;
+        return governedSpeakers({ policy: currentPolicy(), tool, sessionDataDir: dataDir, sessionId, origin })
+          ?.some(speaker => speaker.openId === requestedAs && speaker.turnId === speakerTurnId) ?? false;
+      } catch {
+        return false;
+      }
+    };
     await retryTransientTurnIdentity({
       sessionDataDir: config.session.dataDir, sessionId, turnId: speakerTurnId,
       tool: tool === 'codebase' || tool === 'bitscli' ? 'bytedcli' : tool,
       // A bot that no longer exists is "no longer governed": policyStillWants
       // treats a throwing reader as a refusal to publish.
-      currentPolicy: () => getBot(liveAppId).config.triggerUserAuth,
+      currentPolicy,
     });
     let env = recallProvenIdentityContent(config.session.dataDir, sessionId, speakerTurnId, tool);
     if (!env) {
@@ -1851,6 +1898,14 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
       // publication instead of refusing as if nothing would ever come.
       await awaitTurnIdentityPublication(config.session.dataDir, sessionId);
       env = recallProvenIdentityContent(config.session.dataDir, sessionId, speakerTurnId, tool);
+    }
+    if (env && region && !delegation) {
+      await retryMissingRegionalGrant({
+        sessionDataDir: dataDir, sessionId, turnId: speakerTurnId, region, speakerOpenId: choice.speaker?.openId,
+        currentPolicy, executionStillCurrent, waitMs: grantDeadline - Date.now(),
+      });
+      if (!executionStillCurrent()) return jsonRes(res, 403, blocked('lineage_unproven'));
+      env = recallProvenIdentityContent(dataDir, sessionId, speakerTurnId, tool);
     }
     if (env) {
       return jsonRes(res, 200, {
@@ -2864,10 +2919,10 @@ ipcRoute('POST', '/api/sessions/:sessionId/turns/:triggerId/interrupt', async (_
  * Host-side atomic claim/pop for the UserPromptSubmit hook（#794 方向 B）。
  *
  * 沙箱内的 `botmux user-prompt-hook` 不能在 read-only 的 `prompt-ctx/<sid>` 里
- * unlink（HIGH-2），同正文多轮也不能靠 FIFO 猜（HIGH-1：某轮漏 claim 会串轮到
- * 后续轮）。hook 把 (session 凭据 + fingerprint) 提交到这里，宿主按
- * **managedTurnOrigin.turnId 权威 turn 绑定**精确取该轮的 envelope，先删再返回。
- * 漏 claim 只孤儿化自己那条，不污染后续轮；上一轮的 stale sidecar 永远不会被返回。
+ * unlink（HIGH-2），同正文多轮也不能靠 FIFO 猜（HIGH-1）。hook 提交
+ * (session 凭据 + fingerprint)，宿主在 managedTurnOrigin 与 worker 报告的
+ * type-ahead 候选集里做全局唯一匹配，先删再返回。任何歧义都不消费：
+ * 漏 claim 只孤儿化自己那条，不污染后续轮。
  *
  * 鉴权与 /close、/slash 同构：trusted-host HMAC，或本会话 rotating per-turn
  * capability（沙箱内读 host secret 失败时的回退）。任何未命中/失败 → 404/403，
@@ -2901,13 +2956,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/prompt-ctx/claim', async (req, res, p
       });
     } catch { /* IPC gone */ }
   }
-  // 权威 turnId：daemon 当前这轮的 turnId（worker 发布的 managed_turn_origin）。
-  // hook 不需要、也不应自己提供 turnId——daemon 只认自己的权威值，避免 FIFO 串轮。
+  // 当前轮与 worker 报告的排队轮组成一个候选集。hook 不提供 turnId，因此
+  // 只有全局唯一精确/前缀匹配才能领取；同正文多候选必须 fail-open，不能按队序猜。
   const turnId = ds?.managedTurnOrigin?.turnId;
   if (!turnId) return jsonRes(res, 404, { ok: false, error: 'no_active_turn' });
-  const envelope = claimPromptContext(params.sessionId, turnId, fingerprint, prefix);
-  if (!envelope) return jsonRes(res, 404, { ok: false, error: 'not_found' });
-  jsonRes(res, 200, { ok: true, envelope });
+  const claimed = claimPromptContextAmongTurns(params.sessionId,
+    [turnId, ...(ds?.typeAheadPromptTurnIds ?? [])], fingerprint, prefix);
+  if (!claimed) return jsonRes(res, 404, { ok: false, error: 'not_found' });
+  if (ds?.typeAheadPromptTurnIds?.includes(claimed.turnId)) {
+    ds.typeAheadPromptTurnIds = ds.typeAheadPromptTurnIds.filter(id => id !== claimed.turnId);
+  }
+  jsonRes(res, 200, { ok: true, envelope: claimed.envelope });
 });
 
 /** Return only the live bot's normalized native-subagent policy. The session
@@ -4513,6 +4572,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   const detachedScheduled = backgroundInput ? resolveRegisteredBackgroundContext(backgroundInput) : null;
   const targetLarkAppId = ds?.larkAppId ?? detachedScheduled?.larkAppId;
   const targetChatId = ds?.chatId ?? detachedScheduled?.chatId;
+  const targetSessionChatId = ds?.session.chatId;
   const validHeadlessSession = !!ds?.session.headless
     && ds.session.headless.source === 'cli'
     && isHeadlessId(ds.session.headless.id)
@@ -4528,7 +4588,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     || !boundLarkToolRequest(req, params.sessionId, targetLarkAppId, botConfig)) {
     return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' });
   }
-  if (!body || Object.keys(body).some(key => key !== 'mode' && key !== 'as') || !['bot', 'user'].includes(String(body.mode))
+  if (!body || Object.keys(body).some(key => !['mode', 'as', 'policyOnly'].includes(key)) || !['bot', 'user'].includes(String(body.mode))
+    || body.policyOnly !== undefined && typeof body.policyOnly !== 'boolean'
     || (body.as !== undefined && (body.mode !== 'user' || typeof body.as !== 'string'))) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_lark_tool_request' });
   }
@@ -4536,6 +4597,25 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   let bot: ReturnType<typeof getBot>['config'];
   try { bot = getBot(targetLarkAppId!).config; }
   catch { return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' }); }
+  // Re-evaluate after credential resolution too: operator edits and protected
+  // deliveries may land while a grant/token request is awaiting a provider.
+  const protectedCredentialRefusal = (): string | undefined => {
+    try {
+      const live = getBot(targetLarkAppId!).config;
+      return live.protectedResults === true || ds?.session.protectedResults === true
+        || detachedScheduled?.session.protectedResults === true
+        || new ProtectedResultStore(config.session.dataDir).sessionHasProtection(live.larkAppId, params.sessionId)
+        ? 'protected_result_credential_export_denied' : undefined;
+    } catch { return 'protected_result_policy_unavailable'; }
+  };
+  const refuseProtectedCredential = (): boolean => {
+    const error = protectedCredentialRefusal();
+    if (!error) return false;
+    jsonRes(res, error === 'protected_result_policy_unavailable' ? 503 : 403, { ok: false, error });
+    return true;
+  };
+  if (refuseProtectedCredential()) return;
+  if (body.policyOnly === true) return jsonRes(res, 200, { ok: true, policyOnly: true });
   // Per-person auth is on but lark-user is not among its capabilities: the machine's own lark-cli login serves `--as user`.
   if (body.mode === 'user' && larkUserNative(bot.triggerUserAuth)) {
     if (body.as !== undefined) return jsonRes(res, 403, { ok: false, error: AS_UNAVAILABLE_NATIVE });
@@ -4588,6 +4668,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     if (!stillValidSession || !boundLarkToolRequest(req, params.sessionId, bot.larkAppId)) {
       return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' });
     }
+    if (refuseProtectedCredential()) return;
     return jsonRes(res, 200, {
       ok: true, appId: bot.larkAppId, mode: 'bot', credentialType: 'tenant_access_token', credential: token,
     });
@@ -4761,7 +4842,40 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
           === (liveOrigin?.callerOpenId ? turnCaller : turnPrincipal))
       && ds.managedTurnOrigin?.identityTurnId === identityTurnId)
     : (!!backgroundInput && !!detachedForUser && backgroundContextStillValid(backgroundInput, detachedForUser));
-  if (!boundLarkToolRequest(req, params.sessionId, bot.larkAppId)
+  // Caller/turn stability does not imply that the original transport still
+  // exists. Unlike bot credentials, personal credentials must never enter a
+  // headless session, including one created while the provider was awaited.
+  let userTargetStillValid = false;
+  try {
+    const liveBot = getBot(targetLarkAppId!).config;
+    const targetMatches = (candidate: Pick<DaemonSession, 'session' | 'larkAppId' | 'chatId'>): boolean =>
+      candidate.larkAppId === targetLarkAppId && candidate.chatId === targetChatId
+      && candidate.session.sessionId === params.sessionId
+      && (targetSessionChatId !== undefined
+        ? candidate.session.chatId === targetSessionChatId
+        // Older active sessions can lack the stored chat field. Its absence is
+        // not contradictory evidence; a present, different chat still refuses.
+        : candidate.session.chatId === undefined || candidate.session.chatId === targetChatId);
+    const liveDs = detachedForUser ? undefined : findActiveBySessionId(params.sessionId);
+    const liveDetached = detachedForUser && backgroundInput
+      ? resolveRegisteredBackgroundContext(backgroundInput) : null;
+    userTargetStillValid = liveBot.larkAppId === targetLarkAppId && liveBot.apiOnly !== true
+      && boundLarkToolRequest(req, params.sessionId, targetLarkAppId, liveBot)
+      // A request admitted as managed must not finish under a newly native or
+      // capability-revoked policy. Re-evaluate both against the LIVE bot too.
+      && !larkUserNative(liveBot.triggerUserAuth)
+      && (!delegated || triggerUserAuthApplies(liveBot.triggerUserAuth, 'lark-cli'))
+      && (detachedForUser
+        ? !!liveDetached && liveDetached.job.id === detachedForUser.job.id
+          && targetMatches(liveDetached) && !liveDetached.session.headless
+          // A detached stored identity can remain valid while the active registry
+          // is replaced. Check that live replacement too, not only the old snapshot.
+          && (!liveDetached.ds || (targetMatches(liveDetached.ds) && !liveDetached.ds.session.headless))
+          && !sessionTransportDisabled(liveDetached)
+        : !!liveDs && liveDs.session.status === 'active' && targetMatches(liveDs)
+          && !liveDs.session.headless && !sessionTransportDisabled(liveDs));
+  } catch { /* Unknown live configuration cannot authorize credential export. */ }
+  if (!userTargetStillValid
     || !stableAfterAwait
     // The switch, the owner or the turn's speakers may have changed meanwhile.
     || !ownerFallbackStillHolds(ds, ownerFallback)
@@ -4816,6 +4930,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   if (!resolved.ok) return jsonRes(res, 403, { ok: false, error: delegated
     ? `The original user's authorization for ${bot.larkAppId} is missing. Run botmux auth request --scope "<required scopes>" --json and send the link to that human, then retry with --as user. Do not ask the dispatch bot to authorize.`
     : `Application ${bot.larkAppId} needs this user's authorization. Run ${asPrefix}botmux auth request --scope "<required scopes>" --json${asPrefix ? ` and ${asPrefix}botmux auth wait` : ', or send /login in this conversation'}, then retry with --as user.` });
+  if (refuseProtectedCredential()) return;
   auditOwnerFallback('granted');
   return jsonRes(res, 200, {
     ok: true, appId: resolved.appId, mode: 'user', credentialType: 'user_access_token', credential: resolved.credential,
@@ -8118,7 +8233,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
     type: 'session.update',
     body: {
       sessionId,
-      patch: { status: 'active', closedAt: null },
+      patch: {
+        status: 'active',
+        closedAt: null,
+        queuedActivationPending: null,
+        queuedActivationTailCount: null,
+      },
     },
   });
 
@@ -10155,6 +10275,108 @@ ipcRoute('POST', '/api/groups/:chatId/leave', requireBoundBot(async (_req, res, 
   jsonRes(res, 200, r);
 }));
 
+function isLarkTransportDisabledError(err: unknown): boolean {
+  return err instanceof LarkTransportDisabledError
+    || (err instanceof Error && err.name === 'LarkTransportDisabledError');
+}
+
+function isBoundBotApiOnly(larkAppId: string): boolean {
+  try {
+    return getBot(larkAppId).config.apiOnly === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Host-only top-notice setter through this daemon's exact bound bot identity.
+ * Enforces bound-bot mismatch (port-reuse guard), apiOnly transport refusal,
+ * live chat membership, and message-to-chat ownership (inside putChatTopNotice).
+ */
+ipcRoute('POST', '/api/groups/:chatId/top-notice', requireBoundBot(async (req, res, p) => {
+  const body = await readJsonBodyOrBadJson<unknown>(req, res, 16 * 1024);
+  if (body === BAD_JSON) return;
+  const larkAppId = cachedLarkAppId;
+  const parsed = parseGroupTopNoticeRequest(p.chatId, body, larkAppId);
+  if (!parsed.ok) return jsonRes(res, parsed.status, { ok: false, error: parsed.error });
+  if (isBoundBotApiOnly(larkAppId)) {
+    return jsonRes(res, 400, { ok: false, error: 'lark_transport_disabled' });
+  }
+  try {
+    const inChat = await larkClient.isCurrentBotInChat(larkAppId, parsed.chatId);
+    if (!inChat) return jsonRes(res, 403, { ok: false, error: 'bot_not_in_chat' });
+  } catch (err) {
+    if (isLarkTransportDisabledError(err)) {
+      return jsonRes(res, 400, { ok: false, error: 'lark_transport_disabled' });
+    }
+    return jsonRes(res, 502, { ok: false, error: ipcErrorText(err) });
+  }
+  try {
+    await chatTopNotice.putChatTopNotice(larkAppId, parsed.chatId, parsed.messageId);
+    return jsonRes(res, 200, {
+      ok: true,
+      larkAppId,
+      chatId: parsed.chatId,
+      messageId: parsed.messageId,
+    });
+  } catch (err) {
+    if (isLarkTransportDisabledError(err)) {
+      return jsonRes(res, 400, { ok: false, error: 'lark_transport_disabled' });
+    }
+    const msg = ipcErrorText(err);
+    if (msg.startsWith('message_chat_unavailable')) {
+      return jsonRes(res, 404, { ok: false, error: 'message_chat_unavailable' });
+    }
+    if (msg.startsWith('message_chat_mismatch')) {
+      return jsonRes(res, 409, { ok: false, error: 'message_chat_mismatch' });
+    }
+    return jsonRes(res, 502, { ok: false, error: msg });
+  }
+}, NOT_BOUND_BODY.okFalse));
+
+/**
+ * Host-only share-link generator through this daemon's exact bound bot identity.
+ * Enforces bound-bot mismatch, apiOnly transport refusal, and live chat membership
+ * before invoking `getChatShareLink`.
+ */
+ipcRoute('POST', '/api/groups/:chatId/share-link', requireBoundBot(async (req, res, p) => {
+  const body = await readJsonBodyOrBadJson<unknown>(req, res, 16 * 1024);
+  if (body === BAD_JSON) return;
+  const larkAppId = cachedLarkAppId;
+  const parsed = parseGroupShareLinkRequest(p.chatId, body, larkAppId);
+  if (!parsed.ok) return jsonRes(res, parsed.status, { ok: false, error: parsed.error });
+  if (isBoundBotApiOnly(larkAppId)) {
+    return jsonRes(res, 400, { ok: false, error: 'lark_transport_disabled' });
+  }
+  try {
+    const inChat = await larkClient.isCurrentBotInChat(larkAppId, parsed.chatId);
+    if (!inChat) return jsonRes(res, 403, { ok: false, error: 'bot_not_in_chat' });
+  } catch (err) {
+    if (isLarkTransportDisabledError(err)) {
+      return jsonRes(res, 400, { ok: false, error: 'lark_transport_disabled' });
+    }
+    return jsonRes(res, 502, { ok: false, error: ipcErrorText(err) });
+  }
+  try {
+    const result = await groupsStore.getChatShareLink(larkAppId, parsed.chatId, parsed.validityPeriod);
+    if (!result.ok) {
+      return jsonRes(res, 502, { ok: false, error: result.error });
+    }
+    return jsonRes(res, 200, {
+      ok: true,
+      larkAppId,
+      chatId: parsed.chatId,
+      validityPeriod: parsed.validityPeriod,
+      shareLink: result.shareLink,
+    });
+  } catch (err) {
+    if (isLarkTransportDisabledError(err)) {
+      return jsonRes(res, 400, { ok: false, error: 'lark_transport_disabled' });
+    }
+    return jsonRes(res, 502, { ok: false, error: ipcErrorText(err) });
+  }
+}, NOT_BOUND_BODY.okFalse));
+
 // ─── Oncall bindings (dashboard) ───────────────────────────────────────────
 // PUT  /api/oncall/:chatId  body: {workingDir} — bind or update workingDir
 // DELETE /api/oncall/:chatId — unbind
@@ -10871,11 +11093,20 @@ ipcRoute('GET', '/api/groups/:chatId/members-display', requireBoundBot(async (_r
     // The list is this bot's viewpoint and includes the bot itself. Flag that
     // row so pickers can keep it out of "grant to" choices: exact chat grants
     // reject the receiver as its own subject (receiver_cannot_be_subject).
+    // Keep selfOpenId authoritative when known, while falling back safely to
+    // larkAppId when openId fell back to appId or before /bot/v3/info resolves
+    // (requiring a unique larkAppId match so same-name external bots are not flagged).
     const selfOpenId = getBotOpenId(cachedLarkAppId);
+    const selfAppMatches = members.filter(member => member.larkAppId === cachedLarkAppId).length;
+    const isSelfMember = (member: (typeof members)[number]): boolean => (
+      (Boolean(selfOpenId) && member.openId === selfOpenId)
+      || (member.larkAppId === cachedLarkAppId && (
+        member.openId === cachedLarkAppId
+        || (!selfOpenId && selfAppMatches === 1)
+      ))
+    );
     jsonRes(res, 200, {
-      members: selfOpenId
-        ? members.map(member => (member.openId === selfOpenId ? { ...member, self: true } : member))
-        : members,
+      members: members.map(member => (isSelfMember(member) ? { ...member, self: true } : member)),
     });
   } catch (err) {
     jsonRes(res, 502, { ok: false, error: ipcErrorText(err) });
@@ -11470,6 +11701,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     // disables the toggle wherever the worker would fail-close on it.
     readIsolationSupported: readIsolationEnforceable(cachedLarkAppId),
     backendType: backendTypeStore.getBotBackendType(cachedLarkAppId) ?? null,
+    hcHerdrTabs: getBot(cachedLarkAppId).config.hcHerdrTabs === true,
     // 没有覆盖时会话实际用的后端（BACKEND_TYPE / 自动探测）。Dashboard 判断零注入等
     // 依赖后端的能力时按「覆盖值，否则这个默认值」算生效后端。
     defaultBackendType: config.daemon.backendType,
@@ -13857,6 +14089,11 @@ botConfigPutRoute<{ herdr?: unknown }>('/api/bot-herdr', 'herdr', {
   respond: value => ({ ok: true, herdr: value ? JSON.stringify(value, null, 2) : '' }),
 });
 
+botConfigPutRoute<{ enabled?: unknown }>('/api/bot-hc-herdr-tabs', 'hcHerdrTabs', {
+  normalize: body => typeof body?.enabled === 'boolean' ? fieldOk(body.enabled) : fieldInvalid('invalid_boolean'),
+  respond: value => ({ ok: true, hcHerdrTabs: value === true }),
+});
+
 // Per-bot 最大同时活跃会话数 maxLiveWorkers。Body `{ maxLiveWorkers: number | null }`:
 //   • 正整数  → 设上限；超过后 idle-worker sweeper 把最久未用的会话休眠到上限内
 //   • null    → 清除（回落到内置默认 30）
@@ -14322,42 +14559,58 @@ ipcRoute('PUT', '/api/bot-working-dir-mode', requireBoundBot(async (req, res) =>
 // initial bot members. The dashboard's public route picks any online daemon
 // to act as creator, then forwards here.
 ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
-  let body: {
+  let rawBody: unknown;
+  try {
+    rawBody = await readJsonBody<unknown>(req);
+  } catch {
+    return jsonRes(res, 400, { error: 'bad_json', accepted: false });
+  }
+  if (!isPlainJsonObject(rawBody)) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json', accepted: false });
+  }
+  const body = rawBody as {
     name?: unknown;
+    creatorLarkAppId?: unknown;
     larkAppIds?: unknown;
     userOpenIds?: unknown;
     ownerUnionIds?: unknown;
     transferOwnerUnionId?: unknown;
     transferOwnerTo?: unknown;
     notifyOwnerOpenId?: unknown;
+    ownerNotice?: unknown;
+    managerUserIds?: unknown;
     bindWorkingDir?: unknown;
     roleProfileId?: unknown;
     chatMode?: unknown;
     botCollaboration?: unknown;
+    kickoffBotLarkAppId?: unknown;
+    kickoffPrompt?: unknown;
   };
-  try {
-    body = await readJsonBody<{
-      name?: string;
-      larkAppIds?: string[];
-      userOpenIds?: string[];
-      ownerUnionIds?: string[];
-      transferOwnerUnionId?: string;
-      transferOwnerTo?: string;
-      notifyOwnerOpenId?: string;
-      bindWorkingDir?: string;
-      roleProfileId?: string;
-    }>(req);
-  } catch {
-    return jsonRes(res, 400, { error: 'bad_json', accepted: false });
-  }
   const name = typeof body.name === 'string' && body.name.trim() ? body.name.trim() : undefined;
-  if (!Array.isArray(body.larkAppIds) || !body.larkAppIds.every(x => typeof x === 'string')) {
-    return jsonRes(res, 400, { error: 'larkAppIds_required', accepted: false });
+  // Legacy trusted callers may omit the creator from larkAppIds (or pass an
+  // empty creator-only list); createGroupWithBots adds the bound bot implicitly.
+  const normalizedLarkAppIds = normalizeGroupLarkAppIds(body.larkAppIds, { allowEmpty: true });
+  if (!normalizedLarkAppIds.ok) {
+    return jsonRes(res, 400, { ok: false, error: 'larkAppIds_required', accepted: false });
   }
-  // userOpenIds, transferOwnerTo, notifyOwnerOpenId are optional; pre-validated
-  // upstream by the dashboard route. All open_ids MUST be in the calling bot's
-  // app scope (caller is responsible — Lark open_ids are app-scoped, see
-  // dashboard/operator-selector.ts).
+  const larkAppIds = normalizedLarkAppIds.larkAppIds;
+  // New callers pin the creator explicitly. Both exact identity and roster
+  // membership are enforced only for that form; without the pin, preserve the
+  // legacy implicit-creator contract instead of inventing a new requirement.
+  if (body.creatorLarkAppId !== undefined) {
+    if (typeof body.creatorLarkAppId !== 'string'
+      || !body.creatorLarkAppId.trim()
+      || body.creatorLarkAppId !== body.creatorLarkAppId.trim()) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_creator_lark_app_id', accepted: false });
+    }
+    if (body.creatorLarkAppId !== cachedLarkAppId || !larkAppIds.includes(cachedLarkAppId)) {
+      return jsonRes(res, 409, { ok: false, error: 'bot_mismatch', accepted: false });
+    }
+  }
+  // userOpenIds, transferOwnerTo, notifyOwnerOpenId, managerUserIds are optional;
+  // pre-validated upstream by the dashboard route. All open_ids MUST be in the
+  // calling bot's app scope (caller is responsible — Lark open_ids are app-scoped,
+  // see dashboard/operator-selector.ts).
   const userIds = Array.isArray(body.userOpenIds) && body.userOpenIds.every(x => typeof x === 'string')
     ? (body.userOpenIds as string[])
     : [];
@@ -14384,10 +14637,12 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
   if (roleProfileId && !isValidRoleProfileId(roleProfileId)) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_role_profile_id', accepted: false });
   }
-  // Optional (design 2026-11-03 workflow-dashboard-orchestration §8): a topic
-  // group, and the talk-only grant matrix between the bots that joined (what
-  // CLI create-group writes). Absent → today's behaviour, byte for byte.
-  const groupCreationExtras = parseGroupCreateExtras(body);
+  // Optional fields: chatMode, botCollaboration, kickoffBotLarkAppId,
+  // kickoffPrompt, ownerNotice, managerUserIds. Absent → legacy behaviour byte for byte.
+  const groupCreationExtras = parseGroupCreateOptions(body, {
+    larkAppIds,
+    creatorLarkAppId: cachedLarkAppId,
+  });
   if (!groupCreationExtras.ok) return jsonRes(res, 400, { ok: false, error: groupCreationExtras.error, accepted: false });
   const bindWorkingDir = typeof body.bindWorkingDir === 'string' ? body.bindWorkingDir.trim() : '';
   let bindResolvedPath: string | undefined;
@@ -14396,19 +14651,31 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
     if (!v.ok) return jsonRes(res, 400, { ok: false, error: v.error, accepted: false });
     bindResolvedPath = v.resolvedPath;
   }
+  if (isBoundBotApiOnly(cachedLarkAppId)) {
+    return jsonRes(res, 400, { ok: false, error: 'lark_transport_disabled', accepted: false });
+  }
+  const effectiveUserIds = groupCreationExtras.managerUserIds?.length
+    ? Array.from(new Set([...userIds, ...groupCreationExtras.managerUserIds]))
+    : userIds;
   let createdChatId: string | undefined;
   try {
     const r = await createGroupWithBots({
       creatorLarkAppId: cachedLarkAppId,
-      larkAppIds: body.larkAppIds as string[],
+      larkAppIds,
       name,
-      userOpenIds: userIds,
+      userOpenIds: effectiveUserIds,
       ownerUnionIds,
       transferOwnerUnionId: transferOwnerUnionId ?? undefined,
       transferOwnerTo: transferTo ?? undefined,
       notifyOwnerOpenId: notifyTo ?? undefined,
+      ...(groupCreationExtras.ownerNotice === false ? { ownerNotice: false as const } : {}),
+      ...(groupCreationExtras.managerUserIds !== undefined ? { managerUserIds: groupCreationExtras.managerUserIds } : {}),
       bindWorkingDir: bindWorkingDir || undefined,
       roleProfileId: roleProfileId ?? undefined,
+      ...(groupCreationExtras.kickoffBotLarkAppId !== undefined ? {
+        kickoffBotLarkAppId: groupCreationExtras.kickoffBotLarkAppId,
+        kickoffPrompt: groupCreationExtras.kickoffPrompt,
+      } : {}),
       onChatCreated: chatId => { createdChatId = chatId; },
       ...(groupCreationExtras.chatMode ? { chatMode: groupCreationExtras.chatMode } : {}),
       ...(groupCreationExtras.botCollaboration
@@ -14417,6 +14684,9 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
     });
     jsonRes(res, 200, bindResolvedPath ? { ...r, bindResolvedPath } : r);
   } catch (e) {
+    if (!createdChatId && isLarkTransportDisabledError(e)) {
+      return jsonRes(res, 400, { ok: false, error: 'lark_transport_disabled', accepted: false });
+    }
     // No `accepted:false` here: createChat may already have committed. Preserve
     // the id when the service reached its post-create checkpoint for recovery.
     jsonRes(res, 502, {
@@ -14428,20 +14698,25 @@ ipcRoute('POST', '/api/groups/create', requireBoundBot(async (req, res) => {
 }));
 
 /** The optional `/api/groups/create` fields (absent = unchanged behaviour). */
-export function parseGroupCreateExtras(body: { chatMode?: unknown; botCollaboration?: unknown }):
-  | { ok: true; chatMode?: 'topic' | 'group'; botCollaboration: boolean }
+export function parseGroupCreateExtras(body: {
+  chatMode?: unknown;
+  botCollaboration?: unknown;
+  kickoffBotLarkAppId?: unknown;
+  kickoffPrompt?: unknown;
+  ownerNotice?: unknown;
+  managerUserIds?: unknown;
+}):
+  | {
+    ok: true;
+    chatMode?: 'topic' | 'group';
+    botCollaboration: boolean;
+    kickoffBotLarkAppId?: string;
+    kickoffPrompt?: string;
+    ownerNotice?: boolean;
+    managerUserIds?: string[];
+  }
   | { ok: false; error: string } {
-  if (body.chatMode !== undefined && body.chatMode !== 'topic' && body.chatMode !== 'group') {
-    return { ok: false, error: 'invalid_chat_mode' };
-  }
-  if (body.botCollaboration !== undefined && typeof body.botCollaboration !== 'boolean') {
-    return { ok: false, error: 'invalid_bot_collaboration' };
-  }
-  return {
-    ok: true,
-    ...(body.chatMode !== undefined ? { chatMode: body.chatMode as 'topic' | 'group' } : {}),
-    botCollaboration: body.botCollaboration === true,
-  };
+  return parseGroupCreateOptions(body);
 }
 
 /** The talk-only grant matrix between local bots in one chat, through each
@@ -14638,7 +14913,16 @@ export function startIpcServer(opts: {
         const m = r.pattern.exec(url.pathname);
         if (!m) continue;
         const params: Record<string, string> = {};
-        r.keys.forEach((k, i) => { params[k] = decodeURIComponent(m[i + 1]); });
+        try {
+          for (let i = 0; i < r.keys.length; i++) {
+            params[r.keys[i]] = decodeURIComponent(m[i + 1]);
+          }
+        } catch (err) {
+          if (err instanceof URIError) {
+            return jsonRes(res, 400, { ok: false, error: 'invalid_url_encoding' });
+          }
+          throw err;
+        }
         await r.handler(req, res, params);
         return;
       }

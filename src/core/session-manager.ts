@@ -1730,6 +1730,11 @@ function buildNewTopicBlocks(
     if (routingBlock) blocks.push({ key: 'routing', text: routingBlock });
     if (skillBlock) blocks.push({ key: 'skill', text: skillBlock });
     if (identityBlock) blocks.push({ key: 'identity', text: identityBlock });
+  }
+  // Keep the bot/chat role in the reusable prefix, ahead of session-specific
+  // credentials and ids. All permission boundaries still precede user content.
+  if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
+  if (!adapter.injectsSessionContext) {
     // Trigger-user auth: the same credential boundary the claude-family adapters
     // get via --append-system-prompt. Without it the inline-prompt CLIs
     // (codex/opencode/…) would run with NO constraint at all — and since that is
@@ -1756,7 +1761,6 @@ function buildNewTopicBlocks(
     if (credentialBoundary) blocks.push({ key: 'credentials', text: credentialBoundary });
     blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
   }
-  if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
   if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
   if (responseStyleBlock) blocks.push({ key: 'responseStyle', text: responseStyleBlock });
   if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
@@ -2078,12 +2082,12 @@ function buildFollowUpBlocks(
     : false);
 
   // Put stable context before the user's turn. Follow the new-topic order for
-  // shared blocks: session id first, then role. The whiteboard block is
+  // shared blocks: stable role first, then session id. The whiteboard block is
   // per-turn available context, so place it right after <botmux_reminder> and
   // before <user_message> — consistent with new-topic/refork — not after the
   // user's text. Per-turn attribution (sender/attachments/mentions) stays after.
-  if (!skipSessionId) blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
   if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
+  if (!skipSessionId) blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
   {
     const session = sessionStore.getSession(sessionId);
     const resume = !!session?.cliId || !!session?.lastCliInput || !!session?.backendType;
@@ -4721,7 +4725,15 @@ export async function resumeSession(
   // also publish.
   dashboardEventBus.publish({
     type: 'session.update',
-    body: { sessionId, patch: { status: 'active', closedAt: null } },
+    body: {
+      sessionId,
+      patch: {
+        status: 'active',
+        closedAt: null,
+        queuedActivationPending: null,
+        queuedActivationTailCount: null,
+      },
+    },
   });
   return {
     ok: true,
@@ -6538,6 +6550,17 @@ export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: bo
     ds.session.queuedActivationResume = undefined;
     ds.session.pendingRepoSetup = undefined;
     sessionStore.updateSession(ds.session);
+    dashboardEventBus.publish({
+      type: 'session.update',
+      body: {
+        sessionId: ds.session.sessionId,
+        patch: {
+          queued: false,
+          queuedActivationPending: null,
+          queuedActivationTailCount: null,
+        },
+      },
+    });
     return { ok: true };
   }
   // Repo selection / auto-worktree or another ingress already owns this
