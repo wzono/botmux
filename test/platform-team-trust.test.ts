@@ -269,6 +269,21 @@ describe('external bots in the platform roster', () => {
     expect(canRunDaemonCommand('pf1', 'oc_public', 'ou_ext', 'on_ext', '/restart', undefined, 'group', true, true, 'cli_other')).toBe(false);
   });
 
+  it('matches the exact external app after another entry with the same union', () => {
+    applyPlatformTeamSync(dataDir, {
+      rev: 'r-ext-shadow',
+      teams: [{
+        teamId: 't1', teamName: 'T1', groupChatIds: [],
+        bots: [{ appId: 'pf1', unionId: 'on_pf1' }, { appId: 'cli_wrong', unionId: 'on_ext', external: true }, { appId: 'cli_right', unionId: 'on_ext', external: true }],
+        memberUnionIds: [],
+      }],
+    });
+    expect(evaluateBotTalk('pf1', 'oc_public', 'ou_ext', 'on_ext', 'cli_right')).toMatchObject({ allowed: true, reason: 'teamBot' });
+    expect(canOperateBotSender('pf1', 'oc_public', 'ou_ext', 'on_ext', 'cli_right')).toBe(true);
+    expect(evaluateBotTalk('pf1', 'oc_public', 'ou_ext', 'on_ext').allowed).toBe(false);
+    expect(evaluateBotTalk('pf1', 'oc_public', 'ou_ext', 'on_ext', 'cli_absent').allowed).toBe(false);
+  });
+
   it('keeps the team-group first-contact leg when appId is absent', () => {
     seedExternalTeam();
     expect(evaluateBotTalk('pf1', 'oc_t1_hall', 'ou_ext', 'on_ext')).toMatchObject({ allowed: true, reason: 'teamBot' });
@@ -316,6 +331,18 @@ describe('external bots in the platform roster', () => {
     writeLocalBots(['pf1', 'cli_local']);
     expect(evaluateBotTalk('pf1', 'oc_public', 'ou_chosen', 'on_chosen', 'cli_local').allowed).toBe(false);
     expect(canOperateBotSender('pf1', 'oc_public', 'ou_chosen', 'on_chosen', 'cli_local')).toBe(false);
+  });
+
+  it('does not infer an external entry union from the local bot cache', () => {
+    writeLocalBots(['pf1', 'cli_local']);
+    recordBotUnionId(dataDir, 'cli_local', 'on_local');
+    applyPlatformTeamSync(dataDir, {
+      rev: 'r-ext-local-cache',
+      teams: [{ teamId: 't1', teamName: 'T1', groupChatIds: [], bots: [{ appId: 'pf1', unionId: 'on_pf1' }, { appId: 'cli_local', external: true }], memberUnionIds: [] }],
+    });
+    expect(evaluateBotTalk('pf1', 'oc_public', 'ou_local', 'on_local', 'cli_local').allowed).toBe(false);
+    expect(canOperateBotSender('pf1', 'oc_public', 'ou_local', 'on_local', 'cli_local')).toBe(false);
+    expect(cardClickOperatorIsBotOrApp(dataDir, 'pf1', 'ou_local', 'on_local')).toBe(false);
   });
 
   it('an external entry carrying the RECEIVER\'s appId does not make the receiver a team member', () => {

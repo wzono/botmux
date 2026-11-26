@@ -54,6 +54,7 @@ import { SCHEDULE_PROMPT_UNDELIVERED_ERROR_CODE } from './core/deferred-schedule
 import { supportsTranscriptReplyDeliveryForBot } from './core/reply-delivery.js';
 import { TurnProgressNotice, progressNoticeIntervalMinutes } from './utils/turn-progress-notice.js';
 import { traexActiveEmptyComposerReady, traexComposerHoldsInput, traexRestoredComposerReady } from './adapters/cli/traex-footer.js';
+import { traexPreemptionComposerReady } from './adapters/cli/traex.js';
 import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
 import {
   BackgroundTurnAuthorityHold,
@@ -76,7 +77,7 @@ import {
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
+import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, openSync, closeSync, fstatSync, readSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname, isAbsolute, resolve } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
@@ -165,7 +166,7 @@ import {
 import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
 import { classifyRawDispatchFailure, rewrapSubmissionFailure } from './core/raw-dispatch-failure.js';
 import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js';
-import { ActiveTurnAuthority, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
+import { ActiveTurnAuthority, sameTrustedPrincipal, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
 import { isValidMarkerIdentityTurnId } from './core/turn-id-shape.js';
 import { markerBelongsToLiveProcess, readProcessStartIdentity } from './core/session-marker.js';
 import { hostAuthorityPaths } from './services/project-authority-paths.js';
@@ -917,6 +918,16 @@ import {
   createQueuedActivationReceiptObserver,
   type QueuedActivationProof,
 } from './services/queued-activation-receipts.js';
+import {
+  decideDurableArgvReattachSubmission,
+  decideFlushSubmissionRejectionSettlement,
+  decidePromotedActivationMessageHandling,
+  decideRawInputSubmissionReconciliation,
+  reconcileRemoteRecoveredTurnQueue,
+  shouldAdoptPidMarkerWithoutRetiringCurrent,
+  shouldAllowTypeAheadOnReattach,
+  shouldPrepareInitialPromptArg,
+} from './services/queued-activation-reconcile.js';
 import { claudeComposerHoldsInput, decideSessionStartGatedSubmitWarning, diagnoseBackendSubmitFailure, diagnoseSubmitFailure, shouldWaitThroughBusyTurn, SUBMIT_POST_SESSION_START_GRACE_MS, type SubmitFailureDiagnosisReason } from './services/submit-failure-diagnosis.js';
 import {
   runAdoptQueuedWriteSequence,
@@ -1242,9 +1253,20 @@ function awaitingRpcActivationReplayAnchorMs(
   return rpcTurnsAwaitingActivationReplayAnchors.get(ownerKey);
 }
 
+const ambiguousRpcActivationTokens = new Map<string, { generation: RpcTurnGeneration; token: string }>();
+let pendingAmbiguousFreshRpcActivation: {
+  identity: CodexRpcTurnIdentity;
+  generation: RpcTurnGeneration;
+  prompt: string;
+  token: string;
+  sessionId: string;
+  startedAtMs: number;
+} | undefined;
+
 function clearRpcLifecycleFailClosedOwner(
   identity: CodexRpcTurnIdentity,
   generation: RpcTurnGeneration,
+  opts?: { acknowledgeActivation?: boolean },
 ): boolean {
   const ownerKey = rpcTurnOwnerKey(identity);
   if (!sameRpcGeneration(rpcLifecycleFailClosedOwners.get(ownerKey), generation)) {
@@ -1252,6 +1274,13 @@ function clearRpcLifecycleFailClosedOwner(
   }
   rpcLifecycleFailClosedOwners.delete(ownerKey);
   rpcLifecycleFailClosedIdentities.delete(ownerKey);
+  const ambiguousActivation = ambiguousRpcActivationTokens.get(ownerKey);
+  if (ambiguousActivation && sameRpcGeneration(ambiguousActivation.generation, generation)) {
+    ambiguousRpcActivationTokens.delete(ownerKey);
+    if (opts?.acknowledgeActivation === true) {
+      acknowledgeQueuedActivationToken(ambiguousActivation.token);
+    }
+  }
   return true;
 }
 
@@ -1301,6 +1330,11 @@ function stopCodexRpcEngine(): void {
     ...rpcActiveOwners.keys(),
     ...settlingRpcTerminalOwners.keys(),
   ]);
+  // Never ACK ambiguous activation tokens during bare engine teardown: clear
+  // the tracking map BEFORE engine?.stop() can emit synchronous 'stopped'
+  // terminals through settleRpcTurnTerminal.
+  ambiguousRpcActivationTokens.clear();
+  pendingAmbiguousFreshRpcActivation = undefined;
   // stop() emits exact 'stopped' terminals for every engine-owned native turn.
   // Keep the engine identity installed until those synchronous callbacks have
   // retired their matching rpcActive entries.
@@ -1381,6 +1415,8 @@ function stopCodexRpcEngine(): void {
   rpcTurnsAwaitingActivationReplayAnchors.clear();
   rpcLifecycleFailClosedOwners.clear();
   rpcLifecycleFailClosedIdentities.clear();
+  ambiguousRpcActivationTokens.clear();
+  pendingAmbiguousFreshRpcActivation = undefined;
   rpcActiveOwners.clear();
   for (const timer of rpcTerminalHydrationTimers.values()) clearTimeout(timer);
   rpcTerminalHydrationTimers.clear();
@@ -2157,6 +2193,18 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
           awaitingRpcActivationReplayAnchorMs(firstIdentity, firstGeneration),
         );
         installRpcLifecycleFailClosedOwner(firstIdentity, firstGeneration);
+        if (cfg.queuedActivationToken) {
+          // Stash until after spawnCli(msg) finishes: spawnCliBody calls
+          // queuedActivationReceipts.clear(), which would wipe any watch armed here.
+          pendingAmbiguousFreshRpcActivation = {
+            identity: firstIdentity,
+            generation: firstGeneration,
+            prompt: firstTurnPrompt,
+            token: cfg.queuedActivationToken,
+            sessionId: cfg.sessionId,
+            startedAtMs: Date.now(),
+          };
+        }
         deferredFreshRpcTurn = {
           identity: firstIdentity,
           generation: firstGeneration,
@@ -2402,8 +2450,17 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   // too: they may name a queued execution, but never assert that it has started.
   if (msg.type === 'cli_input_backlog' || msg.type === 'failed_turn_rewind'
     || msg.type === 'type_ahead_queued' || msg.type === 'type_ahead_turn_dropped'
-    || msg.type === 'type_ahead_queue_snapshot') {
+    || msg.type === 'type_ahead_queue_snapshot' || msg.type === 'queued_activation_submitted') {
     delete context.scope.execution;
+    delete context.scope.runtime;
+    delete context.scope.operationId;
+    delete context.bindingId;
+  }
+  // turn_input_rejected is a worker-scoped event (workerEvents) that may reject
+  // a predecessor execution (execution_reconciliation_required) from inside a
+  // replacement runtime binding; omit runtime/bindingId so SessionEventGateway
+  // validates scope.execution without rejecting cross-runtime scope mismatch.
+  if (msg.type === 'turn_input_rejected') {
     delete context.scope.runtime;
     delete context.scope.operationId;
     delete context.bindingId;
@@ -3521,6 +3578,7 @@ let lastSpawnEffectiveCliSessionId: string | undefined;
 let inputDeliveryObservedCliSessionId: string | undefined;
 let lastSpawnEffectiveAdapterSessionId: string | undefined;
 let lastSpawnDeferInitialPrompt = false;
+let spawnCliReconciledActivationToken: string | undefined;
 let lastSpawnArgvDurableInitialPrompt = false;
 let lastSpawnArgvDurableInitialPromptSubmission: { baseline: number | null; content: string } | undefined;
 let argvDurableInitialPromptCompletionTimer: ReturnType<typeof setInterval> | null = null;
@@ -7452,6 +7510,7 @@ let durableTurnInFlight = false;
  * distinct from currentBotmuxTurnId: a fresh initial prompt reserves that id
  * before submitTurn awaits the provider ready handshake. */
 let remoteRunnerRecoveredTurnInFlight = false;
+let remoteRunnerRecoveredTurnIdentity: { turnId: string; dispatchAttempt?: number } | undefined;
 const activeTurnAuthority = new ActiveTurnAuthority((previousTurnId, turnId) => {
   // Ordered IPC reaches the daemon before any output attributed to the steer.
   send({ type: 'active_turn_envelope_changed', previousTurnId, turnId });
@@ -9073,7 +9132,15 @@ function writeCliPidMarker(): void {
             const raw = readFileSync(markerPath, 'utf-8');
             const parsed = JSON.parse(raw);
             if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && (parsed.turnId !== currentBotmuxTurnId || ((typeof backend === 'undefined' || !backend || ('isReattach' in backend && backend.isReattach === true)) && (activeTurnAuthority.snapshot() ? !activeAuthorityMatchesMarker(parsed) : !activeTurnAuthority.matchesLastRelease(parsed))))) {
-              if (parsed.backgroundHeld === true || retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed)) {
+              const markerSettled = typeof workerSessionEventScope?.isExecutionSettled === 'function'
+                && workerSessionEventScope.isExecutionSettled(
+                  parsed.turnId,
+                  typeof parsed.dispatchAttempt === 'number' ? parsed.dispatchAttempt : undefined,
+                );
+              if (markerSettled && typeof markTurnRetired === 'function') {
+                markTurnRetired(parsed.turnId);
+              }
+              if (parsed.backgroundHeld === true || retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed) || markerSettled) {
                 // Disk holds an older turn that worker memory has already retired/advanced past.
                 // Do not adopt it back; allow write to overwrite disk with currentBotmuxTurnId.
               } else {
@@ -9094,7 +9161,18 @@ function writeCliPidMarker(): void {
                   publishSandboxRelayCapability();
                   rememberQueuedTurnAdvanceForPendingReady(prevTurnId);
                   log(`Adopted active turn advance from PID marker before write: ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId?.slice(0, 12)}`);
-                } else if (!currentBotmuxTurnId || parsed.turnId === currentBotmuxTurnId) {
+                } else if (
+                  !currentBotmuxTurnId
+                  || parsed.turnId === currentBotmuxTurnId
+                  || (typeof shouldAdoptPidMarkerWithoutRetiringCurrent === 'function'
+                    && shouldAdoptPidMarkerWithoutRetiringCurrent({
+                      initialInputOwnershipPending: typeof initialInputOwnershipPending === 'boolean' && initialInputOwnershipPending,
+                      pendingCurrentTurnQueued: Array.isArray(pendingMessages) && pendingMessages.some(m => m.turnId === currentBotmuxTurnId),
+                      activeTurnStarted: activeTurnAuthority.snapshot()?.started,
+                      currentTurnId: currentBotmuxTurnId,
+                      diskTurnId: parsed.turnId,
+                    }))
+                ) {
                   adoptInitialActiveTurn(parsed, true);
                   rememberQueuedTurnAdvanceForPendingReady();
                 } else {
@@ -9216,9 +9294,28 @@ function restoreQueuedTurnsFromMarkerDisk(markerPath: string): void {
       const raw = readFileSync(markerPath, 'utf-8');
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && (parsed.turnId !== currentBotmuxTurnId || ((typeof backend === 'undefined' || !backend || ('isReattach' in backend && backend.isReattach === true)) && (activeTurnAuthority.snapshot() ? !activeAuthorityMatchesMarker(parsed) : !activeTurnAuthority.matchesLastRelease(parsed))))) {
-        if (parsed.backgroundHeld === true || retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed)) {
+        const markerSettled = typeof workerSessionEventScope?.isExecutionSettled === 'function'
+          && workerSessionEventScope.isExecutionSettled(
+            parsed.turnId,
+            typeof parsed.dispatchAttempt === 'number' ? parsed.dispatchAttempt : undefined,
+          );
+        if (markerSettled && typeof markTurnRetired === 'function') {
+          markTurnRetired(parsed.turnId);
+        }
+        if (parsed.backgroundHeld === true || retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed) || markerSettled) {
           // Disk holds an older turn that has already terminated; do not re-adopt it.
-        } else if (!currentBotmuxTurnId || parsed.turnId === currentBotmuxTurnId) {
+        } else if (
+          !currentBotmuxTurnId
+          || parsed.turnId === currentBotmuxTurnId
+          || (typeof shouldAdoptPidMarkerWithoutRetiringCurrent === 'function'
+            && shouldAdoptPidMarkerWithoutRetiringCurrent({
+              initialInputOwnershipPending: typeof initialInputOwnershipPending === 'boolean' && initialInputOwnershipPending,
+              pendingCurrentTurnQueued: Array.isArray(pendingMessages) && pendingMessages.some(m => m.turnId === currentBotmuxTurnId),
+              activeTurnStarted: activeTurnAuthority.snapshot()?.started,
+              currentTurnId: currentBotmuxTurnId,
+              diskTurnId: parsed.turnId,
+            }))
+        ) {
           adoptInitialActiveTurn(parsed, true);
         } else {
           adoptDisplacedActiveTurn(parsed);
@@ -9322,7 +9419,15 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
         const raw = readFileSync(markerPath, 'utf-8');
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && (parsed.turnId !== currentBotmuxTurnId || ((typeof backend === 'undefined' || !backend || ('isReattach' in backend && backend.isReattach === true)) && (activeTurnAuthority.snapshot() ? !activeAuthorityMatchesMarker(parsed) : !activeTurnAuthority.matchesLastRelease(parsed))))) {
-          if (parsed.backgroundHeld === true || retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed)) {
+          const markerSettled = typeof workerSessionEventScope?.isExecutionSettled === 'function'
+            && workerSessionEventScope.isExecutionSettled(
+              parsed.turnId,
+              typeof parsed.dispatchAttempt === 'number' ? parsed.dispatchAttempt : undefined,
+            );
+          if (markerSettled && typeof markTurnRetired === 'function') {
+            markTurnRetired(parsed.turnId);
+          }
+          if (parsed.backgroundHeld === true || retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed) || markerSettled) {
             // Disk holds an older turn that worker memory has already retired/advanced past.
           } else {
             const idx = queuedTypeAheadTurns.findIndex(t => t.turnId === parsed.turnId);
@@ -17330,19 +17435,20 @@ function codexBridgeStartTimer(): void {
             }
           }
         }
-        codexBridgeIngest();
         // Cursor's mirror can flush THIS turn's user line as late as the end
         // of the first assistant step (a tool-less reply flushes the whole
         // turn at once, at the end). While the CLI is visibly busy the queued
         // heads' bounded leases must not lapse waiting for that flush —
-        // refresh them each tick (the argv-baked confirmed first turn and
-        // type-ahead successors included); the 120s hard cap means a false
-        // "busy" screen still prunes and the queue recovers. Non-adopt only:
-        // adopt keeps its historical timing (an expired adopt mark degrades
-        // to local-turn synthesis, still visible in Lark).
+        // refresh them each tick BEFORE ingest's own prune (the argv-baked
+        // confirmed first turn and type-ahead successors included); the 120s
+        // hard cap means a false "busy" screen still prunes and the queue
+        // recovers. Non-adopt only: adopt keeps its historical timing (an
+        // expired adopt mark degrades to local-turn synthesis, still visible
+        // in Lark).
         if (!isPromptReady && !lastInitConfig?.adoptMode) {
           codexBridgeQueue.refreshUnstartedHeadAttributionLease(Date.now(), CURSOR_BUSY_REFRESH_MAX_MS);
         }
+        codexBridgeIngest();
         if (isPromptReady) emitReadyCodexTurns();
         return;
       }
@@ -19072,6 +19178,7 @@ function codexBridgeIngest(opts: {
     backend.appendWebHistory(renderOrcaTranscriptHistory(result.events));
   }
   codexBridgeQueue.ingest(result.events);
+  if (structuredBridgeIs('traex') && traexPreemption) observeTraexPreemptionTerminal(result.events);
   if (structuredBridgeIs('codex')) {
     observeCodexTuiAsyncQuestions(result.events);
     maybeRestoreCodexTuiAsyncQuestion();
@@ -19391,7 +19498,9 @@ function finalizeRpcTurnTerminal(
   }
   settlingRpcTerminalOwners.delete(ownerKey);
   clearAwaitingRpcActivation(identity, generation);
-  clearRpcLifecycleFailClosedOwner(identity, generation);
+  clearRpcLifecycleFailClosedOwner(identity, generation, {
+    acknowledgeActivation: terminal.status === 'completed' || terminal.status === 'failed' || terminal.status === 'aborted',
+  });
   if (sameRpcGeneration(rpcActiveOwners.get(ownerKey), generation)) {
     rpcActiveOwners.delete(ownerKey);
   }
@@ -19489,7 +19598,9 @@ function settleRpcTurnTerminal(
   }
   settlingRpcTerminalOwners.set(ownerKey, generation);
   clearAwaitingRpcActivation(terminal.identity, generation);
-  clearRpcLifecycleFailClosedOwner(terminal.identity, generation);
+  clearRpcLifecycleFailClosedOwner(terminal.identity, generation, {
+    acknowledgeActivation: terminal.status === 'completed' || terminal.status === 'failed' || terminal.status === 'aborted',
+  });
   if (sameRpcGeneration(rpcActiveOwners.get(ownerKey), generation)) {
     rpcActiveOwners.delete(ownerKey);
   }
@@ -19653,7 +19764,7 @@ function retireRpcLifecycleFromStructuredTerminal(
   if (sameRpcGeneration(rpcActiveOwners.get(ownerKey), generation)) {
     rpcActiveOwners.delete(ownerKey);
   }
-  clearRpcLifecycleFailClosedOwner(identity, generation);
+  clearRpcLifecycleFailClosedOwner(identity, generation, { acknowledgeActivation: true });
   codexBridgeQueue.stopRpcActive(identity.turnId, identity.dispatchAttempt);
 }
 
@@ -23327,6 +23438,346 @@ let preemptedTurnId: string | undefined;
 const PREEMPT_COOLDOWN_MS = 2_000;
 let preemptCooldownUntil = 0;
 
+type TraexPreemptionLease = {
+  backend: SessionBackend; generation: number; lifetime: number; pid?: number; nativeSessionId?: string;
+  nativeTurnId?: string; turnId: string; dispatchAttempt?: number; webGeneration: number;
+  originalInput?: string; restoredDraftCleared?: true;
+  restoredDraftProbe?: Promise<void>;
+  restoredDraftGeometryUnknown?: true;
+  incomingTurnId?: string; incomingCaller?: TrustedCaller;
+  interruptGeneration: number; requestedAt: number; delivered?: true; settled?: true; unknownNotified?: true; nativeCompleted?: true;
+};
+let traexPreemption: TraexPreemptionLease | undefined;
+let traexPreemptionTimer: ReturnType<typeof setTimeout> | undefined;
+
+function traexPreemptionEligible(incoming: PendingCliInput): boolean {
+  const active = activeTurnAuthority.snapshot();
+  return lastInitConfig?.cliId === 'traex' && !lastInitConfig.adoptMode && !codexRpcEngine
+    && !traexAutoModelRuntimeEligible() && !isWorkflowWorker()
+    && !lastInitConfig.existingAppServerEndpoint && ['pty', 'tmux', 'hc'].includes(effectiveBackendType)
+    && incoming.turnId?.startsWith('om_') === true && incoming.dispatchAttempt === undefined
+    && !incoming.durablePrimaryInbox && !incoming.noReplay && !incoming.queueAfterActiveTurn
+    && !incoming.taskContinuation && !incoming.traexAutoModelRecovery && !incoming.traexAutoModelContinuation
+    && !incoming.restartNoteOriginalContent && !incoming.queuedActivationToken && !incoming.codexAppInput
+    && !incoming.codexAppDispatchId && !incoming.vcMeetingImTurnOrigin && !durableTurnInFlight
+    && incoming.trustedCaller?.senderType === 'user' && incoming.trustedCaller.source === undefined
+    && !incoming.trustedCaller.taskContinuation && active?.caller?.senderType === 'user'
+    && active.caller.source === undefined && !active.caller.taskContinuation && active.dispatchAttempt === undefined
+    && sameTrustedPrincipal(active.caller, incoming.trustedCaller);
+}
+
+function traexPreemptionLeaseCurrent(lease: TraexPreemptionLease): boolean {
+  return backend === lease.backend && cliSpawnGeneration === lease.generation && cliLifetimeNonce === lease.lifetime
+    && webTerminalInputGeneration === lease.webGeneration && cliInterruptGeneration === lease.interruptGeneration
+    && !cliRestartInProgress && !rawInputRestartGate && !fatalWorkerErrorPending
+    && !webTerminalInputWireDirty() && (!lease.pid || currentTraexObservedPid() === lease.pid)
+    && (!lease.nativeSessionId || sessionRenameNativeSessionIdNow() === lease.nativeSessionId)
+    && (lease.settled || (currentBotmuxTurnId === lease.turnId && currentBotmuxDispatchAttempt === lease.dispatchAttempt));
+}
+
+function traexPreemptionLeaseNow(): TraexPreemptionLease | undefined {
+  const target = backend;
+  const turnId = currentBotmuxTurnId;
+  const generation = cliSpawnGeneration;
+  const lifetime = cliLifetimeNonce;
+  const webGeneration = webTerminalInputGeneration;
+  const interruptGeneration = cliInterruptGeneration;
+  if (!target || !turnId || currentBotmuxDispatchAttempt !== undefined || cliRestartInProgress
+    || rawInputRestartGate || fatalWorkerErrorPending || webTerminalInputWireDirty()
+    || sessionRenameInFlight() || hookReviewHoldsQueuedWrite() || programStatusBlockedHoldsTypeAhead()
+    || currentInputDeliveryQuarantine() || !backendScreenEvidenceIsAuthoritativeForMutation()) return;
+  const pid = currentTraexObservedPid();
+  const nativeSessionId = sessionRenameNativeSessionIdNow();
+  const owned = pid ? findTraexRolloutSetByPid(pid) : undefined;
+  if (!pid || !nativeSessionId || !owned || !owned.has(nativeSessionId)) return;
+  const nativeTurn = codexBridgeQueue.peek().find(turn => turn.turnId === turnId
+    && turn.dispatchAttempt === currentBotmuxDispatchAttempt && turn.started && turn.finalText === undefined
+    && turn.sourceSessionId === nativeSessionId && turn.sourceTurnId);
+  const nativeInput = traexActiveNativeInput(pid, nativeSessionId);
+  const nativeTurnId = nativeTurn?.sourceTurnId ?? nativeInput?.turnId;
+  if (!nativeTurnId) return;
+  let viewport: string;
+  try { viewport = (target.captureInputState?.() ?? { viewport: captureBackendScreen(target) }).viewport; } catch { return; }
+  if (!traexPreemptionComposerReady(viewport)) return;
+  const lease: TraexPreemptionLease = { backend: target, generation, lifetime,
+    pid, nativeSessionId, nativeTurnId, turnId, dispatchAttempt: currentBotmuxDispatchAttempt,
+    webGeneration, interruptGeneration, requestedAt: Date.now(),
+    originalInput: lastWrittenCliInput?.turnId === turnId && lastWrittenCliInput.dispatchAttempt === currentBotmuxDispatchAttempt
+      ? lastWrittenCliInput.content : recentSubmittedTurnTexts.get(turnId)?.text
+        ?? (nativeInput?.turnId === nativeTurnId ? nativeInput.input : undefined) };
+  // Native interruption discards the old request from the next model input.
+  // Without its exact text we cannot preserve context, even when a cached
+  // bridge record still proves the native turn. Keep the new input queued.
+  return lease.originalInput?.trim() && traexPreemptionLeaseCurrent(lease) ? lease : undefined;
+}
+
+/** Reattach can baseline after task_started; read only the tail of the
+ * PID-owned rollout to prove the last open native task. */
+function traexActiveNativeInput(pid: number, nativeSessionId: string): { turnId: string; input?: string } | undefined {
+  const rollout = findTraexRolloutByPid(pid, nativeSessionId);
+  if (!rollout || rollout.cliSessionId !== nativeSessionId) return;
+  let fd: number | undefined;
+  try {
+    fd = openSync(rollout.path, 'r');
+    const size = fstatSync(fd).size;
+    const start = Math.max(0, size - 262_144);
+    const bytes = Buffer.alloc(size - start);
+    const read = readSync(fd, bytes, 0, bytes.length, start);
+    let turnId: string | undefined;
+    let input: string | undefined;
+    const lines = bytes.subarray(0, read).toString('utf8').split('\n');
+    if (start) lines.shift();
+    for (const line of lines) {
+      let row; try { row = JSON.parse(line); } catch { continue; }
+      if (row.type !== 'event_msg') continue;
+      if (row.payload?.type === 'task_started') { turnId = row.payload.turn_id; input = undefined; }
+      if (row.payload?.turn_id === turnId && row.payload?.type === 'item_completed'
+        && row.payload.item?.type === 'UserMessage' && Array.isArray(row.payload.item.content)) {
+        const text = row.payload.item.content.filter((item: { type?: string; text?: unknown }) => (item.type === 'input_text' || item.type === 'text') && typeof item.text === 'string')
+          .map((item: { text: string }) => item.text).join('\n');
+        if (text) input = text;
+      }
+      if (row.payload?.turn_id === turnId && row.payload?.type === 'user_message' && typeof row.payload.message === 'string') input = row.payload.message;
+      if (['task_complete', 'turn_aborted'].includes(row.payload?.type) && row.payload.turn_id === turnId) { turnId = undefined; input = undefined; }
+    }
+    return typeof turnId === 'string' && turnId ? { turnId, input } : undefined;
+  } catch { return; } finally { if (fd !== undefined) closeSync(fd); }
+}
+
+function armTraexPreemptionPoll(): void {
+  if (traexPreemptionTimer || !traexPreemption) return;
+  traexPreemptionTimer = setTimeout(() => {
+    traexPreemptionTimer = undefined;
+    void resolveTraexPreemption();
+  }, 100);
+  traexPreemptionTimer.unref?.();
+}
+
+function observeTraexPreemptionTerminal(events: readonly CodexBridgeEvent[]): void {
+  const lease = traexPreemption;
+  if (!lease?.delivered || lease.settled || backend !== lease.backend || cliSpawnGeneration !== lease.generation
+    || cliLifetimeNonce !== lease.lifetime || currentTraexObservedPid() !== lease.pid
+    || sessionRenameNativeSessionIdNow() !== lease.nativeSessionId) return;
+  const terminal = events.find(event => event.kind === 'assistant_final'
+    && event.sourceSessionId === lease.nativeSessionId && event.sourceTurnId === lease.nativeTurnId);
+  if (!terminal) return;
+  const attributed = codexBridgeQueue.peek().find(turn => turn.turnId === lease.turnId
+    && turn.dispatchAttempt === lease.dispatchAttempt && turn.sourceTurnId === lease.nativeTurnId);
+  if (attributed?.terminalStatus === 'completed' || (attributed?.finalText !== undefined && attributed.terminalStatus === undefined)) {
+    lease.settled = true; lease.nativeCompleted = true; armTraexPreemptionPoll(); return;
+  }
+  if (terminal.terminalStatus !== 'ambiguous' || !terminal.terminalErrorCode?.startsWith('traex_turn_aborted')) return;
+  lease.settled = true;
+  inflightInputs.retireTurn(lease.turnId);
+  emitTurnTerminal(lease.turnId, 'cancelled', 'preempted_by_user_message', lease.dispatchAttempt);
+  retireStructuredTurnAttribution([{ turnId: lease.turnId, dispatchAttempt: lease.dispatchAttempt }]);
+  armTraexPreemptionPoll();
+}
+
+/** Read the whole draft at a bounded native size. A suffix or length-only
+ * chip never establishes ownership; restore the original grid on every exit. */
+async function clearTraexOwnedRestoredDraft(pending: TraexPreemptionLease): Promise<void> {
+  const target = pending.backend;
+  const original = pending.originalInput;
+  const current = (): boolean => traexPreemption === pending && traexPreemptionLeaseCurrent(pending)
+    && !isFlushing && !injectionFlushing && commandLineWritesPending === 0 && !cliSubmissionInFlight
+    && !hookReviewHoldsQueuedWrite() && !programStatusBlockedHoldsTypeAhead();
+  const capture = (): string => {
+    try { return target.captureInputState?.()?.viewport ?? ''; } catch { return ''; }
+  };
+  const matches = (screen: string): boolean => !!original && !/\[Pasted Content \d+ chars?\]/i.test(screen)
+    && traexComposerHoldsInput(screen, original, { glyphTolerant: true });
+  if (!original || !current()) return;
+  let restoreSize: { cols: number; rows: number } | undefined;
+  let evidenceSize: { cols: number; rows: number } | undefined;
+  try {
+    let viewport = capture();
+    if (/\[Pasted Content \d+ chars?\]/i.test(viewport)) return;
+    if (!matches(viewport)) {
+      if (effectiveBackendType !== 'tmux' || lastInitConfig?.adoptMode || !target.getPaneSize) return;
+      const size = target.getPaneSize();
+      if (!size || size.cols < 80 || size.cols > 320 || size.rows < 24 || size.rows > 2048) return;
+      const contentCols = Math.max(1, size.cols - 4);
+      const requiredRows = original.split(/\r?\n/).reduce((sum, line) =>
+        sum + Math.max(1, Math.ceil(Array.from(line).length * 2 / contentCols)), 0) + 24;
+      const rows = Math.max(size.rows, requiredRows);
+      if (rows > 2048) return;
+      restoreSize = size;
+      pending.restoredDraftGeometryUnknown = true;
+      evidenceSize = { cols: size.cols, rows };
+      target.resize(evidenceSize.cols, evidenceSize.rows);
+      const deadline = Math.min(Date.now() + 1500, pending.requestedAt + 10_000);
+      while (Date.now() < deadline && current()) {
+        const actual = target.getPaneSize();
+        if (!actual || actual.cols !== evidenceSize.cols || actual.rows !== evidenceSize.rows) return;
+        viewport = capture();
+        if (matches(viewport)) break;
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+    if (!current() || !matches(viewport)) return;
+    await new Promise(resolve => setTimeout(resolve, 100));
+    if (!current() || !matches(capture())) return;
+    if (evidenceSize) {
+      const actual = target.getPaneSize?.();
+      if (!actual || actual.cols !== evidenceSize.cols || actual.rows !== evidenceSize.rows) return;
+    }
+    pending.restoredDraftCleared = true; // A second Ctrl+C could quit the native CLI.
+    invalidatePromptReadinessEvidence();
+    const accepted = 'sendSpecialKeys' in target
+      ? (target as SessionBackend & { sendSpecialKeys(...keys: string[]): unknown }).sendSpecialKeys('C-c')
+      : target.write('\x03');
+    if (accepted === false) log('TraeX owned restored draft clear unconfirmed; waiting for a fresh empty composer');
+    await new Promise(resolve => setTimeout(resolve, 100));
+    // The normal poll must reject the temporary "ctrl+c again to quit" footer.
+    capture();
+  } catch (error) {
+    log('TraeX owned restored draft verification failed: ' + String(error));
+  } finally {
+    if (restoreSize && evidenceSize && backend === target && cliSpawnGeneration === pending.generation
+      && cliLifetimeNonce === pending.lifetime && webTerminalInputGeneration === pending.webGeneration) {
+      try {
+        const actual = target.getPaneSize?.();
+        if (actual?.cols === evidenceSize.cols && actual.rows === evidenceSize.rows) {
+          target.resize(restoreSize.cols, restoreSize.rows);
+          const restored = target.getPaneSize?.();
+          if (restored?.cols === restoreSize.cols && restored.rows === restoreSize.rows) pending.restoredDraftGeometryUnknown = undefined;
+        }
+      } catch { log('TraeX temporary draft viewport size restore failed; input remains held'); }
+    }
+  }
+}
+
+async function resolveTraexPreemption(): Promise<void> {
+  const pending = traexPreemption;
+  if (!pending) return;
+  if (pending.restoredDraftProbe) return;
+  if (backend !== pending.backend || cliSpawnGeneration !== pending.generation || cliLifetimeNonce !== pending.lifetime) {
+    traexPreemption = undefined; return;
+  }
+  const nativeCurrent = (!pending.pid || currentTraexObservedPid() === pending.pid)
+    && (!pending.nativeSessionId || sessionRenameNativeSessionIdNow() === pending.nativeSessionId);
+  if (!nativeCurrent || (!traexPreemptionLeaseCurrent(pending) && !pending.settled)) {
+    if (!pending.unknownNotified) {
+      pending.unknownNotified = true;
+      send({ type: 'user_notify', turnId: pendingMessages[0]?.turnId,
+        message: 'TraeX 中断期间输入或原生归属已变化；新消息已保留，需等待当前原生任务终态或显式恢复。' });
+    }
+    return;
+  }
+  if (isFlushing || injectionFlushing || commandLineWritesPending > 0 || cliSubmissionInFlight) {
+    armTraexPreemptionPoll(); return;
+  }
+  if (webTerminalInputWireDirty()) return;
+  let viewport: string;
+  try { viewport = (pending.backend.captureInputState?.() ?? { viewport: captureBackendScreen(pending.backend) }).viewport; }
+  catch { viewport = ''; }
+  if (pending.settled && !pending.nativeCompleted && !pending.restoredDraftCleared && pending.originalInput
+    && !traexRestoredComposerReady(viewport, { requireThreadReady: true })) {
+    if (Date.now() - pending.requestedAt > 10_000) {
+      if (!pending.unknownNotified) { pending.unknownNotified = true; send({ type: 'user_notify',
+        turnId: pendingMessages[0]?.turnId, message: 'TraeX 恢复草稿未取得全文或安全清理证明；新消息已保留，需显式恢复。' }); }
+      return;
+    }
+    pending.restoredDraftProbe = clearTraexOwnedRestoredDraft(pending);
+    await pending.restoredDraftProbe;
+    pending.restoredDraftProbe = undefined;
+    armTraexPreemptionPoll(); return;
+  }
+  if (!pending.delivered) {
+    if (traexRestoredComposerReady(viewport, { requireThreadReady: true })) {
+      drainReliableTerminalBeforeInterrupt();
+      traexPreemption = undefined; markPromptReady(); void flushPending(); return;
+    }
+    const lease = traexPreemptionLeaseNow();
+    if (!lease || lease.turnId !== pending.turnId) {
+      if (Date.now() - pending.requestedAt < 10_000) armTraexPreemptionPoll();
+      else if (!pending.unknownNotified) { pending.unknownNotified = true; send({ type: 'user_notify',
+        turnId: pendingMessages[0]?.turnId, message: 'TraeX 当前输入框无法安全中断；新消息已保留，等待原生任务结束或显式恢复。' }); }
+      return;
+    }
+    lease.requestedAt = pending.requestedAt;
+    lease.incomingTurnId = pending.incomingTurnId;
+    lease.incomingCaller = pending.incomingCaller;
+    traexPreemption = lease;
+    await runAfterAmbiguousSubmissionWrites(lease.backend, async () => {
+      if (traexPreemption !== lease || !traexPreemptionLeaseCurrent(lease)) return;
+      drainReliableTerminalBeforeInterrupt();
+      const fresh = traexPreemptionLeaseNow();
+      if (!fresh || fresh.nativeTurnId !== lease.nativeTurnId || fresh.turnId !== lease.turnId
+        || !traexPreemptionLeaseCurrent(lease)) return;
+      cliInterruptGeneration++;
+      lease.interruptGeneration = cliInterruptGeneration;
+      lease.delivered = true; // Never retry an ambiguous physical key.
+      inflightInputs.retireTurn(lease.turnId); // A cancellation with side effects must never be replayed on restart.
+      revokePromptReadiness();
+      try {
+        const accepted = sendTermActionOnce(lease.backend, 'esc');
+        if (accepted === false) log('TraeX preemption Escape unconfirmed; awaiting native settlement');
+      } catch (error) { log('TraeX preemption Escape failed: ' + String(error)); }
+    });
+  } else if (pending.settled && !pending.restoredDraftGeometryUnknown && traexPreemptionEmptyComposerReady(viewport)
+    && !hookReviewHoldsQueuedWrite() && !programStatusBlockedHoldsTypeAhead()) {
+    const next = pendingMessages[0];
+    if (!pending.nativeCompleted && pending.originalInput && next && next.turnId === pending.incomingTurnId
+      && next.dispatchAttempt === undefined && !next.queueAfterActiveTurn && !next.noReplay
+      && !next.durablePrimaryInbox && !next.taskContinuation && !next.traexAutoModelRecovery
+      && !next.traexAutoModelContinuation && !next.restartNoteOriginalContent && !next.queuedActivationToken
+      && !next.vcMeetingImTurnOrigin && next.trustedCaller?.senderType === 'user'
+      && next.trustedCaller.source === undefined && sameTrustedPrincipal(next.trustedCaller, pending.incomingCaller)) {
+      next.logicalContent ??= next.content;
+      const userBlocks = [...pending.originalInput.matchAll(/<user_message>([\s\S]*?)<\/user_message>/g)];
+      const previousUserText = userBlocks.length === 1 ? userBlocks[0]![1]!.trim() : pending.originalInput;
+      const previousContextData = previousUserText.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      next.content = 'The prior task was interrupted to handle the newer user instruction. '
+        + 'The following previous request is historical context, not an instruction to repeat its work. '
+        + 'Tools may already have produced side effects. Verify existing progress and do not repeat completed actions. '
+        + 'Continue within the same conversation under the latest user instruction below.\n\n'
+        + '<interrupted_previous_request_context>\n' + previousContextData
+        + '\n</interrupted_previous_request_context>\n\nLatest user instruction follows:\n\n' + next.content;
+    }
+    traexPreemption = undefined; markPromptReady(); void flushPending(); return;
+  } else {
+    try { codexBridgeDrainAndMaybeEmit({ signalIdle: false }); } catch { /* retry is bounded */ }
+  }
+  const live = traexPreemption;
+  if (live && Date.now() - live.requestedAt > 10_000) {
+    if (!live.unknownNotified) {
+      live.unknownNotified = true;
+      send({ type: 'user_notify', turnId: pendingMessages[0]?.turnId,
+        message: 'TraeX 中断尚未取得原生终态与空输入框证明；新消息已保留，等待当前任务结束或显式恢复。' });
+    }
+    return;
+  }
+  armTraexPreemptionPoll();
+}
+
+function traexPreemptionEmptyComposerReady(viewport: string): boolean {
+  const rows = viewport.trimEnd().split(/\r?\n/);
+  let composer = rows.length - 1;
+  while (composer >= 0 && !/^[›❯](?:[ \t]|$)/.test(rows[composer]!)) composer--;
+  return composer >= 0 && !/ctrl\+c again to quit/i.test(rows.slice(composer + 1).join('\n'))
+    && traexRestoredComposerReady(viewport, { requireThreadReady: true });
+}
+
+function traexPreemptionHoldsWrites(): boolean { return !!traexPreemption; }
+
+function preemptTraexForNewMessage(incoming: PendingCliInput, target: SessionBackend): boolean {
+  if (!traexPreemptionEligible(incoming) || backend !== target || incoming.turnId === currentBotmuxTurnId) return false;
+  if (traexPreemption) return true;
+  const turnId = currentBotmuxTurnId;
+  if (!turnId) return false;
+  const busy = traexPreemptionLeaseNow();
+  if (!busy && isPromptReady && !isFlushing && !cliSubmissionInFlight && commandLineWritesPending === 0) return false;
+  traexPreemption = busy ?? { backend: target, generation: cliSpawnGeneration, lifetime: cliLifetimeNonce,
+    turnId, dispatchAttempt: currentBotmuxDispatchAttempt, webGeneration: webTerminalInputGeneration,
+    interruptGeneration: cliInterruptGeneration, requestedAt: Date.now() };
+  traexPreemption.incomingTurnId = incoming.turnId;
+  traexPreemption.incomingCaller = incoming.trustedCaller;
+  void resolveTraexPreemption();
+  return true;
+}
+
 /** Only a real user IM turn may interrupt CI work. Internal runtime traffic
  *  (task notifications, todo reminders, replays, continuations) shares the same
  *  message channel and must never abort a turn. */
@@ -23350,9 +23801,10 @@ function isUserImTurnId(turnId: string | undefined): boolean {
  * no write is in flight, and this exact turn has not already been preempted.
  */
 function preemptActiveTurnForNewMessage(
-  incoming: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt' | 'durablePrimaryInbox' | 'queueAfterActiveTurn' | 'noReplay' | 'taskContinuation'>,
+  incoming: PendingCliInput,
   targetBackend: SessionBackend,
 ): boolean {
+  if (lastInitConfig?.cliId === 'traex' && !codexRpcEngine) return preemptTraexForNewMessage(incoming, targetBackend);
   if (cliAdapter?.preemptsOnNewMessage !== true) return false;
   if (!isUserImTurnId(incoming.turnId)) return false;
   if (incoming.queueAfterActiveTurn || incoming.noReplay || incoming.taskContinuation) return false;
@@ -23528,6 +23980,7 @@ const inFlightKeepaliveFingerprints = new Map<string, number>();
 
 /** 排队注入一行 TUI 命令：idle（isPromptReady）时经串行恢复事务敲入。 */
 async function flushPendingInjections(): Promise<void> {
+  if (lastInitConfig?.cliId === 'traex' && traexPreemptionHoldsWrites()) return;
   if (nativeSessionForkPending() || webTerminalInputWireDirty()) return;
   if (codexModelMigrationCheckNeeded() && await codexModelMigrationAdmit('write') !== 'proceed') return;
   if (webTerminalInputWireDirty()) return;
@@ -24982,6 +25435,38 @@ function handleVisibleStartupInteraction(data: string): boolean {
   const stripped = data.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
   if (!TRUST_DIALOG_PATTERN.test(stripped)) return false;
 
+  const traexTrust = lastInitConfig?.cliId === 'traex';
+  const backendAtSchedule = backend;
+  const generationAtSchedule = cliSpawnGeneration;
+  const lifetimeAtSchedule = traexTrust ? cliLifetimeNonce : undefined;
+  const interruptAtSchedule = traexTrust ? cliInterruptGeneration : undefined;
+  const webInputAtSchedule = traexTrust ? webTerminalInputGeneration : undefined;
+  const readinessAtSchedule = traexTrust ? promptReadinessRevision : undefined;
+  // A persistent observer can replay the old trust page from scrollback. Only
+  // the current native viewport may authorize this delayed TraeX control key.
+  const currentTraexTrustDialog = (): boolean => {
+    if (!backendAtSchedule || !backendScreenEvidenceIsAuthoritativeForMutation()) return false;
+    try {
+      const viewport = backendAtSchedule.captureViewport?.()
+        ?? backendAtSchedule.captureInputState?.()?.viewport
+        ?? (!backendAtSchedule.captureCurrentScreen ? renderer?.rawSnapshot() : undefined);
+      if (!viewport || detectCliStartupBlocker(viewport)?.rule !== 'codex-family-folder-trust') return false;
+      const selections = stripAnsiScreenText(viewport).split(/\r?\n/)
+        .filter(line => /^[ \t]*[❯›]/.test(line));
+      return /^[ \t]*[❯›][ \t]*1[.)][ \t]*(?:Yes, continue|Trust and continue)[ \t]*$/.test(selections.at(-1) ?? '');
+    } catch { return false; }
+  };
+  const currentTraexTrustLease = (): boolean => backend === backendAtSchedule
+    && cliSpawnGeneration === generationAtSchedule && cliLifetimeNonce === lifetimeAtSchedule
+    && cliInterruptGeneration === interruptAtSchedule && webTerminalInputGeneration === webInputAtSchedule
+    && promptReadinessRevision === readinessAtSchedule && !closeRequested
+    && !cliRestartInProgress && !rawInputRestartGate && !fatalWorkerErrorPending
+    && !codexRpcEngine
+    && !isFlushing && !injectionFlushing && !cliSubmissionInFlight && commandLineWritesPending === 0
+    && !traexPreemptionHoldsWrites() && !sessionRenameInFlight() && !nativeSessionForkPending()
+    && !pendingWebTerminalInput() && !webTerminalInputWireDirty();
+  if (traexTrust && (!currentTraexTrustLease() || !currentTraexTrustDialog() || !currentTraexTrustLease())) return false;
+
   trustHandled = true;
   log('Trust dialog detected, auto-accepting...');
   // Codex 0.149 的按键处理器在信任框渲染的瞬间尚未就绪，同步发出的 Enter 会
@@ -24990,10 +25475,9 @@ function handleVisibleStartupInteraction(data: string): boolean {
   // trustHandled 已同步置位，后续 chunk 重复命中同一文案不会重入。
   // 围栏：400ms 内若发生 respawn（崩溃/配置切换/restart），旧 timer 不得把
   // Enter 发进新会话的 backend（与本文件其它延迟回调的围栏约定一致）。
-  const backendAtSchedule = backend;
-  const generationAtSchedule = cliSpawnGeneration;
   setTimeout(() => {
     if (backend !== backendAtSchedule || cliSpawnGeneration !== generationAtSchedule) return;
+    if (traexTrust && (!currentTraexTrustLease() || !currentTraexTrustDialog() || !currentTraexTrustLease())) return;
     try {
       if (backend) invalidatePromptReadinessEvidence();
       if (backend && 'sendSpecialKeys' in backend) {
@@ -25797,9 +26281,15 @@ async function handleTrustedCodexAppMarker(
           ),
         },
       ];
+      const settledRecoveredEntry = codexAppRecoveredDispatches.find(
+        entry => entry.dispatchId === codexAppDispatchId,
+      );
       codexAppRecoveredDispatches = codexAppRecoveredDispatches.filter(
         entry => entry.dispatchId !== codexAppDispatchId,
       );
+      if (settledRecoveredEntry?.queuedActivationToken) {
+        acknowledgeQueuedActivationToken(settledRecoveredEntry.queuedActivationToken);
+      }
     } else {
       if (isCodexAppCliId(lastInitConfig?.cliId)
           && codexAppDispatchHandle !== undefined
@@ -27375,6 +27865,7 @@ function holdForNativeSessionFork(): boolean {
 }
 
 function markPromptReady(): void {
+  if (lastInitConfig?.cliId === 'traex' && traexPreemption) { void resolveTraexPreemption(); return; }
   if (workerSessionEventScope && !hasCurrentSessionRuntime()) {
     warnPromptReadySkipped('turn-authority-missing');
     return;
@@ -29012,6 +29503,122 @@ function observeQueuedActivationReceipt(
   return false;
 }
 
+const unconfirmedQueuedActivations = new Map<string, { item: PendingCliInput; generation: number }>();
+/** Explicit operator-authorized replay tokens, valid for exactly one CLI generation. */
+const authorizedQueuedActivationReplays = new Map<string, number>();
+
+/** Called only after an explicitly authorized restart enters its new CLI generation. */
+function authorizeUnconfirmedQueuedActivationReplay(): number {
+  const items: PendingCliInput[] = [];
+  for (const [token, entry] of [...unconfirmedQueuedActivations]) {
+    unconfirmedQueuedActivations.delete(token);
+    // Stale/cancelled observers and already-settled tokens never gain replay authority.
+    if (!queuedActivationReceipts.has(token) || queuedActivationReceipts.isSettled(token)) continue;
+    queuedActivationReceipts.cancel(token);
+    authorizedQueuedActivationReplays.set(token, cliSpawnGeneration);
+    items.push(entry.item);
+  }
+  if (items.length > 0) {
+    pendingMessages.unshift(...items);
+    log(`Operator authorized replay of ${items.length} unconfirmed queued activation(s) for CLI generation ${cliSpawnGeneration}`);
+  }
+  return items.length;
+}
+
+function durableArgvActivationRecheck(
+  item: PendingCliInput,
+): (() => SubmitRecheckResult | Promise<SubmitRecheckResult>) | undefined {
+  const adapter = cliAdapter;
+  if (!adapter?.durableInitialPromptViaArgs || !adapter.findInitialPromptArgSubmission || !item.content
+    || lastInitConfig?.resume) return undefined;
+  return () => {
+    const probeResult = adapter.findInitialPromptArgSubmission!(0, item.content);
+    const resumeCmd = adapter.buildResumeCommand?.({ sessionId, cliSessionId: undefined });
+    const ownedCliSessionId = resumeCmd?.match(/(?:^|\s)-s\s+(\S+)/)?.[1];
+    const decision = decideDurableArgvReattachSubmission({
+      probeResult,
+      expectedCliSessionId: lastInitConfig?.cliSessionId,
+      ownedCliSessionId,
+      promptContainsSessionId: Boolean(sessionId && item.content.includes(sessionId)),
+    });
+    return decision.action === 'already_submitted'
+      ? { submitted: true as const, ...(decision.cliSessionId ? { cliSessionId: decision.cliSessionId } : {}) }
+      : false;
+  };
+}
+
+/** A persisted `submitting`/`reconciling` phase proves only intent-to-write.
+ *  Keep the exact activation read-only until an authoritative receipt arrives;
+ *  never ACK from that phase alone and never replay the retained bytes blindly. */
+function observeUnconfirmedQueuedActivation(
+  item: PendingCliInput,
+  opts?: {
+    recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
+    durableTerminalStatus?: 'failed' | 'ambiguous';
+    deferRedrive?: boolean;
+    onSettledExtra?: (proof: QueuedActivationProof, redrive: () => void) => void;
+  },
+): boolean {
+  const evidenceTurnId = item.turnId;
+  const generation = cliSpawnGeneration;
+  const activationToken = item.queuedActivationToken;
+  if (activationToken) unconfirmedQueuedActivations.set(activationToken, { item, generation });
+  const writeStartedAtMs = evidenceTurnId && typeof inputDeliveryEvidence?.writeStartedAtMs === 'function'
+    ? inputDeliveryEvidence.writeStartedAtMs({
+      turnId: evidenceTurnId,
+      dispatchAttempt: item.dispatchAttempt,
+      cliGeneration: generation,
+    })
+    : undefined;
+  let failureChain: SubmitFailureChainKey | undefined;
+  const receiptBackend = backend;
+  const redrive = (): void => {
+    if (cliSpawnGeneration !== generation || backend !== receiptBackend || cliRestartInProgress) return;
+    try { redriveRejectedStructuredReady(); } finally { void flushPending(); }
+  };
+  const settled = observeQueuedActivationReceipt(
+    item,
+    opts?.recheck,
+    item.content,
+    {
+      generation,
+      ...(evidenceTurnId ? { turnId: evidenceTurnId } : {}),
+      ...(evidenceTurnId ? {
+        probeEvidence: () => probeAuthoritativeQueuedActivationEvidence(
+          {
+            turnId: evidenceTurnId,
+            sendMarkerTurnId: item.turnId,
+            dispatchAttempt: item.dispatchAttempt,
+            generation,
+            allowStandaloneSendMarker: cliGenerationTurnWrites <= 1,
+          },
+          writeStartedAtMs,
+        ),
+      } : {}),
+      onSettledExtra: proof => {
+        if (activationToken) unconfirmedQueuedActivations.delete(activationToken);
+        if (failureChain) submitFailureChains.cancel(failureChain);
+        opts?.onSettledExtra?.(proof, redrive);
+        if (!opts?.deferRedrive) queueMicrotask(redrive);
+      },
+    },
+  );
+  if (!settled) {
+    failureChain = scheduleSubmitFailureNotify(
+      item.logicalContent ?? item.content,
+      opts?.recheck,
+      t('worker.transcriptLabel'),
+      undefined,
+      undefined,
+      usageLimitTracker.currentTurn(),
+      item,
+      opts?.durableTerminalStatus ?? 'ambiguous',
+      codexBridgeFallbackActive(),
+    );
+  }
+  return settled;
+}
+
 function codexAppRuntimeTypeAheadReady(): boolean {
   return isCodexAppCliId(lastInitConfig?.cliId)
     && codexAppControlProven
@@ -29297,6 +29904,7 @@ function promotePendingHumanInterruption(): boolean {
 }
 
 async function flushPending(): Promise<void> {
+  if (lastInitConfig?.cliId === 'traex' && traexPreemptionHoldsWrites()) { armTraexPreemptionPoll(); return; }
   // Settlement is bookkeeping, not a CLI write; dirty must not strand it.
   settleFailedTurnRewindOffQueue('left the queue before it reached the CLI', false);
   if (webTerminalInputWireDirty()) return;
@@ -29490,8 +30098,14 @@ async function flushPending(): Promise<void> {
       supersedeBackgroundAuthorityHold('superseded_by_message');
     }
   }
+  const effectiveSupportsTypeAhead = typeof shouldAllowTypeAheadOnReattach === 'function'
+    ? shouldAllowTypeAheadOnReattach(
+        typeof reattachOpenTurnGate === 'boolean' && reattachOpenTurnGate && !isCodexAppCliId(lastInitConfig?.cliId),
+        runtimeSupportsTypeAhead,
+      )
+    : runtimeSupportsTypeAhead;
   const typeAheadAllowed = pendingInputAllowsTypeAhead(
-    runtimeSupportsTypeAhead,
+    effectiveSupportsTypeAhead,
     durableTurnInFlight,
     pendingMessages[0],
     directRpcTurnBlocksTypeAhead() || programStatusBlockedHoldsTypeAhead(),
@@ -29776,6 +30390,7 @@ async function flushPending(): Promise<void> {
     let holdDrainForPreferredReset = false;
     while (pendingMessages.length > 0 && backend && cliAdapter && !holdDrainForPreferredReset
       && !webTerminalInputWireDirty()) {
+      if (lastInitConfig?.cliId === 'traex' && traexPreemptionHoldsWrites()) { armTraexPreemptionPoll(); break; }
       if (guardTraexFirstAdmission && webTerminalInputGeneration !== firstAdmissionWebInputGeneration) {
         holdFirstAdmissionAfterWebInput();
         break;
@@ -29950,10 +30565,45 @@ async function flushPending(): Promise<void> {
         break;
       }
       const continuedExecution = item.traexAutoModelRecovery ? item.traexAutoModelContinuation?.execution : undefined;
-      if (workerSessionEventScope && !(continuedExecution && item.turnId
+      const replayAuthorized = !continuedExecution && !!item.queuedActivationToken
+        && authorizedQueuedActivationReplays.get(item.queuedActivationToken) === cliSpawnGeneration;
+      if (replayAuthorized) {
+        authorizedQueuedActivationReplays.delete(item.queuedActivationToken!);
+        log(`Writing operator-authorized unconfirmed activation replay (turn=${item.turnId?.substring(0, 16) ?? '-'})`);
+      }
+      if (workerSessionEventScope && !replayAuthorized && !(continuedExecution && item.turnId
         ? workerSessionEventScope.canSubmitContinuation(item.turnId, continuedExecution)
         : workerSessionEventScope.canSubmit(item.turnId, item.dispatchAttempt))) {
+        const submissionGate = !continuedExecution
+          ? workerSessionEventScope.inspectSubmissionGate?.(item.turnId, item.dispatchAttempt)
+          : undefined;
+        const rejectionSettlement = typeof decideFlushSubmissionRejectionSettlement === 'function'
+          ? decideFlushSubmissionRejectionSettlement({
+            isCodexApp: isCodexAppCliId(lastInitConfig?.cliId),
+            hasToken: !!item.queuedActivationToken,
+            gate: submissionGate,
+          })
+          : 'retain';
+        let holdForUnconfirmedActivation = false;
+        if (rejectionSettlement === 'settle_already_submitted') {
+          log(
+            `Settled already-submitted queued activation ${item.queuedActivationToken!.substring(0, 8)} `
+            + `without re-submitting (phase=${submissionGate?.phase ?? '-'})`,
+          );
+          acknowledgeQueuedActivation(item);
+        } else if (rejectionSettlement === 'observe_only') {
+          log(
+            `Queued activation requires authoritative submission evidence before ACK `
+            + `(turn=${item.turnId?.substring(0, 16) ?? '-'}, phase=${submissionGate?.phase ?? '-'})`,
+          );
+          holdForUnconfirmedActivation = !observeUnconfirmedQueuedActivation(item, {
+            recheck: durableArgvActivationRecheck(item),
+          });
+        }
         if (item.turnId) send({ type: 'turn_input_rejected', turnId: item.turnId, ...(item.dispatchAttempt !== undefined ? { dispatchAttempt: item.dispatchAttempt } : {}), reason: 'execution_reconciliation_required' });
+        // An unproven activation remains the FIFO owner. Its receipt observer
+        // holds the exact head; do not let later queued inputs overtake it.
+        if (holdForUnconfirmedActivation) break;
         continue;
       }
       if (continuedExecution && item.turnId) workerSessionEventScope?.enterContinuation(item.turnId, continuedExecution);
@@ -30719,6 +31369,44 @@ async function flushPending(): Promise<void> {
             replayAnchorMs,
           );
           installRpcLifecycleFailClosedOwner(rpcTurnIdentity, rpcTurnGeneration);
+          if (item.queuedActivationToken) {
+            const ambiguousRpcIdentity = rpcTurnIdentity;
+            const ambiguousRpcGeneration = rpcTurnGeneration;
+            const ownerKey = rpcTurnOwnerKey(ambiguousRpcIdentity);
+            ambiguousRpcActivationTokens.set(ownerKey, {
+              generation: ambiguousRpcGeneration,
+              token: item.queuedActivationToken,
+            });
+            const rpcEvidenceBaselineMs = typeof inputDeliveryEvidence?.writeStartedAtMs === 'function'
+              ? (inputDeliveryEvidence.writeStartedAtMs({
+                  turnId: ambiguousRpcIdentity.turnId,
+                  dispatchAttempt: ambiguousRpcIdentity.dispatchAttempt,
+                  cliGeneration: writeGeneration,
+                }) ?? Date.now())
+              : Date.now();
+            observeQueuedActivationReceipt(
+              item,
+              undefined,
+              rpcContext?.content ?? msg,
+              {
+                generation: writeGeneration,
+                turnId: ambiguousRpcIdentity.turnId,
+                probeEvidence: () => probeAuthoritativeQueuedActivationEvidence(
+                  {
+                    turnId: ambiguousRpcIdentity.turnId,
+                    sendMarkerTurnId: item.turnId,
+                    dispatchAttempt: item.dispatchAttempt,
+                    generation: writeGeneration,
+                    allowStandaloneSendMarker: cliGenerationTurnWrites <= 1,
+                  },
+                  rpcEvidenceBaselineMs,
+                ),
+                onSettledExtra: () => {
+                  ambiguousRpcActivationTokens.delete(ownerKey);
+                },
+              },
+            );
+          }
           log(
             `Codex RPC turn/start became ambiguous; held exact owner and blocked successors `
             + `turn=${rpcTurnIdentity.turnId} attempt=${rpcTurnIdentity.dispatchAttempt ?? '-'} `
@@ -31430,8 +32118,14 @@ function sendToPty(
     return true;
   }
   if (!cliAdapter) return false;
+  const sendSupportsTypeAhead = typeof shouldAllowTypeAheadOnReattach === 'function'
+    ? shouldAllowTypeAheadOnReattach(
+        typeof reattachOpenTurnGate === 'boolean' && reattachOpenTurnGate && !isCodexAppCliId(lastInitConfig?.cliId),
+        runtimePtyInputPolicy().supportsTypeAhead,
+      )
+    : runtimePtyInputPolicy().supportsTypeAhead;
   const supportsTypeAhead = pendingInputAllowsTypeAhead(
-    runtimePtyInputPolicy().supportsTypeAhead,
+    sendSupportsTypeAhead,
     durableTurnInFlight,
     next,
     directRpcTurnBlocksTypeAhead() || programStatusBlockedHoldsTypeAhead(),
@@ -31461,6 +32155,7 @@ function sendToPty(
   if (preemptActiveTurnForNewMessage(next, backend)) {
     log(`Preempting running turn for newer user message: "${content.substring(0, 80)}"`);
   }
+  if (lastInitConfig?.cliId === 'traex' && traexPreemptionHoldsWrites()) return true;
   // User-override semantics: a fresh Lark message while a TUI prompt is "active"
   // takes precedence over the AI-detected prompt. The screen analyzer can be
   // wrong (false positive on a question that has no rendered options) and a
@@ -31487,7 +32182,8 @@ function sendToPty(
   // TUI has booted. First-ready or positive initialization evidence proves
   // this; keep that evidence available to messages arriving after the startup
   // observer's one-time queue flush, even if resyncs prevent ordinary idle.
-  if (!recoverSessionRenameAfterPersistentReattach(next) && !sessionRenameInFlight() && commandLineWritesPending === 0 && shouldWriteNow({
+  if (!(lastInitConfig?.cliId === 'traex' && traexPreemptionHoldsWrites())
+    && !recoverSessionRenameAfterPersistentReattach(next) && !sessionRenameInFlight() && commandLineWritesPending === 0 && shouldWriteNow({
     isPromptReady,
     isFlushing,
     supportsTypeAhead,
@@ -32810,8 +33506,31 @@ async function spawnCli(
   if (!workerSessionEventScope) return spawnCliBody(cfg, opts);
   const firstBinding = !workerSessionEventScope.currentBinding();
   if (cfg.prompt && !workerSessionEventScope.canSubmit(cfg.turnId, cfg.dispatchAttempt, cfg.sessionCommand?.execution)) {
-    if (cfg.turnId) send({ type: 'turn_input_rejected', turnId: cfg.turnId, ...(cfg.dispatchAttempt !== undefined ? { dispatchAttempt: cfg.dispatchAttempt } : {}), reason: 'execution_reconciliation_required' });
-    cfg.prompt = ''; initialInputOwnershipPending = false;
+    const submissionGate = workerSessionEventScope.inspectSubmissionGate?.(
+      cfg.turnId,
+      cfg.dispatchAttempt,
+      cfg.sessionCommand?.execution,
+    );
+    const rejectionSettlement = typeof decideFlushSubmissionRejectionSettlement === 'function'
+      ? decideFlushSubmissionRejectionSettlement({
+        isCodexApp: typeof isCodexAppCliId === 'function' && isCodexAppCliId(cfg.cliId),
+        hasToken: !!cfg.queuedActivationToken,
+        gate: submissionGate,
+      })
+      : 'retain';
+    if (rejectionSettlement === 'settle_already_submitted') {
+      spawnCliReconciledActivationToken = cfg.queuedActivationToken;
+    }
+    if (cfg.turnId && rejectionSettlement !== 'observe_only') {
+      send({ type: 'turn_input_rejected', turnId: cfg.turnId, ...(cfg.dispatchAttempt !== undefined ? { dispatchAttempt: cfg.dispatchAttempt } : {}), reason: 'execution_reconciliation_required' });
+    }
+    // An unconfirmed persisted phase must not authorize either a blind replay or
+    // a direct ACK. Keep the exact init payload through spawn so the adapter's
+    // authoritative reattach probe and the post-spawn receipt observer can decide.
+    if (rejectionSettlement !== 'observe_only') {
+      cfg.prompt = '';
+      initialInputOwnershipPending = false;
+    }
   }
   const execution = firstBinding || cfg.prompt ? cfg.sessionCommand?.execution : undefined;
   const previousBinding = workerSessionEventScope.currentBinding();
@@ -32901,6 +33620,8 @@ async function spawnCliBody(
     : cfg.sandboxNetworkPolicy;
   if (!codexRpcEngine) codexCleanupLaunchTarget = undefined;
   remoteRunnerRecoveredTurnInFlight = false;
+  remoteRunnerRecoveredTurnIdentity = undefined;
+  lastSpawnPersistentReattach = false;
   // Probed once at the early gate and reused at the final child-env gate so a
   // launch runs --version/--help only once; profile FILES are re-read at both
   // gates (the late scan still catches a deletion mid-setup).
@@ -35388,7 +36109,11 @@ async function spawnCliBody(
     additionalArgs?: string[];
     env?: Record<string, string>;
   } | undefined;
-  if (cfg.prompt) {
+  if (shouldPrepareInitialPromptArg({
+    hasPrompt: !!cfg.prompt,
+    willReattachPersistent,
+    adoptMode: cfg.adoptMode === true,
+  })) {
     const prepared = cliAdapter.prepareInitialPromptArg?.({
       initialPrompt: cfg.prompt,
       sessionId: effectiveAdapterSessionId,
@@ -35446,6 +36171,7 @@ async function spawnCliBody(
     preparedArg: preparedInitialPrompt,
     preparedDeferredContent: preparedDeferredInput?.content,
     defer: deferInitialPrompt,
+    willReattachPersistent,
   });
   preparedInitialPrompt = initialPromptDelivery.argvPrompt;
   lastSpawnStructuredArgvPrompt = preparedInitialPrompt;
@@ -35465,7 +36191,6 @@ async function spawnCliBody(
     ...argvBakedOpts,
     reliableTurnTerminal: cliAdapter.reliableTurnTerminal === true,
   });
-  armPendingArgvTurnExecutionStart(cfg.turnId, cfg.dispatchAttempt, spawnArgvNeedsWorkingSeed);
   // Fresh evidence window for the argv first-turn start gate (Pi): the new
   // generation must not inherit a previous spawn's latch or fail-open timer.
   stopSpawnArgvTurnStartFailOpen();
@@ -35487,6 +36212,15 @@ async function spawnCliBody(
     && !!cliAdapter.confirmInitialPromptArgSubmission
     && durableInitialPromptArgBaseline !== null
     && hasDurableInitialPrompt;
+  // Durable-argv adapters (OpenCode/MiMoCode) confirm `--prompt` ingestion via
+  // their SQLite store (finalizeArgvSubmission); delaying turn_execution_started
+  // until that confirmation keeps SessionContract in 'queued' if the process
+  // dies before ingesting `--prompt`.
+  armPendingArgvTurnExecutionStart(
+    cfg.turnId,
+    cfg.dispatchAttempt,
+    spawnArgvNeedsWorkingSeed && !lastSpawnArgvDurableInitialPrompt,
+  );
   lastSpawnArgvDurableInitialPromptSubmission = lastSpawnArgvDurableInitialPrompt
     ? { baseline: durableInitialPromptArgBaseline!, content: preparedInitialPrompt! }
     : undefined;
@@ -36672,11 +37406,15 @@ async function spawnCliBody(
       sandboxHome,
     );
     const mandatoryDenyPaths: string[] = [];
-    const hostOnlyDenyPaths: string[] = [
-      join(canonical(dataDir), 'schedule-preconditions'),
-      join(canonical(dataDir), 'link-refs'),
-      ...hostAuthorityPaths(canonical(dataDir)),
-    ];
+    const hostOnlyDataDirs = [...new Set([
+      canonical(dataDir),
+      canonical(join(canonical(defaultBotmuxHome), 'data')),
+    ])];
+    const hostOnlyDenyPaths: string[] = [...new Set(hostOnlyDataDirs.flatMap(dir => [
+      join(dir, 'schedule-preconditions'),
+      join(dir, 'link-refs'),
+      ...hostAuthorityPaths(dir),
+    ]))];
     const mandatoryDenyRegexes: string[] = [];
     const mandatoryReadOnlyPaths: string[] = [];
     // Linux: the per-session sandbox tree (`sandboxes/<sid>`) holds the deny-mask
@@ -37302,8 +38040,12 @@ async function spawnCliBody(
       homeDir: scratchHome,
       sessionId: cfg.sessionId,
     });
+    const scratchHostAuthorityDataDirs = [...new Set([
+      scratchCanonical(scratchDataDir),
+      scratchCanonical(join(scratchCanonical(defaultBotmuxHome), 'data')),
+    ])];
     const scratchDeny = [...new Set<string>([
-      ...hostAuthorityPaths(scratchCanonical(scratchDataDir)),
+      ...scratchHostAuthorityDataDirs.flatMap(hostAuthorityPaths),
       ...credentialRules.denyPaths.map(path =>
         scratchProtectedPathSet.has(path) ? path : scratchCanonical(path)),
       ...existingProtectedPathVariants(scratchProtectedPaths),
@@ -37782,10 +38524,18 @@ async function spawnCliBody(
       botmuxHome: canonical(configuredBotmuxHome),
       defaultBotmuxHome: canonical(defaultBotmuxHome),
     }, seatbeltProtectedPaths);
-    // Imported-task authority is nested under dataDir, not among the legacy
-    // root-level dashboard files enumerated by credential-only profiles.
-    rules.denyPaths.push(...hostAuthorityPaths(canonical(isolationRuntimeDataDir)));
-    rules.denyWritePaths.push(...hostAuthorityPaths(canonical(isolationRuntimeDataDir)));
+    // Imported-task and host-only turn authority is nested under dataDir (both
+    // the configured runtime data dir and default ~/.botmux/data when custom
+    // SESSION_DATA_DIR is used), not among the legacy root-level dashboard files.
+    const seatbeltHostAuthorityDataDirs = [...new Set([
+      canonical(isolationRuntimeDataDir),
+      canonical(join(seatbeltHome, '.botmux', 'data')),
+      canonical(join(canonical(defaultBotmuxHome), 'data')),
+    ])];
+    for (const authorityDataDir of seatbeltHostAuthorityDataDirs) {
+      rules.denyPaths.push(...hostAuthorityPaths(authorityDataDir));
+      rules.denyWritePaths.push(...hostAuthorityPaths(authorityDataDir));
+    }
     const profileDir = join(isolationRuntimeDataDir, 'read-isolation');
     mkdirSync(profileDir, { recursive: true });
     const originDirectory = managedOriginCapabilityDirectory(
@@ -37907,15 +38657,29 @@ async function spawnCliBody(
       }
     };
     const credentialOnlyProtectedPaths = protectedPathsForHome(hostHomeDir);
-    for (const path of hostAuthorityPaths(isolationRuntimeDataDir)) {
-      try { mkdirSync(path, { recursive: true, mode: 0o700 }); } catch {
-        throw new Error('project authority mask directory unavailable');
+    const credentialOnlyAuthorityDataDirs = [...new Set([
+      isolationRuntimeDataDir,
+      ...[...processedRoots].map(root => join(root, 'data')),
+    ])];
+    for (const authorityDataDir of credentialOnlyAuthorityDataDirs) {
+      try {
+        const dirShape = lstatSync(authorityDataDir);
+        if (!dirShape.isDirectory() || dirShape.isSymbolicLink()) {
+          throw new Error('project authority mask directory is not safe');
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException | undefined)?.code !== 'ENOENT') throw error;
       }
-      const shape = lstatSync(path);
-      if (!shape.isDirectory() || shape.isSymbolicLink()) {
-        throw new Error('project authority mask directory is not safe');
+      for (const path of hostAuthorityPaths(authorityDataDir)) {
+        try { mkdirSync(path, { recursive: true, mode: 0o700 }); } catch {
+          throw new Error('project authority mask directory unavailable');
+        }
+        const shape = lstatSync(path);
+        if (!shape.isDirectory() || shape.isSymbolicLink()) {
+          throw new Error('project authority mask directory is not safe');
+        }
+        hideDirectories.add(realpathSync(path));
       }
-      hideDirectories.add(realpathSync(path));
     }
     for (const path of [
       ...credentialOnlyProtectedPaths,
@@ -38355,6 +39119,7 @@ async function spawnCliBody(
   cliOutlivesWorker = cliSurvivesWorkerExit({ backendType: effectiveBackendType, persistentSessionName });
   const actuallyReattachedPersistent = 'isReattach' in backend
     && backend.isReattach === true;
+  lastSpawnPersistentReattach = actuallyReattachedPersistent;
   prepareDeploymentContinuationForSpawn(cfg, actuallyReattachedPersistent);
   // A NEW process resuming the same conversation — not a re-attach, whose CLI
   // never stopped: the transcript bridge's baseline reads what the previous
@@ -39759,9 +40524,20 @@ async function spawnCliBody(
     if (fatalWorkerErrorPending || backend !== observedBackend) return;
     try {
       if (currentBotmuxTurnId && currentBotmuxTurnId !== turn.turnId) {
-        throw new Error(
-          `turn ${currentBotmuxTurnId.substring(0, 12)} already owns this worker`,
-        );
+        const canAdoptOverUnstartedInit = typeof shouldAdoptPidMarkerWithoutRetiringCurrent === 'function'
+          && shouldAdoptPidMarkerWithoutRetiringCurrent({
+            initialInputOwnershipPending: typeof initialInputOwnershipPending === 'boolean' && initialInputOwnershipPending,
+            pendingCurrentTurnQueued: Array.isArray(pendingMessages) && pendingMessages.some(m => m.turnId === currentBotmuxTurnId),
+            activeTurnStarted: activeTurnAuthority.snapshot()?.started,
+            currentTurnId: currentBotmuxTurnId,
+            diskTurnId: turn.turnId,
+          });
+        if (!canAdoptOverUnstartedInit) {
+          throw new Error(
+            `turn ${currentBotmuxTurnId.substring(0, 12)} already owns this worker`,
+          );
+        }
+        activeTurnAuthority.clear();
       }
       // Fence startup synchronously before awaiting the daemon. The backend
       // resolves its ready handshake immediately after this callback returns;
@@ -39803,6 +40579,30 @@ async function spawnCliBody(
           ? true
           : undefined,
       );
+      remoteRunnerRecoveredTurnIdentity = {
+        turnId: turn.turnId,
+        ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+      };
+      workerSessionEventScope?.recordSubmission(turn.turnId, turn.dispatchAttempt);
+      const recoveredQueue = reconcileRemoteRecoveredTurnQueue(
+        pendingMessages,
+        remoteRunnerRecoveredTurnIdentity,
+        lastInitConfig,
+      );
+      if (recoveredQueue.remaining.length !== pendingMessages.length) {
+        pendingMessages.splice(0, pendingMessages.length, ...recoveredQueue.remaining);
+      }
+      for (const token of recoveredQueue.matchedTokens) {
+        // When matching the in-progress init turn before init finishes ready +
+        // publishRuntimeContract, let case 'init' emit the ACK post-ready so
+        // tail promotion never races the runtime binding.
+        if (recoveredQueue.matchedInitTurn
+          && !initPromptMaterialized
+          && token === lastInitConfig?.queuedActivationToken) {
+          continue;
+        }
+        acknowledgeQueuedActivationToken(token, sessionId);
+      }
       publishSandboxRelayCapability();
       log(
         `Recovered provider-owned remote turn ${turn.turnId.substring(0, 12)} `
@@ -40389,7 +41189,17 @@ async function spawnCliBody(
     // release keeps its settle: that is the pre-existing behavior for legacy
     // adapters, whose own cap is far away.
     if (forced) cancelFirstFlushSettle();
-    if (decideHardTimeoutAction(runtimePtyInputPolicy().supportsTypeAhead) === 'flush') {
+    // Keep soft-timeout and durable/cross-principal type-ahead behavior intact.
+    // Only at the hard cap (forced === true), after deferPromptReadyWhileBusy
+    // has already proved the reattached pane is neither busy nor mid-turn, let
+    // a stuck reattachOpenTurnGate (scrolled-off readyPattern) fall through to
+    // markPromptReady() so Case C / promoted tails cannot deadlock forever.
+    const hardCapQuietReattachRelease = forced
+      && typeof reattachOpenTurnGate === 'boolean'
+      && reattachOpenTurnGate
+      && !isCodexAppCliId(lastInitConfig?.cliId)
+      && !activeTurnBlocks(pendingMessages[0] ?? {});
+    if (!hardCapQuietReattachRelease && decideHardTimeoutAction(runtimePtyInputPolicy().supportsTypeAhead) === 'flush') {
       const armPromptSeed = shouldArmFirstPromptTimeoutPromptSeed({
         wasAwaitingPostHookPrompt,
         hasPendingInput: hasPendingInputForFlush(),
@@ -40495,6 +41305,9 @@ function killCli(opts: {
    * record of the turn it is executing) for the worker that reattaches it. */
   preserveCliPidMarker?: boolean;
 } = {}): void {
+  if (traexPreemptionTimer) clearTimeout(traexPreemptionTimer);
+  traexPreemptionTimer = undefined;
+  traexPreemption = undefined;
   if (lastInitConfig?.cliId === 'minimax') minimaxFinalReceiver.reset();
   resetAntigravityNativeQuotaLog();
   activeTransientRateLimit = undefined;
@@ -40694,6 +41507,8 @@ async function restartCliProcess(
   opts: {
     immediate?: boolean;
     preservePending?: boolean;
+    /** Explicit user restart may retry unconfirmed activations once in the new generation. */
+    allowUnconfirmedActivationReplay?: boolean;
     skipRestartBudget?: boolean;
     exactResumeSessionId?: string;
     restartCause?: CliRestartCause;
@@ -40737,6 +41552,7 @@ async function restartCliProcess(
   }
   if (typeof queuedActivationReceipts?.size === 'function'
     && queuedActivationReceipts.size() > 0
+    && !opts.allowUnconfirmedActivationReplay
     && !closeRequested) {
     queuedActivationReceipts.clear();
     log(`In-worker CLI restart (${reason}) has an unsettled queued activation receipt; retiring worker for daemon journal recovery`);
@@ -40752,6 +41568,10 @@ async function restartCliProcess(
   // until killCli/spawnCli would leave a window where an old timer can mutate
   // the next durable attempt while destroySession is still awaiting.
   cliSpawnGeneration += 1;
+  // Authorization is always generation-scoped: an unrelated later restart drops it.
+  authorizedQueuedActivationReplays.clear();
+  if (opts.allowUnconfirmedActivationReplay) authorizeUnconfirmedQueuedActivationReplay();
+  unconfirmedQueuedActivations.clear();
   // Old-generation deferred submit rechecks are stale by definition: cancel
   // them now so no lingering timer warns or mutates the replacement attempt.
   submitFailureChains.clear();
@@ -44657,6 +45477,7 @@ function emitTurnTerminal(
     // fence. Exact turn identity is sufficient: a later/stale terminal cannot
     // match after capture attribution advances.
     remoteRunnerRecoveredTurnInFlight = false;
+    remoteRunnerRecoveredTurnIdentity = undefined;
     wakePending = true;
   }
   if (wakePending) {
@@ -46080,10 +46901,65 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           // init so the daemon retries a clean incarnation instead of freezing.
           throw new Error('codex RPC resume: could not replace stale --remote pane; aborting init');
         }
+        spawnCliReconciledActivationToken = undefined;
         await spawnCli(msg, { pluginGenerationPrepared: rpcPluginGenerationPrepared, retryPaneAgentStart: !msg.restartAttemptId });
         if (traexAutoModelRuntimeEligible()) publishActiveRuntime({ model: msg.model, reasoningEffort: msg.reasoningEffort });
         await prepareCodexNativeTitleGeneration(msg, codexRpcEngine);
         if (codexRpcEngine) armRpcStartupDialogDismiss(); // boundary #4: keep the --remote pane from freezing on a startup dialog
+        const freshAmbiguousRpc = pendingAmbiguousFreshRpcActivation;
+        pendingAmbiguousFreshRpcActivation = undefined;
+        if (freshAmbiguousRpc && codexRpcEngine === freshAmbiguousRpc.generation.engine) {
+          const scopeBinding = workerSessionEventScope?.currentBinding();
+          if (scopeBinding && workerSessionEventScope) {
+            const rpcExec = msg.sessionCommand?.execution
+              ?? workerSessionEventScope.executionForTurn(
+                freshAmbiguousRpc.identity.turnId,
+                freshAmbiguousRpc.identity.dispatchAttempt,
+              );
+            workerSessionEventScope.run(scopeBinding, () => {
+              markTurnExecutionStart(
+                freshAmbiguousRpc.identity.turnId,
+                freshAmbiguousRpc.identity.dispatchAttempt,
+                { evidenceAlreadyStarted: true },
+              );
+            }, rpcExec);
+          }
+          const ownerKey = rpcTurnOwnerKey(freshAmbiguousRpc.identity);
+          ambiguousRpcActivationTokens.set(ownerKey, {
+            generation: freshAmbiguousRpc.generation,
+            token: freshAmbiguousRpc.token,
+          });
+          const ambiguousGeneration = cliSpawnGeneration;
+          const ambiguousBackend = backend;
+          const watched = queuedActivationReceipts.watch(freshAmbiguousRpc.token, {
+            probeEvidence: () => probeAuthoritativeQueuedActivationEvidence(
+              {
+                turnId: freshAmbiguousRpc.identity.turnId,
+                sendMarkerTurnId: freshAmbiguousRpc.identity.turnId,
+                dispatchAttempt: freshAmbiguousRpc.identity.dispatchAttempt,
+                generation: ambiguousGeneration,
+                allowStandaloneSendMarker: true,
+              },
+              freshAmbiguousRpc.startedAtMs,
+            ),
+            sessionId: freshAmbiguousRpc.sessionId,
+            generation: ambiguousGeneration,
+            turnId: freshAmbiguousRpc.identity.turnId,
+            ...(freshAmbiguousRpc.identity.dispatchAttempt !== undefined
+              ? { dispatchAttempt: freshAmbiguousRpc.identity.dispatchAttempt }
+              : {}),
+            isCurrent: () => cliSpawnGeneration === ambiguousGeneration
+              && backend === ambiguousBackend
+              && codexRpcEngine === freshAmbiguousRpc.generation.engine
+              && !cliRestartInProgress,
+            onSettled: proof => {
+              ambiguousRpcActivationTokens.delete(ownerKey);
+              if (proof.cliSessionId) persistCliSessionId(proof.cliSessionId);
+              acknowledgeQueuedActivationToken(freshAmbiguousRpc.token, freshAmbiguousRpc.sessionId);
+            },
+          });
+          if (watched) queuedActivationReceipts.probeToken(freshAmbiguousRpc.token);
+        }
         if (deferredFreshRpcTurn) {
           const deferred = deferredFreshRpcTurn;
           deferredFreshRpcTurn = undefined;
@@ -46164,10 +47040,86 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         const initialNativeSessionTitle = msg.nativeSessionTitle;
         const initialNativeSessionTitlePrompt = msg.nativeSessionTitlePrompt;
         // Received before this init's own prompt, so they go ahead of it.
-        const predecessorUnsentInputs = takeUnsentInputsFromPredecessor(msg);
+        const predecessorUnsentInputs = takeUnsentInputsFromPredecessor(msg).filter(entry => !(
+          msg.reconcileQueuedActivation
+          && entry.turnId === msg.reconcileQueuedActivation.turnId
+          && entry.dispatchAttempt === msg.reconcileQueuedActivation.dispatchAttempt
+        ));
         let initialInputCommitted = false;
         let initialInputQueued = false;
-        if (shouldQueueInitialPrompt({
+        let reconciledInitActivationToken: string | undefined;
+        const remoteRunnerRecoveredInitTurn = Boolean(
+          remoteRunnerRecoveredTurnIdentity
+          && msg.turnId
+          && remoteRunnerRecoveredTurnIdentity.turnId === msg.turnId
+          && remoteRunnerRecoveredTurnIdentity.dispatchAttempt === msg.dispatchAttempt,
+        );
+        let durableArgvReattachSettled = false;
+        if (remoteRunnerRecoveredInitTurn) {
+          initialInputCommitted = true;
+          reconciledInitActivationToken = msg.queuedActivationToken;
+        } else if (
+          lastSpawnPersistentReattach
+          && !msg.resume
+          && msg.prompt
+          && !codexRpcEngine
+          && cliAdapter?.durableInitialPromptViaArgs === true
+          && cliAdapter.findInitialPromptArgSubmission
+        ) {
+          const probeResult = cliAdapter.findInitialPromptArgSubmission(0, msg.prompt);
+          const resumeCmd = cliAdapter.buildResumeCommand?.({ sessionId, cliSessionId: undefined });
+          const ownedCliSessionId = resumeCmd?.match(/(?:^|\s)-s\s+(\S+)/)?.[1];
+          const reattachDecision = decideDurableArgvReattachSubmission({
+            probeResult,
+            expectedCliSessionId: msg.cliSessionId,
+            ownedCliSessionId,
+            promptContainsSessionId: Boolean(sessionId && msg.prompt.includes(sessionId)),
+          });
+          if (reattachDecision.action === 'already_submitted') {
+            durableArgvReattachSettled = true;
+            initialInputCommitted = true;
+            reconciledInitActivationToken = msg.queuedActivationToken;
+            if (reattachDecision.cliSessionId) persistCliSessionId(reattachDecision.cliSessionId);
+            if (msg.turnId && workerSessionEventScope) {
+              const scopeBinding = workerSessionEventScope.currentBinding();
+              if (scopeBinding) {
+                const exec = msg.sessionCommand?.execution
+                  ?? workerSessionEventScope.executionForTurn(msg.turnId, msg.dispatchAttempt);
+                workerSessionEventScope.run(scopeBinding, () => {
+                  markTurnExecutionStart(msg.turnId, msg.dispatchAttempt, { evidenceAlreadyStarted: true });
+                }, exec);
+              }
+            }
+            if (msg.dispatchAttempt !== undefined
+              && reattachDecision.cliSessionId
+              && msg.turnId
+              && cliAdapter.isInitialPromptComplete
+              && backend) {
+              durableTurnInFlight = true;
+              const completion = {
+                baseline: 0,
+                content: msg.prompt,
+                cliSessionId: reattachDecision.cliSessionId,
+                turnId: msg.turnId,
+                dispatchAttempt: msg.dispatchAttempt,
+                adapter: cliAdapter,
+              };
+              argvDurableInitialPromptCompletion = completion;
+              watchArgvDurableInitialPromptCompletion({
+                ...completion,
+                backend,
+                generation: cliSpawnGeneration,
+              });
+            }
+            log(`Reconciled already-submitted durable argv initial prompt on persistent reattach (turn=${msg.turnId?.substring(0, 16) ?? '-'})`);
+          }
+        }
+        const reattachQueueAfterActiveTurn = lastSpawnPersistentReattach && (
+          reattachOpenTurnGate
+          || (activeTurnAuthority.snapshot()?.started === true
+            && activeTurnAuthority.snapshot()?.turnId !== msg.turnId)
+        );
+        if (!remoteRunnerRecoveredInitTurn && !durableArgvReattachSettled && shouldQueueInitialPrompt({
           hasPrompt: !!msg.prompt,
           rpcEngineActive: !!codexRpcEngine,
           queuePrompt: rpcDecision.queuePrompt,
@@ -46186,6 +47138,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             ...(lastSpawnQueuedInitialPromptLogicalContent
               ? { logicalContent: lastSpawnQueuedInitialPromptLogicalContent }
               : {}),
+            ...(reattachQueueAfterActiveTurn ? { queueAfterActiveTurn: true as const } : {}),
             turnId: msg.turnId,
             replyTurnId: msg.replyTurnId,
             dispatchAttempt: msg.dispatchAttempt,
@@ -46216,9 +47169,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           initialInputQueued = true;
         } else if (isCodexAppCliId(msg.cliId)) {
           pendingMessages.unshift(...recoveredAcceptedInputs);
-        } else if (msg.prompt) {
+        } else if (!remoteRunnerRecoveredInitTurn && !durableArgvReattachSettled && msg.prompt) {
           // A successful spawn with a non-queued prompt means the adapter baked
-          // it into argv or the RPC engine already accepted it.
+          // it into argv or the RPC engine already accepted it. Cold-start argv
+          // execution start is published via pendingTurnExecutionStart once the
+          // daemon assigns the live runtime (runtime_contract_assigned).
           initialInputCommitted = true;
           if (!codexRpcEngine) recordStructuredInput(msg.turnId, lastSpawnStructuredArgvPrompt ?? msg.prompt);
           // An argv-baked prompt is input the CLI has not consumed until its
@@ -46291,6 +47246,16 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             const finalizeArgvSubmission = (cliSessionId?: string) => {
               if (!argvIsCurrent()) return;
               if (cliSessionId) persistCliSessionId(cliSessionId);
+              if (msg.turnId && workerSessionEventScope?.canSubmit(msg.turnId, msg.dispatchAttempt, msg.sessionCommand?.execution)) {
+                const scopeBinding = workerSessionEventScope.currentBinding();
+                if (scopeBinding) {
+                  const exec = msg.sessionCommand?.execution
+                    ?? workerSessionEventScope.executionForTurn(msg.turnId, msg.dispatchAttempt);
+                  workerSessionEventScope.run(scopeBinding, () => {
+                    markTurnExecutionStart(msg.turnId, msg.dispatchAttempt, { evidenceAlreadyStarted: true });
+                  }, exec);
+                }
+              }
               if (msg.queuedActivationToken) {
                 acknowledgeQueuedActivationToken(msg.queuedActivationToken);
               }
@@ -46433,6 +47398,24 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           turnId: currentBotmuxTurnId,
           dispatchAttempt: currentBotmuxDispatchAttempt,
         });
+        const postInitReconcileToken = msg.reconcileQueuedActivation
+          ? msg.queuedActivationToken
+          : (reconciledInitActivationToken ?? (typeof spawnCliReconciledActivationToken === 'string' ? spawnCliReconciledActivationToken : undefined));
+        spawnCliReconciledActivationToken = undefined;
+        if (msg.reconcileQueuedActivation?.evidenceRequired && msg.queuedActivationToken) {
+          const item: PendingCliInput = {
+            content: msg.reconcileQueuedActivation.submittedText ?? '',
+            turnId: msg.reconcileQueuedActivation.turnId,
+            ...(msg.reconcileQueuedActivation.dispatchAttempt !== undefined
+              ? { dispatchAttempt: msg.reconcileQueuedActivation.dispatchAttempt }
+              : {}),
+            queuedActivationToken: msg.queuedActivationToken,
+            ...(msg.nativeSessionTitle ? { nativeSessionTitle: msg.nativeSessionTitle } : {}),
+          };
+          observeUnconfirmedQueuedActivation(item);
+        } else if (postInitReconcileToken) {
+          acknowledgeQueuedActivationToken(postInitReconcileToken, msg.sessionId);
+        }
       } catch (err: any) {
         if (err instanceof CliSpawnSupersededError) return;
         initialInputOwnershipPending = false;
@@ -46683,12 +47666,26 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // Cross-principal turns are rejected at this worker boundary. The daemon
       // normally isolates them before worker IPC; this closes races/restarts so
       // another human can never steer the active turn directly.
-      if (!msg.queueAfterActiveTurn && activeTurnBlocks({
+      const messageActiveTurnBlocked = activeTurnBlocks({
         turnId: msg.turnId,
         dispatchAttempt: msg.dispatchAttempt,
         trustedCaller: msg.trustedCaller,
         trustedController: msg.trustedController,
-      })) {
+      });
+      const activeTurnSnapshotForMessage = activeTurnAuthority.snapshot();
+      const promotedActivationDecision = typeof decidePromotedActivationMessageHandling === 'function'
+        ? decidePromotedActivationMessageHandling({
+            hasQueuedActivationToken: !!msg.queuedActivationToken,
+            explicitQueueAfterActiveTurn: msg.queueAfterActiveTurn === true,
+            reattachOpenTurnGate: typeof reattachOpenTurnGate === 'boolean' && reattachOpenTurnGate,
+            remoteRunnerRecoveredTurnInFlight: typeof remoteRunnerRecoveredTurnInFlight === 'boolean' && remoteRunnerRecoveredTurnInFlight,
+            activeTurnBlocks: messageActiveTurnBlocked,
+            activeTurnStartedOnDifferentTurn: activeTurnSnapshotForMessage?.started === true
+              && activeTurnSnapshotForMessage.turnId !== msg.turnId,
+          })
+        : { queueAfterActiveTurn: msg.queueAfterActiveTurn === true, reason: 'none' as const };
+      const effectiveQueueAfterActiveTurn = promotedActivationDecision.queueAfterActiveTurn;
+      if (!effectiveQueueAfterActiveTurn && messageActiveTurnBlocked) {
         if (ordinaryImTurnId) {
           rejectOrdinaryImTurn(
             ordinaryImTurnId,
@@ -46715,7 +47712,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // Adopt handlers are async and serialized below, so their renderer/usage
       // turn begins inside writeAdoptMessage. Non-adopt keeps the immediate
       // baseline while the message waits for normal flush scheduling.
-      if (!lastInitConfig?.adoptMode && !msg.queueAfterActiveTurn) {
+      if (!lastInitConfig?.adoptMode && !effectiveQueueAfterActiveTurn) {
         renderer?.markNewTurn();
         // PTY/tmux CLIs call `usageLimitTracker.beginTurn()` inside `prepareNormalWrite`
         // at the actual CLI write moment (avoiding premature wipe of Turn 1's active
@@ -46797,7 +47794,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           // turn whose `botmux send` could sneak its sentAtMs past this
           // turn's markTimeMs and falsely suppress its fallback.
           const inputCommitted = sendToPty(content, msg.turnId, {
-            ...(msg.queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
+            ...(effectiveQueueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
             codexAppInput,
             dispatchAttempt: msg.dispatchAttempt,
             durablePrimaryInbox: msg.durablePrimaryInbox,
@@ -47015,6 +48012,66 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     }
 
     case 'raw_input': {
+      const rawSubmissionGate = workerSessionEventScope?.inspectSubmissionGate?.(
+        msg.turnId,
+        undefined,
+        msg.sessionCommand?.execution,
+      );
+      const rawReconcileAction = typeof decideRawInputSubmissionReconciliation === 'function'
+        ? decideRawInputSubmissionReconciliation({
+            isCodexApp: isCodexAppCliId(lastInitConfig?.cliId),
+            hasToken: !!msg.queuedActivationToken,
+            gate: rawSubmissionGate,
+          })
+        : 'deliver';
+      if (rawReconcileAction === 'observe_only') {
+        log(
+          `Raw input requires authoritative submission evidence before ACK `
+          + `(turn=${msg.turnId?.substring(0, 16) ?? '-'}, phase=${rawSubmissionGate?.phase ?? '-'})`,
+        );
+        const deliverBundledFollowUp = () => {
+          if (msg.followUpContent) {
+            sendToPty(msg.followUpContent, msg.followUpTurnId, {
+              codexAppInput: msg.followUpCodexAppInput,
+              trustedController: msg.trustedController,
+              ...(msg.mojoLivePatch ? { mojoLivePatch: msg.mojoLivePatch } : {}),
+            });
+          }
+        };
+        const item: PendingCliInput = {
+          content: msg.content,
+          ...(msg.turnId ? { turnId: msg.turnId } : {}),
+          ...(msg.queuedActivationToken ? { queuedActivationToken: msg.queuedActivationToken } : {}),
+        };
+        observeUnconfirmedQueuedActivation(item, {
+          deferRedrive: true,
+          onSettledExtra: (_proof, redrive) => {
+            // observeQueuedActivationReceipt ACKs in its finally block. Preserve
+            // the established ACK -> bundled followUp -> successor redrive order.
+            queueMicrotask(() => {
+              try { deliverBundledFollowUp(); } finally { redrive(); }
+            });
+          },
+        });
+        break;
+      }
+      if (rawReconcileAction !== 'deliver') {
+        log(
+          `Skipped already-submitted raw input (${msg.content.substring(0, 40)}) `
+          + `turn=${msg.turnId?.substring(0, 16) ?? '-'} phase=${rawSubmissionGate?.phase ?? '-'}`,
+        );
+        if (rawReconcileAction === 'skip_and_ack' && msg.queuedActivationToken) {
+          acknowledgeQueuedActivationToken(msg.queuedActivationToken);
+        }
+        if (msg.followUpContent) {
+          sendToPty(msg.followUpContent, msg.followUpTurnId, {
+            codexAppInput: msg.followUpCodexAppInput,
+            trustedController: msg.trustedController,
+            ...(msg.mojoLivePatch ? { mojoLivePatch: msg.mojoLivePatch } : {}),
+          });
+        }
+        break;
+      }
       const unattendedRefusal = unattendedRawInputRefusal(msg);
       if (unattendedRefusal) {
         log(`Refused unattended raw input without safe composer evidence: ${unattendedRefusal.refusal} `
@@ -47069,7 +48126,8 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         || startupCommandsInProgress || startupCommandAckHold !== null || nativeSessionForkPending();
       // A busy native turn can accept passthrough, but an adapter's pending
       // paste/Enter/receipt owns the composer until its flush releases it.
-      if (isFlushing || cliSubmissionInFlight || commandLineWritesPending > 0
+      if ((lastInitConfig?.cliId === 'traex' && traexPreemptionHoldsWrites())
+        || isFlushing || cliSubmissionInFlight || commandLineWritesPending > 0
         || cliRestartInProgress || rawInputRestartGate || recoverSessionRenameAfterPersistentReattach() || sessionRenameInFlight()
         || (codexRpcEngine && hybridRpcTurnBlocksAdministrativeInput())
         || shouldHoldCodexRunnerInput(codexRunnerFreshness)
@@ -47279,6 +48337,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         // auto-restart 那条裸 restart 的计数兜底。
         {
           preservePending: true,
+          allowUnconfirmedActivationReplay: msg.allowUnconfirmedActivationReplay === true && !!msg.attemptId,
           immediate: msg.reason === 'account_rotation',
           skipRestartBudget: !!msg.updateWorkingDir || !!msg.topicEffort || msg.reason === 'account_rotation',
           ...(msg.topicEffort ? { exactResumeSessionId: msg.topicEffort.nativeSessionId } : {}),
