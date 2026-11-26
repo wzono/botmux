@@ -31,6 +31,7 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { getBotUnionId } from './bot-union-ids-store.js';
 import { listTeamGroups, replaceTeamGroupsByPrefix } from './team-groups-store.js';
 
 /** teamId prefix used when mirroring platform team groups into team-groups.json. */
@@ -193,7 +194,11 @@ export function isPlatformTeamBot(dataDir: string, unionId: string | undefined):
   const data = readFile(dataDir);
   if (!data) return false;
   for (const t of data.teams) {
-    for (const b of t.bots) if (!b.external && b.unionId === id) return true;
+    for (const b of t.bots) {
+      if (b.external) continue;
+      if (b.unionId === id) return true;
+      if (!b.unionId && getBotUnionId(dataDir, b.appId) === id) return true;
+    }
   }
   return false;
 }
@@ -236,7 +241,9 @@ export function isPlatformTeamBotTrustedBy(
   if (!data) return false;
   let senderAppIds: string[] | undefined;
   for (const t of data.teams) {
-    const sender = t.bots.find((b) => b.unionId === id && (!b.external || (!!senderApp && b.appId === senderApp)));
+    const sender = t.bots.find((b) => b.external
+      ? b.unionId === id && !!senderApp && b.appId === senderApp
+      : b.unionId === id || (!b.unionId && getBotUnionId(dataDir, b.appId) === id));
     if (!sender) continue;
     if (receiver && hasTeamBotmuxBot(t, receiver)) return true;
     // 外部机器人不跑在任何机器上：同机腿只认 botmux bot 条目。
