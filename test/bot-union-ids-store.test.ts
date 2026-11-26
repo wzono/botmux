@@ -3,7 +3,7 @@
  * (the platform roster's source of truth).
  * Run: pnpm vitest run test/bot-union-ids-store.test.ts
  */
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, beforeEach } from 'vitest';
@@ -40,6 +40,26 @@ describe('bot-union-ids-store', () => {
     recordBotUnionId(dataDir, 'cli_b', 'on_b');
     expect(getBotUnionId(dataDir, 'cli_a')).toBe('on_a');
     expect(getBotUnionId(dataDir, 'cli_b')).toBe('on_b');
+  });
+
+  it('preserves both entries when independent writers update the shared store', () => {
+    recordBotUnionId(dataDir, 'cli_seed', 'on_seed');
+    const fp = join(dataDir, 'bot-union-ids.json');
+
+    expect(recordBotUnionId(dataDir, 'cli_a', 'on_a', 10)).toBe(true);
+    expect(recordBotUnionId(dataDir, 'cli_b', 'on_b', 20)).toBe(true);
+
+    expect(JSON.parse(readFileSync(fp, 'utf-8'))).toMatchObject({
+      cli_seed: { unionId: 'on_seed' },
+      cli_a: { unionId: 'on_a', learnedAt: 10 },
+      cli_b: { unionId: 'on_b', learnedAt: 20 },
+    });
+  });
+
+  it('does not replace a newer observation with an older one', () => {
+    expect(recordBotUnionId(dataDir, 'cli_a', 'on_new', 20)).toBe(true);
+    expect(recordBotUnionId(dataDir, 'cli_a', 'on_old', 10)).toBe(false);
+    expect(getBotUnionId(dataDir, 'cli_a')).toBe('on_new');
   });
 
   it('learns own union_id from a self @mention', () => {
