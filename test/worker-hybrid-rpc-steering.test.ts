@@ -47,6 +47,7 @@ function harness() {
   h.scope.turnAuthorityIdentity = loadWorkerFunction('turnAuthorityIdentity', h.scope);
   h.scope.rpcTurnOwnerKey = loadWorkerFunction('rpcTurnOwnerKey', h.scope);
   h.scope.directRpcTurnBlocksTypeAhead = loadWorkerFunction('directRpcTurnBlocksTypeAhead', h.scope);
+  h.scope.traexPreemptionHoldsWrites = loadWorkerFunction('traexPreemptionHoldsWrites', h.scope);
   // Lazily resolve the worker's actual authorization at the write edge.
   h.scope.hybridRpcInputMaySteer = (...args: any[]) =>
     loadWorkerFunction('hybridRpcInputMaySteer', h.scope)(...args);
@@ -243,6 +244,8 @@ function lifecycleHarness() {
     },
     rpcTurnsAwaitingActivationIdentities: new Map(), rpcTurnsAwaitingActivationReplayAnchors: new Map(),
     pendingRpcTurnTerminals: new Map(), rpcLifecycleFailClosedIdentities: new Map(),
+    // These ordinary steering fixtures have no tokened queued activation.
+    ambiguousRpcActivationTokens: new Map(), pendingAmbiguousFreshRpcActivation: undefined,
     rpcTerminalHydrationTimers: new Map(), rpcTerminalHydrationTerminals: new Map(),
     CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS: [10, 20],
     universalOutputHandoff: false, checkpointCodexAdoptRecovery: vi.fn(), checkpointStructuredBridgeRecovery: vi.fn(),
